@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Rust nightly tools
+        run: rustup toolchain install nightly --component miri --component rust-src --component rustfmt
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Cache cargo quality tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-nextest*
+            ~/.cargo/bin/cargo-llvm-cov*
+            ~/.cargo/bin/cargo-crap*
+            ~/.cargo/bin/similarity-rs*
+            ~/.cargo/bin/cargo-machete*
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            ~/.cache/cargo-binstall
+          key: cargo-quality-tools-${{ runner.os }}-v1-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      - name: Install quality tools
+        run: cargo binstall cargo-nextest cargo-llvm-cov cargo-crap similarity-rs cargo-machete --no-confirm
+
+      - name: Check
+        run: make check
+
+      - name: Run tests
+        run: make test-all
+
+      - name: Lint
+        run: make lint
+
+      - name: Code health
+        run: make code-health
