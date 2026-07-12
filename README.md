@@ -1,20 +1,19 @@
 # radicle-team
 
-`radicle-team` runs a predefined team of AI software engineers that collaborate
-through [Radicle](https://radicle.dev) like human contributors. Each member has
-its own Radicle identity, role, seniority, personality, model, and capabilities.
-Teams can mix fast, inexpensive junior developers with more capable senior,
-architecture, security, or other specialist agents.
+`radicle-team` provides a finite set of AI software-engineer presets that
+collaborate through [Radicle](https://radicle.dev) like human contributors. Each
+preset is a stable character with a fixed name, identity, role, personality, and
+capabilities. A running application represents one selected team member.
 
 An agent watches Radicle for work addressed to it: issue assignments, mentions,
 replies, and patch reviews. It can discuss and create issues, implement assigned
 work, publish patches, and address review comments until the patch is accepted.
 Radicle remains the shared source of truth for code and collaboration.
 
-The project is distributed as a single binary. Each team member runs as a
-separate configured process with its own Radicle node and coding-agent backend.
-The whole team can run on one local machine or be distributed across servers;
-members coordinate only through Radicle.
+The project provides a reusable library and a thin binary. Each selected member
+runs as a separate process with its own Radicle node and identity. The whole
+team can run on one local machine or be distributed across servers; members
+coordinate only through Radicle.
 
 ## Development
 
