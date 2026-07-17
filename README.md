@@ -42,8 +42,8 @@ All stats are rated from 1 to 5.
   
   Special trait: **Sees Three Moves Ahead**
 
-- **Vera — Security Engineer.** Sharp, skeptical, and armed with very dry
-  humor. Notices the unlocked door everyone else has already walked through.
+- **Vera — Security Engineer.** Sharp, skeptical, and armed with very dry humor.
+  Notices the unlocked door everyone else has already walked through.
   
   `INT 5 · SPD 3 · EXP 4 · CRE 3 · CAU 5`  
   
@@ -66,7 +66,7 @@ All stats are rated from 1 to 5.
 
 ## Development
 
-- `make run` — run the application.
+- `make run` — run Nico; select another member with `make run MEMBER=vera`.
 - `make check` — type-check all features and targets.
 - `make test-all` — run all tests and targets with `cargo-nextest`.
 - `make lint` — run Clippy with warnings denied and verify formatting.

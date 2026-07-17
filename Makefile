@@ -1,6 +1,8 @@
 CARGO_PACKAGES := -p radicle-team
+MEMBER ?= nico
 MIRI_FLAGS := -Zmiri-disable-isolation -Zmiri-tree-borrows
 MIRI_PACKAGES := radicle-team
+MIRI_SYSROOT := $(CURDIR)/target/miri-sysroot
 COVERAGE_LCOV := target/radicle-team-lcov.info
 CRAP_REPORT := target/radicle-team-crap.md
 CRAP_EXCLUDES := --exclude '**/build.rs' --exclude '**/benches/**' --exclude '**/examples/**' --exclude '**/tests.rs' --exclude '**/*_tests.rs' --exclude '**/tests/**'
@@ -9,7 +11,7 @@ SIMILARITY_ARGS := src --threshold 0.92 --min-lines 12 --min-tokens 80 --fail-on
 .PHONY: run check test-all lint fmt code-health
 
 run:
-	cargo run
+	cargo run -- $(MEMBER)
 
 check:
 	cargo check $(CARGO_PACKAGES) --all-features --all-targets
@@ -32,7 +34,8 @@ code-health:
 	cargo llvm-cov nextest $(CARGO_PACKAGES) --all-features --all-targets --lcov --output-path $(COVERAGE_LCOV)
 	cargo crap --workspace --lcov $(COVERAGE_LCOV) $(CRAP_EXCLUDES) --format markdown --output $(CRAP_REPORT)
 	cargo crap --workspace --lcov $(COVERAGE_LCOV) $(CRAP_EXCLUDES) --summary --fail-above
+	MIRI_SYSROOT="$(MIRI_SYSROOT)" cargo +nightly miri setup
 	@set -e; \
 	for package in $(MIRI_PACKAGES); do \
-		MIRIFLAGS="$(MIRI_FLAGS)" cargo +nightly miri test -p "$$package" --all-features; \
+		MIRI_SYSROOT="$(MIRI_SYSROOT)" MIRIFLAGS="$(MIRI_FLAGS)" cargo +nightly miri test -p "$$package" --all-features; \
 	done
