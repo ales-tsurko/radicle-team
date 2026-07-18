@@ -97,6 +97,16 @@ impl Member {
             },
         }
     }
+
+    pub(crate) fn is_mentioned_in(self, body: &str) -> bool {
+        body.split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '@' | '_' | '-'))
+        })
+        .any(|word| {
+            word.strip_prefix('@')
+                .is_some_and(|name| name.eq_ignore_ascii_case(self.id()))
+        })
+    }
 }
 
 impl fmt::Display for Member {
@@ -170,7 +180,7 @@ impl Stats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::member::{Member, UnknownMember};
 
     #[test]
     fn parses_every_member_id() {

@@ -15,6 +15,15 @@ runs as a separate process with its own Radicle node and identity. The whole
 team can run on one local machine or be distributed across servers; members
 coordinate only through Radicle.
 
+Member data is isolated under
+`$RADICLE_TEAM_HOME/members/<member>/`; `RADICLE_TEAM_HOME` defaults to
+`~/.radicle-team`. Each member directory contains its Radicle home and watcher
+state database, allowing all members to run on the same machine.
+
+The watcher recognizes every issue and patch interaction relevant to the
+member, including assignments, mentions, replies, comments, reviews,
+revisions, reactions, resolutions, lifecycle changes, and merges.
+
 ## Team
 
 All stats are rated from 1 to 5.
@@ -66,7 +75,9 @@ All stats are rated from 1 to 5.
 
 ## Development
 
-- `make run` — run Nico; select another member with `make run MEMBER=vera`.
+- `make run REPO=<RID>` — run Nico for a repository; select another member with
+  `make run REPO=<RID> MEMBER=vera`. Run the binary directly with `--home PATH`
+  to override `RADICLE_TEAM_HOME`.
 - `make check` — type-check all features and targets.
 - `make test-all` — run all tests and targets with `cargo-nextest`.
 - `make lint` — run Clippy with warnings denied and verify formatting.

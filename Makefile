@@ -1,5 +1,6 @@
 CARGO_PACKAGES := -p radicle-team
 MEMBER ?= nico
+REPO ?=
 MIRI_FLAGS := -Zmiri-disable-isolation -Zmiri-tree-borrows
 MIRI_PACKAGES := radicle-team
 MIRI_SYSROOT := $(CURDIR)/target/miri-sysroot
@@ -11,7 +12,7 @@ SIMILARITY_ARGS := src --threshold 0.92 --min-lines 12 --min-tokens 80 --fail-on
 .PHONY: run check test-all lint fmt code-health
 
 run:
-	cargo run -- $(MEMBER)
+	cargo run -- $(MEMBER) --repo $(REPO)
 
 check:
 	cargo check $(CARGO_PACKAGES) --all-features --all-targets
