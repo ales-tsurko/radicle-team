@@ -8,6 +8,39 @@ use radicle::{
     identity::{Did, RepoId},
 };
 
+/// Activity addressed to or otherwise relevant to the selected member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activity {
+    /// Repository containing the activity.
+    pub repository: RepoId,
+    /// Issue or patch receiving the activity.
+    pub subject: Subject,
+    /// Operation which produced the activity.
+    pub operation: EntryId,
+    /// Author of the operation.
+    pub author: Did,
+    /// Why the activity requires attention.
+    pub kind: Kind,
+}
+
+impl Activity {
+    pub(super) fn new(
+        repository: RepoId,
+        subject: Subject,
+        operation: EntryId,
+        author: Did,
+        kind: Kind,
+    ) -> Self {
+        Self {
+            repository,
+            subject,
+            operation,
+            author,
+            kind,
+        }
+    }
+}
+
 /// Collaborative object receiving an interaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Subject {
@@ -15,6 +48,37 @@ pub enum Subject {
     Issue(ObjectId),
     /// Radicle patch.
     Patch(ObjectId),
+}
+
+/// Reason an interaction requires the member's attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The member was assigned an issue or patch review.
+    Assigned,
+    /// The member was mentioned in text.
+    Mentioned(Target),
+    /// A comment replied to one of the member's comments.
+    Replied {
+        /// New reply.
+        comment: Comment,
+        /// Member comment receiving the reply.
+        reply_to: EntryId,
+    },
+    /// Another relevant interaction occurred.
+    Changed(Change),
+}
+
+/// Location containing a mention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// Issue or patch title or description.
+    Subject,
+    /// Discussion comment.
+    Comment(Comment),
+    /// Patch review summary.
+    Review(ReviewId),
+    /// Patch revision description.
+    Revision(RevisionId),
 }
 
 /// Comment location within a collaborative object.
@@ -42,19 +106,6 @@ impl Comment {
     pub(super) const fn revision(revision: RevisionId, comment: EntryId) -> Self {
         Self::Revision { revision, comment }
     }
-}
-
-/// Location containing a mention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Target {
-    /// Issue or patch title or description.
-    Subject,
-    /// Discussion comment.
-    Comment(Comment),
-    /// Patch review summary.
-    Review(ReviewId),
-    /// Patch revision description.
-    Revision(RevisionId),
 }
 
 /// Change relevant because the member owns, reviews, or is assigned to the subject.
@@ -123,55 +174,4 @@ pub enum Change {
         /// Whether the reaction was added or removed.
         active: bool,
     },
-}
-
-/// Reason an interaction requires the member's attention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    /// The member was assigned an issue or patch review.
-    Assigned,
-    /// The member was mentioned in text.
-    Mentioned(Target),
-    /// A comment replied to one of the member's comments.
-    Replied {
-        /// New reply.
-        comment: Comment,
-        /// Member comment receiving the reply.
-        reply_to: EntryId,
-    },
-    /// Another relevant interaction occurred.
-    Changed(Change),
-}
-
-/// Activity addressed to or otherwise relevant to the selected member.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Activity {
-    /// Repository containing the activity.
-    pub repository: RepoId,
-    /// Issue or patch receiving the activity.
-    pub subject: Subject,
-    /// Operation which produced the activity.
-    pub operation: EntryId,
-    /// Author of the operation.
-    pub author: Did,
-    /// Why the activity requires attention.
-    pub kind: Kind,
-}
-
-impl Activity {
-    pub(super) fn new(
-        repository: RepoId,
-        subject: Subject,
-        operation: EntryId,
-        author: Did,
-        kind: Kind,
-    ) -> Self {
-        Self {
-            repository,
-            subject,
-            operation,
-            author,
-            kind,
-        }
-    }
 }

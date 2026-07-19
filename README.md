@@ -24,44 +24,71 @@ The watcher recognizes every issue and patch interaction relevant to the
 member, including assignments, mentions, replies, comments, reviews,
 revisions, reactions, resolutions, lifecycle changes, and merges.
 
+
+
+
+## Configuration
+
+The project uses one `.radicle-team.toml` configuration file. By default it is
+loaded from the repository's canonical branch. `--config PATH` selects an
+explicit file with the same schema; sources are never combined.
+
+```toml
+version = 1
+
+[members.nico]
+signing_did = "did:key:z6Mk..."
+generation = 1
+state = "active"
+```
+
+The file contains project settings, including member identity bindings. Private
+keys and passphrases are never stored in it.
+
+
+
+
 ## Team
 
-All stats are rated from 1 to 5.
+All stats are rated from 1 to 5. `INT` represents model capability, `SPD`
+response speed, `EXP` engineering autonomy, `CRE` solution exploration, and
+`CAU` risk-aware deliberation.
 
 - **Nico — Junior Developer.** A little silly, endlessly curious, and always
   eager to try something. Works fast, occasionally breaks things, and learns
-  even faster. 
+  even faster.
 
-  `INT 3 · SPD 5 · EXP 1 · CRE 4 · CAU 2`  
- 
+  `INT 3 · SPD 5 · EXP 1 · CRE 4 · CAU 2`
+
   Special trait: **Beginner's Luck**
 
 - **Maya — Senior Developer.** Calm, capable, and difficult to surprise. Turns
   vague ideas and messy code into something that actually ships.
-  
-  `INT 5 · SPD 4 · EXP 5 · CRE 3 · CAU 4`  
-  
+
+  `INT 5 · SPD 3 · EXP 5 · CRE 4 · CAU 4`
+
   Special trait: **Gets It Done**
 
 - **Leon — Software Architect.** Sees the whole system while everyone else is
   looking at one file. Thoughtful and patient, but deeply suspicious of
-  shortcuts. 
+  shortcuts.
 
-  `INT 5 · SPD 2 · EXP 5 · CRE 4 · CAU 5`  
-  
+  `INT 5 · SPD 2 · EXP 5 · CRE 4 · CAU 5`
+
   Special trait: **Sees Three Moves Ahead**
 
 - **Vera — Security Engineer.** Sharp, skeptical, and armed with very dry humor.
   Notices the unlocked door everyone else has already walked through.
-  
-  `INT 5 · SPD 3 · EXP 4 · CRE 3 · CAU 5`  
-  
+
+  `INT 5 · SPD 2 · EXP 5 · CRE 3 · CAU 5`
+
   Special trait: **Trust Nothing**
 
-- **Nora — UX/UI Designer.** Empathetic, expressive, and unafraid to challenge
-  the team. Knows that "technically working" is not the same as being usable.
+- **Nora — UX/UI Designer & Frontend Developer.** Empathetic, expressive, and
+  unafraid to challenge the team. Knows that "technically working" is not the
+  same as being usable.
 
-  `INT 4 · SPD 4 · EXP 4 · CRE 5 · CAU 3`  
+  `INT 4 · SPD 4 · EXP 4 · CRE 5 · CAU 3`
 
   Special trait: **Human Perspective**
 
@@ -69,15 +96,21 @@ All stats are rated from 1 to 5.
   clues. Sometimes disappears down a rabbit hole, but usually returns with the
   missing answer.
 
-  `INT 5 · SPD 3 · EXP 4 · CRE 5 · CAU 4`  
+  `INT 5 · SPD 1 · EXP 5 · CRE 4 · CAU 5`
 
   Special trait: **Leave No Stone Unturned**
 
+
+
+
 ## Development
 
-- `make run REPO=<RID>` — run Nico for a repository; select another member with
-  `make run REPO=<RID> MEMBER=vera`. Run the binary directly with `--home PATH`
-  to override `RADICLE_TEAM_HOME`.
+Contributions follow the repository [style guide](STYLE.md).
+
+- `make run REPO=<RID>` — run Nico for a repository; select another member
+  with `make run REPO=<RID> MEMBER=vera`. Run the binary directly with
+  `--home PATH` to override `RADICLE_TEAM_HOME`, or `--config PATH` to select
+  an explicit project configuration file.
 - `make check` — type-check all features and targets.
 - `make test-all` — run all tests and targets with `cargo-nextest`.
 - `make lint` — run Clippy with warnings denied and verify formatting.

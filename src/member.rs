@@ -1,7 +1,7 @@
 use std::{fmt, str::FromStr};
 
 /// A fixed member of the team.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Member {
     /// Junior developer.
     Nico,
@@ -11,7 +11,7 @@ pub enum Member {
     Leon,
     /// Security engineer.
     Vera,
-    /// UX/UI designer.
+    /// UX/UI designer and frontend developer.
     Nora,
     /// Researcher.
     Theo,
@@ -59,7 +59,7 @@ impl Member {
                 role: "Senior Developer",
                 description: "Calm, capable, and difficult to surprise. Turns vague ideas and \
                               messy code into something that actually ships.",
-                stats: Stats::new(5, 4, 5, 3, 4),
+                stats: Stats::new(5, 3, 5, 4, 4),
                 special_trait: "Gets It Done",
             },
             Self::Leon => Profile {
@@ -75,12 +75,12 @@ impl Member {
                 role: "Security Engineer",
                 description: "Sharp, skeptical, and armed with very dry humor. Notices the \
                               unlocked door everyone else has already walked through.",
-                stats: Stats::new(5, 3, 4, 3, 5),
+                stats: Stats::new(5, 2, 5, 3, 5),
                 special_trait: "Trust Nothing",
             },
             Self::Nora => Profile {
                 name: "Nora",
-                role: "UX/UI Designer",
+                role: "UX/UI Designer & Frontend Developer",
                 description: "Empathetic, expressive, and unafraid to challenge the team. Knows \
                               that technically working is not the same as being usable.",
                 stats: Stats::new(4, 4, 4, 5, 3),
@@ -92,7 +92,7 @@ impl Member {
                 description: "A patient investigator who happily follows strange clues. Sometimes \
                               disappears down a rabbit hole, but usually returns with the missing \
                               answer.",
-                stats: Stats::new(5, 3, 4, 5, 4),
+                stats: Stats::new(5, 1, 5, 4, 5),
                 special_trait: "Leave No Stone Unturned",
             },
         }
@@ -131,11 +131,6 @@ impl FromStr for Member {
     }
 }
 
-/// Error returned when a team member name is unknown.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown member '{0}'; expected nico, maya, leon, vera, nora, or theo")]
-pub struct UnknownMember(String);
-
 /// A member's fixed character profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
@@ -154,15 +149,15 @@ pub struct Profile {
 /// Character statistics rated from 1 to 5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
-    /// Intelligence.
+    /// Model capability and reasoning quality.
     pub intelligence: u8,
-    /// Speed.
+    /// Response and execution speed.
     pub speed: u8,
-    /// Experience.
+    /// Engineering judgment and autonomy.
     pub experience: u8,
-    /// Creativity.
+    /// Breadth of solution exploration.
     pub creativity: u8,
-    /// Caution.
+    /// Deliberation and risk awareness.
     pub caution: u8,
 }
 
@@ -177,6 +172,11 @@ impl Stats {
         }
     }
 }
+
+/// Error returned when a team member name is unknown.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown member '{0}'; expected nico, maya, leon, vera, nora, or theo")]
+pub struct UnknownMember(String);
 
 #[cfg(test)]
 mod tests {
@@ -204,7 +204,7 @@ mod tests {
             (Member::Maya, "Maya", "Senior Developer"),
             (Member::Leon, "Leon", "Software Architect"),
             (Member::Vera, "Vera", "Security Engineer"),
-            (Member::Nora, "Nora", "UX/UI Designer"),
+            (Member::Nora, "Nora", "UX/UI Designer & Frontend Developer"),
             (Member::Theo, "Theo", "Researcher"),
         ];
 

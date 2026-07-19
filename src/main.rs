@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use radicle_team::{Application, cli::Cli};
+use radicle_team::cli::Cli;
 
 use crate::logging::Logging;
 
@@ -16,10 +16,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let mut application = Application::new(cli.member(), cli.repository());
-    if let Some(home) = cli.home() {
-        application = application.with_home(home);
-    }
+    let application = cli.application();
 
     match application.run() {
         Ok(()) => ExitCode::SUCCESS,

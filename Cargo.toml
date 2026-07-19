@@ -8,12 +8,19 @@ resolver = "3"
 
 [dependencies]
 clap = { version = "4.6.2", features = ["derive", "env"] }
+config = { version = "0.15.25", default-features = false, features = ["toml"] }
 directories = "6.0.0"
+keyring = "4.1.5"
 radicle = "0.24.0"
+rand = "0.9.2"
+serde = { version = "1.0.228", features = ["derive"] }
 sqlite = "0.37.0"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["process"] }
 
 [lints]
 workspace = true

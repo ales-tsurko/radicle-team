@@ -7,7 +7,7 @@
 //!
 //! # Lifecycle
 //!
-//! 1. Resolve the member-specific Radicle home and load its profile.
+//! 1. Receive a profile already provisioned and validated by the identity subsystem.
 //! 2. Connect to the local node and verify that its identity matches the profile.
 //! 3. Replay every issue and patch operation to reconstruct classification state.
 //! 4. Emit only operations not recorded in the member's local state database.
@@ -39,10 +39,7 @@
 //! - `issue` and `patch` adapt Radicle action enums into normalized actions.
 //! - `state` persists processed operation IDs for idempotent rescanning.
 
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 
 use radicle::{
     cob::{
@@ -52,26 +49,20 @@ use radicle::{
         store::access::ReadOnly,
         stream::CobStream as _,
     },
-    crypto::ssh::Keystore,
-    git,
     identity::RepoId,
     node::{Handle as _, Node, NodeId, events::Event as NodeEvent},
-    profile::{Config, Home as RadicleHome, Profile as RadicleProfile},
-    storage::{
-        ReadStorage as _, RefUpdate,
-        git::{Repository, Storage, transport},
-    },
+    profile::Profile as RadicleProfile,
+    storage::{ReadStorage as _, RefUpdate, git::Repository},
 };
 
-pub use crate::watcher::activity::{Activity, Change, Comment, Kind, Subject, Target};
 use crate::{
-    home::MemberHome,
     member::Member,
     watcher::{
         classification::{ActionEnvelope, Context as ClassificationContext, NormalizedAction},
         state::ProcessedOperations,
     },
 };
+pub use crate::watcher::activity::{Activity, Change, Comment, Kind, Subject, Target};
 
 mod activity;
 mod classification;
@@ -134,110 +125,11 @@ macro_rules! store_scanner {
     };
 }
 
-/// Error produced by the Radicle watcher.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// Loading the Radicle profile failed.
-    #[error("failed to load Radicle profile: {0}")]
-    Profile(#[from] radicle::profile::Error),
-    /// Resolving the member's application home failed.
-    #[error("failed to resolve team member home: {0}")]
-    Home(#[from] crate::home::Error),
-    /// Communicating with the Radicle node failed.
-    #[error("Radicle node error: {0}")]
-    Node(#[from] radicle::node::Error),
-    /// The node and profile use different identities.
-    #[error("Radicle node identity {node} does not match profile identity {profile}")]
-    IdentityMismatch {
-        /// Identity loaded from the profile.
-        profile: NodeId,
-        /// Identity reported by the node.
-        node: NodeId,
-    },
-    /// Opening the Radicle repository failed.
-    #[error("failed to open Radicle repository: {0}")]
-    Repository(#[from] radicle::storage::RepositoryError),
-    /// Reading a collaborative object store failed.
-    #[error("failed to read Radicle collaborative objects: {0}")]
-    CobStore(#[from] radicle::cob::store::Error),
-    /// Opening a collaborative object operation stream failed.
-    #[error("failed to open collaborative object operation stream: {0}")]
-    CobStream(#[from] radicle::cob::stream::error::Stream),
-    /// Reading a collaborative object operation failed.
-    #[error("failed to read collaborative object operation: {0}")]
-    CobOperation(#[from] radicle::cob::stream::error::Ops),
-    /// Reading or writing the local watcher database failed.
-    #[error("watcher database error: {0}")]
-    Database(#[from] sqlite::Error),
-    /// Preparing the local watcher database failed.
-    #[error("watcher state I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    /// The node closed its event stream.
-    #[error("Radicle node closed its event stream")]
-    EventStreamClosed,
-}
-
 /// Watches a repository for activity addressed to one team member.
 #[derive(Debug, Clone)]
 pub struct Watcher {
     member: Member,
     repository: RepoId,
-    home: Option<PathBuf>,
-}
-
-#[derive(Default)]
-struct PendingActivities {
-    assignment: Option<Activity>,
-    activities: Vec<Activity>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ScanScope {
-    member: Member,
-    member_id: NodeId,
-    repository: RepoId,
-    object: ObjectId,
-    subject: Subject,
-    actionable: bool,
-}
-
-impl ScanScope {
-    const fn new(
-        member: Member,
-        member_id: NodeId,
-        repository: RepoId,
-        object: ObjectId,
-        subject: Subject,
-        actionable: bool,
-    ) -> Self {
-        Self {
-            member,
-            member_id,
-            repository,
-            object,
-            subject,
-            actionable,
-        }
-    }
-}
-
-impl PendingActivities {
-    fn add(&mut self, activity: Activity) {
-        match activity.kind {
-            Kind::Assigned => self.assignment = Some(activity),
-            _ => self.activities.push(activity),
-        }
-    }
-
-    fn emit(self, assigned: bool, actionable: bool, emit: &mut impl FnMut(Activity)) {
-        if assigned
-            && actionable
-            && let Some(activity) = self.assignment
-        {
-            emit(activity);
-        }
-        self.activities.into_iter().for_each(emit);
-    }
 }
 
 impl Watcher {
@@ -263,31 +155,11 @@ impl Watcher {
     /// Creates a watcher for `member` and `repository`.
     #[must_use]
     pub const fn new(member: Member, repository: RepoId) -> Self {
-        Self {
-            member,
-            repository,
-            home: None,
-        }
+        Self { member, repository }
     }
 
-    /// Uses an explicit application home directory.
-    #[must_use]
-    pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
-        self.home = Some(home.into());
-        self
-    }
-
-    /// Loads the local Radicle profile and watches until the node disconnects.
-    pub fn run(&self, emit: impl FnMut(Activity)) -> Result<(), Error> {
-        let home = match &self.home {
-            Some(root) => MemberHome::at(root, self.member),
-            None => MemberHome::discover(self.member)?,
-        };
-        let profile = Self::load_profile(&home.radicle())?;
-        self.run_with_profile(&profile, &home.state_database(), emit)
-    }
-
-    fn run_with_profile(
+    /// Watches with an identity profile already validated by the controller.
+    pub(crate) fn run(
         &self,
         profile: &RadicleProfile,
         state_path: &Path,
@@ -383,39 +255,6 @@ impl Watcher {
         Ok(())
     }
 
-    fn load_profile(path: &Path) -> Result<RadicleProfile, radicle::profile::Error> {
-        let home = RadicleHome::new(path.to_path_buf())?;
-        let (keystore, public_key) = Self::load_profile_key(&home)?;
-        let config = Config::load(home.config().as_path())?;
-        let storage = Storage::open(
-            home.storage(),
-            git::UserInfo {
-                alias: config.alias().clone(),
-                key: public_key,
-            },
-        )?;
-        transport::local::register(storage.clone());
-
-        Ok(RadicleProfile {
-            home,
-            storage,
-            keystore,
-            public_key,
-            config,
-        })
-    }
-
-    fn load_profile_key(
-        home: &RadicleHome,
-    ) -> Result<(Keystore, radicle::crypto::PublicKey), radicle::profile::Error> {
-        let keystore = Keystore::new(&home.keys());
-        let public_key = keystore
-            .public_key()?
-            .ok_or_else(|| radicle::profile::Error::NotFound(home.path().to_path_buf()))?;
-
-        Ok((keystore, public_key))
-    }
-
     fn next_event_updates_cobs(
         &self,
         events: &mut impl Iterator<Item = Result<NodeEvent, radicle::node::Error>>,
@@ -454,6 +293,98 @@ impl Watcher {
                 .is_some_and(|id| id.is_issue() || id.is_patch())
         })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScanScope {
+    member: Member,
+    member_id: NodeId,
+    repository: RepoId,
+    object: ObjectId,
+    subject: Subject,
+    actionable: bool,
+}
+
+impl ScanScope {
+    const fn new(
+        member: Member,
+        member_id: NodeId,
+        repository: RepoId,
+        object: ObjectId,
+        subject: Subject,
+        actionable: bool,
+    ) -> Self {
+        Self {
+            member,
+            member_id,
+            repository,
+            object,
+            subject,
+            actionable,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingActivities {
+    assignment: Option<Activity>,
+    activities: Vec<Activity>,
+}
+
+impl PendingActivities {
+    fn add(&mut self, activity: Activity) {
+        match activity.kind {
+            Kind::Assigned => self.assignment = Some(activity),
+            _ => self.activities.push(activity),
+        }
+    }
+
+    fn emit(self, assigned: bool, actionable: bool, emit: &mut impl FnMut(Activity)) {
+        if assigned
+            && actionable
+            && let Some(activity) = self.assignment
+        {
+            emit(activity);
+        }
+        self.activities.into_iter().for_each(emit);
+    }
+}
+
+/// Error produced by the Radicle watcher.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Communicating with the Radicle node failed.
+    #[error("Radicle node error: {0}")]
+    Node(#[from] radicle::node::Error),
+    /// The node and profile use different identities.
+    #[error("Radicle node identity {node} does not match profile identity {profile}")]
+    IdentityMismatch {
+        /// Identity loaded from the profile.
+        profile: NodeId,
+        /// Identity reported by the node.
+        node: NodeId,
+    },
+    /// Opening the Radicle repository failed.
+    #[error("failed to open Radicle repository: {0}")]
+    Repository(#[from] radicle::storage::RepositoryError),
+    /// Reading a collaborative object store failed.
+    #[error("failed to read Radicle collaborative objects: {0}")]
+    CobStore(#[from] radicle::cob::store::Error),
+    /// Opening a collaborative object operation stream failed.
+    #[error("failed to open collaborative object operation stream: {0}")]
+    CobStream(#[from] radicle::cob::stream::error::Stream),
+    /// Reading a collaborative object operation failed.
+    #[error("failed to read collaborative object operation: {0}")]
+    CobOperation(#[from] radicle::cob::stream::error::Ops),
+    /// Reading or writing the local watcher database failed.
+    #[error("watcher database error: {0}")]
+    Database(#[from] sqlite::Error),
+    /// Preparing the local watcher database failed.
+    #[error("watcher state I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// The node closed its event stream.
+    #[error("Radicle node closed its event stream")]
+    EventStreamClosed,
 }
 
 #[cfg(test)]

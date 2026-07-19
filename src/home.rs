@@ -1,6 +1,8 @@
 //! Team member filesystem locations.
 
-use std::{env, path::PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+use std::{env, fs, io, path::PathBuf};
 
 use directories::BaseDirs;
 
@@ -8,14 +10,6 @@ use crate::member::Member;
 
 /// Environment variable overriding the application home directory.
 pub const ENVIRONMENT_VARIABLE: &str = "RADICLE_TEAM_HOME";
-
-/// Error resolving the application home directory.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// The operating-system home directory could not be determined.
-    #[error("could not determine the user home directory; set {ENVIRONMENT_VARIABLE}")]
-    HomeUnavailable,
-}
 
 /// Filesystem locations owned by one team member.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +51,20 @@ impl MemberHome {
         &self.path
     }
 
+    /// Creates the member directory with private permissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory cannot be created or secured.
+    pub fn create(&self) -> Result<(), io::Error> {
+        fs::create_dir_all(&self.path)?;
+
+        #[cfg(unix)]
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o700))?;
+
+        Ok(())
+    }
+
     /// Returns the member's Radicle home directory.
     #[must_use]
     pub fn radicle(&self) -> PathBuf {
@@ -68,6 +76,20 @@ impl MemberHome {
     pub fn state_database(&self) -> PathBuf {
         self.path.join("state.db")
     }
+
+    /// Returns the member process lock path.
+    #[must_use]
+    pub fn process_lock(&self) -> PathBuf {
+        self.path.join("process.lock")
+    }
+}
+
+/// Error resolving the application home directory.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The operating-system home directory could not be determined.
+    #[error("could not determine the user home directory; set {ENVIRONMENT_VARIABLE}")]
+    HomeUnavailable,
 }
 
 #[cfg(test)]
@@ -85,6 +107,10 @@ mod tests {
         assert_eq!(
             home.state_database(),
             Path::new("/team/members/nico/state.db")
+        );
+        assert_eq!(
+            home.process_lock(),
+            Path::new("/team/members/nico/process.lock")
         );
     }
 }
