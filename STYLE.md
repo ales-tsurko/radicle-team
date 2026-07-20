@@ -10,6 +10,14 @@ Nightly `rustfmt` is the Rust formatting authority.
 
 ## Module layout
 
+Keep crate roots and directory module roots thin. `lib.rs` and `mod.rs` files
+contain module-level documentation, re-exports, and module declarations. Move
+substantial implementations into focused module files. Small glue code is
+acceptable only when a separate module would make navigation harder.
+
+Represent modules with submodules as directories: use `foo/mod.rs` with
+`foo/submodule.rs`, never `foo.rs` alongside a `foo/` directory.
+
 Write modules from the public concept down to its details:
 
 1. Module documentation.

@@ -82,6 +82,12 @@ impl MemberHome {
     pub fn process_lock(&self) -> PathBuf {
         self.path.join("process.lock")
     }
+
+    /// Returns the managed Radicle node log path.
+    #[must_use]
+    pub fn node_log(&self) -> PathBuf {
+        self.path.join("node.log")
+    }
 }
 
 /// Error resolving the application home directory.
@@ -112,5 +118,6 @@ mod tests {
             home.process_lock(),
             Path::new("/team/members/nico/process.lock")
         );
+        assert_eq!(home.node_log(), Path::new("/team/members/nico/node.log"));
     }
 }

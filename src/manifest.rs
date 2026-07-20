@@ -1,15 +1,17 @@
-//! Project configuration for a Radicle team.
+//! Repository manifest for a Radicle team.
 //!
-//! [`Config`] loads the single `.radicle-team.toml` project configuration from a repository's
-//! canonical commit or from one explicitly selected administrator-owned file. `config-rs` parses
-//! the versioned document; domain validation rejects unknown members and duplicated active DIDs,
-//! then verifies that the selected member is active and bound to the locally loaded
-//! [`Identity`](crate::identity::Identity).
+//! [`Manifest`](crate::manifest::Manifest) loads the single `.radicle-team.toml` manifest from a
+//! repository's canonical commit or from one explicitly selected administrator-owned file. The file
+//! is shared repository policy, not machine-local application state: contributors must agree on its
+//! reviewed character-to-DID bindings, while private identity material remains in the application
+//! home. `config-rs` parses the versioned document; domain validation rejects unknown members and
+//! duplicated active DIDs, then verifies that the selected member is active and bound to the
+//! locally loaded [`Identity`](crate::identity::Identity).
 //!
-//! Member identity bindings are one security-sensitive section of the configuration. Validating
-//! one produces [`ValidatedBinding`](crate::config::ValidatedBinding), which carries the member,
-//! DID, generation, and source revision used by later processing. The watcher must not run before
-//! that validation succeeds.
+//! Member identity bindings are one security-sensitive section of the manifest. Validating one
+//! produces [`ValidatedBinding`](crate::manifest::ValidatedBinding), which carries the member, DID,
+//! generation, and source revision used by later processing. The watcher must not run before that
+//! validation succeeds.
 
 use std::{
     collections::BTreeMap,
@@ -31,23 +33,23 @@ use crate::{
     member::{Member, UnknownMember},
 };
 
-/// Name of the project configuration file.
+/// Name of the repository manifest file.
 pub const FILE_NAME: &str = ".radicle-team.toml";
 const SCHEMA_VERSION: u32 = 1;
 
-/// Parsed project configuration.
+/// Parsed repository manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Config {
+pub struct Manifest {
     members: BTreeMap<Member, Binding>,
     revision: Revision,
 }
 
-impl Config {
-    /// Loads project configuration from the repository's canonical branch.
+impl Manifest {
+    /// Loads the manifest from the repository's canonical branch.
     ///
     /// # Errors
     ///
-    /// Returns an error when the canonical commit or configuration cannot be read and validated.
+    /// Returns an error when the canonical commit or manifest cannot be read and validated.
     pub fn load_repository(repository: &Repository) -> Result<Self, Error> {
         let (_, commit) = repository.canonical_head()?;
         let blob = repository
@@ -60,7 +62,21 @@ impl Config {
         )
     }
 
-    /// Loads project configuration from an explicit administrator-owned file.
+    /// Loads the manifest when the repository contains it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the canonical commit or an existing manifest cannot be read and
+    /// validated.
+    pub fn load_optional_repository(repository: &Repository) -> Result<Option<Self>, Error> {
+        match Self::load_repository(repository) {
+            Ok(manifest) => Ok(Some(manifest)),
+            Err(Error::Git { source, .. }) if source.code() == raw::ErrorCode::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Loads the manifest from an explicit administrator-owned file.
     ///
     /// # Errors
     ///
@@ -73,6 +89,36 @@ impl Config {
         })?;
 
         Self::parse(&contents, Revision::External)
+    }
+
+    /// Loads an explicit administrator-owned manifest when it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an existing file has unsafe permissions or cannot be read and
+    /// validated.
+    pub fn load_optional_file(path: &Path) -> Result<Option<Self>, Error> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Self::load_file(path).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(Error::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    /// Parses proposed manifest contents and validates the selected binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the contents or selected binding are invalid.
+    pub(crate) fn validate_candidate(
+        contents: &str,
+        member: Member,
+        did: Did,
+    ) -> Result<ValidatedBinding, Error> {
+        Self::parse(contents, Revision::External)?.validate_did(member, did)
     }
 
     /// Validates the selected member against the local signing identity.
@@ -186,10 +232,10 @@ pub enum BindingState {
     Inactive,
 }
 
-/// Revision from which project configuration was loaded.
+/// Revision from which the manifest was loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Revision {
-    /// Canonical repository commit containing the configuration.
+    /// Canonical repository commit containing the manifest.
     Repository(Oid),
     /// Explicit administrator-owned file.
     External,
@@ -246,24 +292,24 @@ struct Document {
     members: BTreeMap<String, Binding>,
 }
 
-/// Error loading or validating project configuration.
+/// Error loading or validating a repository manifest.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Reading an external configuration file failed.
-    #[error("failed to read project configuration from '{path}': {source}")]
+    /// Reading an external manifest failed.
+    #[error("failed to read repository manifest from '{path}': {source}")]
     Io {
-        /// Configuration file path.
+        /// Manifest path.
         path: PathBuf,
         /// Underlying filesystem error.
         source: io::Error,
     },
-    /// The external configuration file has unsafe ownership or permissions.
-    #[error("unsafe project configuration file: {0}")]
+    /// The external manifest has unsafe ownership or permissions.
+    #[error("unsafe repository manifest: {0}")]
     Permissions(#[from] crate::identity::PermissionError),
     /// Computing the canonical repository head failed.
     #[error("failed to resolve canonical repository head: {0}")]
     Repository(#[from] RepositoryError),
-    /// Reading the configuration from Git failed.
+    /// Reading the manifest from Git failed.
     #[error("failed to read '{FILE_NAME}' from canonical commit {commit}: {source}")]
     Git {
         /// Canonical commit.
@@ -271,19 +317,19 @@ pub enum Error {
         /// Git error.
         source: raw::Error,
     },
-    /// The configuration is not UTF-8.
-    #[error("project configuration is not valid UTF-8: {0}")]
+    /// The manifest is not UTF-8.
+    #[error("repository manifest is not valid UTF-8: {0}")]
     Utf8(#[from] str::Utf8Error),
-    /// Configuration parsing failed.
-    #[error("invalid project configuration: {0}")]
-    Configuration(#[from] config::ConfigError),
-    /// The configuration schema is unsupported.
-    #[error("unsupported project configuration schema {actual}; expected {SCHEMA_VERSION}")]
+    /// Manifest parsing failed.
+    #[error("invalid repository manifest: {0}")]
+    Parse(#[from] config::ConfigError),
+    /// The manifest schema is unsupported.
+    #[error("unsupported repository manifest schema {actual}; expected {SCHEMA_VERSION}")]
     Schema {
         /// Unsupported schema version.
         actual: u32,
     },
-    /// The configuration names a character that is not built in.
+    /// The manifest names a character that is not built in.
     #[error(transparent)]
     UnknownMember(#[from] UnknownMember),
     /// Two active members use the same signing identity.
@@ -297,7 +343,7 @@ pub enum Error {
         did: Did,
     },
     /// The selected member is absent.
-    #[error("project configuration has no binding for member {member}; add {did} to '{FILE_NAME}'")]
+    #[error("repository manifest has no binding for member {member}; add {did} to '{FILE_NAME}'")]
     Missing {
         /// Selected member.
         member: Member,
@@ -305,12 +351,10 @@ pub enum Error {
         did: Did,
     },
     /// The selected member is inactive.
-    #[error("project configuration binding for member {0} is inactive")]
+    #[error("repository manifest binding for member {0} is inactive")]
     Inactive(Member),
     /// The binding and local signing identity differ.
-    #[error(
-        "project configuration binds member {member} to {binding}, but the key derives {local}"
-    )]
+    #[error("repository manifest binds member {member} to {binding}, but the key derives {local}")]
     DidMismatch {
         /// Selected member.
         member: Member,
@@ -323,10 +367,12 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use radicle::identity::Did;
 
     use crate::{
-        config::{Config, Error, Revision},
+        manifest::{Error, Manifest, Revision},
         member::Member,
     };
 
@@ -336,19 +382,27 @@ mod tests {
     struct Fixture;
 
     impl Fixture {
-        fn parse(body: &str) -> Result<Config, Error> {
-            Config::parse(body, Revision::External)
+        fn parse(body: &str) -> Result<Manifest, Error> {
+            Manifest::parse(body, Revision::External)
         }
     }
 
     #[test]
-    fn parses_project_configuration() {
-        let config = Fixture::parse(&format!(
+    fn accepts_a_missing_explicit_manifest_during_setup() {
+        let path = PathBuf::from("target/tests/manifest/missing.toml");
+        let _result = fs::remove_file(&path);
+
+        assert!(matches!(Manifest::load_optional_file(&path), Ok(None)));
+    }
+
+    #[test]
+    fn parses_repository_manifest() {
+        let manifest = Fixture::parse(&format!(
             "version = 1\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
              \"active\"\n"
         ))
-        .expect("configuration should parse");
-        let binding = config
+        .expect("manifest should parse");
+        let binding = manifest
             .members
             .get(&Member::Nico)
             .expect("Nico should exist");
@@ -383,7 +437,7 @@ mod tests {
     fn rejects_unknown_project_settings() {
         assert!(matches!(
             Fixture::parse("version = 1\nunknown = true\n[members]\n"),
-            Err(Error::Configuration(_))
+            Err(Error::Parse(_))
         ));
     }
 

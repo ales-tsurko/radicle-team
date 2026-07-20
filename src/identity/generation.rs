@@ -1,10 +1,10 @@
 //! Local rollback protection for repository member bindings.
 //!
 //! [`GenerationStore`] records the highest accepted DID and generation for each repository and
-//! member in the application's SQLite state database. When validated configuration is observed
+//! member in the application's SQLite state database. When a validated manifest is observed
 //! again, it rejects an older generation and rejects a changed DID unless the generation increased.
 //!
-//! Repository governance decides which configuration is canonical; this module only prevents stale
+//! Repository governance decides which manifest is canonical; this module only prevents stale
 //! local or external data from silently reactivating an identity the process has already replaced.
 //! The application records the generation after binding validation and before starting the watcher.
 
@@ -13,7 +13,7 @@ use std::{fs, num::TryFromIntError, path::Path};
 use radicle::identity::RepoId;
 use sqlite::{Connection, State};
 
-use crate::{config::ValidatedBinding, member::Member};
+use crate::{manifest::ValidatedBinding, member::Member};
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS member_binding_generations (
@@ -24,6 +24,7 @@ const SCHEMA: &str = "
         PRIMARY KEY (repository, member)
     ) STRICT;
 ";
+const MAX_GENERATION: u64 = i64::MAX.unsigned_abs();
 
 /// Persistent highest observed binding generations.
 pub struct GenerationStore {
@@ -95,6 +96,19 @@ impl GenerationStore {
         statement.next()?;
 
         Ok(())
+    }
+
+    /// Returns a generation safe for adding or replacing a member binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when prior state cannot be read or its generation is exhausted.
+    pub fn next_generation(&self, repository: RepoId, member: Member) -> Result<u64, Error> {
+        match self.previous(repository, member)? {
+            Some(previous) if previous.generation < MAX_GENERATION => Ok(previous.generation + 1),
+            Some(_) => Err(Error::GenerationExhausted { repository, member }),
+            None => Ok(1),
+        }
     }
 
     fn from_connection(connection: Connection) -> Result<Self, Error> {
@@ -173,6 +187,14 @@ pub enum Error {
         /// Reused generation.
         generation: u64,
     },
+    /// The last recorded generation cannot be incremented.
+    #[error("binding generation is exhausted for {member} in {repository}")]
+    GenerationExhausted {
+        /// Repository whose generation is exhausted.
+        repository: RepoId,
+        /// Member whose generation is exhausted.
+        member: Member,
+    },
 }
 
 #[cfg(all(test, not(miri)))]
@@ -185,8 +207,8 @@ mod tests {
     };
 
     use crate::{
-        config::{Revision, ValidatedBinding},
         identity::{GenerationStore, generation::Error},
+        manifest::{Revision, ValidatedBinding},
         member::Member,
     };
 
@@ -256,6 +278,39 @@ mod tests {
         assert!(matches!(
             store.record(Fixture::repository(), Fixture::binding(MAYA, 1)),
             Err(Error::ReplacementGeneration { .. })
+        ));
+    }
+
+    #[test]
+    fn advances_the_suggested_generation() {
+        let store = GenerationStore::memory().expect("store should open");
+
+        assert!(matches!(
+            store.next_generation(Fixture::repository(), Member::Nico),
+            Ok(1)
+        ));
+        store
+            .record(Fixture::repository(), Fixture::binding(NICO, 3))
+            .expect("binding should be recorded");
+        assert!(matches!(
+            store.next_generation(Fixture::repository(), Member::Nico),
+            Ok(4)
+        ));
+    }
+
+    #[test]
+    fn rejects_an_exhausted_suggested_generation() {
+        let store = GenerationStore::memory().expect("store should open");
+        store
+            .record(
+                Fixture::repository(),
+                Fixture::binding(NICO, super::MAX_GENERATION),
+            )
+            .expect("maximum generation should be recorded");
+
+        assert!(matches!(
+            store.next_generation(Fixture::repository(), Member::Nico),
+            Err(Error::GenerationExhausted { .. })
         ));
     }
 }

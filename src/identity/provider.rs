@@ -11,7 +11,7 @@
 //! model subprocesses have identity-bearing environment variables removed.
 //!
 //! The application invokes this module after acquiring the member-home lock and before validating
-//! project configuration or starting the watcher.
+//! repository manifest or starting the watcher.
 
 use std::{
     fmt, io,
@@ -80,7 +80,9 @@ impl Identity {
 
     /// Configures a trusted Radicle subprocess with this identity.
     pub fn configure_radicle_command(&self, command: &mut Command) {
-        command.env(radicle::profile::env::RAD_HOME, self.profile.home().path());
+        command
+            .env(radicle::profile::env::RAD_HOME, self.profile.home().path())
+            .env_remove(radicle::profile::env::RAD_SOCKET);
         match &self.passphrase {
             Some(passphrase) => {
                 command.env(radicle::profile::env::RAD_PASSPHRASE, passphrase);
@@ -159,7 +161,9 @@ where
     ) -> Result<Identity, Error> {
         match provider {
             Provider::Managed { protection } => self.load_managed(member, member_home, *protection),
-            Provider::RadicleHome { home, expected_did } => self.load_existing(home, *expected_did),
+            Provider::RadicleHome { home, expected_did } => {
+                self.load_existing(member, home, *expected_did)
+            }
         }
     }
 
@@ -194,10 +198,16 @@ where
         Identity::from_profile(profile, passphrase)
     }
 
-    fn load_existing(&self, path: &Path, expected_did: Option<Did>) -> Result<Identity, Error> {
+    fn load_existing(
+        &self,
+        member: Member,
+        path: &Path,
+        expected_did: Option<Did>,
+    ) -> Result<Identity, Error> {
         let home = RadicleHome::load(path)?;
+        let keystore = Keystore::new(&home.keys());
+        let passphrase = self.existing_passphrase(member, &home, &keystore)?;
         let profile = Self::load_profile(home)?;
-        let passphrase = radicle::profile::env::passphrase();
         let identity = Identity::from_profile(profile, passphrase)?;
 
         if let Some(expected) = expected_did
@@ -355,9 +365,9 @@ pub enum Error {
     /// The operating-system credential could not be accessed.
     #[error("passphrase credential error: {0}")]
     Credential(#[from] crate::identity::credentials::Error),
-    /// An encrypted managed key has no available passphrase.
+    /// An encrypted key has no available passphrase.
     #[error(
-        "encrypted managed key has no passphrase in RAD_PASSPHRASE or the system credential store"
+        "encrypted identity key has no passphrase in RAD_PASSPHRASE or the system credential store"
     )]
     MissingPassphrase,
     /// A managed Radicle profile was only partly created.
@@ -524,6 +534,38 @@ mod tests {
     }
 
     #[test]
+    fn requires_a_passphrase_for_an_encrypted_existing_identity() {
+        let directory = TestDirectory::new();
+        let home = directory.member_home();
+        let manager = Manager::new(MemoryCredentials::default());
+        manager
+            .load(Member::Nico, &home, &Provider::default())
+            .expect("encrypted identity should be provisioned");
+
+        assert!(matches!(
+            Manager::new(MemoryCredentials::default()).load(
+                Member::Nico,
+                &home,
+                &Provider::RadicleHome {
+                    home: home.radicle(),
+                    expected_did: None,
+                },
+            ),
+            Err(Error::MissingPassphrase)
+        ));
+        let _identity = manager
+            .load(
+                Member::Nico,
+                &home,
+                &Provider::RadicleHome {
+                    home: home.radicle(),
+                    expected_did: None,
+                },
+            )
+            .expect("stored passphrase should unlock the existing identity");
+    }
+
+    #[test]
     fn detects_partially_initialized_managed_home() {
         let directory = TestDirectory::new();
         let home = directory.member_home();
@@ -554,6 +596,7 @@ mod tests {
             )
             .expect("identity should be provisioned");
         let mut trusted = Command::new("radicle-node");
+        trusted.env(radicle::profile::env::RAD_SOCKET, "/unrelated/socket");
         identity.configure_radicle_command(&mut trusted);
         let mut untrusted = Command::new("model");
         untrusted.env(radicle::profile::env::RAD_PASSPHRASE, "secret");
@@ -562,6 +605,11 @@ mod tests {
         crate::identity::Identity::sanitize_command(&mut untrusted);
 
         assert!(trusted.get_envs().any(|(name, _)| name == "RAD_HOME"));
+        assert!(
+            trusted
+                .get_envs()
+                .any(|(name, value)| name == "RAD_SOCKET" && value.is_none())
+        );
         assert!(
             untrusted
                 .get_envs()

@@ -4,10 +4,10 @@
 //! identity. It keeps the fixed character separate from its Radicle DID and holds the member-home
 //! lock that prevents two local processes from using the same identity.
 //!
-//! [`Manager`] resolves a [`Provider`] into an [`Identity`](crate::identity::Identity).
-//! [`GenerationStore`] prevents an older member identity binding from silently replacing one
-//! already observed locally. Project configuration and binding validation live in
-//! [`crate::config`].
+//! [`Manager`](crate::identity::Manager) resolves a [`Provider`](crate::identity::Provider) into an
+//! [`Identity`](crate::identity::Identity). [`GenerationStore`](crate::identity::GenerationStore)
+//! prevents an older member identity binding from silently replacing one already observed locally.
+//! Project configuration and binding validation live in [`crate::manifest`].
 
 pub use crate::identity::{
     credentials::{CredentialId, CredentialStore, Error as CredentialError, SystemCredentialStore},

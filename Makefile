@@ -9,10 +9,7 @@ CRAP_REPORT := target/radicle-team-crap.md
 CRAP_EXCLUDES := --exclude '**/build.rs' --exclude '**/benches/**' --exclude '**/examples/**' --exclude '**/tests.rs' --exclude '**/*_tests.rs' --exclude '**/tests/**'
 SIMILARITY_ARGS := src --threshold 0.92 --min-lines 12 --min-tokens 80 --fail-on-duplicates
 
-.PHONY: run check test-all lint fmt code-health
-
-run:
-	cargo run -- $(MEMBER) --repo $(REPO)
+.PHONY: check test-all lint fmt code-health
 
 check:
 	cargo check $(CARGO_PACKAGES) --all-features --all-targets

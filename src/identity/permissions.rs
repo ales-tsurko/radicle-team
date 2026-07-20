@@ -1,11 +1,11 @@
-//! Filesystem checks shared by identity providers and configuration loaders.
+//! Filesystem checks shared by identity providers and manifest loaders.
 //!
 //! [`Permissions`] creates private member directories and validates sensitive files before they
 //! enter the identity system. Private keys must deny group and other access, while administrator
-//! configuration files may be readable but not writable by them. On Unix, both must belong to the
+//! manifest files may be readable but not writable by them. On Unix, both must belong to the
 //! current user.
 //!
-//! Keeping these checks here gives managed keys, imported Radicle homes, and external configuration
+//! Keeping these checks here gives managed keys, imported Radicle homes, and external manifests
 //! files one consistent fail-closed policy.
 
 #[cfg(unix)]

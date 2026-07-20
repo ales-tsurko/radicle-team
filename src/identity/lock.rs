@@ -1,9 +1,8 @@
 //! Exclusive local ownership of a member identity.
 //!
-//! [`MemberLock`] acquires an operating-system file lock inside one
-//! [`MemberHome`](crate::home::MemberHome). The application holds it from before identity loading
-//! until the watcher stops, preventing two local processes from using the same member home and
-//! reacting to an event twice.
+//! [`MemberLock`] acquires an operating-system file lock inside one [`MemberHome`]. The application
+//! holds it from before identity loading until the watcher stops, preventing two local processes
+//! from using the same member home and reacting to an event twice.
 //!
 //! The lock coordinates processes on one filesystem only. It intentionally does not claim to fence
 //! copies of the same private key on other machines, which the identity design declares

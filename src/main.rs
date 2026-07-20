@@ -16,9 +16,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let application = cli.application();
-
-    match application.run() {
+    match cli.execute() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "application stopped");

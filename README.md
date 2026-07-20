@@ -5,10 +5,10 @@ through [Radicle](https://radicle.dev) like human contributors. Each member is a
 stable character with a fixed name, identity, role, personality, and
 capabilities. A running application represents one selected team member.
 
-An agent watches Radicle for work addressed to it: issue assignments, mentions,
-replies, and patch reviews. It can discuss and create issues, implement assigned
-work, publish patches, and address review comments until the patch is accepted.
-Radicle remains the shared source of truth for code and collaboration.
+A running member watches Radicle for work addressed to it: issue assignments,
+mentions, replies, and patch reviews. The current runtime classifies and reports
+that activity without modifying collaborative objects. Radicle remains the
+shared source of truth for code and collaboration.
 
 The project provides a reusable library and a thin binary. Each selected member
 runs as a separate process with its own Radicle node and identity. The whole
@@ -24,14 +24,30 @@ The watcher recognizes every issue and patch interaction relevant to the
 member, including assignments, mentions, replies, comments, reviews,
 revisions, reactions, resolutions, lifecycle changes, and merges.
 
+## Quick start
 
+Install Radicle with `rad` and `radicle-node` on `PATH`, then prepare a member:
 
+```sh
+radicle-team setup nico --repo rad:...
+```
 
-## Configuration
+The setup wizard provisions the identity, handles private-repository access, and
+offers to prepare the required manifest change. Repository manifests are
+published as patches. Once setup reports that Nico is ready, start the member:
 
-The project uses one `.radicle-team.toml` configuration file. By default it is
-loaded from the repository's canonical branch. `--config PATH` selects an
-explicit file with the same schema; sources are never combined.
+```sh
+radicle-team run nico --repo rad:...
+```
+
+See the [usage guide](USAGE.md) for private repositories, multiple members,
+identity options, and troubleshooting.
+
+## Repository manifest
+
+Each project uses one `.radicle-team.toml` manifest. By default it is loaded
+from the repository's canonical branch. `--manifest PATH` selects an explicit
+file with the same schema; sources are never combined.
 
 ```toml
 version = 1
@@ -44,9 +60,6 @@ state = "active"
 
 The file contains project settings, including member identity bindings. Private
 keys and passphrases are never stored in it.
-
-
-
 
 ## Team
 
@@ -107,10 +120,6 @@ response speed, `EXP` engineering autonomy, `CRE` solution exploration, and
 
 Contributions follow the repository [style guide](STYLE.md).
 
-- `make run REPO=<RID>` — run Nico for a repository; select another member
-  with `make run REPO=<RID> MEMBER=vera`. Run the binary directly with
-  `--home PATH` to override `RADICLE_TEAM_HOME`, or `--config PATH` to select
-  an explicit project configuration file.
 - `make check` — type-check all features and targets.
 - `make test-all` — run all tests and targets with `cargo-nextest`.
 - `make lint` — run Clippy with warnings denied and verify formatting.
