@@ -3,8 +3,41 @@
 `radicle-team` runs one selected team member as an isolated Radicle identity
 and node. The same machine can run multiple members as separate processes.
 
+## Members
 
+All stats are rated from 1 to 5. `INT` represents model capability, `SPD`
+response speed, `EXP` engineering autonomy, `CRE` solution exploration, and
+`CAU` risk-aware deliberation.
 
+- **Nico — Junior Developer.** A little silly, endlessly curious, and eager to
+  try something. Works fast, occasionally breaks things, and learns even
+  faster. `INT 3 · SPD 5 · EXP 1 · CRE 4 · CAU 2`. Special trait:
+  **Beginner's Luck**.
+
+- **Maya — Senior Developer.** Calm, capable, and difficult to surprise. Turns
+  vague ideas and messy code into something that ships.
+  `INT 5 · SPD 3 · EXP 5 · CRE 4 · CAU 4`. Special trait:
+  **Gets It Done**.
+
+- **Leon — Software Architect.** Sees the whole system while everyone else is
+  looking at one file. Thoughtful, patient, and suspicious of shortcuts.
+  `INT 5 · SPD 2 · EXP 5 · CRE 4 · CAU 5`. Special trait:
+  **Sees Three Moves Ahead**.
+
+- **Vera — Security Engineer.** Sharp, skeptical, and armed with dry humor.
+  Notices the unlocked door everyone else has walked through.
+  `INT 5 · SPD 2 · EXP 5 · CRE 3 · CAU 5`. Special trait:
+  **Trust Nothing**.
+
+- **Nora — UX/UI Designer & Frontend Developer.** Empathetic, expressive, and
+  unafraid to challenge the team. Knows that technically working is not the
+  same as usable. `INT 4 · SPD 4 · EXP 4 · CRE 5 · CAU 3`. Special trait:
+  **Human Perspective**.
+
+- **Theo — Researcher.** A patient investigator who follows strange clues.
+  Sometimes disappears down a rabbit hole, but usually returns with the missing
+  answer. `INT 5 · SPD 1 · EXP 5 · CRE 4 · CAU 5`. Special trait:
+  **Leave No Stone Unturned**.
 
 ## Prerequisites
 
@@ -18,9 +51,6 @@ Build the application from this repository:
 cargo install --path .
 ```
 
-
-
-
 ## Set up a member
 
 Run setup once for each member and repository:
@@ -33,21 +63,21 @@ Setup creates or loads Nico's identity, starts Nico's node, synchronizes the
 repository, and prints the DID. For private repositories, the wizard waits
 while an authority grants that DID access and then retries synchronization.
 Setup also records a persistent seeding policy for the repository in the
-member's Radicle home, so later watcher synchronization remains enabled.
+member's Radicle home.
 
 If the repository manifest or member binding is missing, run setup from the
 repository checkout. It shows the exact Git commands and asks before writing
 `.radicle-team.toml`, creating a commit, and opening a Radicle patch with the
 user's identity. After that patch reaches the canonical branch, the wizard
-validates it and finishes with a message such as:
+validates it and finishes with:
 
 ```text
 nico is ready for rad:... with binding generation 1
 ```
 
 Setup publishes only when `HEAD` exactly matches the live canonical `rad` tip.
-Switch to an up-to-date canonical branch first, so unrelated commits and
-patches are never included.
+Switch to an up-to-date canonical branch first so unrelated commits and patches
+are never included.
 
 For a private repository, its authority must grant the printed DID access
 before synchronization can succeed. A known seed can be supplied explicitly:
@@ -62,9 +92,6 @@ Passing `--seed` uses those peers for that synchronization.
 When standard input or output is not a terminal, setup does not prompt or
 modify the checkout. It prints the required action and exits instead.
 
-
-
-
 ## Run a member
 
 After setup reports that the member is ready, start the watcher:
@@ -73,12 +100,10 @@ After setup reports that the member is ready, start the watcher:
 radicle-team run nico --repo rad:...
 ```
 
-The process owns the member's node for its lifetime. It watches relevant issue
-and patch activity until stopped. `SIGINT` and `SIGTERM` are forwarded as a
-graceful node shutdown before the child is reaped.
-
-
-
+The process owns the member's node for its lifetime. It classifies relevant
+assignments, mentions, replies, comments, reviews, revisions, reactions,
+resolutions, lifecycle changes, and merges until stopped. `SIGINT` and
+`SIGTERM` trigger graceful node shutdown before the child is reaped.
 
 ## Repository manifest
 
@@ -90,10 +115,9 @@ During interactive setup, the wizard asks before updating an explicit manifest
 at `PATH`, creating it when absent. It updates that file directly and does not
 create a repository patch. New explicit manifests use mode `0600` on Unix.
 
-The file belongs to the repository because it defines shared policy: every
-contributor must see the same reviewed mapping between characters and DIDs.
-`~/.radicle-team` is reserved for machine-private identity material, logs,
-locks, and local watcher state.
+The repository manifest defines shared policy: every contributor sees the same
+reviewed mapping between members and DIDs. Machine-private identity material,
+logs, locks, and watcher state remain under `~/.radicle-team`.
 
 ```toml
 version = 1
@@ -117,12 +141,9 @@ An encrypted `--identity-home` must provide its passphrase through
 `RAD_PASSPHRASE` or the matching operating-system credential. SSH-agent access
 alone cannot unlock the managed `radicle-node` process.
 
-
-
-
 ## Run multiple members
 
-Set up and run each character independently:
+Set up and run each member independently:
 
 ```sh
 radicle-team run nico --repo rad:...
@@ -136,9 +157,6 @@ Their identities, nodes, storage, and state are isolated below:
 ```
 
 Two processes cannot use the same member home concurrently.
-
-
-
 
 ## Identity and diagnostics
 

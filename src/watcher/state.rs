@@ -6,7 +6,7 @@ use radicle::{
     cob::{EntryId, ObjectId},
     identity::RepoId,
 };
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 use sqlite::State;
 use sqlite::{Connection, Statement};
 
@@ -33,7 +33,7 @@ impl ProcessedOperations {
         Self::from_connection(Connection::open(path)?)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(miri)))]
     fn memory() -> Result<Self, Error> {
         Self::from_connection(Connection::open(":memory:")?)
     }
@@ -43,7 +43,7 @@ impl ProcessedOperations {
         Ok(Self { connection })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(miri)))]
     fn contains(
         &self,
         repository: RepoId,

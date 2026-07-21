@@ -634,17 +634,21 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, str::FromStr as _};
+    #[cfg(not(miri))]
+    use std::{fs, path::PathBuf};
+    use std::str::FromStr as _;
 
-    use radicle::{git::Oid, identity::RepoId};
+    #[cfg(not(miri))]
+    use radicle::git::Oid;
+    use radicle::identity::RepoId;
 
+    #[cfg(not(miri))]
     use crate::{
-        Application, Setup, SetupStatus,
         application::SetupValidation,
         home::MemberHome,
         manifest::{Revision, ValidatedBinding},
-        member::Member,
     };
+    use crate::{Application, Setup, SetupStatus, member::Member};
 
     #[test]
     fn application_retains_selection() {
@@ -712,6 +716,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
     fn accepts_a_ready_binding_at_the_maximum_generation() {
         let root = PathBuf::from("target/tests/application/max-ready-generation");
         let _result = fs::remove_dir_all(&root);

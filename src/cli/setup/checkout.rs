@@ -22,9 +22,15 @@ pub(super) struct RepositoryCheckout {
 impl RepositoryCheckout {
     pub(super) fn current(expected: RepoId) -> Result<Option<Self>, Error> {
         let path = std::env::current_dir()?;
+        let actual = Self::inspect_identity(&path)?;
+
+        Self::matching(path, expected, actual)
+    }
+
+    fn inspect_identity(path: &Path) -> Result<Option<RepoId>, Error> {
         let output = Command::new("rad")
             .args(["inspect", "--rid", "."])
-            .current_dir(&path)
+            .current_dir(path)
             .output()?;
         if !output.status.success() {
             return Ok(None);
@@ -34,7 +40,15 @@ impl RepositoryCheckout {
             .parse::<RepoId>()
             .map_err(Error::CheckoutIdentity)?;
 
-        if actual != expected {
+        Ok(Some(actual))
+    }
+
+    fn matching(
+        path: PathBuf,
+        expected: RepoId,
+        actual: Option<RepoId>,
+    ) -> Result<Option<Self>, Error> {
+        if actual != Some(expected) {
             return Ok(None);
         }
         let repository = Repository::discover(path)?;

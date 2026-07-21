@@ -135,7 +135,7 @@ impl GenerationStore {
         }))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(miri)))]
     fn memory() -> Result<Self, Error> {
         Self::from_connection(Connection::open(":memory:")?)
     }
