@@ -11,8 +11,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust:
-    name: Rust
+  platform:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: platform-${{ runner.os }}
+
+      - name: Check
+        run: cargo check --workspace --all-features --all-targets
+
+      - name: Run tests
+        run: cargo test --workspace --all-features --all-targets
+
+  quality:
+    name: Quality
     runs-on: ubuntu-latest
 
     steps:
@@ -51,12 +84,6 @@ jobs:
 
       - name: Install quality tools
         run: cargo binstall cargo-nextest cargo-llvm-cov cargo-crap similarity-rs cargo-machete --no-confirm
-
-      - name: Check
-        run: make check
-
-      - name: Run tests
-        run: make test-all
 
       - name: Lint
         run: make lint
