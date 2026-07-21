@@ -30,17 +30,11 @@ impl Fixture {
 
     fn initialize_repository(&self) {
         self.git(&["init", "-b", "main"]);
+        self.git(&["config", "user.name", "Test"]);
+        self.git(&["config", "user.email", "test@example.com"]);
         fs::write(self.0.join("README.md"), "# Test\n").expect("repository file should be written");
         self.git(&["add", "README.md"]);
-        self.git(&[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "Initial commit",
-        ]);
+        self.git(&["commit", "-m", "Initial commit"]);
         self.git(&["init", "--bare", "-b", "main", "canonical.git"]);
         self.git(&["remote", "add", "rad", "canonical.git"]);
         self.git(&["push", "rad", "main:main"]);

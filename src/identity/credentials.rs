@@ -128,8 +128,12 @@ mod tests {
     fn credential_id_is_scoped_to_member_and_home() {
         let home = MemberHome::at("/team", Member::Nico);
         let id = CredentialId::new(Member::Nico, &home.radicle());
+        let other_member = CredentialId::new(Member::Maya, &home.radicle());
+        let other_home = MemberHome::at("/other-team", Member::Nico);
+        let other_home = CredentialId::new(Member::Nico, &other_home.radicle());
 
         assert!(id.account().contains("nico"));
-        assert!(id.account().contains("/team/members/nico/radicle"));
+        assert_ne!(id, other_member);
+        assert_ne!(id, other_home);
     }
 }

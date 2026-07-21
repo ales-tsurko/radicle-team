@@ -24,12 +24,12 @@ impl Permissions {
     }
 
     fn file(path: &Path, _policy: FilePolicy) -> Result<(), Error> {
-        let metadata = Self::metadata(path)?;
+        let _metadata = Self::metadata(path)?;
 
         #[cfg(unix)]
         {
-            Self::owner(path, &metadata)?;
-            let mode = metadata.mode() & 0o777;
+            Self::owner(path, &_metadata)?;
+            let mode = _metadata.mode() & 0o777;
             if mode & _policy.denied_mode() != 0 {
                 return Err(Error::Mode {
                     path: path.into(),
