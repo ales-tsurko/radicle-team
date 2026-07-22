@@ -16,6 +16,7 @@
 //!     -> member-specific classification
 //!     -> internal activity
 //!     -> typed Agent method
+//!     -> validated Radicle reply
 //! ```
 //!
 //! [`watcher::Watcher`] rebuilds issue and patch state from their operation histories whenever a
@@ -28,7 +29,9 @@
 //! typed `assigned`, `mentioned`, `replied`, or `changed` method. Agent adapters for Codex, Claude
 //! Code, and other runtimes implement that interface and never receive the internal activity model
 //! directly. [`Application::run_with_agent`] supplies an adapter; [`Application::run`] keeps the
-//! command-line application's current logging behavior.
+//! command-line application's current logging behavior. An adapter can return a typed
+//! [`agent::Outcome::Reply`]; the controller validates its discussion target and publishes it with
+//! the managed member identity.
 //!
 //! During `run`, the application also starts a loopback-only, read-only MCP server scoped to the
 //! selected repository and member profile. [`agent::Agent::start`] receives its unguessable
@@ -41,11 +44,15 @@
 //!
 //! Full history replay is required because later operations depend on earlier assignment and
 //! ownership state. Successful action deliveries are stored in SQLite so rescans do not report
-//! them twice; each delivery is recorded immediately after its adapter call succeeds, so a later
-//! failure does not replay earlier successes. Adapters receive a stable [`agent::DeliveryId`] in
+//! them twice; each delivery is recorded immediately after its adapter call and requested publish
+//! succeed, so a later failure does not replay earlier successes. Adapters receive a stable
+//! [`agent::DeliveryId`] in
 //! [`agent::Context`] and must use it as an idempotency key because a failure after an external
 //! side effect can cause redelivery. Its action position distinguishes multiple deliveries from one
-//! Radicle operation.
+//! Radicle operation. Controller-published replies carry the same delivery ID in their commit
+//! message, so a retry can detect an already-published result. New and retried replies are
+//! persisted before publication, re-sign repository refs when recovered, and are announced through
+//! the managed node before their deliveries are checkpointed.
 //!
 //! # Trust boundaries
 //!
@@ -53,7 +60,8 @@
 //! name to the permitted signing DID and a monotonic generation, preventing a stale or replaced
 //! local identity from continuing silently. Private keys and watcher state remain in the isolated
 //! member home, while the repository manifest contains only shared identity policy. The application
-//! validates this binding after synchronization and before watching activity.
+//! validates this binding after synchronization, before watching activity, and again immediately
+//! before every agent-requested write.
 
 pub use crate::application::{Application, Error, Setup, SetupStatus};
 
@@ -75,5 +83,5 @@ pub mod member;
 /// Supervised Radicle node lifecycle.
 pub mod node;
 mod shutdown;
-/// Read-only Radicle activity watching.
+/// Radicle activity watching and agent-outcome publication.
 pub mod watcher;

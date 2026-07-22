@@ -1,9 +1,9 @@
-//! Read-only Radicle activity watcher.
+//! Radicle activity watcher and agent-outcome publisher.
 //!
 //! A [`Watcher`](crate::watcher::Watcher) observes one repository as one
 //! [`Member`](crate::member::Member), classifies interactions requiring that member's attention,
-//! and dispatches them through an [`Agent`](crate::agent::Agent). It reads Radicle state but never
-//! changes collaborative objects.
+//! dispatches them through an [`Agent`](crate::agent::Agent), and publishes requested replies with
+//! the managed member identity.
 //!
 //! # Lifecycle
 //!
@@ -37,6 +37,7 @@
 //! - `activity` defines the public activity, subject, target, and change model.
 //! - `classification` contains the normalized action model and generic reducer.
 //! - `issue` and `patch` adapt Radicle action enums into normalized actions.
+//! - the agent publisher validates and writes typed reply outcomes.
 //! - `runtime` owns scanning and node-event orchestration.
 //! - `state` persists processed operation IDs for idempotent rescanning.
 

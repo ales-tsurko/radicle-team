@@ -10,6 +10,7 @@ use radicle::{
     cob::EntryId,
     identity::{Did, RepoId},
     node::{Node, NodeId, policy::Scope},
+    profile::Profile as RadicleProfile,
     storage::{ReadRepository as _, ReadStorage as _},
 };
 
@@ -364,20 +365,30 @@ impl Application {
         home: &MemberHome,
         identity: &identity::Identity,
     ) -> Result<manifest::ValidatedBinding, Error> {
-        let binding = self.load_validated_binding(identity).await?;
+        self.validate_profile_binding(home, identity.profile(), identity.did())
+            .await
+    }
+
+    async fn validate_profile_binding(
+        &self,
+        home: &MemberHome,
+        profile: &RadicleProfile,
+        did: Did,
+    ) -> Result<manifest::ValidatedBinding, Error> {
+        let binding = self.load_profile_binding(profile, did).await?;
         self.record_binding(home, binding).await?;
 
         Ok(binding)
     }
 
-    async fn load_validated_binding(
+    async fn load_profile_binding(
         &self,
-        identity: &identity::Identity,
+        profile: &RadicleProfile,
+        did: Did,
     ) -> Result<manifest::ValidatedBinding, Error> {
-        let storage = identity.profile().storage.clone();
+        let storage = profile.storage.clone();
         let repository_id = self.repository;
         let member = self.member;
-        let did = identity.did();
         let manifest_file = self.manifest_file.clone();
         tokio::task::spawn_blocking(move || {
             let repository = storage.repository(repository_id)?;
@@ -473,6 +484,25 @@ struct AgentRuntime {
     context: context::Server,
 }
 
+#[derive(Debug, Clone)]
+struct WriteAuthorizer {
+    application: Application,
+    home: MemberHome,
+    profile: RadicleProfile,
+    did: Did,
+}
+
+#[async_trait::async_trait]
+impl agent::Authorizer for WriteAuthorizer {
+    async fn authorize(&self) -> Result<(), String> {
+        self.application
+            .validate_profile_binding(&self.home, &self.profile, self.did)
+            .await
+            .map(|_binding| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl AgentRuntime {
     async fn start(
         application: &Application,
@@ -509,12 +539,20 @@ impl AgentRuntime {
         application: &Application,
         agent: &mut (impl Agent + ?Sized),
     ) -> Result<(), Error> {
+        let authorizer = WriteAuthorizer {
+            application: application.clone(),
+            home: self.runtime.home.clone(),
+            profile: self.runtime.identity.profile().clone(),
+            did: self.runtime.identity.did(),
+        };
         let watched = watcher::Watcher::new(application.member, application.repository)
             .run(
                 self.runtime.identity.profile(),
                 self.runtime.node.node(),
                 &self.runtime.home.state_database(),
                 agent,
+                self.runtime.identity.memory_signer(),
+                authorizer,
             )
             .await;
         let interrupted = application.shutdown.is_requested();

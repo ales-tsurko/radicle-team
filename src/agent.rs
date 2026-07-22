@@ -9,12 +9,20 @@ use std::{error::Error as StdError, fmt};
 
 use async_trait::async_trait;
 use radicle::{
-    cob::EntryId,
+    cob::{
+        EntryId,
+        patch::{ReviewId, RevisionId},
+    },
     identity::{Did, RepoId},
 };
 use url::Url;
 
 pub use crate::watcher::{Change, Comment, Subject, Target};
+
+mod publisher;
+pub(crate) use publisher::{Announcer, Authorizer, Publisher};
+#[cfg(all(test, not(miri)))]
+pub(crate) use publisher::Error as PublishError;
 
 /// Common context supplied to every agent method.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,8 +86,41 @@ impl std::fmt::Debug for McpEndpoint {
 pub enum Outcome {
     /// No repository update is required.
     NoAction,
-    /// Reply to the interaction that triggered the method.
-    Reply(String),
+    /// Publish a reply to a Radicle discussion.
+    Reply(Reply),
+}
+
+/// Reply requested by an agent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Reply {
+    /// Reply body.
+    pub body: String,
+    /// Discussion receiving the reply.
+    pub target: ReplyTarget,
+}
+
+/// Radicle discussion location receiving an agent reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ReplyTarget {
+    /// Issue discussion. `reply_to` defaults to the issue description.
+    Issue {
+        /// Existing issue comment receiving the reply.
+        reply_to: Option<EntryId>,
+    },
+    /// Patch revision discussion.
+    Revision {
+        /// Revision containing the discussion.
+        revision: RevisionId,
+        /// Existing revision comment receiving the reply.
+        reply_to: Option<EntryId>,
+    },
+    /// Patch review discussion.
+    Review {
+        /// Review containing the discussion.
+        review: ReviewId,
+        /// Existing review comment receiving the reply.
+        reply_to: Option<EntryId>,
+    },
 }
 
 /// A backend capable of handling activity addressed to one team member.

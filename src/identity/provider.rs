@@ -3,7 +3,8 @@
 //! [`Manager`] is the identity subsystem's entry point. It either initializes a native Radicle
 //! profile below the selected member home or loads a dedicated existing Radicle home. In both cases
 //! it verifies the private key, derives the DID, checks an optional expected DID, and returns an
-//! [`Identity`] that owns the validated Radicle profile.
+//! [`Identity`] that owns the validated Radicle profile and any signer unlocked by its stored
+//! passphrase.
 //!
 //! Managed encrypted keys obtain their passphrase from `RAD_PASSPHRASE` or the configured
 //! credential store. The resulting identity deliberately exposes command configuration methods
@@ -52,6 +53,7 @@ pub struct Identity {
     profile: RadicleProfile,
     did: Did,
     passphrase: Option<Passphrase>,
+    signer: Option<MemorySigner>,
 }
 
 impl fmt::Debug for Identity {
@@ -76,6 +78,10 @@ impl Identity {
     #[must_use]
     pub const fn profile(&self) -> &RadicleProfile {
         &self.profile
+    }
+
+    pub(crate) fn memory_signer(&self) -> Option<MemorySigner> {
+        self.signer.clone()
     }
 
     /// Configures a trusted Radicle subprocess with this identity.
@@ -107,11 +113,12 @@ impl Identity {
         passphrase: Option<Passphrase>,
     ) -> Result<Self, Error> {
         let encrypted = profile.keystore.is_encrypted()?;
-        if encrypted && passphrase.is_none() {
+        let signer = if encrypted && passphrase.is_none() {
             drop(profile.signer()?);
+            None
         } else {
-            drop(MemorySigner::load(&profile.keystore, passphrase.clone())?);
-        }
+            Some(MemorySigner::load(&profile.keystore, passphrase.clone())?)
+        };
         Permissions::private_file(profile.keystore.secret_key_path())?;
         let did = Did::from(profile.id());
 
@@ -119,6 +126,7 @@ impl Identity {
             profile,
             did,
             passphrase,
+            signer,
         })
     }
 }
@@ -472,6 +480,7 @@ mod tests {
         let identity = manager
             .load(Member::Nico, &home, &provider)
             .expect("identity should be provisioned");
+        assert!(identity.memory_signer().is_some());
         let did = identity.did();
         drop(identity);
 
@@ -480,6 +489,7 @@ mod tests {
             .expect("identity should reload");
 
         assert_eq!(reloaded.did(), did);
+        assert!(reloaded.memory_signer().is_some());
     }
 
     #[test]
