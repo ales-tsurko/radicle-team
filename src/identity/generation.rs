@@ -8,12 +8,12 @@
 //! local or external data from silently reactivating an identity the process has already replaced.
 //! The application records the generation after binding validation and before starting the watcher.
 
-use std::{fs, num::TryFromIntError, path::Path};
+use std::{num::TryFromIntError, path::Path};
 
 use radicle::identity::RepoId;
-use sqlite::{Connection, State};
+use sqlite::State;
 
-use crate::{manifest::ValidatedBinding, member::Member};
+use crate::{database::Database, manifest::ValidatedBinding, member::Member};
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS member_binding_generations (
@@ -28,7 +28,7 @@ const MAX_GENERATION: u64 = i64::MAX.unsigned_abs();
 
 /// Persistent highest observed binding generations.
 pub struct GenerationStore {
-    connection: Connection,
+    database: Database,
 }
 
 impl std::fmt::Debug for GenerationStore {
@@ -45,11 +45,11 @@ impl GenerationStore {
     /// # Errors
     ///
     /// Returns an error when the database cannot be opened or initialized.
-    pub fn open(path: &Path) -> Result<Self, Error> {
+    pub async fn open(path: &Path) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        Self::from_connection(Connection::open(path)?)
+        Self::from_database(Database::open(path).await?).await
     }
 
     /// Rejects rollback and records the validated binding as the latest seen.
@@ -58,44 +58,46 @@ impl GenerationStore {
     ///
     /// Returns an error for rollback, replacement without a generation
     /// increase, an unrepresentable generation, or a database failure.
-    pub fn record(&self, repository: RepoId, binding: ValidatedBinding) -> Result<(), Error> {
-        if let Some(previous) = self.previous(repository, binding.member())? {
-            if binding.generation() < previous.generation {
-                return Err(Error::Rollback {
-                    repository,
-                    member: binding.member(),
-                    observed: binding.generation(),
-                    highest: previous.generation,
-                });
-            }
-            if binding.did().to_string() != previous.did
-                && binding.generation() <= previous.generation
-            {
-                return Err(Error::ReplacementGeneration {
-                    repository,
-                    member: binding.member(),
-                    generation: binding.generation(),
-                });
-            }
-        }
-
+    pub async fn record(&self, repository: RepoId, binding: ValidatedBinding) -> Result<(), Error> {
         let generation = i64::try_from(binding.generation())?;
-        let mut statement = self.connection.prepare(
-            "INSERT INTO member_binding_generations (repository, member, did, generation)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (repository, member) DO UPDATE SET
-                 did = excluded.did,
-                 generation = excluded.generation",
-        )?;
-        let repository = repository.to_string();
+        let repository_id = repository.to_string();
+        let member_id = binding.member().id().to_owned();
         let did = binding.did().to_string();
-        statement.bind((1, repository.as_str()))?;
-        statement.bind((2, binding.member().id()))?;
-        statement.bind((3, did.as_str()))?;
-        statement.bind((4, generation))?;
-        statement.next()?;
-
-        Ok(())
+        let outcome = self
+            .database
+            .call(move |connection| {
+                connection.execute("BEGIN IMMEDIATE")?;
+                let outcome = Self::record_transaction(
+                    connection,
+                    &repository_id,
+                    &member_id,
+                    &did,
+                    generation,
+                );
+                outcome
+                    .and_then(|outcome| {
+                        connection.execute("COMMIT")?;
+                        Ok(outcome)
+                    })
+                    .inspect_err(|_| {
+                        let _rollback = connection.execute("ROLLBACK");
+                    })
+            })
+            .await?;
+        match outcome {
+            RecordOutcome::Recorded => Ok(()),
+            RecordOutcome::Rollback { highest } => Err(Error::Rollback {
+                repository,
+                member: binding.member(),
+                observed: binding.generation(),
+                highest: u64::try_from(highest)?,
+            }),
+            RecordOutcome::Replacement => Err(Error::ReplacementGeneration {
+                repository,
+                member: binding.member(),
+                generation: binding.generation(),
+            }),
+        }
     }
 
     /// Returns a generation safe for adding or replacing a member binding.
@@ -103,41 +105,99 @@ impl GenerationStore {
     /// # Errors
     ///
     /// Returns an error when prior state cannot be read or its generation is exhausted.
-    pub fn next_generation(&self, repository: RepoId, member: Member) -> Result<u64, Error> {
-        match self.previous(repository, member)? {
+    pub async fn next_generation(&self, repository: RepoId, member: Member) -> Result<u64, Error> {
+        match self.previous(repository, member).await? {
             Some(previous) if previous.generation < MAX_GENERATION => Ok(previous.generation + 1),
             Some(_) => Err(Error::GenerationExhausted { repository, member }),
             None => Ok(1),
         }
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, Error> {
-        connection.execute(SCHEMA)?;
-        Ok(Self { connection })
+    async fn from_database(database: Database) -> Result<Self, Error> {
+        database.execute(SCHEMA).await?;
+        Ok(Self { database })
     }
 
-    fn previous(&self, repository: RepoId, member: Member) -> Result<Option<Previous>, Error> {
-        let mut statement = self.connection.prepare(
+    fn record_transaction(
+        connection: &sqlite::ConnectionThreadSafe,
+        repository: &str,
+        member: &str,
+        did: &str,
+        generation: i64,
+    ) -> sqlite::Result<RecordOutcome> {
+        let mut previous = connection.prepare(
             "SELECT did, generation FROM member_binding_generations
              WHERE repository = ?1 AND member = ?2",
         )?;
-        let repository = repository.to_string();
-        statement.bind((1, repository.as_str()))?;
-        statement.bind((2, member.id()))?;
-        if statement.next()? != State::Row {
-            return Ok(None);
+        previous.bind((1, repository))?;
+        previous.bind((2, member))?;
+        if previous.next()? == State::Row {
+            let previous_did = previous.read::<String, _>("did")?;
+            let previous_generation = previous.read::<i64, _>("generation")?;
+            if generation < previous_generation {
+                return Ok(RecordOutcome::Rollback {
+                    highest: previous_generation,
+                });
+            }
+            if did != previous_did && generation <= previous_generation {
+                return Ok(RecordOutcome::Replacement);
+            }
         }
-        let generation = statement.read::<i64, _>("generation")?;
+        drop(previous);
 
-        Ok(Some(Previous {
-            did: statement.read::<String, _>("did")?,
-            generation: u64::try_from(generation)?,
-        }))
+        let mut update = connection.prepare(
+            "INSERT INTO member_binding_generations (repository, member, did, generation)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (repository, member) DO UPDATE SET
+                 did = excluded.did,
+                 generation = excluded.generation",
+        )?;
+        update.bind((1, repository))?;
+        update.bind((2, member))?;
+        update.bind((3, did))?;
+        update.bind((4, generation))?;
+        update.next()?;
+        Ok(RecordOutcome::Recorded)
+    }
+
+    async fn previous(
+        &self,
+        repository: RepoId,
+        member: Member,
+    ) -> Result<Option<Previous>, Error> {
+        let repository = repository.to_string();
+        let member = member.id().to_owned();
+        let previous = self
+            .database
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT did, generation FROM member_binding_generations
+                     WHERE repository = ?1 AND member = ?2",
+                )?;
+                statement.bind((1, repository.as_str()))?;
+                statement.bind((2, member.as_str()))?;
+                if statement.next()? != State::Row {
+                    return Ok(None);
+                }
+                Ok(Some((
+                    statement.read::<String, _>("did")?,
+                    statement.read::<i64, _>("generation")?,
+                )))
+            })
+            .await?;
+        previous
+            .map(|(did, generation)| {
+                Ok(Previous {
+                    did,
+                    generation: u64::try_from(generation)?,
+                })
+            })
+            .transpose()
     }
 
     #[cfg(all(test, not(miri)))]
-    fn memory() -> Result<Self, Error> {
-        Self::from_connection(Connection::open(":memory:")?)
+    async fn memory() -> Result<Self, Error> {
+        Self::from_database(Database::memory().await?).await
     }
 }
 
@@ -145,6 +205,13 @@ impl GenerationStore {
 struct Previous {
     did: String,
     generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordOutcome {
+    Recorded,
+    Rollback { highest: i64 },
+    Replacement,
 }
 
 /// Error validating or recording an observed binding generation.
@@ -155,7 +222,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
     /// The state database could not be accessed.
     #[error("identity state database error: {0}")]
-    Database(#[from] sqlite::Error),
+    Database(String),
     /// A generation cannot be represented by SQLite.
     #[error("binding generation is too large: {0}")]
     Generation(#[from] TryFromIntError),
@@ -197,6 +264,12 @@ pub enum Error {
     },
 }
 
+impl From<crate::database::Error> for Error {
+    fn from(error: crate::database::Error) -> Self {
+        Self::Database(error.to_string())
+    }
+}
+
 #[cfg(all(test, not(miri)))]
 mod tests {
     use std::str::FromStr as _;
@@ -233,20 +306,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn records_and_advances_generation() {
-        let store = GenerationStore::memory().expect("store should open");
+    #[tokio::test]
+    async fn records_and_advances_generation() {
+        let store = GenerationStore::memory().await.expect("store should open");
 
         store
             .record(Fixture::repository(), Fixture::binding(NICO, 1))
+            .await
             .expect("first binding should be recorded");
         store
             .record(Fixture::repository(), Fixture::binding(MAYA, 2))
+            .await
             .expect("replacement should be recorded");
 
         assert_eq!(
             store
                 .previous(Fixture::repository(), Member::Nico)
+                .await
                 .expect("binding should be read"),
             Some(super::Previous {
                 did: MAYA.to_owned(),
@@ -255,62 +331,97 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_generation_rollback() {
-        let store = GenerationStore::memory().expect("store should open");
+    #[tokio::test]
+    async fn rejects_generation_rollback() {
+        let store = GenerationStore::memory().await.expect("store should open");
         store
             .record(Fixture::repository(), Fixture::binding(NICO, 2))
+            .await
             .expect("first binding should be recorded");
 
         assert!(matches!(
-            store.record(Fixture::repository(), Fixture::binding(NICO, 1)),
+            store
+                .record(Fixture::repository(), Fixture::binding(NICO, 1))
+                .await,
             Err(Error::Rollback { .. })
         ));
     }
 
-    #[test]
-    fn rejects_replacement_without_generation_change() {
-        let store = GenerationStore::memory().expect("store should open");
+    #[tokio::test]
+    async fn rejects_replacement_without_generation_change() {
+        let store = GenerationStore::memory().await.expect("store should open");
         store
             .record(Fixture::repository(), Fixture::binding(NICO, 1))
+            .await
             .expect("first binding should be recorded");
 
         assert!(matches!(
-            store.record(Fixture::repository(), Fixture::binding(MAYA, 1)),
+            store
+                .record(Fixture::repository(), Fixture::binding(MAYA, 1))
+                .await,
             Err(Error::ReplacementGeneration { .. })
         ));
     }
 
-    #[test]
-    fn advances_the_suggested_generation() {
-        let store = GenerationStore::memory().expect("store should open");
+    #[tokio::test]
+    async fn advances_the_suggested_generation() {
+        let store = GenerationStore::memory().await.expect("store should open");
 
         assert!(matches!(
-            store.next_generation(Fixture::repository(), Member::Nico),
+            store
+                .next_generation(Fixture::repository(), Member::Nico)
+                .await,
             Ok(1)
         ));
         store
             .record(Fixture::repository(), Fixture::binding(NICO, 3))
+            .await
             .expect("binding should be recorded");
         assert!(matches!(
-            store.next_generation(Fixture::repository(), Member::Nico),
+            store
+                .next_generation(Fixture::repository(), Member::Nico)
+                .await,
             Ok(4)
         ));
     }
 
-    #[test]
-    fn rejects_an_exhausted_suggested_generation() {
-        let store = GenerationStore::memory().expect("store should open");
+    #[tokio::test]
+    async fn rejects_an_exhausted_suggested_generation() {
+        let store = GenerationStore::memory().await.expect("store should open");
         store
             .record(
                 Fixture::repository(),
                 Fixture::binding(NICO, super::MAX_GENERATION),
             )
+            .await
             .expect("maximum generation should be recorded");
 
         assert!(matches!(
-            store.next_generation(Fixture::repository(), Member::Nico),
+            store
+                .next_generation(Fixture::repository(), Member::Nico)
+                .await,
             Err(Error::GenerationExhausted { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_records_cannot_overwrite_a_newer_generation() {
+        let store = GenerationStore::memory().await.expect("store should open");
+        let newer = store.record(Fixture::repository(), Fixture::binding(NICO, 2));
+        let older = store.record(Fixture::repository(), Fixture::binding(NICO, 1));
+
+        let (newer, older) = tokio::join!(newer, older);
+
+        newer.expect("newer binding should be recorded");
+        assert!(older.is_ok() || matches!(older, Err(Error::Rollback { .. })));
+        assert_eq!(
+            store
+                .previous(Fixture::repository(), Member::Nico)
+                .await
+                .expect("binding should be read")
+                .expect("binding should exist")
+                .generation,
+            2
+        );
     }
 }

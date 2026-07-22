@@ -130,6 +130,14 @@ impl Manifest {
         self.validate_did(member, identity.did())
     }
 
+    pub(crate) fn validate_member(
+        &self,
+        member: Member,
+        did: Did,
+    ) -> Result<ValidatedBinding, Error> {
+        self.validate_did(member, did)
+    }
+
     fn validate_did(&self, member: Member, did: Did) -> Result<ValidatedBinding, Error> {
         self.validate_unique_active_dids()?;
         let binding = self

@@ -21,15 +21,15 @@ impl SetupWizard {
         Self { application }
     }
 
-    pub(super) fn run(self) -> Result<(), Error> {
+    pub(super) async fn run(self) -> Result<(), Error> {
         if !Self::is_interactive() {
-            let setup = self.application.setup()?;
+            let setup = self.application.setup().await?;
             println!("{}", self.noninteractive_output(setup));
             return Ok(());
         }
 
         cliclack::intro(format!(" Set up {} ", self.application.member()))?;
-        self.run_interactive()
+        self.run_interactive().await
     }
 
     fn noninteractive_output(&self, setup: Setup) -> String {
@@ -70,27 +70,27 @@ impl SetupWizard {
         )
     }
 
-    fn run_interactive(&self) -> Result<(), Error> {
+    async fn run_interactive(&self) -> Result<(), Error> {
         loop {
-            if self.step()? == Step::Complete {
+            if self.step().await? == Step::Complete {
                 return Ok(());
             }
         }
     }
 
-    fn step(&self) -> Result<Step, Error> {
-        match self.attempt() {
-            Ok(setup) => self.handle_setup(setup),
+    async fn step(&self) -> Result<Step, Error> {
+        match self.attempt().await {
+            Ok(setup) => self.handle_setup(setup).await,
             Err(error) => self.handle_error(error),
         }
     }
 
-    fn handle_setup(&self, setup: Setup) -> Result<Step, Error> {
+    async fn handle_setup(&self, setup: Setup) -> Result<Step, Error> {
         if matches!(setup.status(), SetupStatus::Ready { .. }) {
             cliclack::outro(setup)?;
             Ok(Step::Complete)
         } else {
-            self.prepare_manifest(setup)?;
+            self.prepare_manifest(setup).await?;
             Ok(Step::Retry)
         }
     }
@@ -104,45 +104,51 @@ impl SetupWizard {
         }
     }
 
-    fn attempt(&self) -> Result<Setup, crate::Error> {
+    async fn attempt(&self) -> Result<Setup, crate::Error> {
         let spinner = cliclack::spinner();
         spinner.start("Preparing identity and synchronizing repository");
-        let result = self.application.setup();
-        match &result {
-            Ok(_) => spinner.stop("Repository synchronized"),
-            Err(_) => spinner.error("Setup needs attention"),
-        }
-        result
+        self.application
+            .setup()
+            .await
+            .inspect(|_| spinner.stop("Repository synchronized"))
+            .inspect_err(|_| spinner.error("Setup needs attention"))
     }
 
-    fn prepare_manifest(&self, setup: Setup) -> Result<(), Error> {
+    async fn prepare_manifest(&self, setup: Setup) -> Result<(), Error> {
         let entry = self.show_manifest(setup)?;
         if let Some(path) = self.application.manifest_file() {
-            return self.prepare_explicit_manifest(path, entry, setup.status());
+            return self
+                .prepare_explicit_manifest(path, entry, setup.status())
+                .await;
         }
 
         self.prepare_repository_manifest(entry, setup.status())
+            .await
     }
 
-    fn prepare_repository_manifest(
+    async fn prepare_repository_manifest(
         &self,
         entry: ManifestEntry,
         status: SetupStatus,
     ) -> Result<(), Error> {
-        match RepositoryCheckout::current(self.application.repository())? {
-            Some(checkout) => self.prepare_checkout(checkout, entry, status),
+        let repository = self.application.repository();
+        let checkout = tokio::task::spawn_blocking(move || RepositoryCheckout::current(repository))
+            .await
+            .map_err(|error| Error::Task(error.to_string()))??;
+        match checkout {
+            Some(checkout) => self.prepare_checkout(checkout, entry, status).await,
             None => self.missing_checkout(),
         }
     }
 
-    fn prepare_explicit_manifest(
+    async fn prepare_explicit_manifest(
         &self,
         path: &Path,
         entry: ManifestEntry,
         status: SetupStatus,
     ) -> Result<(), Error> {
         if self.confirm_explicit_manifest(path)? {
-            Self::update_explicit_manifest(path, entry, status)
+            Self::update_explicit_manifest(path, entry, status).await
         } else {
             self.wait_for_manifest()
         }
@@ -156,12 +162,16 @@ impl SetupWizard {
             .map_err(Error::from)
     }
 
-    fn update_explicit_manifest(
+    async fn update_explicit_manifest(
         path: &Path,
         entry: ManifestEntry,
         status: SetupStatus,
     ) -> Result<(), Error> {
-        if entry.prepare(path, status)? {
+        let path = path.to_owned();
+        let changed = tokio::task::spawn_blocking(move || entry.prepare(&path, status))
+            .await
+            .map_err(|error| Error::Task(error.to_string()))??;
+        if changed {
             cliclack::log::success("Explicit manifest updated")?;
         }
         Ok(())
@@ -175,20 +185,24 @@ impl SetupWizard {
         Ok(entry)
     }
 
-    fn prepare_checkout(
+    async fn prepare_checkout(
         &self,
         checkout: RepositoryCheckout,
         entry: ManifestEntry,
         status: SetupStatus,
     ) -> Result<(), Error> {
-        if self.confirm_publish(&checkout)? {
-            Self::publish_manifest(&checkout, entry, status)?;
+        if self.confirm_publish(&checkout).await? {
+            Self::publish_manifest(checkout, entry, status).await?;
         }
         self.wait_for_manifest()
     }
 
-    fn confirm_publish(&self, checkout: &RepositoryCheckout) -> Result<bool, Error> {
-        let commands = checkout.commands(self.application.member())?;
+    async fn confirm_publish(&self, checkout: &RepositoryCheckout) -> Result<bool, Error> {
+        let checkout = checkout.clone();
+        let member = self.application.member();
+        let commands = tokio::task::spawn_blocking(move || checkout.commands(member))
+            .await
+            .map_err(|error| Error::Task(error.to_string()))??;
         cliclack::note("Commands", commands)?;
         cliclack::confirm("Create the manifest commit and open a Radicle patch?")
             .initial_value(true)
@@ -196,12 +210,15 @@ impl SetupWizard {
             .map_err(Error::from)
     }
 
-    fn publish_manifest(
-        checkout: &RepositoryCheckout,
+    async fn publish_manifest(
+        checkout: RepositoryCheckout,
         entry: ManifestEntry,
         status: SetupStatus,
     ) -> Result<(), Error> {
-        if checkout.publish(entry, status)? {
+        let published = tokio::task::spawn_blocking(move || checkout.publish(entry, status))
+            .await
+            .map_err(|error| Error::Task(error.to_string()))??;
+        if published {
             cliclack::log::success("Manifest patch published")?;
         }
 
@@ -359,6 +376,9 @@ pub enum Error {
         /// Process exit status.
         status: ExitStatus,
     },
+    /// A blocking setup task failed.
+    #[error("setup task failed: {0}")]
+    Task(String),
 }
 
 impl From<crate::Error> for Error {

@@ -95,13 +95,16 @@ impl Cli {
     /// # Errors
     ///
     /// Returns an error when setup or member execution fails.
-    pub fn execute(self) -> Result<(), Error> {
+    pub async fn execute(self) -> Result<(), Error> {
         let mode = self.mode();
         let shutdown = Shutdown::install()?;
         let application = self.application().with_shutdown(shutdown);
         match mode {
-            Mode::Setup => SetupWizard::new(application).run().map_err(Error::from),
-            Mode::Run => application.run().map_err(Error::from),
+            Mode::Setup => SetupWizard::new(application)
+                .run()
+                .await
+                .map_err(Error::from),
+            Mode::Run => application.run().await.map_err(Error::from),
         }
     }
 

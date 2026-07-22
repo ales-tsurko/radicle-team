@@ -5,79 +5,75 @@ use std::{path::Path, time::Duration};
 use radicle::{
     cob::{
         ObjectId, Op, TypedId,
-        issue::{IssueStream, Issues, State as IssueState},
-        patch::{PatchStream, Patches, State as PatchState},
+        issue::{Action as IssueAction, IssueStream, Issues, State as IssueState},
+        patch::{Action as PatchAction, PatchStream, Patches, State as PatchState},
         store::access::ReadOnly,
         stream::CobStream as _,
     },
     identity::RepoId,
     node::{Handle as _, Node, NodeId, events::Event as NodeEvent},
     profile::Profile as RadicleProfile,
-    storage::{ReadStorage as _, RefUpdate, git::Repository},
+    storage::{ReadStorage as _, RefUpdate, git::Storage},
 };
 
 use crate::{
+    agent::{self, Agent, Outcome},
     member::Member,
     watcher::{
         activity::{Activity, Kind, Subject},
         classification::{ActionEnvelope, Context as ClassificationContext, NormalizedAction},
-        state::ProcessedOperations,
+        state::ProcessedActivities,
     },
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+const HISTORY_BUFFER: usize = 32;
 
-macro_rules! scan_store {
-    (
-        $objects:expr,
-        $watcher:expr,
-        $repository:expr,
-        $member_id:expr,
-        $state:expr,
-        $emit:expr,
-        $stream:ident,
-        $subject:path,
-        $actionable:expr
-    ) => {{
-        $objects.try_for_each(|object| {
-            let (id, object) = object?;
-            let stream = $stream::init(id, $repository);
-            let scope = ScanScope::new(
-                $watcher.member,
-                $member_id,
-                $watcher.repository,
-                id,
-                $subject(id),
-                $actionable(&object),
-            );
-            Watcher::scan_history(stream.all()?, scope, $state, $emit)
-        })
-    }};
-}
-
-macro_rules! store_scanner {
-    ($name:ident, $store:ident, $stream:ident, $subject:path, $actionable:expr) => {
-        fn $name(
-            &self,
-            repository: &Repository,
-            member_id: NodeId,
-            state: &ProcessedOperations,
-            emit: &mut impl FnMut(Activity),
-        ) -> Result<(), Error> {
-            let objects = $store::open(repository, ReadOnly)?;
-            scan_store!(
-                objects.all()?,
-                self,
-                repository,
-                member_id,
-                state,
-                emit,
-                $stream,
-                $subject,
-                $actionable
-            )
+macro_rules! history_scanner {
+    ($name:ident, $action:ty, $store:ident, $stream:ident, $actionable:expr) => {
+        fn $name(&self, storage: Storage) -> tokio::sync::mpsc::Receiver<HistoryEvent<$action>> {
+            self.stream_histories(storage, |repository, sender| {
+                let objects = $store::open(&repository, ReadOnly)?;
+                for object in objects.all()? {
+                    let (id, object) = object?;
+                    send_history(
+                        sender,
+                        HistoryEvent::Begin {
+                            object: id,
+                            actionable: $actionable(&object),
+                        },
+                    )?;
+                    for operation in $stream::init(id, &repository).all()? {
+                        send_history(sender, HistoryEvent::Operation(operation?))?;
+                    }
+                    send_history(sender, HistoryEvent::End)?;
+                }
+                Ok(())
+            })
         }
     };
+}
+
+enum HistoryEvent<A> {
+    Begin { object: ObjectId, actionable: bool },
+    Operation(Op<A>),
+    End,
+    Failed(Error),
+}
+
+struct ActiveHistory {
+    scope: ScanScope,
+    context: ClassificationContext,
+    pending: PendingActivities,
+}
+
+fn send_history<A>(
+    sender: &tokio::sync::mpsc::Sender<HistoryEvent<A>>,
+    event: HistoryEvent<A>,
+) -> Result<(), Error> {
+    sender
+        .blocking_send(event)
+        .map_err(|_send| Error::HistoryStreamClosed)
 }
 
 /// Watches a repository for activity addressed to one team member.
@@ -88,23 +84,23 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    store_scanner!(
-        scan_patches,
+    history_scanner!(
+        issue_histories,
+        IssueAction,
+        Issues,
+        IssueStream,
+        |issue: &radicle::cob::issue::Issue| matches!(issue.state(), IssueState::Open)
+    );
+
+    history_scanner!(
+        patch_histories,
+        PatchAction,
         Patches,
         PatchStream,
-        Subject::Patch,
         |patch: &radicle::cob::patch::Patch| matches!(
             patch.state(),
             PatchState::Open { .. } | PatchState::Draft
         )
-    );
-
-    store_scanner!(
-        scan_issues,
-        Issues,
-        IssueStream,
-        Subject::Issue,
-        |issue: &radicle::cob::issue::Issue| matches!(issue.state(), IssueState::Open)
     );
 
     /// Creates a watcher for `member` and `repository`.
@@ -114,71 +110,271 @@ impl Watcher {
     }
 
     /// Watches with an identity profile already validated by the controller.
-    pub(crate) fn run(
+    pub(crate) async fn run(
         &self,
         profile: &RadicleProfile,
         node: &Node,
         state_path: &Path,
-        emit: impl FnMut(Activity),
+        agent: &mut (impl Agent + ?Sized),
     ) -> Result<(), Error> {
-        let member_id = Self::verify_profile(profile, node)?;
-        let repository = profile.storage.repository(self.repository)?;
-        let state = ProcessedOperations::open(state_path)?;
-        let mut events = node.subscribe(EVENT_TIMEOUT)?;
-        self.watch(&repository, member_id, &state, &mut events, emit)
+        let member_id = Self::verify_profile(*profile.id(), node.clone()).await?;
+        let storage = profile.storage.clone();
+        let state = ProcessedActivities::open(state_path).await?;
+        let events = self.subscribe(node.clone()).await?;
+        self.watch(&storage, member_id, &state, events, agent).await
     }
 
-    fn verify_profile(profile: &RadicleProfile, node: &Node) -> Result<NodeId, Error> {
-        let member_id = *profile.id();
-        Self::verify_identity(member_id, node.nid()?)?;
+    async fn verify_profile(member_id: NodeId, node: Node) -> Result<NodeId, Error> {
+        let node_id = tokio::task::spawn_blocking(move || node.nid())
+            .await
+            .map_err(|error| Error::Task(error.to_string()))??;
+        Self::verify_identity(member_id, node_id)?;
 
         Ok(member_id)
     }
 
-    fn watch(
+    async fn watch(
         &self,
-        repository: &Repository,
+        storage: &Storage,
         member_id: NodeId,
-        state: &ProcessedOperations,
-        events: &mut impl Iterator<Item = Result<NodeEvent, radicle::node::Error>>,
-        mut emit: impl FnMut(Activity),
+        state: &ProcessedActivities,
+        mut events: tokio::sync::mpsc::Receiver<Result<(), Error>>,
+        agent: &mut (impl Agent + ?Sized),
     ) -> Result<(), Error> {
-        self.scan_all(repository, member_id, state, &mut emit)?;
+        self.scan_all(storage, member_id, state, agent).await?;
         loop {
-            self.rescan_after_event(repository, member_id, state, events, &mut emit)?;
+            Self::await_update(&mut events).await?;
+            self.scan_all(storage, member_id, state, agent).await?;
         }
     }
 
-    fn rescan_after_event(
-        &self,
-        repository: &Repository,
-        member_id: NodeId,
-        state: &ProcessedOperations,
-        events: &mut impl Iterator<Item = Result<NodeEvent, radicle::node::Error>>,
-        emit: &mut impl FnMut(Activity),
+    async fn await_update(
+        events: &mut tokio::sync::mpsc::Receiver<Result<(), Error>>,
     ) -> Result<(), Error> {
-        if self.next_event_updates_cobs(events)? {
-            self.scan_all(repository, member_id, state, emit)?;
+        events.recv().await.ok_or(Error::EventStreamClosed)??;
+        while let Ok(event) = events.try_recv() {
+            event?;
         }
         Ok(())
     }
 
-    fn scan_all(
+    async fn subscribe(
         &self,
-        repository: &Repository,
-        member_id: NodeId,
-        state: &ProcessedOperations,
-        emit: &mut impl FnMut(Activity),
-    ) -> Result<(), Error> {
-        self.scan_issues(repository, member_id, state, emit)?;
-        self.scan_patches(repository, member_id, state, emit)
+        node: Node,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<(), Error>>, Error> {
+        let watcher = self.clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (ready, readiness) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let mut events = match node.subscribe(EVENT_TIMEOUT).map_err(Error::from) {
+                Ok(events) => {
+                    if ready.send(Ok(())).is_err() {
+                        return;
+                    }
+                    events
+                }
+                Err(error) => {
+                    let _ignored = ready.send(Err(error));
+                    return;
+                }
+            };
+            let result: Result<(), Error> = (|| {
+                loop {
+                    if watcher.next_event_updates_cobs(&mut events)? {
+                        sender
+                            .blocking_send(Ok(()))
+                            .map_err(|_send| Error::EventStreamClosed)?;
+                    }
+                }
+            })();
+            if let Err(error) = result {
+                let _ignored = sender.blocking_send(Err(error));
+            }
+        });
+        readiness
+            .await
+            .map_err(|error| Error::Task(error.to_string()))??;
+        Ok(receiver)
     }
 
-    fn scan_history<A>(
+    async fn scan_all(
+        &self,
+        storage: &Storage,
+        member_id: NodeId,
+        state: &ProcessedActivities,
+        agent: &mut (impl Agent + ?Sized),
+    ) -> Result<(), Error> {
+        let issues = self.issue_histories(storage.clone());
+        self.scan_objects(issues, member_id, state, agent, Subject::Issue)
+            .await?;
+        let patches = self.patch_histories(storage.clone());
+        self.scan_objects(patches, member_id, state, agent, Subject::Patch)
+            .await
+    }
+
+    async fn scan_objects<A>(
+        &self,
+        mut histories: tokio::sync::mpsc::Receiver<HistoryEvent<A>>,
+        member_id: NodeId,
+        state: &ProcessedActivities,
+        agent: &mut (impl Agent + ?Sized),
+        subject: fn(ObjectId) -> Subject,
+    ) -> Result<(), Error>
+    where
+        for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
+    {
+        let mut active = None;
+        while let Some(event) = histories.recv().await {
+            self.handle_history_event(event, member_id, subject, &mut active, state, agent)
+                .await?;
+        }
+        Self::complete_history_stream(active)
+    }
+
+    fn stream_histories<A, F>(
+        &self,
+        storage: Storage,
+        scan: F,
+    ) -> tokio::sync::mpsc::Receiver<HistoryEvent<A>>
+    where
+        A: Send + 'static,
+        F: FnOnce(
+                radicle::storage::git::Repository,
+                &tokio::sync::mpsc::Sender<HistoryEvent<A>>,
+            ) -> Result<(), Error>
+            + Send
+            + 'static,
+    {
+        let repository_id = self.repository;
+        let (sender, receiver) = tokio::sync::mpsc::channel(HISTORY_BUFFER);
+        let failure = sender.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let result = storage
+                .repository(repository_id)
+                .map_err(Error::from)
+                .and_then(|repository| scan(repository, &sender));
+            if let Err(error) = result {
+                let _failed = sender.blocking_send(HistoryEvent::Failed(error));
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(error) = task.await {
+                let _failed = failure
+                    .send(HistoryEvent::Failed(Error::Task(error.to_string())))
+                    .await;
+            }
+        });
+        receiver
+    }
+
+    async fn handle_history_event<A>(
+        &self,
+        event: HistoryEvent<A>,
+        member_id: NodeId,
+        subject: fn(ObjectId) -> Subject,
+        active: &mut Option<ActiveHistory>,
+        state: &ProcessedActivities,
+        agent: &mut (impl Agent + ?Sized),
+    ) -> Result<(), Error>
+    where
+        for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
+    {
+        match event {
+            HistoryEvent::Begin { object, actionable } => {
+                self.begin_history(object, actionable, member_id, subject, active)
+            }
+            HistoryEvent::Operation(operation) => Self::scan_active(operation, active, state).await,
+            HistoryEvent::End => Self::finish_active(active, state, agent).await,
+            HistoryEvent::Failed(error) => Err(error),
+        }
+    }
+
+    fn begin_history(
+        &self,
+        object: ObjectId,
+        actionable: bool,
+        member_id: NodeId,
+        subject: fn(ObjectId) -> Subject,
+        active: &mut Option<ActiveHistory>,
+    ) -> Result<(), Error> {
+        let history = ActiveHistory {
+            scope: ScanScope::new(
+                self.member,
+                member_id,
+                self.repository,
+                object,
+                subject(object),
+                actionable,
+            ),
+            context: ClassificationContext::default(),
+            pending: PendingActivities::default(),
+        };
+        if active.replace(history).is_some() {
+            Err(Error::HistoryProtocol(
+                "history began before the previous history ended",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn scan_active<A>(
+        operation: Op<A>,
+        active: &mut Option<ActiveHistory>,
+        state: &ProcessedActivities,
+    ) -> Result<(), Error>
+    where
+        for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
+    {
+        let active = active.as_mut().ok_or(Error::HistoryProtocol(
+            "operation arrived before history began",
+        ))?;
+        Self::scan_operation(
+            operation,
+            active.scope,
+            &mut active.context,
+            &mut active.pending,
+            state,
+        )
+        .await
+    }
+
+    async fn finish_active(
+        active: &mut Option<ActiveHistory>,
+        state: &ProcessedActivities,
+        agent: &mut (impl Agent + ?Sized),
+    ) -> Result<(), Error> {
+        let active = active
+            .take()
+            .ok_or(Error::HistoryProtocol("history ended before it began"))?;
+        active
+            .pending
+            .dispatch(
+                active.context.assigned(),
+                active.scope.actionable,
+                active.scope,
+                state,
+                agent,
+            )
+            .await
+    }
+
+    fn complete_history_stream(active: Option<ActiveHistory>) -> Result<(), Error> {
+        if active.is_some() {
+            Err(Error::HistoryProtocol(
+                "history stream closed before history ended",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(test, not(miri)))]
+    async fn scan_history<A>(
         operations: impl Iterator<Item = Result<Op<A>, radicle::cob::stream::error::Ops>>,
         scope: ScanScope,
-        state: &ProcessedOperations,
-        emit: &mut impl FnMut(Activity),
+        state: &ProcessedActivities,
+        agent: &mut (impl Agent + ?Sized),
     ) -> Result<(), Error>
     where
         for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
@@ -186,22 +382,44 @@ impl Watcher {
         let mut context = ClassificationContext::default();
         let mut pending = PendingActivities::default();
         for operation in operations {
-            let operation = operation?;
-            let new = state.insert(scope.repository, scope.object, operation.id)?;
-            let activities = context.classify(
-                &operation,
-                scope.member,
-                scope.member_id,
-                scope.repository,
-                scope.subject,
-            );
-            if new {
-                activities
-                    .into_iter()
-                    .for_each(|activity| pending.add(activity));
+            Self::scan_operation(operation?, scope, &mut context, &mut pending, state).await?;
+        }
+        pending
+            .dispatch(context.assigned(), scope.actionable, scope, state, agent)
+            .await
+    }
+
+    async fn scan_operation<A>(
+        operation: Op<A>,
+        scope: ScanScope,
+        context: &mut ClassificationContext,
+        pending: &mut PendingActivities,
+        state: &ProcessedActivities,
+    ) -> Result<(), Error>
+    where
+        for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
+    {
+        let activities = context.classify(
+            &operation,
+            scope.member,
+            scope.member_id,
+            scope.repository,
+            scope.subject,
+        );
+        for activity in activities {
+            let delivery = activity.delivery_id();
+            let delivered = state
+                .contains(
+                    scope.repository,
+                    scope.object,
+                    delivery.operation,
+                    delivery.action,
+                )
+                .await?;
+            if !delivered {
+                pending.add(activity);
             }
         }
-        pending.emit(context.assigned(), scope.actionable, emit);
         Ok(())
     }
 
@@ -278,25 +496,90 @@ impl ScanScope {
 #[derive(Default)]
 struct PendingActivities {
     assignment: Option<Activity>,
+    skipped: Vec<Activity>,
     activities: Vec<Activity>,
 }
 
 impl PendingActivities {
     fn add(&mut self, activity: Activity) {
         match activity.kind {
-            Kind::Assigned => self.assignment = Some(activity),
+            Kind::Assigned => {
+                if let Some(superseded) = self.assignment.replace(activity) {
+                    self.skipped.push(superseded);
+                }
+            }
             _ => self.activities.push(activity),
         }
     }
 
-    fn emit(self, assigned: bool, actionable: bool, emit: &mut impl FnMut(Activity)) {
-        if assigned
-            && actionable
-            && let Some(activity) = self.assignment
-        {
-            emit(activity);
+    async fn dispatch(
+        self,
+        assigned: bool,
+        actionable: bool,
+        scope: ScanScope,
+        state: &ProcessedActivities,
+        agent: &mut (impl Agent + ?Sized),
+    ) -> Result<(), Error> {
+        for activity in self.skipped {
+            Self::checkpoint(activity, scope, state).await?;
         }
-        self.activities.into_iter().for_each(emit);
+        if let Some(activity) = self.assignment {
+            if assigned && actionable {
+                Self::deliver(activity, scope, state, agent).await?;
+            } else {
+                Self::checkpoint(activity, scope, state).await?;
+            }
+        }
+        for activity in self.activities {
+            Self::deliver(activity, scope, state, agent).await?;
+        }
+        Ok(())
+    }
+
+    async fn deliver(
+        activity: Activity,
+        scope: ScanScope,
+        state: &ProcessedActivities,
+        agent: &mut (impl Agent + ?Sized),
+    ) -> Result<(), Error> {
+        let delivery = activity.delivery_id();
+        Self::process_outcome(activity, agent).await?;
+        Self::checkpoint_delivery(delivery, scope, state).await
+    }
+
+    async fn checkpoint(
+        activity: Activity,
+        scope: ScanScope,
+        state: &ProcessedActivities,
+    ) -> Result<(), Error> {
+        let delivery = activity.delivery_id();
+        Self::checkpoint_delivery(delivery, scope, state).await
+    }
+
+    async fn checkpoint_delivery(
+        delivery: crate::agent::DeliveryId,
+        scope: ScanScope,
+        state: &ProcessedActivities,
+    ) -> Result<(), Error> {
+        let _inserted = state
+            .insert(
+                scope.repository,
+                scope.object,
+                delivery.operation,
+                delivery.action,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn process_outcome(
+        activity: Activity,
+        agent: &mut (impl Agent + ?Sized),
+    ) -> Result<(), Error> {
+        match activity.dispatch(agent).await? {
+            Outcome::NoAction => Ok(()),
+            Outcome::Reply(_) => Err(Error::UnsupportedOutcome),
+        }
     }
 }
 
@@ -328,17 +611,40 @@ pub enum Error {
     CobOperation(#[from] radicle::cob::stream::error::Ops),
     /// Reading or writing the local watcher database failed.
     #[error("watcher database error: {0}")]
-    Database(#[from] sqlite::Error),
+    Database(String),
+    /// An agent adapter failed while handling classified activity.
+    #[error(transparent)]
+    Agent(#[from] agent::Error),
+    /// The agent requested an action which the controller cannot publish yet.
+    #[error("the agent requested an unsupported repository action")]
+    UnsupportedOutcome,
     /// Preparing the local watcher database failed.
     #[error("watcher state I/O error: {0}")]
     Io(#[from] std::io::Error),
     /// The node closed its event stream.
     #[error("Radicle node closed its event stream")]
     EventStreamClosed,
+    /// A history producer stopped because its consumer was closed.
+    #[error("Radicle history stream consumer closed")]
+    HistoryStreamClosed,
+    /// The internal history producer emitted an invalid sequence.
+    #[error("invalid Radicle history stream: {0}")]
+    HistoryProtocol(&'static str),
+    /// A blocking Radicle operation task failed.
+    #[error("watcher task failed: {0}")]
+    Task(String),
+}
+
+impl From<crate::database::Error> for Error {
+    fn from(error: crate::database::Error) -> Self {
+        Self::Database(error.to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(miri))]
+    use std::io;
     use std::{collections::BTreeSet, str::FromStr as _};
 
     use radicle::{
@@ -354,10 +660,16 @@ mod tests {
         identity::{Did, RepoId},
     };
 
+    #[cfg(not(miri))]
+    use crate::{
+        agent::{self, Agent, Context as AgentContext, DeliveryId, Outcome, Target},
+        watcher::state::ProcessedActivities,
+    };
     use crate::{
         member::Member,
         watcher::{
-            Activity, Change, Comment, Kind, Subject,
+            Change, Comment, Subject,
+            activity::{Activity, Kind},
             classification::{ActionEnvelope, Context, NormalizedAction},
         },
     };
@@ -373,11 +685,67 @@ mod tests {
 
     struct Fixture;
 
+    #[cfg(not(miri))]
+    struct RejectingAgent {
+        mentions: usize,
+        reject: usize,
+        deliveries: Vec<DeliveryId>,
+    }
+
+    #[cfg(not(miri))]
+    #[async_trait::async_trait]
+    impl Agent for RejectingAgent {
+        async fn assigned(&mut self, _context: AgentContext) -> Result<Outcome, agent::Error> {
+            Ok(Outcome::NoAction)
+        }
+
+        async fn mentioned(
+            &mut self,
+            context: AgentContext,
+            _target: Target,
+        ) -> Result<Outcome, agent::Error> {
+            self.mentions += 1;
+            self.deliveries.push(context.delivery);
+            if self.mentions == self.reject {
+                Err(agent::Error::new(io::Error::other("rejected")))
+            } else {
+                Ok(Outcome::NoAction)
+            }
+        }
+
+        async fn replied(
+            &mut self,
+            _context: AgentContext,
+            _comment: Comment,
+            _reply_to: EntryId,
+        ) -> Result<Outcome, agent::Error> {
+            Ok(Outcome::NoAction)
+        }
+
+        async fn changed(
+            &mut self,
+            _context: AgentContext,
+            _change: Change,
+        ) -> Result<Outcome, agent::Error> {
+            Ok(Outcome::NoAction)
+        }
+    }
+
     impl Fixture {
         fn operation<A>(id: &str, action: A, author: PublicKey, type_name: TypeName) -> Op<A> {
+            Self::operation_with(id, action, Vec::new(), author, type_name)
+        }
+
+        fn operation_with<A>(
+            id: &str,
+            action: A,
+            additional: Vec<A>,
+            author: PublicKey,
+            type_name: TypeName,
+        ) -> Op<A> {
             Op::new(
                 EntryId::from_str(id).expect("operation should be valid"),
-                (action, Vec::new()),
+                (action, additional),
                 author,
                 Timestamp::from_secs(0),
                 None,
@@ -448,6 +816,138 @@ mod tests {
         assert!(!Member::Nico.is_mentioned_in("Ask @nicole"));
         assert!(!Member::Nico.is_mentioned_in("mail@example@nico"));
         assert!(!Member::Nico.is_mentioned_in("nico"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(miri))]
+    async fn leaves_rejected_activity_unprocessed_for_retry() {
+        let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
+        let object = ObjectId::from_str(ISSUE).expect("issue should be valid");
+        let operation = Fixture::operation(
+            OPERATION,
+            Action::Comment {
+                body: "Please investigate, @nico".to_owned(),
+                reply_to: None,
+                embeds: Vec::new(),
+            },
+            PublicKey::from_str(AUTHOR).expect("author should be valid"),
+            TYPENAME.clone(),
+        );
+        let scope = super::ScanScope::new(
+            Member::Nico,
+            PublicKey::from_str(MEMBER).expect("member key should be valid"),
+            repository,
+            object,
+            Subject::Issue(object),
+            true,
+        );
+        let state = ProcessedActivities::memory()
+            .await
+            .expect("state should open");
+
+        assert!(matches!(
+            super::Watcher::scan_history(
+                std::iter::once(Ok(operation)),
+                scope,
+                &state,
+                &mut RejectingAgent {
+                    mentions: 0,
+                    reject: 1,
+                    deliveries: Vec::new(),
+                },
+            )
+            .await,
+            Err(super::Error::Agent(_))
+        ));
+        assert!(
+            !state
+                .contains(
+                    repository,
+                    object,
+                    EntryId::from_str(OPERATION).expect("operation should be valid"),
+                    0,
+                )
+                .await
+                .expect("state should be readable")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(miri))]
+    async fn checkpoints_each_successful_action_before_a_later_failure() {
+        let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
+        let object = ObjectId::from_str(ISSUE).expect("issue should be valid");
+        let comment = |body: &str| Action::Comment {
+            body: body.to_owned(),
+            reply_to: None,
+            embeds: Vec::new(),
+        };
+        let operation = Fixture::operation_with(
+            OPERATION,
+            comment("First request, @nico"),
+            vec![comment("Second request, @nico")],
+            PublicKey::from_str(AUTHOR).expect("author should be valid"),
+            TYPENAME.clone(),
+        );
+        let operation_id = operation.id;
+        let scope = super::ScanScope::new(
+            Member::Nico,
+            PublicKey::from_str(MEMBER).expect("member key should be valid"),
+            repository,
+            object,
+            Subject::Issue(object),
+            true,
+        );
+        let state = ProcessedActivities::memory()
+            .await
+            .expect("state should open");
+        let mut agent = RejectingAgent {
+            mentions: 0,
+            reject: 2,
+            deliveries: Vec::new(),
+        };
+
+        assert!(matches!(
+            super::Watcher::scan_history(
+                std::iter::once(Ok(operation.clone())),
+                scope,
+                &state,
+                &mut agent,
+            )
+            .await,
+            Err(super::Error::Agent(_))
+        ));
+        assert!(
+            state
+                .contains(repository, object, operation_id, 0)
+                .await
+                .expect("first lookup")
+        );
+        assert!(
+            !state
+                .contains(repository, object, operation_id, 1)
+                .await
+                .expect("second lookup")
+        );
+
+        super::Watcher::scan_history(std::iter::once(Ok(operation)), scope, &state, &mut agent)
+            .await
+            .expect("retry should finish");
+        assert_eq!(agent.mentions, 3);
+        assert_eq!(
+            agent
+                .deliveries
+                .iter()
+                .map(|delivery| delivery.action)
+                .collect::<Vec<_>>(),
+            [0, 1, 1]
+        );
+        assert!(
+            state
+                .contains(repository, object, operation_id, 1)
+                .await
+                .expect("second lookup")
+        );
     }
 
     #[test]

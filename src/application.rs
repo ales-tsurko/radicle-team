@@ -3,16 +3,19 @@
 use std::{
     fmt, io,
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Output},
+    process::ExitStatus,
 };
 
 use radicle::{
+    cob::EntryId,
     identity::{Did, RepoId},
     node::{Node, NodeId, policy::Scope},
     storage::{ReadRepository as _, ReadStorage as _},
 };
 
 use crate::{
+    agent::{self, Agent, Change, Comment, Context as AgentContext, Outcome, Target},
+    context,
     home::{self, MemberHome},
     identity::{self, GenerationStore, Manager, MemberLock, Provider},
     manifest::{self, Manifest},
@@ -23,7 +26,7 @@ use crate::{
 };
 
 /// A single Radicle team member application.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Application {
     member: Member,
     repository: RepoId,
@@ -129,17 +132,17 @@ impl Application {
     ///
     /// Returns an error when identity provisioning, node startup, synchronization, repository
     /// access, or manifest validation fails.
-    pub fn setup(&self) -> Result<Setup, Error> {
-        let runtime = Runtime::start(self)?;
-        let setup = self.prepare_setup(&runtime);
-        let stopped = runtime.stop(&self.shutdown);
+    pub async fn setup(&self) -> Result<Setup, Error> {
+        let runtime = Runtime::start(self).await?;
+        let setup = self.prepare_setup(&runtime).await;
+        let stopped = runtime.stop(&self.shutdown).await;
 
         Self::finish_after_stop(setup, stopped)
     }
 
-    fn prepare_setup(&self, runtime: &Runtime) -> Result<Setup, Error> {
-        self.synchronize(&runtime.identity)?;
-        let status = self.setup_status(&runtime.home, &runtime.identity)?;
+    async fn prepare_setup(&self, runtime: &Runtime) -> Result<Setup, Error> {
+        self.synchronize(&runtime.identity).await?;
+        let status = self.setup_status(&runtime.home, &runtime.identity).await?;
         let did = runtime.identity.did();
 
         Ok(Setup {
@@ -174,8 +177,17 @@ impl Application {
     ///
     /// Returns an error if manifest, identity, repository, node, event stream, or local state
     /// validation fails.
-    pub fn run(&self) -> Result<(), Error> {
-        let (runtime, binding) = self.start_run()?;
+    pub async fn run(&self) -> Result<(), Error> {
+        self.run_with_agent(&mut LoggingAgent).await
+    }
+
+    /// Runs the team member and dispatches relevant activity to `agent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if preparation, watching, or agent dispatch fails.
+    pub async fn run_with_agent(&self, agent: &mut (impl Agent + ?Sized)) -> Result<(), Error> {
+        let (runtime, binding) = self.start_run().await?;
         let profile = self.member.profile();
         tracing::info!(
             member = profile.name,
@@ -183,35 +195,43 @@ impl Application {
             generation = binding.generation(),
             "team member initialized"
         );
-        let result = watcher::Watcher::new(self.member, self.repository).run(
-            runtime.identity.profile(),
-            runtime.node.node(),
-            &runtime.home.state_database(),
-            |activity| {
-                tracing::info!(?activity, "activity received");
-            },
-        );
-        let interrupted = self.shutdown.is_requested();
-        let stopped = runtime.stop(&self.shutdown);
-        if interrupted {
-            return stopped.map_err(Error::from);
-        }
-        result.map_err(Error::from)?;
-        stopped.map_err(Error::from)
+        AgentRuntime::start(self, runtime, agent)
+            .await?
+            .run(self, agent)
+            .await
     }
 
-    fn start_run(&self) -> Result<(Runtime, manifest::ValidatedBinding), Error> {
-        let runtime = Runtime::start(self)?;
-        let binding = self.prepare_run(&runtime);
+    fn warn_agent_stop(stopped: Result<(), agent::Error>) {
+        if let Err(error) = stopped {
+            tracing::warn!(%error, "failed to stop agent after application error");
+        }
+    }
+
+    fn warn_context_stop(stopped: Result<(), context::Error>) {
+        if let Err(error) = stopped {
+            tracing::warn!(%error, "failed to stop context server after application error");
+        }
+    }
+
+    fn warn_node_stop(stopped: &Result<(), node::Error>, after: &str) {
+        if let Err(error) = stopped {
+            tracing::warn!(%error, %after, "failed to stop node");
+        }
+    }
+
+    async fn start_run(&self) -> Result<(Runtime, manifest::ValidatedBinding), Error> {
+        let runtime = Runtime::start(self).await?;
+        let binding = self.prepare_run(&runtime).await;
         match binding {
             Ok(binding) => Ok((runtime, binding)),
-            Err(error) => Self::finish_after_stop(Err(error), runtime.stop(&self.shutdown)),
+            Err(error) => Self::finish_after_stop(Err(error), runtime.stop(&self.shutdown).await),
         }
     }
 
-    fn prepare_run(&self, runtime: &Runtime) -> Result<manifest::ValidatedBinding, Error> {
-        self.synchronize(&runtime.identity)?;
+    async fn prepare_run(&self, runtime: &Runtime) -> Result<manifest::ValidatedBinding, Error> {
+        self.synchronize(&runtime.identity).await?;
         self.validate_binding(&runtime.home, &runtime.identity)
+            .await
     }
 
     fn member_home(&self) -> Result<MemberHome, home::Error> {
@@ -227,18 +247,19 @@ impl Application {
             .map_err(Error::from)
     }
 
-    fn synchronize(&self, identity: &identity::Identity) -> Result<(), Error> {
+    async fn synchronize(&self, identity: &identity::Identity) -> Result<(), Error> {
         self.ensure_running()?;
         let output = self
             .sync_command(identity)
             .output()
+            .await
             .map_err(Error::SyncSpawn)?;
         self.ensure_running()?;
         self.validate_sync_output(identity, output)
     }
 
-    fn sync_command(&self, identity: &identity::Identity) -> Command {
-        let mut command = Command::new("rad");
+    fn sync_command(&self, identity: &identity::Identity) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("rad");
         command
             .arg("sync")
             .arg("--fetch")
@@ -250,7 +271,7 @@ impl Application {
             command.arg("--seed").arg(seed.to_string());
         }
         command.arg(self.repository.to_string());
-        identity.configure_radicle_command(&mut command);
+        identity.configure_radicle_command(command.as_std_mut());
 
         command
     }
@@ -258,7 +279,7 @@ impl Application {
     fn validate_sync_output(
         &self,
         identity: &identity::Identity,
-        output: Output,
+        output: std::process::Output,
     ) -> Result<(), Error> {
         if output.status.success() {
             Ok(())
@@ -277,12 +298,17 @@ impl Application {
         }
     }
 
-    fn seed_repository(&self, identity: &identity::Identity, node: &Node) -> Result<(), Error> {
+    async fn seed_repository(
+        &self,
+        identity: &identity::Identity,
+        node: &Node,
+    ) -> Result<(), Error> {
+        let profile = identity.profile().clone();
+        let repository = self.repository;
         let mut node = node.clone();
-        identity
-            .profile()
-            .seed(self.repository, Scope::All, &mut node)?;
-
+        tokio::task::spawn_blocking(move || profile.seed(repository, Scope::All, &mut node))
+            .await
+            .map_err(|error| Error::Task(error.to_string()))??;
         Ok(())
     }
 
@@ -294,96 +320,142 @@ impl Application {
         }
     }
 
-    fn setup_status(
+    async fn setup_status(
         &self,
         home: &MemberHome,
         identity: &identity::Identity,
     ) -> Result<SetupStatus, Error> {
-        let manifest = self.setup_manifest(identity)?;
-
-        SetupValidation::new(manifest, self.member, identity)?.record(self, home)
+        let validation = self.load_setup_validation(identity).await?;
+        validation.record(self, home).await
     }
 
-    fn setup_manifest(&self, identity: &identity::Identity) -> Result<Option<Manifest>, Error> {
-        let repository = identity.profile().storage.repository(self.repository)?;
-        self.validate_repository_access(&repository, identity.did())?;
-
-        self.load_setup_manifest(&repository).map_err(Error::from)
+    async fn load_setup_validation(
+        &self,
+        identity: &identity::Identity,
+    ) -> Result<SetupValidation, Error> {
+        let storage = identity.profile().storage.clone();
+        let repository_id = self.repository;
+        let member = self.member;
+        let did = identity.did();
+        let manifest_file = self.manifest_file.clone();
+        tokio::task::spawn_blocking(move || {
+            let repository = storage.repository(repository_id)?;
+            Self::validate_repository_access(&repository, repository_id, did)?;
+            let manifest = match manifest_file {
+                Some(path) => Manifest::load_optional_file(&path),
+                None => Manifest::load_optional_repository(&repository),
+            }?;
+            SetupValidation::new(manifest, member, did).map_err(Error::from)
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))?
     }
 
-    fn next_binding_generation(&self, home: &MemberHome) -> Result<u64, Error> {
-        GenerationStore::open(&home.state_database())?
+    async fn next_binding_generation(&self, home: &MemberHome) -> Result<u64, Error> {
+        GenerationStore::open(&home.state_database())
+            .await?
             .next_generation(self.repository, self.member)
+            .await
             .map_err(Error::from)
     }
 
-    fn validate_binding(
+    async fn validate_binding(
         &self,
         home: &MemberHome,
         identity: &identity::Identity,
     ) -> Result<manifest::ValidatedBinding, Error> {
-        let binding = self.load_validated_binding(identity)?;
-        self.record_binding(home, binding)?;
+        let binding = self.load_validated_binding(identity).await?;
+        self.record_binding(home, binding).await?;
 
         Ok(binding)
     }
 
-    fn load_validated_binding(
+    async fn load_validated_binding(
         &self,
         identity: &identity::Identity,
     ) -> Result<manifest::ValidatedBinding, Error> {
-        let repository = identity.profile().storage.repository(self.repository)?;
-        self.validate_repository_access(&repository, identity.did())?;
-        let manifest = self.load_manifest(&repository)?;
-
-        manifest
-            .validate(self.member, identity)
-            .map_err(Error::from)
+        let storage = identity.profile().storage.clone();
+        let repository_id = self.repository;
+        let member = self.member;
+        let did = identity.did();
+        let manifest_file = self.manifest_file.clone();
+        tokio::task::spawn_blocking(move || {
+            let repository = storage.repository(repository_id)?;
+            Self::validate_repository_access(&repository, repository_id, did)?;
+            let manifest = match manifest_file {
+                Some(path) => Manifest::load_file(&path),
+                None => Manifest::load_repository(&repository),
+            }?;
+            manifest.validate_member(member, did).map_err(Error::from)
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))?
     }
 
-    fn record_binding(
+    async fn record_binding(
         &self,
         home: &MemberHome,
         binding: manifest::ValidatedBinding,
     ) -> Result<(), Error> {
-        GenerationStore::open(&home.state_database())?
+        GenerationStore::open(&home.state_database())
+            .await?
             .record(self.repository, binding)
+            .await
             .map_err(Error::from)
     }
 
     fn validate_repository_access(
-        &self,
         repository: &radicle::storage::git::Repository,
+        repository_id: RepoId,
         did: Did,
     ) -> Result<(), Error> {
         if repository.identity_doc()?.is_visible_to(&did) {
             Ok(())
         } else {
             Err(Error::RepositoryAccess {
-                repository: self.repository,
+                repository: repository_id,
                 did,
             })
         }
     }
+}
 
-    fn load_manifest(
-        &self,
-        repository: &radicle::storage::git::Repository,
-    ) -> Result<Manifest, manifest::Error> {
-        match &self.manifest_file {
-            Some(path) => Manifest::load_file(path),
-            None => Manifest::load_repository(repository),
-        }
+#[derive(Debug, Default, Clone, Copy)]
+struct LoggingAgent;
+
+#[async_trait::async_trait]
+impl Agent for LoggingAgent {
+    async fn assigned(&mut self, context: AgentContext) -> Result<Outcome, agent::Error> {
+        tracing::info!(?context, "assignment received");
+        Ok(Outcome::NoAction)
     }
 
-    fn load_setup_manifest(
-        &self,
-        repository: &radicle::storage::git::Repository,
-    ) -> Result<Option<Manifest>, manifest::Error> {
-        match &self.manifest_file {
-            Some(path) => Manifest::load_optional_file(path),
-            None => Manifest::load_optional_repository(repository),
-        }
+    async fn mentioned(
+        &mut self,
+        context: AgentContext,
+        target: Target,
+    ) -> Result<Outcome, agent::Error> {
+        tracing::info!(?context, ?target, "mention received");
+        Ok(Outcome::NoAction)
+    }
+
+    async fn replied(
+        &mut self,
+        context: AgentContext,
+        comment: Comment,
+        reply_to: EntryId,
+    ) -> Result<Outcome, agent::Error> {
+        tracing::info!(?context, ?comment, %reply_to, "reply received");
+        Ok(Outcome::NoAction)
+    }
+
+    async fn changed(
+        &mut self,
+        context: AgentContext,
+        change: Change,
+    ) -> Result<Outcome, agent::Error> {
+        tracing::info!(?context, ?change, "relevant change received");
+        Ok(Outcome::NoAction)
     }
 }
 
@@ -395,10 +467,122 @@ struct Runtime {
     node: NodeManager,
 }
 
+#[derive(Debug)]
+struct AgentRuntime {
+    runtime: Runtime,
+    context: context::Server,
+}
+
+impl AgentRuntime {
+    async fn start(
+        application: &Application,
+        runtime: Runtime,
+        agent: &mut (impl Agent + ?Sized),
+    ) -> Result<Self, Error> {
+        let context = match context::Server::start(
+            runtime.identity.profile().storage.clone(),
+            application.repository,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                return Application::finish_after_stop(
+                    Err(Error::Context(error.to_string())),
+                    runtime.stop(&application.shutdown).await,
+                );
+            }
+        };
+        if let Err(error) = agent.start(context.endpoint()).await {
+            Application::warn_agent_stop(agent.stop().await);
+            Application::warn_context_stop(context.stop().await);
+            return Application::finish_after_stop(
+                Err(error.into()),
+                runtime.stop(&application.shutdown).await,
+            );
+        }
+        Ok(Self { runtime, context })
+    }
+
+    async fn run(
+        self,
+        application: &Application,
+        agent: &mut (impl Agent + ?Sized),
+    ) -> Result<(), Error> {
+        let watched = watcher::Watcher::new(application.member, application.repository)
+            .run(
+                self.runtime.identity.profile(),
+                self.runtime.node.node(),
+                &self.runtime.home.state_database(),
+                agent,
+            )
+            .await;
+        let interrupted = application.shutdown.is_requested();
+        let cleanup = RunCleanup {
+            agent: agent.stop().await,
+            context: self.context.stop().await,
+            node: self.runtime.stop(&application.shutdown).await,
+        };
+        cleanup.finish(watched, interrupted)
+    }
+}
+
+struct RunCleanup {
+    agent: Result<(), agent::Error>,
+    context: Result<(), context::Error>,
+    node: Result<(), node::Error>,
+}
+
+impl RunCleanup {
+    fn finish(self, watched: Result<(), watcher::Error>, interrupted: bool) -> Result<(), Error> {
+        if interrupted {
+            return self.interrupted();
+        }
+        match watched {
+            Ok(()) => self.successful(),
+            Err(error) => self.watcher_failed(error),
+        }
+    }
+
+    fn interrupted(self) -> Result<(), Error> {
+        Application::warn_agent_stop(self.agent);
+        Application::warn_context_stop(self.context);
+        self.node.map_err(Error::from)
+    }
+
+    fn watcher_failed(self, error: watcher::Error) -> Result<(), Error> {
+        Application::warn_agent_stop(self.agent);
+        Application::warn_context_stop(self.context);
+        Application::warn_node_stop(&self.node, "application error");
+        Err(error.into())
+    }
+
+    fn successful(self) -> Result<(), Error> {
+        match self.agent {
+            Ok(()) => self.after_agent(),
+            Err(error) => {
+                Application::warn_context_stop(self.context);
+                Application::warn_node_stop(&self.node, "agent shutdown error");
+                Err(error.into())
+            }
+        }
+    }
+
+    fn after_agent(self) -> Result<(), Error> {
+        match self.context {
+            Ok(()) => self.node.map_err(Error::from),
+            Err(error) => {
+                Application::warn_node_stop(&self.node, "context server error");
+                Err(Error::Context(error.to_string()))
+            }
+        }
+    }
+}
+
 impl Runtime {
-    fn start(application: &Application) -> Result<Self, Error> {
+    async fn start(application: &Application) -> Result<Self, Error> {
         let home = application.member_home()?;
-        let (lock, identity, node) = Self::initialize(application, &home)?;
+        let (lock, identity, node) = Self::initialize(application, &home).await?;
 
         Ok(Self {
             home,
@@ -408,47 +592,69 @@ impl Runtime {
         })
     }
 
-    fn initialize(
+    async fn initialize(
         application: &Application,
         home: &MemberHome,
     ) -> Result<(MemberLock, identity::Identity, NodeManager), Error> {
-        let lock = MemberLock::acquire(home)?;
-        let identity = application.load_identity(home)?;
+        let home = home.clone();
+        let application = application.clone();
+        let worker_home = home.clone();
+        let worker_application = application.clone();
+        let (lock, identity) = tokio::task::spawn_blocking(move || {
+            let lock = MemberLock::acquire(&worker_home)?;
+            let identity = worker_application.load_identity(&worker_home)?;
+            Ok::<_, Error>((lock, identity))
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))??;
         tracing::info!(
             member = %application.member,
             did = %identity.did(),
             "member identity loaded"
         );
-        let node = Self::start_node(application, home, &identity)?;
+        let node = Self::start_node(&application, &home, &identity).await?;
 
         Ok((lock, identity, node))
     }
 
-    fn start_node(
+    async fn start_node(
         application: &Application,
         home: &MemberHome,
         identity: &identity::Identity,
     ) -> Result<NodeManager, Error> {
-        let node = NodeManager::start_supervised(identity, home, &application.shutdown)?;
-        let prepared = application
-            .ensure_running()
-            .and_then(|()| application.seed_repository(identity, node.node()));
-        if let Err(error) = prepared {
-            if let Err(stop) = Self::stop_node(node, &application.shutdown) {
-                tracing::warn!(%stop, "failed to stop node after application error");
+        let node = NodeManager::start_supervised(identity, home, &application.shutdown).await?;
+        match Self::prepare_node(application, identity, &node).await {
+            Ok(()) => Ok(node),
+            Err(error) => {
+                Self::stop_after_start_error(node, &application.shutdown).await;
+                Err(error)
             }
-            return Err(error);
         }
-
-        Ok(node)
     }
 
-    fn stop(self, shutdown: &Shutdown) -> Result<(), node::Error> {
-        Self::stop_node(self.node, shutdown)
+    async fn prepare_node(
+        application: &Application,
+        identity: &identity::Identity,
+        node: &NodeManager,
+    ) -> Result<(), Error> {
+        application.ensure_running()?;
+        application.seed_repository(identity, node.node()).await
     }
 
-    fn stop_node(node: NodeManager, shutdown: &Shutdown) -> Result<(), node::Error> {
-        shutdown.finish_supervision(|| node.stop_supervised(shutdown))
+    async fn stop_after_start_error(node: NodeManager, shutdown: &Shutdown) {
+        if let Err(stop) = Self::stop_node(node, shutdown).await {
+            tracing::warn!(%stop, "failed to stop node after application error");
+        }
+    }
+
+    async fn stop(self, shutdown: &Shutdown) -> Result<(), node::Error> {
+        Self::stop_node(self.node, shutdown).await
+    }
+
+    async fn stop_node(node: NodeManager, shutdown: &Shutdown) -> Result<(), node::Error> {
+        let result = node.stop_supervised(shutdown).await;
+        shutdown.release_supervision();
+        result
     }
 }
 
@@ -460,34 +666,34 @@ enum SetupValidation {
 }
 
 impl SetupValidation {
-    fn new(
-        manifest: Option<Manifest>,
-        member: Member,
-        identity: &identity::Identity,
-    ) -> Result<Self, manifest::Error> {
+    fn new(manifest: Option<Manifest>, member: Member, did: Did) -> Result<Self, manifest::Error> {
         let Some(manifest) = manifest else {
             return Ok(Self::ManifestMissing);
         };
-        match manifest.validate(member, identity) {
+        match manifest.validate_member(member, did) {
             Ok(binding) => Ok(Self::Ready(binding)),
             Err(manifest::Error::Missing { .. }) => Ok(Self::BindingMissing),
             Err(error) => Err(error),
         }
     }
 
-    fn record(self, application: &Application, home: &MemberHome) -> Result<SetupStatus, Error> {
+    async fn record(
+        self,
+        application: &Application,
+        home: &MemberHome,
+    ) -> Result<SetupStatus, Error> {
         match self {
             Self::Ready(binding) => {
-                application.record_binding(home, binding)?;
+                application.record_binding(home, binding).await?;
                 Ok(SetupStatus::Ready {
                     generation: binding.generation(),
                 })
             }
             Self::ManifestMissing => Ok(SetupStatus::ManifestMissing {
-                generation: application.next_binding_generation(home)?,
+                generation: application.next_binding_generation(home).await?,
             }),
             Self::BindingMissing => Ok(SetupStatus::BindingMissing {
-                generation: application.next_binding_generation(home)?,
+                generation: application.next_binding_generation(home).await?,
             }),
         }
     }
@@ -630,6 +836,15 @@ pub enum Error {
     /// Watching Radicle activity failed.
     #[error("Radicle watcher error: {0}")]
     Watcher(#[from] watcher::Error),
+    /// Starting or stopping the run-scoped context server failed.
+    #[error("agent context server error: {0}")]
+    Context(String),
+    /// Starting or stopping the agent adapter failed.
+    #[error(transparent)]
+    Agent(#[from] agent::Error),
+    /// A blocking filesystem or Radicle task failed.
+    #[error("application task failed: {0}")]
+    Task(String),
 }
 
 #[cfg(test)]
@@ -715,9 +930,9 @@ mod tests {
         assert!(output.contains("version = 1"));
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(not(miri))]
-    fn accepts_a_ready_binding_at_the_maximum_generation() {
+    async fn accepts_a_ready_binding_at_the_maximum_generation() {
         let root = PathBuf::from("target/tests/application/max-ready-generation");
         let _result = fs::remove_dir_all(&root);
         let repository = RepoId::from_str("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc")
@@ -735,10 +950,12 @@ mod tests {
         );
         application
             .record_binding(&home, binding)
+            .await
             .expect("maximum generation should be recorded");
 
         let status = SetupValidation::Ready(binding)
             .record(&application, &home)
+            .await
             .expect("a ready maximum generation should not be incremented");
 
         assert_eq!(

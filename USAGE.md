@@ -1,7 +1,7 @@
 # Usage guide
 
-`radicle-team` runs one selected team member as an isolated Radicle identity
-and node. The same machine can run multiple members as separate processes.
+`radicle-team` runs one selected team member as an isolated Radicle identity and
+node. The same machine can run multiple members as separate processes.
 
 ## Members
 
@@ -11,33 +11,48 @@ response speed, `EXP` engineering autonomy, `CRE` solution exploration, and
 
 - **Nico — Junior Developer.** A little silly, endlessly curious, and eager to
   try something. Works fast, occasionally breaks things, and learns even
-  faster. `INT 3 · SPD 5 · EXP 1 · CRE 4 · CAU 2`. Special trait:
-  **Beginner's Luck**.
+  faster. 
+
+  `INT 3 · SPD 5 · EXP 1 · CRE 4 · CAU 2`
+
+  Special trait: **Beginner's Luck**.
 
 - **Maya — Senior Developer.** Calm, capable, and difficult to surprise. Turns
   vague ideas and messy code into something that ships.
-  `INT 5 · SPD 3 · EXP 5 · CRE 4 · CAU 4`. Special trait:
-  **Gets It Done**.
+
+  `INT 5 · SPD 3 · EXP 5 · CRE 4 · CAU 4`
+
+  Special trait: **Gets It Done**.
 
 - **Leon — Software Architect.** Sees the whole system while everyone else is
   looking at one file. Thoughtful, patient, and suspicious of shortcuts.
-  `INT 5 · SPD 2 · EXP 5 · CRE 4 · CAU 5`. Special trait:
-  **Sees Three Moves Ahead**.
+
+  `INT 5 · SPD 2 · EXP 5 · CRE 4 · CAU 5`
+
+  Special trait: **Sees Three Moves Ahead**.
 
 - **Vera — Security Engineer.** Sharp, skeptical, and armed with dry humor.
   Notices the unlocked door everyone else has walked through.
-  `INT 5 · SPD 2 · EXP 5 · CRE 3 · CAU 5`. Special trait:
-  **Trust Nothing**.
+
+  `INT 5 · SPD 2 · EXP 5 · CRE 3 · CAU 5`
+  
+  Special trait: **Trust Nothing**.
 
 - **Nora — UX/UI Designer & Frontend Developer.** Empathetic, expressive, and
-  unafraid to challenge the team. Knows that technically working is not the
-  same as usable. `INT 4 · SPD 4 · EXP 4 · CRE 5 · CAU 3`. Special trait:
-  **Human Perspective**.
+  unafraid to challenge the team. Knows that technically working is not the same
+  as usable. 
+
+  `INT 4 · SPD 4 · EXP 4 · CRE 5 · CAU 3`
+
+  Special trait: **Human Perspective**.
 
 - **Theo — Researcher.** A patient investigator who follows strange clues.
   Sometimes disappears down a rabbit hole, but usually returns with the missing
-  answer. `INT 5 · SPD 1 · EXP 5 · CRE 4 · CAU 5`. Special trait:
-  **Leave No Stone Unturned**.
+  answer. 
+
+  `INT 5 · SPD 1 · EXP 5 · CRE 4 · CAU 5`
+
+  Special trait: **Leave No Stone Unturned**.
 
 ## Prerequisites
 

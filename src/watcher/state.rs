@@ -1,16 +1,14 @@
-//! Persistent operation deduplication for idempotent watcher rescans.
+//! Persistent activity-delivery deduplication for idempotent watcher rescans.
 
-use std::{fs, path::Path};
+use std::path::Path;
 
 use radicle::{
     cob::{EntryId, ObjectId},
     identity::RepoId,
 };
-#[cfg(all(test, not(miri)))]
 use sqlite::State;
-use sqlite::{Connection, Statement};
 
-use crate::watcher::Error;
+use crate::{database::Database, watcher::Error};
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS processed_operations (
@@ -19,83 +17,135 @@ const SCHEMA: &str = "
         operation TEXT NOT NULL,
         PRIMARY KEY (repository, object, operation)
     ) STRICT;
+    CREATE TABLE IF NOT EXISTS processed_activities (
+        repository TEXT NOT NULL,
+        object TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        action TEXT NOT NULL,
+        PRIMARY KEY (repository, object, operation, action)
+    ) STRICT;
 ";
 
-pub(super) struct ProcessedOperations {
-    connection: Connection,
+pub(super) struct ProcessedActivities {
+    database: Database,
 }
 
-impl ProcessedOperations {
-    pub(super) fn open(path: &Path) -> Result<Self, Error> {
+impl ProcessedActivities {
+    pub(super) async fn open(path: &Path) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        Self::from_connection(Connection::open(path)?)
+        Self::from_database(Database::open(path).await?).await
     }
 
     #[cfg(all(test, not(miri)))]
-    fn memory() -> Result<Self, Error> {
-        Self::from_connection(Connection::open(":memory:")?)
+    pub(super) async fn memory() -> Result<Self, Error> {
+        Self::from_database(Database::memory().await?).await
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, Error> {
-        connection.execute(SCHEMA)?;
-        Ok(Self { connection })
+    async fn from_database(database: Database) -> Result<Self, Error> {
+        database.execute(SCHEMA).await?;
+        Ok(Self { database })
     }
 
-    #[cfg(all(test, not(miri)))]
-    fn contains(
+    pub(super) async fn contains(
         &self,
         repository: RepoId,
         object: ObjectId,
         operation: EntryId,
+        action: usize,
     ) -> Result<bool, Error> {
-        let mut statement = self.operation_statement(
-            "SELECT 1 FROM processed_operations
-             WHERE repository = ?1 AND object = ?2 AND operation = ?3",
-            repository,
-            object,
-            operation,
-        )?;
-
-        Ok(statement.next()? == State::Row)
+        self.operation(repository, object, operation, action, Operation::Contains)
+            .await
     }
 
-    pub(super) fn insert(
+    pub(super) async fn insert(
         &self,
         repository: RepoId,
         object: ObjectId,
         operation: EntryId,
+        action: usize,
     ) -> Result<bool, Error> {
-        let mut statement = self.operation_statement(
-            "INSERT OR IGNORE INTO processed_operations (repository, object, operation)
-             VALUES (?1, ?2, ?3)",
-            repository,
-            object,
-            operation,
-        )?;
-        statement.next()?;
-
-        Ok(self.connection.change_count() == 1)
+        self.operation(repository, object, operation, action, Operation::Insert)
+            .await
     }
 
-    fn operation_statement<'connection>(
-        &'connection self,
-        query: &str,
+    async fn operation(
+        &self,
         repository: RepoId,
         object: ObjectId,
         operation: EntryId,
-    ) -> Result<Statement<'connection>, Error> {
-        let mut statement = self.connection.prepare(query)?;
-        let repository = repository.to_string();
-        let object = object.to_string();
-        let operation = operation.to_string();
-        statement.bind((1, repository.as_str()))?;
-        statement.bind((2, object.as_str()))?;
-        statement.bind((3, operation.as_str()))?;
-
-        Ok(statement)
+        action: usize,
+        kind: Operation,
+    ) -> Result<bool, Error> {
+        let values = operation_values(repository, object, operation, action);
+        self.database
+            .call(move |connection| {
+                let mut statement = connection.prepare(kind.query())?;
+                bind_operation(&mut statement, &values)?;
+                match kind {
+                    Operation::Contains => Ok(statement.next()? == State::Row),
+                    Operation::Insert => {
+                        statement.next()?;
+                        Ok(connection.change_count() == 1)
+                    }
+                }
+            })
+            .await
+            .map_err(Error::from)
     }
+}
+
+#[derive(Clone, Copy)]
+enum Operation {
+    Contains,
+    Insert,
+}
+
+impl Operation {
+    const fn query(self) -> &'static str {
+        match self {
+            Self::Contains => {
+                "SELECT 1
+                 WHERE EXISTS (
+                     SELECT 1 FROM processed_operations
+                     WHERE repository = ?1 AND object = ?2 AND operation = ?3
+                 ) OR EXISTS (
+                     SELECT 1 FROM processed_activities
+                     WHERE repository = ?1 AND object = ?2 AND operation = ?3 AND action = ?4
+                 )"
+            }
+            Self::Insert => {
+                "INSERT OR IGNORE INTO processed_activities
+                     (repository, object, operation, action)
+                 VALUES (?1, ?2, ?3, ?4)"
+            }
+        }
+    }
+}
+
+fn operation_values(
+    repository: RepoId,
+    object: ObjectId,
+    operation: EntryId,
+    action: usize,
+) -> [String; 4] {
+    [
+        repository.to_string(),
+        object.to_string(),
+        operation.to_string(),
+        action.to_string(),
+    ]
+}
+
+fn bind_operation(
+    statement: &mut sqlite::Statement<'_>,
+    values: &[String; 4],
+) -> sqlite::Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        statement.bind((index + 1, value.as_str()))?;
+    }
+    Ok(())
 }
 
 #[cfg(all(test, not(miri)))]
@@ -107,11 +157,13 @@ mod tests {
         identity::RepoId,
     };
 
-    use crate::watcher::state::ProcessedOperations;
+    use crate::watcher::state::ProcessedActivities;
 
-    #[test]
-    fn remembers_processed_operations() {
-        let store = ProcessedOperations::memory().expect("in-memory store should open");
+    #[tokio::test]
+    async fn distinguishes_actions_within_an_operation() {
+        let store = ProcessedActivities::memory()
+            .await
+            .expect("in-memory store should open");
         let repository = RepoId::from_str("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc")
             .expect("repository ID should be valid");
         let object = ObjectId::from_str("1111111111111111111111111111111111111111")
@@ -121,23 +173,39 @@ mod tests {
 
         assert!(
             !store
-                .contains(repository, object, operation)
-                .expect("lookup should succeed")
+                .contains(repository, object, operation, 0)
+                .await
+                .expect("lookup")
         );
         assert!(
             store
-                .insert(repository, object, operation)
-                .expect("insert should succeed")
+                .insert(repository, object, operation, 0)
+                .await
+                .expect("insert")
         );
         assert!(
             !store
-                .insert(repository, object, operation)
-                .expect("duplicate insert should succeed")
+                .insert(repository, object, operation, 0)
+                .await
+                .expect("duplicate")
         );
         assert!(
             store
-                .contains(repository, object, operation)
-                .expect("lookup should succeed")
+                .contains(repository, object, operation, 0)
+                .await
+                .expect("lookup")
+        );
+        assert!(
+            !store
+                .contains(repository, object, operation, 1)
+                .await
+                .expect("distinct action lookup")
+        );
+        assert!(
+            store
+                .insert(repository, object, operation, 1)
+                .await
+                .expect("distinct action insert")
         );
     }
 }

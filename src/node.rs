@@ -10,19 +10,19 @@
 //! and databases. Radicle's default client profile does not open a listening TCP port, so multiple
 //! members can run concurrently without port allocation.
 //! [`NodeManager::stop`](crate::node::NodeManager::stop) requests graceful shutdown; dropping the
-//! manager forcibly reaps a child that is still running. The CLI handles interruption and
+//! manager forcibly terminates a child that is still running. The CLI handles interruption and
 //! termination signals, forwards graceful shutdown to the node, and then lets the manager reap it.
 
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{ExitStatus, Stdio},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    thread,
     time::{Duration, Instant},
 };
 
 use radicle::node::{Handle as _, Node, NodeId};
+use tokio::process::{Child, Command};
 
 use crate::{home::MemberHome, identity::Identity, shutdown::Shutdown};
 
@@ -55,13 +55,13 @@ impl ChildHandle {
         if let Some(child) = child.as_mut()
             && child.try_wait()?.is_none()
         {
-            child.kill()?;
+            child.start_kill()?;
         }
 
         Ok(())
     }
 
-    pub(crate) fn wait(&self) -> Result<ExitStatus, io::Error> {
+    pub(crate) async fn wait(&self) -> Result<ExitStatus, io::Error> {
         loop {
             {
                 let mut child = self.lock();
@@ -76,7 +76,7 @@ impl ChildHandle {
                     return Ok(status);
                 }
             }
-            thread::sleep(POLL_INTERVAL);
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
@@ -92,49 +92,69 @@ impl NodeManager {
     ///
     /// Returns an error when another node is already running, the process cannot be started, it
     /// exits before becoming ready, or it reports an unexpected identity.
-    pub fn start(identity: &Identity, home: &MemberHome) -> Result<Self, Error> {
-        let mut manager = Self::spawn_manager(identity, home)?;
-        manager.wait_until_ready(*identity.profile().id(), STARTUP_TIMEOUT)?;
-
-        Ok(manager)
+    pub async fn start(identity: &Identity, home: &MemberHome) -> Result<Self, Error> {
+        let mut manager = Self::spawn_manager(identity, home).await?;
+        match manager
+            .wait_until_ready(*identity.profile().id(), STARTUP_TIMEOUT)
+            .await
+        {
+            Ok(()) => Ok(manager),
+            Err(error) => {
+                if let Err(cleanup) = manager.terminate_and_reap().await {
+                    tracing::warn!(%cleanup, "failed to reap node after startup error");
+                }
+                Err(error)
+            }
+        }
     }
 
-    pub(crate) fn start_supervised(
+    pub(crate) async fn start_supervised(
+        identity: &Identity,
+        home: &MemberHome,
+        shutdown: &Shutdown,
+    ) -> Result<Self, Error> {
+        let mut manager = Self::spawn_supervised(identity, home, shutdown).await?;
+        shutdown.supervise(manager.node(), manager.child_handle());
+        match manager
+            .wait_until_ready(*identity.profile().id(), STARTUP_TIMEOUT)
+            .await
+        {
+            Ok(()) => Ok(manager),
+            Err(error) => Err(Self::cleanup_failed_start(manager, shutdown, error).await),
+        }
+    }
+
+    async fn spawn_supervised(
         identity: &Identity,
         home: &MemberHome,
         shutdown: &Shutdown,
     ) -> Result<Self, Error> {
         shutdown.begin_start();
-        let mut manager = match Self::spawn_manager(identity, home) {
-            Ok(manager) => manager,
-            Err(error) => {
-                shutdown.cancel_start();
-                return Err(error);
-            }
-        };
-        shutdown.supervise(manager.node(), manager.child_handle());
-        if let Err(error) = manager.wait_until_ready(*identity.profile().id(), STARTUP_TIMEOUT) {
-            let cleanup = shutdown.finish_supervision(|| {
-                if shutdown.shutdown_started() {
-                    manager.reap()
-                } else {
-                    drop(manager);
-                    Ok(())
-                }
-            });
-            if let Err(cleanup) = cleanup {
-                tracing::warn!(%cleanup, "failed to reap node after startup error");
-            }
-            return Err(error);
-        }
-
-        Ok(manager)
+        Self::spawn_manager(identity, home).await.inspect_err(|_| {
+            shutdown.cancel_start();
+        })
     }
 
-    fn spawn_manager(identity: &Identity, home: &MemberHome) -> Result<Self, Error> {
-        let node = Self::available_node(identity)?;
+    async fn cleanup_failed_start(manager: Self, shutdown: &Shutdown, error: Error) -> Error {
+        let cleanup = if shutdown.shutdown_started() {
+            manager.reap().await
+        } else {
+            manager.terminate_and_reap().await
+        };
+        shutdown.release_supervision();
+        if let Err(cleanup) = cleanup {
+            tracing::warn!(%cleanup, "failed to reap node after startup error");
+        }
+        error
+    }
+
+    async fn spawn_manager(identity: &Identity, home: &MemberHome) -> Result<Self, Error> {
+        let socket = identity.profile().home().socket_default();
+        let node = tokio::task::spawn_blocking(move || Self::available_node(socket))
+            .await
+            .map_err(|error| Error::Task(error.to_string()))??;
         let log = home.node_log();
-        let child = Self::spawn(identity, &log)?;
+        let child = Self::spawn(identity, &log).await?;
         Ok(Self {
             child: ChildHandle::new(child),
             node,
@@ -142,37 +162,40 @@ impl NodeManager {
         })
     }
 
-    fn available_node(identity: &Identity) -> Result<Node, Error> {
-        let socket = identity.profile().home().socket_default();
+    fn available_node(socket: PathBuf) -> Result<Node, Error> {
         let node = Node::new(&socket);
         if node.is_running() {
-            return Err(Error::AlreadyRunning(socket.into()));
+            return Err(Error::AlreadyRunning(socket.into_boxed_path()));
         }
         Self::ensure_socket_absent(&socket)?;
 
         Ok(node)
     }
 
-    fn spawn(identity: &Identity, log: &Path) -> Result<Child, Error> {
-        let output = fs::OpenOptions::new()
+    async fn spawn(identity: &Identity, log: &Path) -> Result<Child, Error> {
+        let output = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(log)
+            .await
             .map_err(|source| Error::Log {
                 path: log.to_path_buf(),
                 source,
             })?;
-        let error = output.try_clone().map_err(|source| Error::Log {
+        let error = output.try_clone().await.map_err(|source| Error::Log {
             path: log.to_path_buf(),
             source,
         })?;
+        let output = output.into_std().await;
+        let error = error.into_std().await;
         let mut command = Command::new("radicle-node");
         command
             .arg("--log-level")
             .arg("info")
             .stdout(Stdio::from(output))
-            .stderr(Stdio::from(error));
-        identity.configure_radicle_command(&mut command);
+            .stderr(Stdio::from(error))
+            .kill_on_drop(true);
+        identity.configure_radicle_command(command.as_std_mut());
         command.spawn().map_err(Error::Spawn)
     }
 
@@ -192,31 +215,37 @@ impl NodeManager {
     /// # Errors
     ///
     /// Returns an error when the shutdown request or process wait fails.
-    pub fn stop(mut self) -> Result<(), Error> {
-        self.node.clone().shutdown().map_err(Error::Control)?;
-        self.reap_child()
+    pub async fn stop(mut self) -> Result<(), Error> {
+        Self::shutdown_node(self.node.clone()).await?;
+        self.reap_child().await
     }
 
-    pub(crate) fn stop_supervised(mut self, shutdown: &Shutdown) -> Result<(), Error> {
+    pub(crate) async fn stop_supervised(mut self, shutdown: &Shutdown) -> Result<(), Error> {
         if shutdown.shutdown_started() {
-            return self.reap_child();
+            return self.reap_child().await;
         }
-        match self.node.clone().shutdown() {
+        match Self::shutdown_node(self.node.clone()).await {
             Ok(()) => {
                 shutdown.mark_shutdown_started();
-                self.reap_child()
+                self.reap_child().await
             }
-            Err(_) if shutdown.shutdown_started() => self.reap_child(),
-            Err(error) => Err(Error::Control(error)),
+            Err(_) if shutdown.shutdown_started() => self.reap_child().await,
+            Err(error) => Err(error),
         }
     }
 
-    pub(crate) fn reap(mut self) -> Result<(), Error> {
-        self.reap_child()
+    pub(crate) async fn reap(mut self) -> Result<(), Error> {
+        self.reap_child().await
     }
 
-    fn reap_child(&mut self) -> Result<(), Error> {
-        let status = self.child.wait().map_err(Error::Wait)?;
+    async fn terminate_and_reap(self) -> Result<(), Error> {
+        self.child.kill().map_err(Error::Wait)?;
+        let _status = self.child.wait().await.map_err(Error::Wait)?;
+        Ok(())
+    }
+
+    async fn reap_child(&mut self) -> Result<(), Error> {
+        let status = self.child.wait().await.map_err(Error::Wait)?;
         if status.success() {
             Ok(())
         } else {
@@ -227,7 +256,7 @@ impl NodeManager {
         }
     }
 
-    fn wait_until_ready(&mut self, expected: NodeId, timeout: Duration) -> Result<(), Error> {
+    async fn wait_until_ready(&mut self, expected: NodeId, timeout: Duration) -> Result<(), Error> {
         let started = Instant::now();
         while started.elapsed() < timeout {
             let status = {
@@ -243,20 +272,34 @@ impl NodeManager {
                     log: self.log.clone(),
                 });
             }
-            if let Ok(actual) = self.node.nid() {
+            if let Ok(actual) = Self::node_id(self.node.clone()).await {
                 return if actual == expected {
                     Ok(())
                 } else {
                     Err(Error::IdentityMismatch { expected, actual })
                 };
             }
-            thread::sleep(POLL_INTERVAL);
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
 
         Err(Error::StartupTimeout {
             timeout,
             log: self.log.clone(),
         })
+    }
+
+    async fn node_id(node: Node) -> Result<NodeId, Error> {
+        tokio::task::spawn_blocking(move || node.nid())
+            .await
+            .map_err(|error| Error::Task(error.to_string()))?
+            .map_err(Error::Control)
+    }
+
+    async fn shutdown_node(node: Node) -> Result<(), Error> {
+        tokio::task::spawn_blocking(move || node.shutdown())
+            .await
+            .map_err(|error| Error::Task(error.to_string()))?
+            .map_err(Error::Control)
     }
 
     fn ensure_socket_absent(socket: &Path) -> Result<(), Error> {
@@ -274,7 +317,6 @@ impl NodeManager {
 impl Drop for NodeManager {
     fn drop(&mut self) {
         let _killed = self.child.kill();
-        let _status = self.child.wait();
     }
 }
 
@@ -315,6 +357,9 @@ pub enum Error {
     /// The node process could not be inspected or reaped.
     #[error("failed to wait for radicle-node: {0}")]
     Wait(io::Error),
+    /// A blocking Radicle operation task failed.
+    #[error("managed node task failed: {0}")]
+    Task(String),
     /// The child exited unexpectedly.
     #[error("radicle-node exited with {status}; see '{log}'")]
     Exited {
@@ -346,7 +391,7 @@ pub enum Error {
 
 #[cfg(all(test, unix, not(miri)))]
 mod tests {
-    use std::{fs, path::PathBuf, process::Command, time::Duration};
+    use std::{fs, path::PathBuf, time::Duration};
 
     use radicle::node::{Node, NodeId};
 
@@ -369,9 +414,9 @@ mod tests {
         fs::remove_file(socket).expect("socket placeholder should be removed");
     }
 
-    #[test]
-    fn reports_a_child_that_exits_during_startup() {
-        let child = Command::new("/bin/sh")
+    #[tokio::test]
+    async fn reports_a_child_that_exits_during_startup() {
+        let child = tokio::process::Command::new("/bin/sh")
             .args(["-c", "exit 7"])
             .spawn()
             .expect("test child should start");
@@ -387,8 +432,38 @@ mod tests {
         let expected = NODE.parse::<NodeId>().expect("node ID should parse");
 
         assert!(matches!(
-            manager.wait_until_ready(expected, Duration::from_secs(1)),
+            manager
+                .wait_until_ready(expected, Duration::from_secs(1))
+                .await,
             Err(Error::Exited { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn forced_startup_cleanup_reaps_the_child() {
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .expect("test child should start");
+        let handle = ChildHandle::new(child);
+        let manager = NodeManager {
+            child: handle.clone(),
+            node: Node::new(std::env::temp_dir().join("radicle-team-unused-socket")),
+            log: PathBuf::from("node.log"),
+        };
+
+        manager
+            .terminate_and_reap()
+            .await
+            .expect("child should be terminated and reaped");
+
+        assert_eq!(
+            handle
+                .wait()
+                .await
+                .expect_err("reaped child should no longer be owned")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 }

@@ -7,12 +7,9 @@
 //! the handler terminates the CLI instead of suppressing the operating-system signal indefinitely.
 //! This is necessary because operating-system termination does not run Rust destructors by itself.
 
-use std::{
-    sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
+use std::sync::{
+    Arc, Mutex, MutexGuard, PoisonError,
+    atomic::{AtomicBool, Ordering},
 };
 
 use radicle::node::{Handle as _, Node};
@@ -28,7 +25,12 @@ pub(crate) struct Shutdown {
 impl Shutdown {
     /// Installs the CLI signal handler.
     pub(crate) fn install() -> Result<Self, ctrlc::Error> {
-        let shutdown = Self::default();
+        let shutdown = Self {
+            state: Arc::new(State {
+                runtime: Some(tokio::runtime::Handle::current()),
+                ..State::default()
+            }),
+        };
         let handler = shutdown.clone();
         ctrlc::set_handler(move || {
             if !handler.request() {
@@ -77,12 +79,8 @@ impl Shutdown {
         }
     }
 
-    /// Runs node cleanup while it remains supervised, then releases it.
-    pub(crate) fn finish_supervision<T>(&self, cleanup: impl FnOnce() -> T) -> T {
-        let result = cleanup();
+    pub(crate) fn release_supervision(&self) {
         let _node = self.node().take();
-
-        result
     }
 
     /// Returns whether the signal was handled without immediate process termination.
@@ -123,25 +121,18 @@ impl Shutdown {
         if self.state.shutdown_started.swap(true, Ordering::AcqRel) {
             return RequestResult::Handled;
         }
-        let shutdown = self.clone();
         let child = node.child.clone();
-        match thread::Builder::new()
-            .name("radicle-node-shutdown".to_owned())
-            .spawn(move || shutdown.shutdown_node(node))
-        {
-            Ok(_worker) => RequestResult::Handled,
-            Err(_) => {
-                self.state.shutdown_started.store(false, Ordering::Release);
+        let Some(runtime) = self.state.runtime.clone() else {
+            let _result = child.kill();
+            self.state.shutdown_started.store(false, Ordering::Release);
+            return RequestResult::Failed;
+        };
+        runtime.spawn_blocking(move || {
+            if node.handle.clone().shutdown().is_err() {
                 let _result = child.kill();
-                RequestResult::Failed
             }
-        }
-    }
-
-    fn shutdown_node(&self, node: SupervisedNode) {
-        if node.handle.clone().shutdown().is_err() {
-            let _result = node.child.kill();
-        }
+        });
+        RequestResult::Handled
     }
 
     fn supervised_node(&self) -> Option<SupervisedNode> {
@@ -162,6 +153,7 @@ struct State {
     shutdown_started: AtomicBool,
     starting: AtomicBool,
     node: Mutex<Option<SupervisedNode>>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,53 +202,56 @@ mod tests {
 
     #[cfg(all(unix, not(miri)))]
     fn supervised_test_child() -> (Shutdown, crate::node::ChildHandle) {
-        use std::process::Command;
-
         use radicle::node::Node;
 
         use crate::node::ChildHandle;
 
-        let child = Command::new("/bin/sh")
+        let child = tokio::process::Command::new("/bin/sh")
             .args(["-c", "exec sleep 60"])
             .spawn()
             .expect("test child should start");
-        let node = Node::new(
-            std::env::temp_dir().join(format!("radicle-team-unresponsive-node-{}", child.id())),
-        );
+        let node = Node::new(std::env::temp_dir().join(format!(
+            "radicle-team-unresponsive-node-{}",
+            child.id().expect("test child should have an ID")
+        )));
         let handle = ChildHandle::new(child);
-        let shutdown = Shutdown::default();
+        let shutdown = Shutdown {
+            state: std::sync::Arc::new(super::State {
+                runtime: Some(tokio::runtime::Handle::current()),
+                ..super::State::default()
+            }),
+        };
         shutdown.supervise(&node, handle.clone());
 
         (shutdown, handle)
     }
 
     #[cfg(all(unix, not(miri)))]
-    #[test]
-    fn kills_a_child_when_control_shutdown_fails() {
+    #[tokio::test]
+    async fn kills_a_child_when_control_shutdown_fails() {
         let (shutdown, handle) = supervised_test_child();
 
         assert!(shutdown.request());
         assert!(
             !handle
                 .wait()
+                .await
                 .expect("test child should be reaped")
                 .success()
         );
     }
 
     #[cfg(all(unix, not(miri)))]
-    #[test]
-    fn a_signal_forces_a_child_that_acknowledged_shutdown() {
+    #[tokio::test]
+    async fn a_signal_forces_a_child_that_acknowledged_shutdown() {
         let (shutdown, handle) = supervised_test_child();
         shutdown.mark_shutdown_started();
-        let waiting = handle.clone();
-        let waiter = std::thread::spawn(move || waiting.wait());
 
         assert!(!shutdown.request());
         assert!(
-            !waiter
-                .join()
-                .expect("waiter should finish")
+            !handle
+                .wait()
+                .await
                 .expect("test child should be reaped")
                 .success()
         );

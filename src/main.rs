@@ -8,7 +8,8 @@ use crate::logging::Logging;
 
 mod logging;
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     if let Err(error) = Logging::init() {
@@ -16,7 +17,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match cli.execute() {
+    match cli.execute().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "application stopped");

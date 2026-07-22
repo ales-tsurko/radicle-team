@@ -8,15 +8,19 @@ use radicle::{
     identity::{Did, RepoId},
 };
 
+use crate::agent::{self, Agent, Context, DeliveryId, Outcome};
+
 /// Activity addressed to or otherwise relevant to the selected member.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Activity {
+pub(super) struct Activity {
     /// Repository containing the activity.
     pub repository: RepoId,
     /// Issue or patch receiving the activity.
     pub subject: Subject,
     /// Operation which produced the activity.
     pub operation: EntryId,
+    /// Position of the relevant action within the operation.
+    pub action: usize,
     /// Author of the operation.
     pub author: Did,
     /// Why the activity requires attention.
@@ -28,6 +32,7 @@ impl Activity {
         repository: RepoId,
         subject: Subject,
         operation: EntryId,
+        action: usize,
         author: Did,
         kind: Kind,
     ) -> Self {
@@ -35,8 +40,34 @@ impl Activity {
             repository,
             subject,
             operation,
+            action,
             author,
             kind,
+        }
+    }
+
+    pub(super) async fn dispatch(
+        self,
+        agent: &mut (impl Agent + ?Sized),
+    ) -> Result<Outcome, agent::Error> {
+        let context = Context {
+            repository: self.repository,
+            subject: self.subject,
+            delivery: self.delivery_id(),
+            author: self.author,
+        };
+        match self.kind {
+            Kind::Assigned => agent.assigned(context).await,
+            Kind::Mentioned(target) => agent.mentioned(context, target).await,
+            Kind::Replied { comment, reply_to } => agent.replied(context, comment, reply_to).await,
+            Kind::Changed(change) => agent.changed(context, change).await,
+        }
+    }
+
+    pub(super) const fn delivery_id(&self) -> DeliveryId {
+        DeliveryId {
+            operation: self.operation,
+            action: self.action,
         }
     }
 }
@@ -52,7 +83,7 @@ pub enum Subject {
 
 /// Reason an interaction requires the member's attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
+pub(super) enum Kind {
     /// The member was assigned an issue or patch review.
     Assigned,
     /// The member was mentioned in text.
@@ -174,4 +205,127 @@ pub enum Change {
         /// Whether the reaction was added or removed.
         active: bool,
     },
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use std::str::FromStr as _;
+
+    use radicle::{
+        cob::{EntryId, ObjectId},
+        identity::{Did, RepoId},
+    };
+
+    use crate::{
+        agent::{Agent, Context, DeliveryId, Error, Outcome},
+        watcher::activity::{Activity, Change, Comment, Kind, Subject, Target},
+    };
+
+    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+    const SUBJECT: &str = "1111111111111111111111111111111111111111";
+    const OPERATION: &str = "2222222222222222222222222222222222222222";
+    const COMMENT: &str = "3333333333333333333333333333333333333333";
+    const AUTHOR: &str = "did:key:z6MkvUJtYD9dHDJfpevWRT98mzDDpdAtmUjwyDSkyqksUr7C";
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Call {
+        Assigned(Context),
+        Mentioned(Context, Target),
+        Replied(Context, Comment, EntryId),
+        Changed(Context, Change),
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingAgent {
+        calls: Vec<Call>,
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for RecordingAgent {
+        async fn assigned(&mut self, context: Context) -> Result<Outcome, Error> {
+            self.calls.push(Call::Assigned(context));
+            Ok(Outcome::NoAction)
+        }
+
+        async fn mentioned(&mut self, context: Context, target: Target) -> Result<Outcome, Error> {
+            self.calls.push(Call::Mentioned(context, target));
+            Ok(Outcome::NoAction)
+        }
+
+        async fn replied(
+            &mut self,
+            context: Context,
+            comment: Comment,
+            reply_to: EntryId,
+        ) -> Result<Outcome, Error> {
+            self.calls.push(Call::Replied(context, comment, reply_to));
+            Ok(Outcome::NoAction)
+        }
+
+        async fn changed(&mut self, context: Context, change: Change) -> Result<Outcome, Error> {
+            self.calls.push(Call::Changed(context, change));
+            Ok(Outcome::NoAction)
+        }
+    }
+
+    fn context() -> Context {
+        Context {
+            repository: RepoId::from_str(REPOSITORY).expect("repository should be valid"),
+            subject: Subject::Issue(ObjectId::from_str(SUBJECT).expect("subject should be valid")),
+            delivery: DeliveryId {
+                operation: EntryId::from_str(OPERATION).expect("operation should be valid"),
+                action: 0,
+            },
+            author: Did::from_str(AUTHOR).expect("author should be valid"),
+        }
+    }
+
+    fn activity(kind: Kind) -> Activity {
+        let context = context();
+        Activity::new(
+            context.repository,
+            context.subject,
+            context.delivery.operation,
+            context.delivery.action,
+            context.author,
+            kind,
+        )
+    }
+
+    #[tokio::test]
+    async fn dispatches_every_activity_to_its_typed_agent_method() {
+        let comment =
+            Comment::Issue(EntryId::from_str(COMMENT).expect("comment operation should be valid"));
+        let mut agent = RecordingAgent::default();
+
+        activity(Kind::Assigned)
+            .dispatch(&mut agent)
+            .await
+            .expect("assignment should dispatch");
+        activity(Kind::Mentioned(Target::Comment(comment)))
+            .dispatch(&mut agent)
+            .await
+            .expect("mention should dispatch");
+        activity(Kind::Replied {
+            comment,
+            reply_to: context().delivery.operation,
+        })
+        .dispatch(&mut agent)
+        .await
+        .expect("reply should dispatch");
+        activity(Kind::Changed(Change::CommentCreated(comment)))
+            .dispatch(&mut agent)
+            .await
+            .expect("change should dispatch");
+
+        assert_eq!(
+            agent.calls,
+            [
+                Call::Assigned(context()),
+                Call::Mentioned(context(), Target::Comment(comment)),
+                Call::Replied(context(), comment, context().delivery.operation),
+                Call::Changed(context(), Change::CommentCreated(comment)),
+            ]
+        );
+    }
 }

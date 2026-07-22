@@ -17,7 +17,10 @@ use radicle::{
 
 use crate::{
     member::Member,
-    watcher::{Activity, Change, Comment, Kind, Subject, Target},
+    watcher::{
+        Change, Comment, Subject, Target,
+        activity::{Activity, Kind},
+    },
 };
 
 /// Stateful reducer which classifies normalized actions for one collaborative object.
@@ -52,13 +55,14 @@ impl Context {
         }
 
         let mut activities = Vec::new();
-        for action in &operation.actions {
+        for (action_index, action) in operation.actions.iter().enumerate() {
             let normalized = ActionEnvelope::new(action, operation, member_id).into();
             if let Outcome::Relevant(kind) = self.reduce(normalized, member, authored_by_member) {
                 activities.push(Activity::new(
                     repository,
                     subject,
                     operation.id,
+                    action_index,
                     operation.author.into(),
                     kind,
                 ));
