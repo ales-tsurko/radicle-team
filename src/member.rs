@@ -1,3 +1,5 @@
+//! Fixed team members and their public profiles.
+
 use std::{fmt, str::FromStr};
 
 /// A fixed member of the team.
@@ -53,6 +55,7 @@ impl Member {
                               faster.",
                 stats: Stats::new(3, 5, 1, 4, 2),
                 special_trait: "Beginner's Luck",
+                mcp_allow: &["read", "comments", "patches", "reviews"],
             },
             Self::Maya => Profile {
                 name: "Maya",
@@ -61,6 +64,7 @@ impl Member {
                               messy code into something that actually ships.",
                 stats: Stats::new(5, 3, 5, 4, 4),
                 special_trait: "Gets It Done",
+                mcp_allow: &["read", "comments", "issues", "patches", "reviews"],
             },
             Self::Leon => Profile {
                 name: "Leon",
@@ -69,6 +73,7 @@ impl Member {
                               Thoughtful and patient, but deeply suspicious of shortcuts.",
                 stats: Stats::new(5, 2, 5, 4, 5),
                 special_trait: "Sees Three Moves Ahead",
+                mcp_allow: &["read", "comments", "issues", "reviews"],
             },
             Self::Vera => Profile {
                 name: "Vera",
@@ -77,6 +82,7 @@ impl Member {
                               unlocked door everyone else has already walked through.",
                 stats: Stats::new(5, 2, 5, 3, 5),
                 special_trait: "Trust Nothing",
+                mcp_allow: &["read", "comments", "issues", "reviews"],
             },
             Self::Nora => Profile {
                 name: "Nora",
@@ -85,6 +91,7 @@ impl Member {
                               that technically working is not the same as being usable.",
                 stats: Stats::new(4, 4, 4, 5, 3),
                 special_trait: "Human Perspective",
+                mcp_allow: &["read", "comments", "issues", "patches", "reviews"],
             },
             Self::Theo => Profile {
                 name: "Theo",
@@ -94,6 +101,7 @@ impl Member {
                               answer.",
                 stats: Stats::new(5, 1, 5, 4, 5),
                 special_trait: "Leave No Stone Unturned",
+                mcp_allow: &["read", "comments", "issues", "reviews"],
             },
         }
     }
@@ -144,6 +152,8 @@ pub struct Profile {
     pub stats: Stats,
     /// Unique character trait.
     pub special_trait: &'static str,
+    /// MCP permission groups used when setup creates this member's binding.
+    pub mcp_allow: &'static [&'static str],
 }
 
 /// Character statistics rated from 1 to 5.
@@ -198,6 +208,15 @@ mod tests {
     }
 
     #[test]
+    fn detects_member_mentions_without_partial_matches() {
+        assert!(Member::Nico.is_mentioned_in("Could you check this, @Nico?"));
+        assert!(Member::Nico.is_mentioned_in("(@nico) please investigate"));
+        assert!(!Member::Nico.is_mentioned_in("Ask @nicole"));
+        assert!(!Member::Nico.is_mentioned_in("mail@example@nico"));
+        assert!(!Member::Nico.is_mentioned_in("nico"));
+    }
+
+    #[test]
     fn provides_every_member_profile() {
         let expected = [
             (Member::Nico, "Nico", "Junior Developer"),
@@ -213,5 +232,22 @@ mod tests {
             assert_eq!(profile.name, name);
             assert_eq!(profile.role, role);
         }
+    }
+
+    #[test]
+    fn provides_setup_mcp_defaults_as_profile_data() {
+        assert_eq!(
+            Member::Nico.profile().mcp_allow,
+            ["read", "comments", "patches", "reviews"]
+        );
+        assert_eq!(
+            Member::Maya.profile().mcp_allow,
+            ["read", "comments", "issues", "patches", "reviews"]
+        );
+        assert!(
+            !Member::ALL
+                .iter()
+                .any(|member| member.profile().mcp_allow.contains(&"merge_patch"))
+        );
     }
 }

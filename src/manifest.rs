@@ -14,7 +14,7 @@
 //! validation succeeds.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     str,
@@ -26,7 +26,7 @@ use radicle::{
     identity::Did,
     storage::{ReadRepository as _, RepositoryError, git::Repository},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 
 use crate::{
     identity::{Identity, permissions::Permissions},
@@ -160,7 +160,8 @@ impl Manifest {
             binding.signing_did,
             binding.generation,
             self.revision,
-        ))
+        )
+        .with_mcp_allow(binding.mcp_allow.clone()))
     }
 
     fn parse(contents: &str, revision: Revision) -> Result<Self, Error> {
@@ -202,12 +203,14 @@ impl Manifest {
 }
 
 /// One repository's binding from a fixed member to a signing DID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
     signing_did: Did,
     generation: u64,
     state: BindingState,
+    #[serde(default = "McpAllowlist::legacy")]
+    mcp_allow: McpAllowlist,
 }
 
 impl Binding {
@@ -228,6 +231,12 @@ impl Binding {
     pub const fn state(&self) -> BindingState {
         self.state
     }
+
+    /// Returns the MCP methods allowed for this binding.
+    #[must_use]
+    pub fn mcp_allow(&self) -> &McpAllowlist {
+        &self.mcp_allow
+    }
 }
 
 /// Whether a repository member binding may receive work.
@@ -240,6 +249,92 @@ pub enum BindingState {
     Inactive,
 }
 
+/// MCP methods allowed for one member in one repository.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpAllowlist(BTreeSet<String>);
+
+impl McpAllowlist {
+    fn legacy() -> Self {
+        Self::from_group("read")
+    }
+
+    fn from_entries(entries: Vec<String>) -> Result<Self, UnknownMcpPermission> {
+        let mut allowlist = Self::default();
+        for entry in entries {
+            if Self::is_group(&entry) {
+                allowlist.extend_group(&entry);
+            } else if crate::mcp::ToolService::registered_tools()
+                .iter()
+                .any(|method| method == &entry)
+            {
+                allowlist.insert(&entry);
+            } else {
+                return Err(UnknownMcpPermission(entry));
+            }
+        }
+        Ok(allowlist)
+    }
+
+    fn from_group(group: &str) -> Self {
+        let mut allowlist = Self::default();
+        allowlist.extend_group(group);
+        allowlist
+    }
+
+    fn extend_group(&mut self, group: &str) {
+        for method in crate::mcp::ToolService::registered_tools() {
+            if Self::belongs_to_group(method, group) {
+                self.insert(method);
+            }
+        }
+    }
+
+    fn insert(&mut self, method: &str) {
+        let _inserted = self.0.insert(method.to_owned());
+    }
+
+    /// Returns whether the named MCP method is allowed.
+    #[must_use]
+    pub fn allows(&self, method: &str) -> bool {
+        self.0.contains(method)
+    }
+
+    /// Returns the allowed MCP method names.
+    pub fn methods(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+
+    fn is_group(value: &str) -> bool {
+        matches!(
+            value,
+            "read" | "comments" | "issues" | "patches" | "reviews"
+        )
+    }
+
+    fn belongs_to_group(method: &str, group: &str) -> bool {
+        let read = method.starts_with("get_") || method.starts_with("list_");
+        let names = |entity| method.split('_').any(|part| part == entity);
+
+        match group {
+            "read" => read,
+            "comments" => !read && names("comment"),
+            "issues" => !read && names("issue"),
+            "patches" => !read && method != "merge_patch" && names("patch"),
+            "reviews" => !read && names("review"),
+            _ => false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for McpAllowlist {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::from_entries(Vec::<String>::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
 /// Revision from which the manifest was loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Revision {
@@ -250,12 +345,13 @@ pub enum Revision {
 }
 
 /// An active binding verified against the local signing identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedBinding {
     member: Member,
     did: Did,
     generation: u64,
     revision: Revision,
+    mcp_allow: McpAllowlist,
 }
 
 impl ValidatedBinding {
@@ -265,7 +361,13 @@ impl ValidatedBinding {
             did,
             generation,
             revision,
+            mcp_allow: McpAllowlist(BTreeSet::new()),
         }
+    }
+
+    fn with_mcp_allow(mut self, mcp_allow: McpAllowlist) -> Self {
+        self.mcp_allow = mcp_allow;
+        self
     }
 
     /// Returns the bound member.
@@ -291,6 +393,12 @@ impl ValidatedBinding {
     pub const fn revision(&self) -> Revision {
         self.revision
     }
+
+    /// Returns the MCP methods allowed for this binding.
+    #[must_use]
+    pub fn mcp_allow(&self) -> &McpAllowlist {
+        &self.mcp_allow
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +407,10 @@ struct Document {
     version: u32,
     members: BTreeMap<String, Binding>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown MCP permission '{0}'")]
+struct UnknownMcpPermission(String);
 
 /// Error loading or validating a repository manifest.
 #[derive(Debug, thiserror::Error)]
@@ -380,7 +492,7 @@ mod tests {
     use radicle::identity::Did;
 
     use crate::{
-        manifest::{Error, Manifest, Revision},
+        manifest::{Error, Manifest, McpAllowlist, Revision},
         member::Member,
     };
 
@@ -420,6 +532,84 @@ mod tests {
             NICO.parse::<Did>().expect("DID should parse")
         );
         assert_eq!(binding.generation(), 1);
+        assert!(binding.mcp_allow().allows("get_subject"));
+        assert!(binding.mcp_allow().allows("get_diff"));
+        assert!(!binding.mcp_allow().allows("create_comment"));
+    }
+
+    #[test]
+    fn expands_explicit_mcp_groups_without_implicitly_allowing_merge() {
+        for group in ["read", "comments", "issues", "patches", "reviews"] {
+            let allowlist =
+                McpAllowlist::from_entries(vec![group.to_owned()]).expect("group should be known");
+            assert_eq!(
+                allowlist.methods().collect::<Vec<_>>(),
+                crate::mcp::ToolService::registered_tools()
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|method| McpAllowlist::belongs_to_group(method, group))
+                    .collect::<Vec<_>>()
+            );
+            assert!(!allowlist.allows("merge_patch"));
+        }
+    }
+
+    #[test]
+    fn accepts_explicit_methods_and_an_empty_allowlist() {
+        let explicit = Fixture::parse(&format!(
+            "version = 1\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
+             \"active\"\nmcp_allow = [\"merge_patch\"]\n"
+        ))
+        .expect("manifest should parse");
+        let explicit = explicit
+            .members
+            .get(&Member::Nico)
+            .expect("Nico should exist")
+            .mcp_allow();
+        assert_eq!(explicit.methods().collect::<Vec<_>>(), ["merge_patch"]);
+
+        let empty = Fixture::parse(&format!(
+            "version = 1\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
+             \"active\"\nmcp_allow = []\n"
+        ))
+        .expect("manifest should parse");
+        assert_eq!(
+            empty
+                .members
+                .get(&Member::Nico)
+                .expect("Nico should exist")
+                .mcp_allow()
+                .methods()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn accepts_every_registered_tool_without_a_manifest_method_registry() {
+        for method in crate::mcp::ToolService::registered_tools() {
+            let allowlist = McpAllowlist::from_entries(vec![method.clone()])
+                .expect("registered tool should be accepted");
+            assert!(allowlist.allows(method));
+            assert!(
+                method == "merge_patch"
+                    || ["read", "comments", "issues", "patches", "reviews"]
+                        .into_iter()
+                        .any(|group| McpAllowlist::belongs_to_group(method, group)),
+                "registered tool '{method}' must follow a permission-group naming convention"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_mcp_permissions() {
+        assert!(matches!(
+            Fixture::parse(&format!(
+                "version = 1\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
+                 \"active\"\nmcp_allow = [\"everything\"]\n"
+            )),
+            Err(Error::Parse(_))
+        ));
     }
 
     #[test]

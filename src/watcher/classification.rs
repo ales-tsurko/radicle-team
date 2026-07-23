@@ -57,7 +57,7 @@ impl Context {
         let mut activities = Vec::new();
         for (action_index, action) in operation.actions.iter().enumerate() {
             let normalized = ActionEnvelope::new(action, operation, member_id).into();
-            if let Outcome::Relevant(kind) = self.reduce(normalized, member, authored_by_member) {
+            if let Relevance::Relevant(kind) = self.reduce(normalized, member, authored_by_member) {
                 activities.push(Activity::new(
                     repository,
                     subject,
@@ -76,7 +76,7 @@ impl Context {
         action: NormalizedAction<'_>,
         member: Member,
         authored_by_member: bool,
-    ) -> Outcome {
+    ) -> Relevance {
         if authored_by_member && let Some(entity) = action.track {
             self.entities.insert(entity);
         }
@@ -85,7 +85,7 @@ impl Context {
             let changed = assigned != self.assigned;
             self.assigned = assigned;
             if changed && !authored_by_member {
-                return Outcome::Relevant(if assigned {
+                return Relevance::Relevant(if assigned {
                     Kind::Assigned
                 } else {
                     Kind::Changed(Change::Unassigned)
@@ -94,30 +94,30 @@ impl Context {
         }
 
         if authored_by_member {
-            return Outcome::Ignored;
+            return Relevance::Ignored;
         }
 
         for signal in action.signals {
             match signal {
                 Signal::Mention { body, target } if member.is_mentioned_in(body) => {
-                    return Outcome::Relevant(Kind::Mentioned(target));
+                    return Relevance::Relevant(Kind::Mentioned(target));
                 }
                 Signal::Reply {
                     parent: Some(parent),
                     comment,
                 } if self.owns(Entity::Comment(parent)) => {
-                    return Outcome::Relevant(Kind::Replied {
+                    return Relevance::Relevant(Kind::Replied {
                         comment,
                         reply_to: parent,
                     });
                 }
                 Signal::Change { audience, change } if audience.matches(self) => {
-                    return Outcome::Relevant(Kind::Changed(change));
+                    return Relevance::Relevant(Kind::Changed(change));
                 }
                 Signal::Mention { .. } | Signal::Reply { .. } | Signal::Change { .. } => {}
             }
         }
-        Outcome::Ignored
+        Relevance::Ignored
     }
 
     fn involved(&self) -> bool {
@@ -287,7 +287,7 @@ enum Signal<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Outcome {
+enum Relevance {
     Ignored,
     Relevant(Kind),
 }

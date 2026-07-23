@@ -104,7 +104,7 @@ impl Cli {
                 .run()
                 .await
                 .map_err(Error::from),
-            Mode::Run => application.run().await.map_err(Error::from),
+            Mode::Run => Box::pin(application.run()).await.map_err(Error::from),
         }
     }
 

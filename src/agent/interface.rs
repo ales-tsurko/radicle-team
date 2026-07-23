@@ -1,0 +1,167 @@
+//! Agent callback interface and delivery value types.
+
+use std::{error::Error as StdError, fmt, path::PathBuf};
+
+use async_trait::async_trait;
+use radicle::{
+    cob::{
+        EntryId,
+        patch::{ReviewId, RevisionId},
+    },
+    crypto::PublicKey,
+    identity::{Did, RepoId},
+};
+use url::Url;
+
+use crate::watcher::{Change, Comment, Subject, Target};
+
+/// A backend capable of handling activity addressed to one team member.
+#[async_trait]
+pub trait Agent: Send {
+    /// Starts the adapter with access to the run-scoped MCP server.
+    async fn start(&mut self, _mcp: &McpEndpoint) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Handles assignment to an issue or patch review.
+    async fn assigned(&mut self, context: Context) -> Result<(), Error>;
+
+    /// Handles a mention in an issue or patch.
+    async fn mentioned(&mut self, context: Context, target: Target) -> Result<(), Error>;
+
+    /// Handles a reply to one of the member's comments.
+    async fn replied(
+        &mut self,
+        context: Context,
+        comment: Comment,
+        reply_to: EntryId,
+    ) -> Result<(), Error>;
+
+    /// Handles another relevant change to an owned or assigned issue or patch.
+    async fn changed(&mut self, context: Context, change: Change) -> Result<(), Error>;
+
+    /// Stops the adapter and releases its resources.
+    async fn stop(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Common context supplied to every agent method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Context {
+    /// Repository containing the interaction.
+    pub repository: RepoId,
+    /// Issue or patch receiving the interaction.
+    pub subject: Subject,
+    /// Stable identity of this individual delivery within the operation.
+    pub delivery: DeliveryId,
+    /// Author of the operation.
+    pub author: Did,
+    /// Fresh checkout prepared for this delivery.
+    pub workspace: PathBuf,
+}
+
+/// Idempotency key for one classified action delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeliveryId {
+    /// Radicle operation containing the action.
+    pub operation: EntryId,
+    /// Zero-based action position within the operation.
+    pub action: usize,
+}
+
+impl fmt::Display for DeliveryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.operation, self.action)
+    }
+}
+
+/// Address of the scoped MCP server available to an agent while it runs.
+///
+/// This remains a newtype instead of an alias for [`Url`] because the URL embeds a capability
+/// token. The wrapper prevents confusing it with arbitrary URLs and provides a redacted
+/// [`Debug`](std::fmt::Debug) implementation so the capability is not logged accidentally.
+#[derive(Clone, PartialEq, Eq)]
+pub struct McpEndpoint(Url);
+
+impl McpEndpoint {
+    pub(crate) const fn new(url: Url) -> Self {
+        Self(url)
+    }
+
+    /// Returns the validated Streamable HTTP MCP URL.
+    #[must_use]
+    pub const fn url(&self) -> &Url {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for McpEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpEndpoint")
+            .field("transport", &"loopback HTTP")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Error returned by an agent adapter.
+#[derive(Debug, thiserror::Error)]
+#[error("agent adapter failed: {source}")]
+pub struct Error {
+    source: Box<dyn StdError + Send + Sync>,
+}
+
+impl Error {
+    /// Wraps an adapter-specific error.
+    pub fn new(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self {
+            source: Box::new(source),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LegacyPendingReply {
+    pub(crate) reply: LegacyReply,
+    pub(crate) author: PublicKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LegacyReply {
+    pub(crate) body: String,
+    pub(crate) target: LegacyReplyTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum LegacyReplyTarget {
+    Issue {
+        reply_to: Option<EntryId>,
+    },
+    Revision {
+        revision: RevisionId,
+        reply_to: Option<EntryId>,
+    },
+    Review {
+        review: ReviewId,
+        reply_to: Option<EntryId>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use url::Url;
+
+    use crate::agent::McpEndpoint;
+
+    #[test]
+    fn endpoint_debug_output_hides_its_capability() {
+        let endpoint = McpEndpoint::new(
+            Url::parse("http://127.0.0.1:1234/mcp/secret").expect("endpoint should be valid"),
+        );
+        let debug = format!("{endpoint:?}");
+
+        assert!(!debug.contains("secret"));
+        assert_eq!(endpoint.url().as_str(), "http://127.0.0.1:1234/mcp/secret");
+    }
+}

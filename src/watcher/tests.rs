@@ -1,0 +1,522 @@
+//! Watcher classification tests.
+
+use std::{collections::BTreeSet, str::FromStr as _};
+
+use radicle::{
+    cob::{
+        EntryId, Manifest, ObjectId, Op, Reaction, Timestamp, Title, TypeName, Version,
+        issue::{Action, State as IssueState, TYPENAME},
+        patch::{
+            Action as PatchAction, Lifecycle, MergeTarget, ReviewEdit, ReviewId, RevisionId,
+            TYPENAME as PATCH_TYPENAME, Verdict,
+        },
+    },
+    crypto::PublicKey,
+    identity::{Did, RepoId},
+};
+
+use crate::{
+    member::Member,
+    watcher::{
+        Change, Comment, Subject,
+        activity::{Activity, Kind},
+        classification::{ActionEnvelope, Context, NormalizedAction},
+    },
+};
+
+const MEMBER: &str = "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
+const AUTHOR: &str = "z6MkvUJtYD9dHDJfpevWRT98mzDDpdAtmUjwyDSkyqksUr7C";
+const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+const ISSUE: &str = "1111111111111111111111111111111111111111";
+const OPERATION: &str = "2222222222222222222222222222222222222222";
+const COMMENT: &str = "3333333333333333333333333333333333333333";
+const CHANGE: &str = "4444444444444444444444444444444444444444";
+const REPLY: &str = "5555555555555555555555555555555555555555";
+
+struct Fixture;
+
+impl Fixture {
+    fn operation<A>(id: &str, action: A, author: PublicKey, type_name: TypeName) -> Op<A> {
+        Op::new(
+            EntryId::from_str(id).expect("operation should be valid"),
+            (action, Vec::new()),
+            author,
+            Timestamp::from_secs(0),
+            None,
+            Manifest::new(type_name, Version::default()),
+        )
+    }
+
+    fn classify<A>(
+        id: &str,
+        action: A,
+        author: PublicKey,
+        type_name: TypeName,
+        subject: Subject,
+        context: &mut Context,
+    ) -> Vec<Activity>
+    where
+        for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
+    {
+        context.classify(
+            &Self::operation(id, action, author, type_name),
+            Member::Nico,
+            PublicKey::from_str(MEMBER).expect("member key should be valid"),
+            RepoId::from_str(REPOSITORY).expect("repository should be valid"),
+            subject,
+        )
+    }
+
+    fn classify_issue(action: Action, author: PublicKey, context: &mut Context) -> Vec<Activity> {
+        Self::classify(
+            OPERATION,
+            action,
+            author,
+            TYPENAME.clone(),
+            Subject::Issue(ObjectId::from_str(ISSUE).expect("issue should be valid")),
+            context,
+        )
+    }
+
+    fn classify_patch(
+        id: &str,
+        action: PatchAction,
+        author: PublicKey,
+        context: &mut Context,
+    ) -> Vec<Activity> {
+        Self::classify(
+            id,
+            action,
+            author,
+            PATCH_TYPENAME.clone(),
+            Subject::Patch(ObjectId::from_str(ISSUE).expect("patch should be valid")),
+            context,
+        )
+    }
+}
+
+#[test]
+fn classifies_assignment_changes() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let mut context = Context::default();
+    let assignment = Action::Assign {
+        assignees: BTreeSet::from([Did::from(member)]),
+    };
+
+    assert!(matches!(
+        Fixture::classify_issue(assignment.clone(), author, &mut context).as_slice(),
+        [Activity {
+            kind: Kind::Assigned,
+            ..
+        }]
+    ));
+    assert!(context.assigned());
+    assert!(Fixture::classify_issue(assignment, author, &mut context).is_empty());
+    assert!(matches!(
+        Fixture::classify_issue(
+            Action::Assign {
+                assignees: BTreeSet::new()
+            },
+            author,
+            &mut context
+        )
+        .as_slice(),
+        [Activity {
+            kind: Kind::Changed(Change::Unassigned),
+            ..
+        }]
+    ));
+    assert!(!context.assigned());
+}
+
+#[test]
+fn classifies_external_mentions_only() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let mut context = Context::default();
+    let comment = Action::Comment {
+        body: "Hey @nico".to_owned(),
+        reply_to: None,
+        embeds: Vec::new(),
+    };
+
+    assert!(matches!(
+        Fixture::classify_issue(comment.clone(), author, &mut context).as_slice(),
+        [Activity {
+            kind: Kind::Mentioned(_),
+            ..
+        }]
+    ));
+    assert!(Fixture::classify_issue(comment, member, &mut context).is_empty());
+    assert!(matches!(
+        Fixture::classify_issue(
+            Action::CommentEdit {
+                id: EntryId::from_str(ISSUE).expect("comment should be valid"),
+                body: "@Nico, updated".to_owned(),
+                embeds: Vec::new(),
+            },
+            author,
+            &mut context,
+        )
+        .as_slice(),
+        [Activity {
+            kind: Kind::Mentioned(_),
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn classifies_issue_replies_and_owned_discussion() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let mut context = Context::default();
+    let member_comment = Action::Comment {
+        body: "I will investigate".to_owned(),
+        reply_to: None,
+        embeds: Vec::new(),
+    };
+
+    assert!(Fixture::classify_issue(member_comment, member, &mut context).is_empty());
+    assert!(matches!(
+        Fixture::classify(
+            COMMENT,
+            Action::Comment {
+                body: "Here are the details".to_owned(),
+                reply_to: Some(EntryId::from_str(OPERATION).expect("comment should be valid")),
+                embeds: Vec::new(),
+            },
+            author,
+            TYPENAME.clone(),
+            Subject::Issue(ObjectId::from_str(ISSUE).expect("issue should be valid")),
+            &mut context,
+        )
+        .as_slice(),
+        [Activity {
+            kind: Kind::Replied { .. },
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn classifies_patch_assignment_and_review() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let mut assignment_context = Context::default();
+
+    assert!(matches!(
+        Fixture::classify_patch(
+            OPERATION,
+            PatchAction::Assign {
+                assignees: BTreeSet::from([Did::from(member)])
+            },
+            author,
+            &mut assignment_context,
+        )
+        .as_slice(),
+        [Activity {
+            kind: Kind::Assigned,
+            ..
+        }]
+    ));
+
+    let mut owned_context = Context::default();
+    assert!(
+        Fixture::classify_patch(
+            OPERATION,
+            PatchAction::Revision {
+                description: "Initial revision".to_owned(),
+                base: *ObjectId::from_str(ISSUE).expect("base should be valid"),
+                oid: *ObjectId::from_str(COMMENT).expect("head should be valid"),
+                resolves: BTreeSet::new(),
+            },
+            member,
+            &mut owned_context,
+        )
+        .is_empty()
+    );
+    assert!(matches!(
+        Fixture::classify_patch(
+            COMMENT,
+            PatchAction::Review {
+                revision: RevisionId::from(
+                    EntryId::from_str(OPERATION).expect("revision should be valid")
+                ),
+                summary: Some("Looks good".to_owned()),
+                verdict: Some(Verdict::Accept),
+                labels: Vec::new(),
+            },
+            author,
+            &mut owned_context,
+        )
+        .as_slice(),
+        [Activity {
+            kind: Kind::Changed(Change::ReviewSubmitted { .. }),
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn classifies_patch_mentions_and_replies() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let revision = RevisionId::from(EntryId::from_str(ISSUE).expect("revision should be valid"));
+    let review = ReviewId::from(EntryId::from_str(ISSUE).expect("review should be valid"));
+    let mut context = Context::default();
+
+    assert!(
+        Fixture::classify_patch(
+            OPERATION,
+            PatchAction::RevisionComment {
+                revision,
+                location: None,
+                body: "My comment".to_owned(),
+                reply_to: None,
+                embeds: Vec::new(),
+            },
+            member,
+            &mut context,
+        )
+        .is_empty()
+    );
+    assert!(matches!(
+        Fixture::classify_patch(
+            COMMENT,
+            PatchAction::RevisionComment {
+                revision,
+                location: None,
+                body: "A reply".to_owned(),
+                reply_to: Some(EntryId::from_str(OPERATION).expect("comment should be valid")),
+                embeds: Vec::new(),
+            },
+            author,
+            &mut context,
+        )
+        .as_slice(),
+        [Activity {
+            kind: Kind::Replied {
+                comment: Comment::Revision { .. },
+                ..
+            },
+            ..
+        }]
+    ));
+    assert!(matches!(
+        Fixture::classify_patch(
+            COMMENT,
+            PatchAction::ReviewComment {
+                review,
+                body: "Please check this, @nico".to_owned(),
+                location: None,
+                reply_to: None,
+                embeds: Vec::new(),
+            },
+            author,
+            &mut context,
+        )
+        .as_slice(),
+        [Activity {
+            kind: Kind::Mentioned(_),
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn classifies_every_remaining_issue_interaction() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let mut context = Context::default();
+    assert!(
+        Fixture::classify_issue(
+            Action::Comment {
+                body: "Owned discussion".to_owned(),
+                reply_to: None,
+                embeds: Vec::new(),
+            },
+            member,
+            &mut context,
+        )
+        .is_empty()
+    );
+
+    let comment = EntryId::from_str(OPERATION).expect("comment should be valid");
+    let reaction = Reaction::new('👍').expect("reaction should be valid");
+    let actions = [
+        Action::Edit {
+            title: Title::new("Updated issue").expect("title should be valid"),
+        },
+        Action::Lifecycle {
+            state: IssueState::Open,
+        },
+        Action::Label {
+            labels: BTreeSet::new(),
+        },
+        Action::Comment {
+            body: "Additional context".to_owned(),
+            reply_to: None,
+            embeds: Vec::new(),
+        },
+        Action::CommentEdit {
+            id: comment,
+            body: "Edited context".to_owned(),
+            embeds: Vec::new(),
+        },
+        Action::CommentRedact { id: comment },
+        Action::CommentReact {
+            id: comment,
+            reaction,
+            active: true,
+        },
+    ];
+
+    for action in actions {
+        assert!(!Fixture::classify_issue(action, author, &mut context).is_empty());
+    }
+}
+
+#[test]
+fn classifies_every_remaining_patch_interaction() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let revision =
+        RevisionId::from(EntryId::from_str(OPERATION).expect("revision should be valid"));
+    let review = ReviewId::from(EntryId::from_str(COMMENT).expect("review should be valid"));
+    let review_comment = EntryId::from_str(CHANGE).expect("comment should be valid");
+    let revision_comment = EntryId::from_str(REPLY).expect("comment should be valid");
+    let reaction = Reaction::new('👍').expect("reaction should be valid");
+    let mut context = Context::default();
+
+    let member_actions = [
+        (
+            OPERATION,
+            PatchAction::Revision {
+                description: "Initial revision".to_owned(),
+                base: *ObjectId::from_str(ISSUE).expect("base should be valid"),
+                oid: *ObjectId::from_str(COMMENT).expect("head should be valid"),
+                resolves: BTreeSet::new(),
+            },
+        ),
+        (
+            COMMENT,
+            PatchAction::Review {
+                revision,
+                summary: Some("My review".to_owned()),
+                verdict: Some(Verdict::Accept),
+                labels: Vec::new(),
+            },
+        ),
+        (
+            CHANGE,
+            PatchAction::ReviewComment {
+                review,
+                body: "Review comment".to_owned(),
+                location: None,
+                reply_to: None,
+                embeds: Vec::new(),
+            },
+        ),
+        (
+            REPLY,
+            PatchAction::RevisionComment {
+                revision,
+                location: None,
+                body: "Revision comment".to_owned(),
+                reply_to: None,
+                embeds: Vec::new(),
+            },
+        ),
+    ];
+    for (id, action) in member_actions {
+        assert!(Fixture::classify_patch(id, action, member, &mut context).is_empty());
+    }
+
+    let actions = [
+        PatchAction::Edit {
+            title: Title::new("Updated patch").expect("title should be valid"),
+            target: MergeTarget::Delegates,
+        },
+        PatchAction::Label {
+            labels: BTreeSet::new(),
+        },
+        PatchAction::Lifecycle {
+            state: Lifecycle::Archived,
+        },
+        PatchAction::Merge {
+            revision,
+            commit: *ObjectId::from_str(COMMENT).expect("commit should be valid"),
+        },
+        PatchAction::ReviewEdit(ReviewEdit::new(
+            review,
+            "Updated review".to_owned(),
+            Some(Verdict::Reject),
+            Vec::new(),
+            Vec::new(),
+        )),
+        PatchAction::ReviewRedact { review },
+        PatchAction::ReviewReact {
+            review,
+            reaction,
+            active: true,
+        },
+        PatchAction::ReviewCommentEdit {
+            review,
+            comment: review_comment,
+            body: "Edited review comment".to_owned(),
+            embeds: Vec::new(),
+        },
+        PatchAction::ReviewCommentRedact {
+            review,
+            comment: review_comment,
+        },
+        PatchAction::ReviewCommentReact {
+            review,
+            comment: review_comment,
+            reaction,
+            active: true,
+        },
+        PatchAction::ReviewCommentResolve {
+            review,
+            comment: review_comment,
+        },
+        PatchAction::ReviewCommentUnresolve {
+            review,
+            comment: review_comment,
+        },
+        PatchAction::RevisionEdit {
+            revision,
+            description: "Edited revision".to_owned(),
+            embeds: Vec::new(),
+        },
+        PatchAction::RevisionRedact { revision },
+        PatchAction::RevisionReact {
+            revision,
+            location: None,
+            reaction,
+            active: true,
+        },
+        PatchAction::RevisionCommentEdit {
+            revision,
+            comment: revision_comment,
+            body: "Edited revision comment".to_owned(),
+            embeds: Vec::new(),
+        },
+        PatchAction::RevisionCommentRedact {
+            revision,
+            comment: revision_comment,
+        },
+        PatchAction::RevisionCommentReact {
+            revision,
+            comment: revision_comment,
+            reaction,
+            active: true,
+        },
+    ];
+
+    for action in actions {
+        assert!(!Fixture::classify_patch(ISSUE, action, author, &mut context).is_empty());
+    }
+}

@@ -11,11 +11,15 @@ use git2::{
 };
 use radicle::identity::RepoId;
 
-use super::{Error, ManifestEntry};
-use crate::{SetupStatus, manifest::FILE_NAME, member::Member};
+use crate::{
+    SetupStatus,
+    cli::setup::{Error, ManifestEntry},
+    manifest::FILE_NAME,
+    member::Member,
+};
 
 #[derive(Debug, Clone)]
-pub(super) struct RepositoryCheckout {
+pub(crate) struct RepositoryCheckout {
     pub(super) path: PathBuf,
 }
 

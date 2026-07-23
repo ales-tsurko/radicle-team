@@ -1,5 +1,7 @@
 //! Activities which may require the selected member's attention.
 
+use std::path::PathBuf;
+
 use radicle::{
     cob::{
         EntryId, ObjectId,
@@ -8,7 +10,7 @@ use radicle::{
     identity::{Did, RepoId},
 };
 
-use crate::agent::{self, Agent, Context, DeliveryId, Outcome};
+use crate::agent::{self, Agent, Context, DeliveryId};
 
 /// Activity addressed to or otherwise relevant to the selected member.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,18 +51,24 @@ impl Activity {
     pub(super) async fn dispatch(
         self,
         agent: &mut (impl Agent + ?Sized),
-    ) -> Result<Outcome, agent::Error> {
-        let context = Context {
-            repository: self.repository,
-            subject: self.subject,
-            delivery: self.delivery_id(),
-            author: self.author,
-        };
+        workspace: PathBuf,
+    ) -> Result<(), agent::Error> {
+        let context = self.context(workspace);
         match self.kind {
             Kind::Assigned => agent.assigned(context).await,
             Kind::Mentioned(target) => agent.mentioned(context, target).await,
             Kind::Replied { comment, reply_to } => agent.replied(context, comment, reply_to).await,
             Kind::Changed(change) => agent.changed(context, change).await,
+        }
+    }
+
+    pub(super) fn context(&self, workspace: PathBuf) -> Context {
+        Context {
+            repository: self.repository,
+            subject: self.subject,
+            delivery: self.delivery_id(),
+            author: self.author,
+            workspace,
         }
     }
 
@@ -217,7 +225,7 @@ mod tests {
     };
 
     use crate::{
-        agent::{Agent, Context, DeliveryId, Error, Outcome},
+        agent::{Agent, Context, DeliveryId, Error},
         watcher::activity::{Activity, Change, Comment, Kind, Subject, Target},
     };
 
@@ -242,14 +250,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Agent for RecordingAgent {
-        async fn assigned(&mut self, context: Context) -> Result<Outcome, Error> {
+        async fn assigned(&mut self, context: Context) -> Result<(), Error> {
             self.calls.push(Call::Assigned(context));
-            Ok(Outcome::NoAction)
+            Ok(())
         }
 
-        async fn mentioned(&mut self, context: Context, target: Target) -> Result<Outcome, Error> {
+        async fn mentioned(&mut self, context: Context, target: Target) -> Result<(), Error> {
             self.calls.push(Call::Mentioned(context, target));
-            Ok(Outcome::NoAction)
+            Ok(())
         }
 
         async fn replied(
@@ -257,14 +265,14 @@ mod tests {
             context: Context,
             comment: Comment,
             reply_to: EntryId,
-        ) -> Result<Outcome, Error> {
+        ) -> Result<(), Error> {
             self.calls.push(Call::Replied(context, comment, reply_to));
-            Ok(Outcome::NoAction)
+            Ok(())
         }
 
-        async fn changed(&mut self, context: Context, change: Change) -> Result<Outcome, Error> {
+        async fn changed(&mut self, context: Context, change: Change) -> Result<(), Error> {
             self.calls.push(Call::Changed(context, change));
-            Ok(Outcome::NoAction)
+            Ok(())
         }
     }
 
@@ -277,6 +285,7 @@ mod tests {
                 action: 0,
             },
             author: Did::from_str(AUTHOR).expect("author should be valid"),
+            workspace: "/tmp/workspace".into(),
         }
     }
 
@@ -299,22 +308,22 @@ mod tests {
         let mut agent = RecordingAgent::default();
 
         activity(Kind::Assigned)
-            .dispatch(&mut agent)
+            .dispatch(&mut agent, context().workspace)
             .await
             .expect("assignment should dispatch");
         activity(Kind::Mentioned(Target::Comment(comment)))
-            .dispatch(&mut agent)
+            .dispatch(&mut agent, context().workspace)
             .await
             .expect("mention should dispatch");
         activity(Kind::Replied {
             comment,
             reply_to: context().delivery.operation,
         })
-        .dispatch(&mut agent)
+        .dispatch(&mut agent, context().workspace)
         .await
         .expect("reply should dispatch");
         activity(Kind::Changed(Change::CommentCreated(comment)))
-            .dispatch(&mut agent)
+            .dispatch(&mut agent, context().workspace)
             .await
             .expect("change should dispatch");
 

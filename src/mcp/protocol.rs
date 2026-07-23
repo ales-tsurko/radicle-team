@@ -1,0 +1,605 @@
+//! MCP request types, conversions, and validation.
+
+use std::{collections::BTreeSet, str::FromStr as _};
+
+use radicle::{
+    cob::{EntryId, ObjectId, issue, patch},
+    storage::ReadRepository as _,
+};
+use rmcp::Json;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::mcp::server::ServiceError;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct SubjectRequest {
+    pub(super) kind: SubjectKind,
+    pub(super) subject: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct SubjectDocument {
+    pub(super) kind: SubjectKind,
+    pub(super) subject: String,
+    pub(super) title: String,
+    pub(super) description: String,
+    pub(super) state: String,
+    pub(super) author: String,
+    pub(super) assignees: Vec<String>,
+    pub(super) labels: Vec<String>,
+    pub(super) base: Option<String>,
+    pub(super) head: Option<String>,
+}
+
+impl SubjectDocument {
+    pub(super) fn issue(subject: String, issue: &radicle::cob::issue::Issue) -> Self {
+        Self::new(
+            SubjectCore {
+                kind: SubjectKind::Issue,
+                subject,
+                title: issue.title(),
+                description: issue.description(),
+                state: issue.state().to_string(),
+                author: issue.author().to_string(),
+                commits: (None, None),
+            },
+            issue.assignees(),
+            issue.labels(),
+        )
+    }
+
+    pub(super) fn patch(subject: String, patch: &radicle::cob::patch::Patch) -> Self {
+        Self::new(
+            SubjectCore {
+                kind: SubjectKind::Patch,
+                subject,
+                title: patch.title(),
+                description: patch.description(),
+                state: patch.state().to_string(),
+                author: patch.author().to_string(),
+                commits: (Some(patch.base()), Some(patch.head())),
+            },
+            patch.assignees(),
+            patch.labels(),
+        )
+    }
+
+    pub(super) fn new<A, L>(
+        core: SubjectCore<'_>,
+        assignees: impl IntoIterator<Item = A>,
+        labels: impl IntoIterator<Item = L>,
+    ) -> Self
+    where
+        A: ToString,
+        L: ToString,
+    {
+        Self {
+            kind: core.kind,
+            subject: core.subject,
+            title: core.title.to_owned(),
+            description: core.description.to_owned(),
+            state: core.state,
+            author: core.author,
+            assignees: assignees
+                .into_iter()
+                .map(|value| value.to_string())
+                .collect(),
+            labels: labels.into_iter().map(|value| value.to_string()).collect(),
+            base: core.commits.0.map(ToString::to_string),
+            head: core.commits.1.map(ToString::to_string),
+        }
+    }
+}
+
+pub(super) struct SubjectCore<'a> {
+    pub(super) kind: SubjectKind,
+    pub(super) subject: String,
+    pub(super) title: &'a str,
+    pub(super) description: &'a str,
+    pub(super) state: String,
+    pub(super) author: String,
+    pub(super) commits: (Option<&'a radicle::git::Oid>, Option<&'a radicle::git::Oid>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SubjectKind {
+    Issue,
+    Patch,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct EntryRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) entry: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct TimelineRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) cursor: Option<String>,
+    pub(super) limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct TimelinePage {
+    pub(super) entries: Vec<Value>,
+    pub(super) next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct Document {
+    pub(super) data: Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct EntityRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) thread: ThreadKind,
+    pub(super) entity: Option<String>,
+    pub(super) cursor: Option<String>,
+    pub(super) limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ThreadKind {
+    Issue,
+    Review,
+    Revision,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct PatchEntityRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) entity: String,
+    pub(super) cursor: Option<String>,
+    pub(super) limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PatchEntity {
+    Review,
+    Revision,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct DiffRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CommentTargetKind {
+    Issue,
+    Revision,
+    Review,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct CommentWriteRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) target: CommentTargetKind,
+    pub(super) entity: Option<String>,
+    pub(super) comment: Option<String>,
+    pub(super) body: Option<String>,
+    pub(super) reply_to: Option<String>,
+    pub(super) location: Option<LocationRequest>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum CommentOperation {
+    Create,
+    Edit,
+    Redact,
+}
+
+#[derive(Clone)]
+pub(super) enum IssueUpdate {
+    State(issue::State),
+    Labels(Vec<radicle::cob::Label>),
+    Assignees(Vec<radicle::identity::Did>),
+}
+
+#[derive(Clone)]
+pub(super) enum PatchUpdate {
+    State(patch::Lifecycle),
+    Labels(Vec<radicle::cob::Label>),
+    Assignees(BTreeSet<radicle::identity::Did>),
+}
+
+#[derive(Clone)]
+pub(super) enum SubjectUpdate {
+    Issue(IssueUpdate),
+    Patch(PatchUpdate),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum StringUpdate {
+    Labels,
+    Assignees,
+}
+
+#[derive(Clone)]
+pub(super) struct PatchCommits {
+    pub(super) description: String,
+    pub(super) base: radicle::git::Oid,
+    pub(super) head: radicle::git::Oid,
+    pub(super) workspace: std::path::PathBuf,
+}
+
+#[derive(Clone)]
+pub(super) enum PatchCommitAction {
+    Create {
+        title: radicle::cob::Title,
+        labels: Vec<radicle::cob::Label>,
+        draft: bool,
+    },
+    Update(ObjectId),
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct ResolveCommentRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) review: String,
+    pub(super) comment: String,
+    pub(super) resolved: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct LocationRequest {
+    pub(super) commit: String,
+    pub(super) path: String,
+    pub(super) old_start: Option<usize>,
+    pub(super) old_end: Option<usize>,
+    pub(super) new_start: Option<usize>,
+    pub(super) new_end: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct CreateIssueRequest {
+    pub(super) title: String,
+    pub(super) description: String,
+    #[serde(default)]
+    pub(super) labels: Vec<String>,
+    #[serde(default)]
+    pub(super) assignees: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct EditIssueRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) title: Option<String>,
+    pub(super) description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct SetStateRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) state: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct SetStringsRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) values: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct CreatePatchRequest {
+    pub(super) title: String,
+    pub(super) description: String,
+    pub(super) base: String,
+    pub(super) head: String,
+    #[serde(default)]
+    pub(super) labels: Vec<String>,
+    #[serde(default)]
+    pub(super) draft: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct UpdatePatchRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) description: String,
+    pub(super) base: String,
+    pub(super) head: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct EditPatchRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) title: Option<String>,
+    pub(super) revision: Option<String>,
+    pub(super) description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct ReviewWriteRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) revision: Option<String>,
+    pub(super) review: Option<String>,
+    pub(super) verdict: Option<String>,
+    pub(super) summary: Option<String>,
+    #[serde(default)]
+    pub(super) labels: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct MergePatchRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) revision: String,
+    pub(super) commit: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct DiffDocument {
+    pub(super) base: String,
+    pub(super) head: String,
+    pub(super) files: Vec<DiffFile>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct DiffFile {
+    pub(super) old_path: Option<String>,
+    pub(super) new_path: Option<String>,
+    pub(super) lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct DiffLine {
+    pub(super) origin: char,
+    pub(super) old_line: Option<u32>,
+    pub(super) new_line: Option<u32>,
+    pub(super) content: String,
+}
+
+pub(super) fn stringify(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}
+
+pub(super) fn mutation_identity(method: &str, request: &impl Serialize) -> Result<String, String> {
+    let payload = serde_json::to_vec(&(method, request)).map_err(stringify)?;
+    git2::Oid::hash_object(git2::ObjectType::Blob, &payload)
+        .map(|id| id.to_string())
+        .map_err(stringify)
+}
+
+pub(super) fn write_result(value: impl ToString) -> Result<Json<Document>, String> {
+    Ok(Json(Document {
+        data: serde_json::json!({ "id": value.to_string() }),
+    }))
+}
+
+pub(super) fn require_kind(actual: SubjectKind, expected: SubjectKind) -> Result<(), String> {
+    (actual == expected)
+        .then_some(())
+        .ok_or_else(|| "subject kind does not match method".to_owned())
+}
+
+pub(super) fn parse_object_string(value: &str) -> Result<ObjectId, String> {
+    parse_object(value).map_err(|error| error.to_string())
+}
+
+pub(super) fn parse_subject_request(
+    subject: &SubjectRequest,
+    expected: SubjectKind,
+) -> Result<ObjectId, String> {
+    require_kind(subject.kind, expected)?;
+    parse_object_string(&subject.subject)
+}
+
+pub(super) fn parse_issue_state(value: &str) -> Result<issue::State, String> {
+    match value {
+        "open" => Ok(issue::State::Open),
+        "closed" | "closed_other" => Ok(issue::State::Closed {
+            reason: issue::CloseReason::Other,
+        }),
+        "solved" | "closed_solved" => Ok(issue::State::Closed {
+            reason: issue::CloseReason::Solved,
+        }),
+        _ => Err("state must be open, closed, or solved".to_owned()),
+    }
+}
+
+pub(super) fn parse_patch_state(value: &str) -> Result<patch::Lifecycle, String> {
+    match value {
+        "open" => Ok(patch::Lifecycle::Open),
+        "draft" => Ok(patch::Lifecycle::Draft),
+        "archived" => Ok(patch::Lifecycle::Archived),
+        _ => Err("state must be open, draft, or archived".to_owned()),
+    }
+}
+
+pub(super) fn parse_patch_commits(
+    description: String,
+    base: String,
+    head: String,
+    workspace: std::path::PathBuf,
+) -> Result<PatchCommits, String> {
+    Ok(PatchCommits {
+        description,
+        base: radicle::git::Oid::from_str(&base).map_err(stringify)?,
+        head: radicle::git::Oid::from_str(&head).map_err(stringify)?,
+        workspace,
+    })
+}
+
+pub(super) fn parse_entry_string(value: &str) -> Result<EntryId, String> {
+    parse_entry(value).map_err(|error| error.to_string())
+}
+
+pub(super) fn parse_revision(value: EntryId) -> Result<patch::RevisionId, String> {
+    Ok(patch::RevisionId::from(value))
+}
+
+pub(super) fn parse_review(value: EntryId) -> Result<patch::ReviewId, String> {
+    Ok(patch::ReviewId::from(value))
+}
+
+pub(super) fn parse_labels(values: Vec<String>) -> Result<Vec<radicle::cob::Label>, String> {
+    values
+        .into_iter()
+        .map(|value| radicle::cob::Label::from_str(&value).map_err(stringify))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(BTreeSet::into_iter)
+        .map(Iterator::collect)
+}
+
+pub(super) fn parse_dids(values: Vec<String>) -> Result<Vec<radicle::identity::Did>, String> {
+    values
+        .into_iter()
+        .map(|value| radicle::identity::Did::from_str(&value).map_err(stringify))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(BTreeSet::into_iter)
+        .map(Iterator::collect)
+}
+
+pub(super) fn parse_verdict(value: Option<&str>) -> Result<Option<patch::Verdict>, String> {
+    match value {
+        None | Some("none") => Ok(None),
+        Some("accept") => Ok(Some(patch::Verdict::Accept)),
+        Some("reject") => Ok(Some(patch::Verdict::Reject)),
+        Some(_) => Err("verdict must be accept, reject, or none".to_owned()),
+    }
+}
+
+pub(super) fn parse_location(
+    request: LocationRequest,
+) -> Result<radicle::cob::CodeLocation, String> {
+    fn range(
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Result<Option<radicle::cob::CodeRange>, String> {
+        match (start, end) {
+            (None, None) => Ok(None),
+            (Some(start), Some(end)) if start < end => {
+                Ok(Some(radicle::cob::CodeRange::Lines { range: start..end }))
+            }
+            _ => Err("line ranges require start < end".to_owned()),
+        }
+    }
+    Ok(radicle::cob::CodeLocation {
+        commit: radicle::git::Oid::from_str(&request.commit).map_err(stringify)?,
+        path: request.path.into(),
+        old: range(request.old_start, request.old_end)?,
+        new: range(request.new_start, request.new_end)?,
+    })
+}
+
+pub(super) fn import_commits(
+    repository: &radicle::storage::git::Repository,
+    workspace: &std::path::Path,
+    namespace: radicle::crypto::PublicKey,
+    commits: &[radicle::git::Oid],
+) -> Result<(), String> {
+    let bare = git2::Repository::open_bare(repository.path()).map_err(stringify)?;
+    let source = workspace.to_string_lossy();
+    let mut remote = bare.remote_anonymous(&source).map_err(stringify)?;
+    for commit in commits {
+        let reference = format!("refs/namespaces/{namespace}/refs/radicle-team/commits/{commit}");
+        let refspec = format!("+{commit}:{reference}");
+        remote.fetch(&[&refspec], None, None).map_err(stringify)?;
+    }
+    Ok(())
+}
+
+pub(super) fn parse_object(value: &str) -> Result<ObjectId, ServiceError> {
+    ObjectId::from_str(value).map_err(|_error| ServiceError::InvalidId(value.to_owned()))
+}
+
+pub(super) fn parse_entry(value: &str) -> Result<EntryId, ServiceError> {
+    EntryId::from_str(value).map_err(|_error| ServiceError::InvalidId(value.to_owned()))
+}
+
+pub(super) fn validate_merge(
+    repository: &radicle::storage::git::Repository,
+    patch: &patch::Patch,
+    signer: &radicle::node::device::BoxedDevice,
+    revision: patch::RevisionId,
+    commit: radicle::git::Oid,
+) -> Result<(), String> {
+    if patch.revision(&revision).is_none() {
+        return Err("patch revision is unavailable".to_owned());
+    }
+    let branch = repository.default_branch().map_err(stringify)?;
+    let head = repository
+        .reference_oid(signer.public_key(), &branch)
+        .map_err(stringify)?;
+    if commit != head && !repository.is_ancestor_of(commit, head).map_err(stringify)? {
+        return Err("merge commit is not reachable from the delegate's default branch".to_owned());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_code_location(
+    repository: &radicle::storage::git::Repository,
+    revision: &patch::Revision,
+    location: &radicle::cob::CodeLocation,
+) -> Result<(), String> {
+    if location.commit != revision.head() {
+        return Err("location commit must be the reviewed revision head".to_owned());
+    }
+    if location.old.is_none() && location.new.is_none() {
+        return Err("location must include an old or new line range".to_owned());
+    }
+    let base = repository
+        .backend
+        .find_commit((*revision.base()).into())
+        .map_err(stringify)?;
+    let head = repository
+        .backend
+        .find_commit(revision.head().into())
+        .map_err(stringify)?;
+    let diff = repository
+        .backend
+        .diff_tree_to_tree(
+            Some(&base.tree().map_err(stringify)?),
+            Some(&head.tree().map_err(stringify)?),
+            None,
+        )
+        .map_err(stringify)?;
+    let mut matched = false;
+    diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
+        let path_matches = delta.old_file().path() == Some(location.path.as_path())
+            || delta.new_file().path() == Some(location.path.as_path());
+        if !path_matches {
+            return true;
+        }
+        matched |= range_contains(location.old.as_ref(), line.old_lineno())
+            || range_contains(location.new.as_ref(), line.new_lineno());
+        true
+    })
+    .map_err(stringify)?;
+    matched
+        .then_some(())
+        .ok_or_else(|| "location does not intersect the reviewed diff".to_owned())
+}
+
+fn range_contains(range: Option<&radicle::cob::CodeRange>, line: Option<u32>) -> bool {
+    match (range, line) {
+        (Some(radicle::cob::CodeRange::Lines { range }), Some(line)) => {
+            usize::try_from(line).is_ok_and(|line| range.contains(&line))
+        }
+        (Some(radicle::cob::CodeRange::Chars { line: expected, .. }), Some(line)) => {
+            usize::try_from(line).is_ok_and(|line| line == *expected)
+        }
+        _ => false,
+    }
+}

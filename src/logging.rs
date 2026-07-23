@@ -1,3 +1,5 @@
+//! Process-wide tracing configuration.
+
 use tracing_subscriber::{EnvFilter, filter::LevelFilter, util::SubscriberInitExt as _};
 
 pub(crate) struct Logging;

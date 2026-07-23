@@ -15,11 +15,11 @@ use radicle::{
 };
 
 use crate::{
-    agent::{self, Agent, Change, Comment, Context as AgentContext, Outcome, Target},
-    context,
+    agent::{self, Agent, Change, Comment, Context as AgentContext, Target},
     home::{self, MemberHome},
     identity::{self, GenerationStore, Manager, MemberLock, Provider},
     manifest::{self, Manifest},
+    mcp,
     member::Member,
     node::{self, NodeManager},
     shutdown::Shutdown,
@@ -196,7 +196,7 @@ impl Application {
             generation = binding.generation(),
             "team member initialized"
         );
-        AgentRuntime::start(self, runtime, agent)
+        AgentRuntime::start(self, runtime, agent, binding.mcp_allow().clone())
             .await?
             .run(self, agent)
             .await
@@ -208,9 +208,9 @@ impl Application {
         }
     }
 
-    fn warn_context_stop(stopped: Result<(), context::Error>) {
+    fn warn_mcp_stop(stopped: Result<(), mcp::Error>) {
         if let Err(error) = stopped {
-            tracing::warn!(%error, "failed to stop context server after application error");
+            tracing::warn!(%error, "failed to stop MCP server after application error");
         }
     }
 
@@ -376,7 +376,7 @@ impl Application {
         did: Did,
     ) -> Result<manifest::ValidatedBinding, Error> {
         let binding = self.load_profile_binding(profile, did).await?;
-        self.record_binding(home, binding).await?;
+        self.record_binding(home, binding.clone()).await?;
 
         Ok(binding)
     }
@@ -436,18 +436,18 @@ struct LoggingAgent;
 
 #[async_trait::async_trait]
 impl Agent for LoggingAgent {
-    async fn assigned(&mut self, context: AgentContext) -> Result<Outcome, agent::Error> {
+    async fn assigned(&mut self, context: AgentContext) -> Result<(), agent::Error> {
         tracing::info!(?context, "assignment received");
-        Ok(Outcome::NoAction)
+        Ok(())
     }
 
     async fn mentioned(
         &mut self,
         context: AgentContext,
         target: Target,
-    ) -> Result<Outcome, agent::Error> {
+    ) -> Result<(), agent::Error> {
         tracing::info!(?context, ?target, "mention received");
-        Ok(Outcome::NoAction)
+        Ok(())
     }
 
     async fn replied(
@@ -455,18 +455,14 @@ impl Agent for LoggingAgent {
         context: AgentContext,
         comment: Comment,
         reply_to: EntryId,
-    ) -> Result<Outcome, agent::Error> {
+    ) -> Result<(), agent::Error> {
         tracing::info!(?context, ?comment, %reply_to, "reply received");
-        Ok(Outcome::NoAction)
+        Ok(())
     }
 
-    async fn changed(
-        &mut self,
-        context: AgentContext,
-        change: Change,
-    ) -> Result<Outcome, agent::Error> {
+    async fn changed(&mut self, context: AgentContext, change: Change) -> Result<(), agent::Error> {
         tracing::info!(?context, ?change, "relevant change received");
-        Ok(Outcome::NoAction)
+        Ok(())
     }
 }
 
@@ -476,145 +472,6 @@ struct Runtime {
     _lock: MemberLock,
     identity: identity::Identity,
     node: NodeManager,
-}
-
-#[derive(Debug)]
-struct AgentRuntime {
-    runtime: Runtime,
-    context: context::Server,
-}
-
-#[derive(Debug, Clone)]
-struct WriteAuthorizer {
-    application: Application,
-    home: MemberHome,
-    profile: RadicleProfile,
-    did: Did,
-}
-
-#[async_trait::async_trait]
-impl agent::Authorizer for WriteAuthorizer {
-    async fn authorize(&self) -> Result<(), String> {
-        self.application
-            .validate_profile_binding(&self.home, &self.profile, self.did)
-            .await
-            .map(|_binding| ())
-            .map_err(|error| error.to_string())
-    }
-}
-
-impl AgentRuntime {
-    async fn start(
-        application: &Application,
-        runtime: Runtime,
-        agent: &mut (impl Agent + ?Sized),
-    ) -> Result<Self, Error> {
-        let context = match context::Server::start(
-            runtime.identity.profile().storage.clone(),
-            application.repository,
-        )
-        .await
-        {
-            Ok(context) => context,
-            Err(error) => {
-                return Application::finish_after_stop(
-                    Err(Error::Context(error.to_string())),
-                    runtime.stop(&application.shutdown).await,
-                );
-            }
-        };
-        if let Err(error) = agent.start(context.endpoint()).await {
-            Application::warn_agent_stop(agent.stop().await);
-            Application::warn_context_stop(context.stop().await);
-            return Application::finish_after_stop(
-                Err(error.into()),
-                runtime.stop(&application.shutdown).await,
-            );
-        }
-        Ok(Self { runtime, context })
-    }
-
-    async fn run(
-        self,
-        application: &Application,
-        agent: &mut (impl Agent + ?Sized),
-    ) -> Result<(), Error> {
-        let authorizer = WriteAuthorizer {
-            application: application.clone(),
-            home: self.runtime.home.clone(),
-            profile: self.runtime.identity.profile().clone(),
-            did: self.runtime.identity.did(),
-        };
-        let watched = watcher::Watcher::new(application.member, application.repository)
-            .run(
-                self.runtime.identity.profile(),
-                self.runtime.node.node(),
-                &self.runtime.home.state_database(),
-                agent,
-                self.runtime.identity.memory_signer(),
-                authorizer,
-            )
-            .await;
-        let interrupted = application.shutdown.is_requested();
-        let cleanup = RunCleanup {
-            agent: agent.stop().await,
-            context: self.context.stop().await,
-            node: self.runtime.stop(&application.shutdown).await,
-        };
-        cleanup.finish(watched, interrupted)
-    }
-}
-
-struct RunCleanup {
-    agent: Result<(), agent::Error>,
-    context: Result<(), context::Error>,
-    node: Result<(), node::Error>,
-}
-
-impl RunCleanup {
-    fn finish(self, watched: Result<(), watcher::Error>, interrupted: bool) -> Result<(), Error> {
-        if interrupted {
-            return self.interrupted();
-        }
-        match watched {
-            Ok(()) => self.successful(),
-            Err(error) => self.watcher_failed(error),
-        }
-    }
-
-    fn interrupted(self) -> Result<(), Error> {
-        Application::warn_agent_stop(self.agent);
-        Application::warn_context_stop(self.context);
-        self.node.map_err(Error::from)
-    }
-
-    fn watcher_failed(self, error: watcher::Error) -> Result<(), Error> {
-        Application::warn_agent_stop(self.agent);
-        Application::warn_context_stop(self.context);
-        Application::warn_node_stop(&self.node, "application error");
-        Err(error.into())
-    }
-
-    fn successful(self) -> Result<(), Error> {
-        match self.agent {
-            Ok(()) => self.after_agent(),
-            Err(error) => {
-                Application::warn_context_stop(self.context);
-                Application::warn_node_stop(&self.node, "agent shutdown error");
-                Err(error.into())
-            }
-        }
-    }
-
-    fn after_agent(self) -> Result<(), Error> {
-        match self.context {
-            Ok(()) => self.node.map_err(Error::from),
-            Err(error) => {
-                Application::warn_node_stop(&self.node, "context server error");
-                Err(Error::Context(error.to_string()))
-            }
-        }
-    }
 }
 
 impl Runtime {
@@ -697,6 +554,192 @@ impl Runtime {
 }
 
 #[derive(Debug)]
+struct AgentRuntime {
+    runtime: Runtime,
+    mcp: mcp::Server,
+}
+
+impl AgentRuntime {
+    async fn start(
+        application: &Application,
+        runtime: Runtime,
+        agent: &mut (impl Agent + ?Sized),
+        allowlist: manifest::McpAllowlist,
+    ) -> Result<Self, Error> {
+        let authorizer = WriteAuthorizer {
+            application: application.clone(),
+            home: runtime.home.clone(),
+            profile: runtime.identity.profile().clone(),
+            did: runtime.identity.did(),
+        };
+        let (runtime, publisher) =
+            Self::initialize_publisher(application, runtime, authorizer).await?;
+        let mcp = match mcp::Server::start(
+            runtime.identity.profile().storage.clone(),
+            application.repository,
+            publisher,
+            allowlist,
+        )
+        .await
+        {
+            Ok(mcp) => mcp,
+            Err(error) => {
+                return Application::finish_after_stop(
+                    Err(Error::Mcp(error.to_string())),
+                    runtime.stop(&application.shutdown).await,
+                );
+            }
+        };
+        if let Err(error) = agent.start(mcp.endpoint()).await {
+            Application::warn_agent_stop(agent.stop().await);
+            Application::warn_mcp_stop(mcp.stop().await);
+            return Application::finish_after_stop(
+                Err(error.into()),
+                runtime.stop(&application.shutdown).await,
+            );
+        }
+        Ok(Self { runtime, mcp })
+    }
+
+    async fn initialize_publisher(
+        application: &Application,
+        runtime: Runtime,
+        authorizer: WriteAuthorizer,
+    ) -> Result<(Runtime, agent::Publisher), Error> {
+        let publisher = agent::Publisher::new(
+            runtime.identity.profile().clone(),
+            application.repository,
+            runtime.identity.memory_signer(),
+            runtime.node.node().clone(),
+            authorizer,
+        )
+        .with_journal(&runtime.home.state_database())
+        .await;
+        let publisher = match publisher {
+            Ok(publisher) => publisher,
+            Err(error) => {
+                return Application::finish_after_stop(
+                    Err(Error::Mcp(error)),
+                    runtime.stop(&application.shutdown).await,
+                );
+            }
+        };
+        Ok((runtime, publisher))
+    }
+
+    async fn run(
+        self,
+        application: &Application,
+        agent: &mut (impl Agent + ?Sized),
+    ) -> Result<(), Error> {
+        let profile = self.runtime.identity.profile();
+        let workspaces = crate::workspace::Workspaces::new(
+            self.runtime.home.workspaces(),
+            profile.storage.clone(),
+            application.repository,
+            *profile.id(),
+        );
+        let delivery_scope = self.mcp.delivery_scope();
+        let watched = watcher::Watcher::new(application.member, application.repository)
+            .run(
+                profile,
+                self.runtime.node.node(),
+                &self.runtime.home.state_database(),
+                agent,
+                workspaces,
+                delivery_scope,
+            )
+            .await;
+        let interrupted = application.shutdown.is_requested();
+        let cleanup = RunCleanup {
+            agent: agent.stop().await,
+            mcp: self.mcp.stop().await,
+            node: self.runtime.stop(&application.shutdown).await,
+        };
+        cleanup.finish(watched, interrupted)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WriteAuthorizer {
+    application: Application,
+    home: MemberHome,
+    profile: RadicleProfile,
+    did: Did,
+}
+
+#[async_trait::async_trait]
+impl agent::Authorizer for WriteAuthorizer {
+    async fn authorize(&self, method: &str) -> Result<(), String> {
+        self.application
+            .validate_profile_binding(&self.home, &self.profile, self.did)
+            .await
+            .and_then(|binding| {
+                binding
+                    .mcp_allow()
+                    .allows(method)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        Error::Mcp(format!("MCP method '{method}' is no longer allowed"))
+                    })
+            })
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct RunCleanup {
+    agent: Result<(), agent::Error>,
+    mcp: Result<(), mcp::Error>,
+    node: Result<(), node::Error>,
+}
+
+impl RunCleanup {
+    fn finish(self, watched: Result<(), watcher::Error>, interrupted: bool) -> Result<(), Error> {
+        if interrupted {
+            return self.interrupted();
+        }
+        match watched {
+            Ok(()) => self.successful(),
+            Err(error) => self.watcher_failed(error),
+        }
+    }
+
+    fn interrupted(self) -> Result<(), Error> {
+        Application::warn_agent_stop(self.agent);
+        Application::warn_mcp_stop(self.mcp);
+        self.node.map_err(Error::from)
+    }
+
+    fn watcher_failed(self, error: watcher::Error) -> Result<(), Error> {
+        Application::warn_agent_stop(self.agent);
+        Application::warn_mcp_stop(self.mcp);
+        Application::warn_node_stop(&self.node, "application error");
+        Err(error.into())
+    }
+
+    fn successful(self) -> Result<(), Error> {
+        match self.agent {
+            Ok(()) => self.after_agent(),
+            Err(error) => {
+                Application::warn_mcp_stop(self.mcp);
+                Application::warn_node_stop(&self.node, "agent shutdown error");
+                Err(error.into())
+            }
+        }
+    }
+
+    fn after_agent(self) -> Result<(), Error> {
+        match self.mcp {
+            Ok(()) => self.node.map_err(Error::from),
+            Err(error) => {
+                Application::warn_node_stop(&self.node, "MCP server error");
+                Err(Error::Mcp(error.to_string()))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 enum SetupValidation {
     Ready(manifest::ValidatedBinding),
     ManifestMissing,
@@ -722,7 +765,7 @@ impl SetupValidation {
     ) -> Result<SetupStatus, Error> {
         match self {
             Self::Ready(binding) => {
-                application.record_binding(home, binding).await?;
+                application.record_binding(home, binding.clone()).await?;
                 Ok(SetupStatus::Ready {
                     generation: binding.generation(),
                 })
@@ -874,9 +917,9 @@ pub enum Error {
     /// Watching Radicle activity failed.
     #[error("Radicle watcher error: {0}")]
     Watcher(#[from] watcher::Error),
-    /// Starting or stopping the run-scoped context server failed.
-    #[error("agent context server error: {0}")]
-    Context(String),
+    /// Starting or stopping the run-scoped MCP server failed.
+    #[error("MCP server error: {0}")]
+    Mcp(String),
     /// Starting or stopping the agent adapter failed.
     #[error(transparent)]
     Agent(#[from] agent::Error),
@@ -987,7 +1030,7 @@ mod tests {
             Revision::Repository(Oid::from_sha1([0; 20])),
         );
         application
-            .record_binding(&home, binding)
+            .record_binding(&home, binding.clone())
             .await
             .expect("maximum generation should be recorded");
 

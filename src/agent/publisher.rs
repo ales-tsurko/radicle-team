@@ -1,12 +1,12 @@
-//! Publishing validated agent outcomes to Radicle collaborative objects.
+//! Authorized Radicle writes issued through MCP.
 
-use std::fmt;
+use std::{fmt, path::Path, str::FromStr as _, sync::Arc};
 
 use radicle::{
     cob::{
         EntryId, Op,
-        issue::{self, IssueStream},
-        patch::{self, PatchStream},
+        issue::{self, IssueStream, Issues},
+        patch::{self, PatchStream, Patches},
         store::access::ReadOnly,
         stream::CobStream as _,
     },
@@ -16,425 +16,597 @@ use radicle::{
     profile::Profile,
     storage::{ReadRepository as _, ReadStorage as _, SignRepository as _, refs::SignedRefs},
 };
+use sqlite::State;
 
 use crate::{
-    agent::{DeliveryId, Reply, ReplyTarget},
+    agent::{DeliveryId, LegacyReply, LegacyReplyTarget},
+    database::Database,
     watcher::Subject,
 };
 
-/// Publishes agent replies with the managed member identity.
+const JOURNAL_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS mcp_mutations (
+        repository TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        action TEXT NOT NULL,
+        invocation TEXT NOT NULL,
+        method TEXT NOT NULL,
+        author TEXT NOT NULL,
+        result TEXT,
+        PRIMARY KEY (repository, operation, action, invocation)
+    ) STRICT;
+";
+
 #[derive(Clone)]
-pub(crate) struct Publisher<A, V> {
+pub(crate) struct Publisher {
     profile: Profile,
     repository: RepoId,
     signer: Option<MemorySigner>,
-    announcer: A,
-    authorizer: V,
+    announcer: Arc<dyn Announcer>,
+    authorizer: Arc<dyn Authorizer>,
+    journal: Option<MutationJournal>,
+    mutation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-impl<A: fmt::Debug, V: fmt::Debug> fmt::Debug for Publisher<A, V> {
+impl fmt::Debug for Publisher {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Publisher")
             .field("repository", &self.repository)
             .field("signer_loaded", &self.signer.is_some())
-            .field("announcer", &self.announcer)
-            .field("authorizer", &self.authorizer)
             .finish_non_exhaustive()
     }
 }
 
-impl<A, V> Publisher<A, V> {
-    pub(crate) const fn new(
+impl Publisher {
+    pub(crate) fn new(
         profile: Profile,
         repository: RepoId,
         signer: Option<MemorySigner>,
-        announcer: A,
-        authorizer: V,
+        announcer: impl Announcer,
+        authorizer: impl Authorizer,
     ) -> Self {
         Self {
             profile,
             repository,
             signer,
-            announcer,
-            authorizer,
+            announcer: Arc::new(announcer),
+            authorizer: Arc::new(authorizer),
+            journal: None,
+            mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
-}
 
-impl<A: Announcer, V: Authorizer> Publisher<A, V> {
+    pub(crate) async fn with_journal(mut self, path: &Path) -> Result<Self, String> {
+        self.journal = Some(MutationJournal::open(path).await?);
+        Ok(self)
+    }
+
+    #[cfg(all(test, not(miri)))]
+    pub(crate) async fn with_memory_journal(mut self) -> Result<Self, String> {
+        self.journal = Some(MutationJournal::memory().await?);
+        Ok(self)
+    }
+
+    #[cfg(all(test, not(miri)))]
+    pub(crate) async fn forget_completion(&self, key: &MutationKey) -> Result<(), String> {
+        self.journal
+            .as_ref()
+            .ok_or_else(|| "mutation journal is disabled".to_owned())?
+            .forget_completion(self.repository, key)
+            .await
+    }
+
     pub(crate) fn author(&self) -> PublicKey {
         *self.profile.id()
     }
 
-    pub(crate) async fn validate(&self, subject: Subject, reply: &Reply) -> Result<(), Error> {
-        let publisher = self.clone();
-        let target = reply.target;
-        tokio::task::spawn_blocking(move || publisher.validate_blocking(subject, target))
-            .await
-            .map_err(|error| Error::Task(error.to_string()))?
+    pub(crate) async fn authorize(&self, method: &str) -> Result<(), String> {
+        self.authorizer.authorize(method).await
     }
 
-    pub(crate) async fn publish(
-        &self,
-        subject: Subject,
-        delivery: DeliveryId,
-        reply: Reply,
-    ) -> Result<EntryId, Error> {
-        self.authorizer
-            .authorize()
+    pub(crate) async fn reconcile(&self, delivery: DeliveryId) -> Result<(), String> {
+        let Some(journal) = &self.journal else {
+            return Ok(());
+        };
+        let _mutation_guard = self.mutation_lock.lock().await;
+        for entry in journal.entries(self.repository, delivery).await? {
+            if entry.result.is_some() {
+                self.finish_recovery(entry.author).await?;
+                continue;
+            }
+            let publisher = self.clone();
+            let marker = Self::marker(&entry.key);
+            let author = entry.author;
+            let operation = tokio::task::spawn_blocking(move || {
+                let repository = publisher
+                    .profile
+                    .storage
+                    .repository(publisher.repository)
+                    .map_err(stringify)?;
+                let operation = publisher.find_marker(&repository, &marker, author)?;
+                if let Some(operation) = operation
+                    && author != publisher.author()
+                    && !Self::is_signed(&repository, author, operation)?
+                {
+                    return Err("unfinished mutation was not signed by its author".to_owned());
+                }
+                Ok(operation)
+            })
             .await
-            .map_err(Error::Authorization)?;
-        let publisher = self.clone();
-        let operation = tokio::task::spawn_blocking(move || {
-            publisher.publish_blocking(subject, delivery, reply)
-        })
-        .await
-        .map_err(|error| Error::Task(error.to_string()))??;
-        self.announce(self.author()).await?;
-
-        Ok(operation)
+            .map_err(stringify)??;
+            let Some(operation) = operation else {
+                journal.discard(self.repository, &entry.key).await?;
+                continue;
+            };
+            journal
+                .complete(
+                    self.repository,
+                    &entry.key,
+                    &entry.method,
+                    author,
+                    &operation.to_string(),
+                )
+                .await?;
+            self.finish_recovery(author).await?;
+        }
+        Ok(())
     }
 
-    pub(crate) async fn recover(
+    pub(crate) async fn reconcile_legacy(
         &self,
         subject: Subject,
         delivery: DeliveryId,
         author: PublicKey,
-        reply: &Reply,
-    ) -> Result<bool, Error> {
-        self.authorizer
-            .authorize()
-            .await
-            .map_err(Error::Authorization)?;
+        reply: &LegacyReply,
+    ) -> Result<(), String> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let pending_reply = reply.clone();
         let publisher = self.clone();
-        let reply = reply.clone();
-        let operation = tokio::task::spawn_blocking(move || {
-            publisher.recover_blocking(subject, delivery, author, reply)
+        let reply = pending_reply.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            publisher.reconcile_legacy_blocking(subject, delivery, author, reply, false)
         })
         .await
-        .map_err(|error| Error::Task(error.to_string()))??;
-        if operation.is_none() {
-            return Ok(false);
-        }
-        self.announce(author).await?;
-        Ok(true)
-    }
-
-    async fn announce(&self, namespace: PublicKey) -> Result<(), Error> {
-        let mut announcer = self.announcer.clone();
-        let repository = self.repository;
-        tokio::task::spawn_blocking(move || announcer.announce(repository, namespace))
-            .await
-            .map_err(|error| Error::Task(error.to_string()))?
-    }
-
-    fn marker(delivery: DeliveryId) -> String {
-        format!("radicle-team reply {delivery}")
-    }
-
-    fn validate_blocking(&self, subject: Subject, target: ReplyTarget) -> Result<(), Error> {
-        let repository = self.profile.storage.repository(self.repository)?;
-        self.validate_target(&repository, subject, target)
-    }
-
-    fn validate_target(
-        &self,
-        repository: &radicle::storage::git::Repository,
-        subject: Subject,
-        target: ReplyTarget,
-    ) -> Result<(), Error> {
-        match (subject, target) {
-            (Subject::Issue(issue_id), ReplyTarget::Issue { reply_to }) => {
-                let issues = issue::Issues::open(repository, ReadOnly)?;
-                let issue = issues
-                    .get(&issue_id)?
-                    .ok_or(Error::IssueParentUnavailable {
-                        issue: issue_id,
-                        parent: reply_to.unwrap_or(*issue_id),
-                    })?;
-                let parent = reply_to.unwrap_or(*issue_id);
-                if issue.thread().comment(&parent).is_none() {
-                    return Err(Error::IssueParentUnavailable {
-                        issue: issue_id,
-                        parent,
-                    });
-                }
-                Ok(())
-            }
-            (Subject::Patch(patch_id), ReplyTarget::Revision { revision, reply_to }) => self
-                .validate_patch_target(
-                    repository,
-                    patch_id,
-                    PatchTarget::Revision { revision, reply_to },
-                ),
-            (Subject::Patch(patch_id), ReplyTarget::Review { review, reply_to }) => self
-                .validate_patch_target(
-                    repository,
-                    patch_id,
-                    PatchTarget::Review { review, reply_to },
-                ),
-            (subject, target) => Err(Error::InvalidTarget { subject, target }),
-        }
-    }
-
-    fn validate_patch_target(
-        &self,
-        repository: &radicle::storage::git::Repository,
-        patch_id: radicle::cob::ObjectId,
-        target: PatchTarget,
-    ) -> Result<(), Error> {
-        let patches = patch::Patches::open(repository, ReadOnly)?;
-        let valid = patches
-            .get(&patch_id)?
-            .is_some_and(|patch| target.exists(&patch));
-        if valid {
-            Ok(())
-        } else {
-            Err(Error::PatchTargetUnavailable {
-                patch: patch_id,
-                target,
+        .map_err(stringify)??;
+        let outcome = if matches!(outcome, LegacyReconciliation::NeedsAuthorization) {
+            self.authorizer.authorize("create_comment").await?;
+            let publisher = self.clone();
+            let reply = pending_reply;
+            tokio::task::spawn_blocking(move || {
+                publisher.reconcile_legacy_blocking(subject, delivery, author, reply, true)
             })
+            .await
+            .map_err(stringify)??
+        } else {
+            outcome
+        };
+        if let LegacyReconciliation::Ready(author) = outcome {
+            self.announce(author).await.map_err(stringify)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn mutate<T, F, V>(
+        &self,
+        method: &'static str,
+        mutation: Option<MutationKey>,
+        operation: F,
+        validate: V,
+    ) -> Result<String, String>
+    where
+        T: Send + ToString + 'static,
+        F: FnOnce(
+                &radicle::storage::git::Repository,
+                &radicle::node::device::BoxedDevice,
+                &str,
+            ) -> Result<T, String>
+            + Send
+            + 'static,
+        V: Fn(
+                &radicle::storage::git::Repository,
+                PublicKey,
+                EntryId,
+                MutationValidation,
+            ) -> Result<bool, String>
+            + Send
+            + 'static,
+    {
+        self.authorizer.authorize(method).await?;
+        let _mutation_guard = if mutation.is_some() {
+            Some(self.mutation_lock.lock().await)
+        } else {
+            None
+        };
+        let marker = mutation.as_ref().map(Self::marker);
+        let pending = if let (Some(journal), Some(key)) = (&self.journal, mutation.as_ref()) {
+            Some(
+                journal
+                    .begin(self.repository, key, method, self.author())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        if let Some(JournalEntry {
+            result: Some(result),
+            author,
+        }) = pending.as_ref()
+        {
+            self.finish_recovery(*author).await?;
+            return Ok(result.clone());
+        }
+        let pending_author = pending.map(|entry| entry.author);
+        let publisher = self.clone();
+        let recovery_marker = marker.clone();
+        let (value, author) = tokio::task::spawn_blocking(move || {
+            let repository = publisher
+                .profile
+                .storage
+                .repository(publisher.repository)
+                .map_err(|error| error.to_string())?;
+            let signer = match publisher.signer.clone() {
+                Some(signer) => Device::from(signer).boxed(),
+                None => publisher
+                    .profile
+                    .signer()
+                    .map_err(|error| error.to_string())?,
+            };
+            let current = publisher.author();
+            let recovered = match (recovery_marker.as_deref(), pending_author) {
+                (Some(marker), Some(author)) => {
+                    match publisher.find_marker(&repository, marker, author)? {
+                        Some(operation)
+                            if validate(
+                                &repository,
+                                author,
+                                operation,
+                                MutationValidation::Recovery,
+                            )? && (author == current
+                                || Self::is_signed(&repository, author, operation)?) =>
+                        {
+                            Some((operation.to_string(), author))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let (value, author) = match recovered {
+                Some(recovered) => recovered,
+                None => {
+                    let value = if let Some(marker) = recovery_marker.as_deref() {
+                        operation(&repository, &signer, marker)?.to_string()
+                    } else {
+                        operation(&repository, &signer, method)?.to_string()
+                    };
+                    let operation = EntryId::from_str(&value).map_err(stringify)?;
+                    if !validate(&repository, current, operation, MutationValidation::Fresh)? {
+                        return Err("mutation was not applied".to_owned());
+                    }
+                    (value, current)
+                }
+            };
+            if author == current {
+                repository
+                    .sign_refs(&signer)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok::<_, String>((value, author))
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        if let (Some(journal), Some(key)) = (&self.journal, mutation.as_ref()) {
+            journal
+                .complete(self.repository, key, method, author, &value)
+                .await?;
+        }
+        self.announce(author)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(value)
+    }
+
+    fn marker(key: &MutationKey) -> String {
+        if key.invocation == 0 {
+            format!("radicle-team mcp {}:{}", key.delivery, key.request)
+        } else {
+            format!(
+                "radicle-team mcp {}:{}:{}",
+                key.delivery, key.invocation, key.request
+            )
         }
     }
 
-    fn publish_blocking(
+    fn reconcile_legacy_blocking(
         &self,
         subject: Subject,
         delivery: DeliveryId,
-        reply: Reply,
-    ) -> Result<EntryId, Error> {
-        let repository = self.profile.storage.repository(self.repository)?;
-        let marker = Self::marker(delivery);
+        author: PublicKey,
+        reply: LegacyReply,
+        publish: bool,
+    ) -> Result<LegacyReconciliation, String> {
+        let repository = self
+            .profile
+            .storage
+            .repository(self.repository)
+            .map_err(stringify)?;
         let signer = match self.signer.clone() {
             Some(signer) => Device::from(signer).boxed(),
-            None => self.profile.signer()?,
+            None => self.profile.signer().map_err(stringify)?,
         };
-        if let Some(operation) =
-            self.published(&repository, subject, &marker, self.author(), &reply)?
-        {
-            let _signed = repository.sign_refs(&signer)?;
-            return Ok(operation);
+        let current = self.author();
+        let marker = format!("radicle-team reply {delivery}");
+        let recovered = match self.find_legacy(&repository, subject, &marker, author, &reply)? {
+            Some(_operation) if author == current => true,
+            Some(operation) => Self::is_signed(&repository, author, operation)?,
+            None => false,
+        };
+        let author = if recovered {
+            author
+        } else {
+            if !self.legacy_target_exists(&repository, subject, &reply)? {
+                return Ok(LegacyReconciliation::Discard);
+            }
+            if !publish {
+                return Ok(LegacyReconciliation::NeedsAuthorization);
+            }
+            self.publish_legacy(&repository, &signer, subject, &marker, reply)?;
+            current
+        };
+        if author == current {
+            repository.sign_refs(&signer).map_err(stringify)?;
         }
-        self.validate_target(&repository, subject, reply.target)?;
+        Ok(LegacyReconciliation::Ready(author))
+    }
 
+    fn legacy_target_exists(
+        &self,
+        repository: &radicle::storage::git::Repository,
+        subject: Subject,
+        reply: &LegacyReply,
+    ) -> Result<bool, String> {
         match (subject, reply.target) {
-            (Subject::Issue(issue), ReplyTarget::Issue { reply_to }) => {
-                self.publish_issue(&repository, &signer, issue, reply.body, reply_to, &marker)
+            (Subject::Issue(id), LegacyReplyTarget::Issue { reply_to }) => {
+                let issue = Issues::open(repository, ReadOnly)
+                    .map_err(stringify)?
+                    .get(&id)
+                    .map_err(stringify)?;
+                Ok(issue.is_some_and(|issue| {
+                    issue.thread().comment(&reply_to.unwrap_or(*id)).is_some()
+                }))
             }
-            (Subject::Patch(patch), ReplyTarget::Revision { revision, reply_to }) => self
-                .publish_patch(
-                    &repository,
-                    &signer,
-                    patch,
-                    reply.body,
-                    PatchTarget::Revision { revision, reply_to },
-                    &marker,
-                ),
-            (Subject::Patch(patch), ReplyTarget::Review { review, reply_to }) => self
-                .publish_patch(
-                    &repository,
-                    &signer,
-                    patch,
-                    reply.body,
-                    PatchTarget::Review { review, reply_to },
-                    &marker,
-                ),
-            (subject, target) => Err(Error::InvalidTarget { subject, target }),
+            (Subject::Patch(id), LegacyReplyTarget::Revision { revision, reply_to }) => {
+                let patch = Patches::open(repository, ReadOnly)
+                    .map_err(stringify)?
+                    .get(&id)
+                    .map_err(stringify)?;
+                Ok(patch.is_some_and(|patch| {
+                    LegacyPatchTarget::Revision { revision, reply_to }.exists(&patch)
+                }))
+            }
+            (Subject::Patch(id), LegacyReplyTarget::Review { review, reply_to }) => {
+                let patch = Patches::open(repository, ReadOnly)
+                    .map_err(stringify)?
+                    .get(&id)
+                    .map_err(stringify)?;
+                Ok(patch.is_some_and(|patch| {
+                    LegacyPatchTarget::Review { review, reply_to }.exists(&patch)
+                }))
+            }
+            _ => Ok(false),
         }
     }
 
-    fn recover_blocking(
+    fn publish_legacy(
         &self,
+        repository: &radicle::storage::git::Repository,
+        signer: &radicle::node::device::BoxedDevice,
         subject: Subject,
-        delivery: DeliveryId,
-        author: PublicKey,
-        reply: Reply,
-    ) -> Result<Option<EntryId>, Error> {
-        let repository = self.profile.storage.repository(self.repository)?;
-        let operation = self.published(
-            &repository,
-            subject,
-            &Self::marker(delivery),
-            author,
-            &reply,
-        )?;
-        let Some(operation) = operation else {
-            return Ok(None);
-        };
-        if author == self.author() {
-            let signer = match self.signer.clone() {
-                Some(signer) => Device::from(signer).boxed(),
-                None => self.profile.signer()?,
-            };
-            let _signed = repository.sign_refs(&signer)?;
-        } else if !Self::is_signed(&repository, author, operation)? {
-            return Ok(None);
-        }
-        Ok(Some(operation))
-    }
-
-    fn is_signed(
-        repository: &radicle::storage::git::Repository,
-        author: PublicKey,
-        operation: EntryId,
-    ) -> Result<bool, Error> {
-        let Some(signed) = SignedRefs::load(author, repository)? else {
-            return Ok(false);
-        };
-        let operation_oid = operation;
-        for (_name, tip) in signed.iter() {
-            if *tip == operation_oid || repository.is_ancestor_of(operation_oid, *tip)? {
-                return Ok(true);
+        marker: &str,
+        reply: LegacyReply,
+    ) -> Result<EntryId, String> {
+        match (subject, reply.target) {
+            (Subject::Issue(id), LegacyReplyTarget::Issue { reply_to }) => {
+                let mut issues = issue::Cache::no_cache(repository, signer).map_err(stringify)?;
+                let mut issue = issues.get_mut(&id).map_err(stringify)?;
+                let parent = reply_to.unwrap_or(*id);
+                if issue.thread().comment(&parent).is_none() {
+                    return Err("legacy reply parent is unavailable".to_owned());
+                }
+                issue
+                    .transaction(marker, |tx| tx.comment(reply.body, parent, Vec::new()))
+                    .map_err(stringify)
             }
-        }
-        Ok(false)
-    }
-
-    fn publish_issue(
-        &self,
-        repository: &radicle::storage::git::Repository,
-        signer: &radicle::node::device::BoxedDevice,
-        issue_id: radicle::cob::ObjectId,
-        body: String,
-        reply_to: Option<EntryId>,
-        marker: &str,
-    ) -> Result<EntryId, Error> {
-        let mut issues = issue::Cache::no_cache(repository, signer)?;
-        let mut issue = issues.get_mut(&issue_id)?;
-        let parent = reply_to.unwrap_or(*issue_id);
-        if issue.thread().comment(&parent).is_none() {
-            return Err(Error::IssueParentUnavailable {
-                issue: issue_id,
-                parent,
-            });
-        }
-
-        Ok(issue.transaction(marker, |transaction| {
-            transaction.comment(body, parent, Vec::new())
-        })?)
-    }
-
-    fn publish_patch(
-        &self,
-        repository: &radicle::storage::git::Repository,
-        signer: &radicle::node::device::BoxedDevice,
-        patch_id: radicle::cob::ObjectId,
-        body: String,
-        target: PatchTarget,
-        marker: &str,
-    ) -> Result<EntryId, Error> {
-        let mut patches = patch::Cache::no_cache(repository, signer)?;
-        let mut patch = patches.get_mut(&patch_id)?;
-        if !target.exists(&patch) {
-            return Err(Error::PatchTargetUnavailable {
-                patch: patch_id,
-                target,
-            });
-        }
-
-        match target {
-            PatchTarget::Revision { revision, reply_to } => patch
-                .transaction(marker, |transaction| {
-                    transaction.comment(revision, body, reply_to, None, Vec::new())
-                })
-                .map_err(Error::Patch),
-            PatchTarget::Review { review, reply_to } => patch
-                .transaction(marker, |transaction| {
-                    transaction.review_comment(review, body, None, reply_to, Vec::new())
-                })
-                .map_err(Error::Patch),
+            (Subject::Patch(id), LegacyReplyTarget::Revision { revision, reply_to }) => {
+                let mut patches = patch::Cache::no_cache(repository, signer).map_err(stringify)?;
+                let mut patch = patches.get_mut(&id).map_err(stringify)?;
+                let target = LegacyPatchTarget::Revision { revision, reply_to };
+                if !target.exists(&patch) {
+                    return Err("legacy revision reply target is unavailable".to_owned());
+                }
+                patch
+                    .transaction(marker, |tx| {
+                        tx.comment(revision, reply.body, reply_to, None, Vec::new())
+                    })
+                    .map_err(stringify)
+            }
+            (Subject::Patch(id), LegacyReplyTarget::Review { review, reply_to }) => {
+                let mut patches = patch::Cache::no_cache(repository, signer).map_err(stringify)?;
+                let mut patch = patches.get_mut(&id).map_err(stringify)?;
+                let target = LegacyPatchTarget::Review { review, reply_to };
+                if !target.exists(&patch) {
+                    return Err("legacy review reply target is unavailable".to_owned());
+                }
+                patch
+                    .transaction(marker, |tx| {
+                        tx.review_comment(review, reply.body, None, reply_to, Vec::new())
+                    })
+                    .map_err(stringify)
+            }
+            _ => Err("legacy reply target does not match its subject".to_owned()),
         }
     }
 
-    fn published(
+    fn find_legacy(
         &self,
         repository: &radicle::storage::git::Repository,
         subject: Subject,
         marker: &str,
         author: PublicKey,
-        reply: &Reply,
-    ) -> Result<Option<EntryId>, Error> {
+        reply: &LegacyReply,
+    ) -> Result<Option<EntryId>, String> {
         match subject {
-            Subject::Issue(issue) => {
-                let Some(expected) = Self::issue_reply_action(issue, reply) else {
-                    return Ok(None);
+            Subject::Issue(id) => {
+                let LegacyReplyTarget::Issue { reply_to } = reply.target else {
+                    return Err("legacy reply target does not match its subject".to_owned());
                 };
-                self.find_marker(
+                let expected = issue::Action::Comment {
+                    body: reply.body.clone(),
+                    reply_to: Some(reply_to.unwrap_or(*id)),
+                    embeds: Vec::new(),
+                };
+                self.find_matching_in(
                     repository,
-                    IssueStream::init(issue, repository).all()?,
+                    IssueStream::init(id, repository).all(),
                     marker,
                     author,
-                    |operation| Self::matches_action(operation, &expected),
+                    |operation| operation.actions.len() == 1 && operation.actions.head == expected,
                 )
             }
-            Subject::Patch(patch) => {
-                let Some(expected) = Self::patch_reply_action(reply) else {
-                    return Ok(None);
+            Subject::Patch(id) => {
+                let expected = match reply.target {
+                    LegacyReplyTarget::Revision { revision, reply_to } => {
+                        patch::Action::RevisionComment {
+                            revision,
+                            location: None,
+                            body: reply.body.clone(),
+                            reply_to,
+                            embeds: Vec::new(),
+                        }
+                    }
+                    LegacyReplyTarget::Review { review, reply_to } => {
+                        patch::Action::ReviewComment {
+                            review,
+                            body: reply.body.clone(),
+                            location: None,
+                            reply_to,
+                            embeds: Vec::new(),
+                        }
+                    }
+                    LegacyReplyTarget::Issue { .. } => {
+                        return Err("legacy reply target does not match its subject".to_owned());
+                    }
                 };
-                self.find_marker(
+                self.find_matching_in(
                     repository,
-                    PatchStream::init(patch, repository).all()?,
+                    PatchStream::init(id, repository).all(),
                     marker,
                     author,
-                    |operation| Self::matches_action(operation, &expected),
+                    |operation| operation.actions.len() == 1 && operation.actions.head == expected,
                 )
             }
         }
     }
 
-    fn issue_reply_action(issue: issue::IssueId, reply: &Reply) -> Option<issue::Action> {
-        let ReplyTarget::Issue { reply_to } = reply.target else {
-            return None;
-        };
-        Some(issue::Action::Comment {
-            body: reply.body.clone(),
-            reply_to: Some(reply_to.unwrap_or(*issue)),
-            embeds: Vec::new(),
+    async fn finish_recovery(&self, author: PublicKey) -> Result<(), String> {
+        if author != self.author() {
+            return self
+                .announce(author)
+                .await
+                .map_err(|error| error.to_string());
+        }
+        let publisher = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let repository = publisher
+                .profile
+                .storage
+                .repository(publisher.repository)
+                .map_err(|error| error.to_string())?;
+            let signer = match publisher.signer.clone() {
+                Some(signer) => Device::from(signer).boxed(),
+                None => publisher
+                    .profile
+                    .signer()
+                    .map_err(|error| error.to_string())?,
+            };
+            repository
+                .sign_refs(&signer)
+                .map_err(|error| error.to_string())
         })
+        .await
+        .map_err(|error| error.to_string())??;
+        self.announce(author)
+            .await
+            .map_err(|error| error.to_string())
     }
 
-    fn patch_reply_action(reply: &Reply) -> Option<patch::Action> {
-        match reply.target {
-            ReplyTarget::Revision { revision, reply_to } => Some(patch::Action::RevisionComment {
-                revision,
-                location: None,
-                body: reply.body.clone(),
-                reply_to,
-                embeds: Vec::new(),
-            }),
-            ReplyTarget::Review { review, reply_to } => Some(patch::Action::ReviewComment {
-                review,
-                body: reply.body.clone(),
-                location: None,
-                reply_to,
-                embeds: Vec::new(),
-            }),
-            ReplyTarget::Issue { .. } => None,
-        }
-    }
-
-    fn matches_action<T: PartialEq>(operation: &Op<T>, expected: &T) -> bool {
-        operation.actions.len() == 1 && operation.actions.head == *expected
-    }
-
-    fn find_marker<T>(
+    fn find_marker(
         &self,
         repository: &radicle::storage::git::Repository,
-        operations: impl Iterator<Item = Result<Op<T>, radicle::cob::stream::error::Ops>>,
         marker: &str,
         author: PublicKey,
-        matches_reply: impl Fn(&Op<T>) -> bool,
-    ) -> Result<Option<EntryId>, Error> {
-        for operation in operations {
-            let operation = operation?;
-            if operation.author != author {
+    ) -> Result<Option<EntryId>, String> {
+        let issues = Issues::open(repository, ReadOnly).map_err(stringify)?;
+        for issue in issues.all().map_err(stringify)? {
+            let (id, _issue) = issue.map_err(stringify)?;
+            if let Some(operation) = self.find_in(
+                repository,
+                IssueStream::init(id, repository).all(),
+                marker,
+                author,
+            )? {
+                return Ok(Some(operation));
+            }
+        }
+        let patches = Patches::open(repository, ReadOnly).map_err(stringify)?;
+        for patch in patches.all().map_err(stringify)? {
+            let (id, _patch) = patch.map_err(stringify)?;
+            if let Some(operation) = self.find_in(
+                repository,
+                PatchStream::init(id, repository).all(),
+                marker,
+                author,
+            )? {
+                return Ok(Some(operation));
+            }
+        }
+        Ok(None)
+    }
+
+    fn find_in<A>(
+        &self,
+        repository: &radicle::storage::git::Repository,
+        operations: Result<
+            impl Iterator<Item = Result<Op<A>, radicle::cob::stream::error::Ops>>,
+            radicle::cob::stream::error::Stream,
+        >,
+        marker: &str,
+        author: PublicKey,
+    ) -> Result<Option<EntryId>, String> {
+        self.find_matching_in(repository, operations, marker, author, |_| true)
+    }
+
+    fn find_matching_in<A>(
+        &self,
+        repository: &radicle::storage::git::Repository,
+        operations: Result<
+            impl Iterator<Item = Result<Op<A>, radicle::cob::stream::error::Ops>>,
+            radicle::cob::stream::error::Stream,
+        >,
+        marker: &str,
+        author: PublicKey,
+        matches: impl Fn(&Op<A>) -> bool,
+    ) -> Result<Option<EntryId>, String> {
+        for operation in operations.map_err(stringify)? {
+            let operation = operation.map_err(stringify)?;
+            if operation.author != author || !matches(&operation) {
                 continue;
             }
-            if !matches_reply(&operation) {
-                continue;
-            }
-            let commit = repository.backend.find_commit(operation.id.into())?;
+            let commit = repository
+                .backend
+                .find_commit(operation.id.into())
+                .map_err(stringify)?;
             if commit
                 .message()
                 .is_some_and(|message| message.lines().next() == Some(marker))
@@ -444,26 +616,47 @@ impl<A: Announcer, V: Authorizer> Publisher<A, V> {
         }
         Ok(None)
     }
-}
 
-pub(crate) trait Announcer: Clone + std::fmt::Debug + Send + Sync + 'static {
-    fn announce(&mut self, repository: RepoId, namespace: PublicKey) -> Result<(), Error>;
-}
+    fn is_signed(
+        repository: &radicle::storage::git::Repository,
+        author: PublicKey,
+        operation: EntryId,
+    ) -> Result<bool, String> {
+        let Some(signed) = SignedRefs::load(author, repository).map_err(stringify)? else {
+            return Ok(false);
+        };
+        for (_name, tip) in signed.iter() {
+            if signed_tip_reaches(repository, operation, *tip)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 
-#[async_trait::async_trait]
-pub(crate) trait Authorizer: Clone + std::fmt::Debug + Send + Sync + 'static {
-    async fn authorize(&self) -> Result<(), String>;
-}
-
-impl Announcer for Node {
-    fn announce(&mut self, repository: RepoId, namespace: PublicKey) -> Result<(), Error> {
-        let _announced = self.announce_refs_for(repository, [namespace])?;
-        Ok(())
+    async fn announce(&self, namespace: PublicKey) -> Result<(), Error> {
+        let announcer = Arc::clone(&self.announcer);
+        let repository = self.repository;
+        tokio::task::spawn_blocking(move || announcer.announce(repository, namespace))
+            .await
+            .map_err(|error| Error::Task(error.to_string()))?
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum PatchTarget {
+#[derive(Debug, Clone)]
+pub(crate) struct MutationKey {
+    pub(crate) delivery: DeliveryId,
+    pub(crate) invocation: usize,
+    pub(crate) request: String,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum MutationValidation {
+    Fresh,
+    Recovery,
+}
+
+#[derive(Clone, Copy)]
+enum LegacyPatchTarget {
     Revision {
         revision: patch::RevisionId,
         reply_to: Option<EntryId>,
@@ -474,84 +667,327 @@ pub(crate) enum PatchTarget {
     },
 }
 
-impl PatchTarget {
-    fn exists(&self, patch: &patch::Patch) -> bool {
+enum LegacyReconciliation {
+    Discard,
+    NeedsAuthorization,
+    Ready(PublicKey),
+}
+
+impl LegacyPatchTarget {
+    fn exists(self, patch: &patch::Patch) -> bool {
         match self {
             Self::Revision { revision, reply_to } => {
-                patch.revision(revision).is_some_and(|value| {
-                    reply_to.is_none_or(|parent| value.discussion().comment(&parent).is_some())
+                patch.revision(&revision).is_some_and(|revision| {
+                    reply_to.is_none_or(|parent| revision.discussion().comment(&parent).is_some())
                 })
             }
             Self::Review { review, reply_to } => patch
                 .revisions()
                 .flat_map(|(_id, revision)| revision.reviews())
-                .find_map(|(_author, candidate)| (candidate.id() == *review).then_some(candidate))
-                .is_some_and(|value| {
+                .find_map(|(_author, candidate)| (candidate.id() == review).then_some(candidate))
+                .is_some_and(|review| {
                     reply_to.is_none_or(|parent| {
-                        value.comments().any(|(comment, _value)| *comment == parent)
+                        review
+                            .comments()
+                            .any(|(comment, _value)| *comment == parent)
                     })
                 }),
         }
     }
 }
 
-/// Error produced while publishing an agent outcome.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum Error {
-    #[error("reply target {target:?} is invalid for {subject:?}")]
-    InvalidTarget {
-        subject: Subject,
-        target: ReplyTarget,
-    },
-    #[error("reply target {target:?} is unavailable in patch {patch}")]
-    PatchTargetUnavailable {
-        patch: radicle::cob::ObjectId,
-        target: PatchTarget,
-    },
-    #[error("reply parent {parent} is unavailable in issue {issue}")]
-    IssueParentUnavailable {
-        issue: radicle::cob::ObjectId,
-        parent: EntryId,
-    },
-    #[error("failed to announce published reply: {0}")]
-    Node(#[from] radicle::node::Error),
-    #[error("reply publication is no longer authorized: {0}")]
-    Authorization(String),
-    #[error("failed to open Radicle repository: {0}")]
-    Repository(#[from] radicle::storage::RepositoryError),
-    #[error("failed to load member signer: {0}")]
-    Signer(#[from] radicle::profile::SignerError),
-    #[error("failed to open collaborative object cache: {0}")]
-    Profile(#[from] radicle::profile::Error),
-    #[error("failed to load issue: {0}")]
-    IssueCache(#[from] issue::cache::Error),
-    #[error("failed to load patch: {0}")]
-    PatchCache(#[from] patch::cache::Error),
-    #[error("failed to read collaborative object: {0}")]
-    CobStore(#[from] radicle::cob::store::Error),
-    #[error("failed to open collaborative object operation stream: {0}")]
-    Stream(#[from] radicle::cob::stream::error::Stream),
-    #[error("failed to read collaborative object operation: {0}")]
-    Operation(#[from] radicle::cob::stream::error::Ops),
-    #[error("failed to read collaborative object commit: {0}")]
-    Git(#[from] radicle::git::raw::Error),
-    #[error("failed to read signed references: {0}")]
-    SignedRefs(#[from] radicle::storage::refs::sigrefs::read::error::Read),
-    #[error("failed to publish issue reply: {0}")]
-    Issue(#[from] issue::Error),
-    #[error("failed to publish patch reply: {0}")]
-    Patch(#[from] patch::Error),
-    #[error("reply publisher task failed: {0}")]
-    Task(String),
+pub(crate) trait Announcer: fmt::Debug + Send + Sync + 'static {
+    fn announce(&self, repository: RepoId, namespace: PublicKey) -> Result<(), Error>;
 }
 
-impl Error {
-    pub(crate) const fn is_invalid_target(&self) -> bool {
-        matches!(
-            self,
-            Self::InvalidTarget { .. }
-                | Self::PatchTargetUnavailable { .. }
-                | Self::IssueParentUnavailable { .. }
-        )
+impl Announcer for Node {
+    fn announce(&self, repository: RepoId, namespace: PublicKey) -> Result<(), Error> {
+        let mut node = self.clone();
+        let _announced = node.announce_refs_for(repository, [namespace])?;
+        Ok(())
     }
+}
+
+#[async_trait::async_trait]
+pub(crate) trait Authorizer: fmt::Debug + Send + Sync + 'static {
+    async fn authorize(&self, method: &str) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+struct MutationJournal {
+    database: Database,
+}
+
+impl MutationJournal {
+    async fn open(path: &Path) -> Result<Self, String> {
+        Self::from_database(Database::open(path).await.map_err(stringify)?).await
+    }
+
+    #[cfg(all(test, not(miri)))]
+    async fn memory() -> Result<Self, String> {
+        Self::from_database(Database::memory().await.map_err(stringify)?).await
+    }
+
+    async fn from_database(database: Database) -> Result<Self, String> {
+        database.execute(JOURNAL_SCHEMA).await.map_err(stringify)?;
+        Ok(Self { database })
+    }
+
+    async fn begin(
+        &self,
+        repository: RepoId,
+        key: &MutationKey,
+        method: &'static str,
+        author: PublicKey,
+    ) -> Result<JournalEntry, String> {
+        let values = mutation_values(repository, key);
+        let author = author.to_string();
+        self.database
+            .call(move |connection| {
+                let mut insert = connection.prepare(
+                    "INSERT OR IGNORE INTO mcp_mutations
+                         (repository, operation, action, invocation, method, author)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                bind_mutation(&mut insert, &values)?;
+                insert.bind((5, method))?;
+                insert.bind((6, author.as_str()))?;
+                insert.next()?;
+                drop(insert);
+
+                let mut select = connection.prepare(
+                    "SELECT method, author, result FROM mcp_mutations
+                     WHERE repository = ?1 AND operation = ?2
+                       AND action = ?3 AND invocation = ?4",
+                )?;
+                bind_mutation(&mut select, &values)?;
+                if select.next()? != State::Row {
+                    return Err(sqlite::Error {
+                        code: None,
+                        message: Some("mutation disappeared".to_owned()),
+                    });
+                }
+                let stored = select.read::<String, _>(0)?;
+                if stored != method {
+                    return Err(sqlite::Error {
+                        code: None,
+                        message: Some(format!(
+                            "delivery mutation changed from '{stored}' to '{method}'"
+                        )),
+                    });
+                }
+                let author = select.read::<String, _>(1)?;
+                let author = PublicKey::from_str(&author).map_err(|error| sqlite::Error {
+                    code: None,
+                    message: Some(error.to_string()),
+                })?;
+                Ok(JournalEntry {
+                    author,
+                    result: select.read::<Option<String>, _>(2)?,
+                })
+            })
+            .await
+            .map_err(stringify)
+    }
+
+    async fn complete(
+        &self,
+        repository: RepoId,
+        key: &MutationKey,
+        method: &str,
+        author: PublicKey,
+        result: &str,
+    ) -> Result<(), String> {
+        let values = mutation_values(repository, key);
+        let method = method.to_owned();
+        let result = result.to_owned();
+        let author = author.to_string();
+        self.database
+            .call(move |connection| {
+                complete_mutation(connection, &values, &method, &author, &result)
+            })
+            .await
+            .map_err(stringify)
+    }
+
+    async fn entries(
+        &self,
+        repository: RepoId,
+        delivery: DeliveryId,
+    ) -> Result<Vec<DeliveryJournalEntry>, String> {
+        let values = [
+            repository.to_string(),
+            delivery.operation.to_string(),
+            delivery.action.to_string(),
+        ];
+        self.database
+            .call(move |connection| {
+                let mut select = connection.prepare(
+                    "SELECT invocation, method, author, result FROM mcp_mutations
+                     WHERE repository = ?1 AND operation = ?2
+                       AND action = ?3",
+                )?;
+                for (index, value) in values.iter().enumerate() {
+                    select.bind((index + 1, value.as_str()))?;
+                }
+                let mut entries = Vec::new();
+                while select.next()? == State::Row {
+                    let encoded = select.read::<String, _>(0)?;
+                    let (invocation, request) = decode_invocation(encoded)?;
+                    let method = select.read::<String, _>(1)?;
+                    let value = select.read::<String, _>(2)?;
+                    let author = PublicKey::from_str(&value).map_err(|error| sqlite::Error {
+                        code: None,
+                        message: Some(error.to_string()),
+                    })?;
+                    entries.push(DeliveryJournalEntry {
+                        key: MutationKey {
+                            delivery,
+                            invocation,
+                            request,
+                        },
+                        method,
+                        author,
+                        result: select.read::<Option<String>, _>(3)?,
+                    });
+                }
+                Ok(entries)
+            })
+            .await
+            .map_err(stringify)
+    }
+
+    async fn discard(&self, repository: RepoId, key: &MutationKey) -> Result<(), String> {
+        self.update_entry(
+            repository,
+            key,
+            "DELETE FROM mcp_mutations
+             WHERE repository = ?1 AND operation = ?2
+               AND action = ?3 AND invocation = ?4 AND result IS NULL",
+        )
+        .await
+    }
+
+    #[cfg(all(test, not(miri)))]
+    async fn forget_completion(&self, repository: RepoId, key: &MutationKey) -> Result<(), String> {
+        self.update_entry(
+            repository,
+            key,
+            "UPDATE mcp_mutations SET result = NULL
+             WHERE repository = ?1 AND operation = ?2
+               AND action = ?3 AND invocation = ?4",
+        )
+        .await
+    }
+
+    async fn update_entry(
+        &self,
+        repository: RepoId,
+        key: &MutationKey,
+        sql: &'static str,
+    ) -> Result<(), String> {
+        let values = mutation_values(repository, key);
+        self.database
+            .call(move |connection| {
+                let mut update = connection.prepare(sql)?;
+                bind_mutation(&mut update, &values)?;
+                update.next()?;
+                Ok(())
+            })
+            .await
+            .map_err(stringify)
+    }
+}
+
+#[derive(Clone)]
+struct JournalEntry {
+    author: PublicKey,
+    result: Option<String>,
+}
+
+struct DeliveryJournalEntry {
+    key: MutationKey,
+    method: String,
+    author: PublicKey,
+    result: Option<String>,
+}
+
+fn signed_tip_reaches(
+    repository: &radicle::storage::git::Repository,
+    operation: EntryId,
+    tip: radicle::git::Oid,
+) -> Result<bool, String> {
+    if tip == operation {
+        Ok(true)
+    } else {
+        repository.is_ancestor_of(operation, tip).map_err(stringify)
+    }
+}
+
+fn stringify(error: impl fmt::Display) -> String {
+    error.to_string()
+}
+
+fn complete_mutation(
+    connection: &sqlite::ConnectionThreadSafe,
+    values: &[String; 4],
+    method: &str,
+    author: &str,
+    result: &str,
+) -> sqlite::Result<()> {
+    let mut update = connection.prepare(
+        "UPDATE mcp_mutations SET author = ?6, result = ?7
+         WHERE repository = ?1 AND operation = ?2
+           AND action = ?3 AND invocation = ?4 AND method = ?5",
+    )?;
+    bind_mutation(&mut update, values)?;
+    update.bind((5, method))?;
+    update.bind((6, author))?;
+    update.bind((7, result))?;
+    update.next()?;
+    Ok(())
+}
+
+fn mutation_values(repository: RepoId, key: &MutationKey) -> [String; 4] {
+    [
+        repository.to_string(),
+        key.delivery.operation.to_string(),
+        key.delivery.action.to_string(),
+        encode_invocation(key),
+    ]
+}
+
+fn encode_invocation(key: &MutationKey) -> String {
+    format!("{:020}:{}", key.invocation, key.request)
+}
+
+fn decode_invocation(value: String) -> sqlite::Result<(usize, String)> {
+    let Some((invocation, request)) = value.split_once(':') else {
+        return Ok((0, value));
+    };
+    let invocation = invocation
+        .parse()
+        .map_err(|error: std::num::ParseIntError| sqlite::Error {
+            code: None,
+            message: Some(error.to_string()),
+        })?;
+    Ok((invocation, request.to_owned()))
+}
+
+fn bind_mutation(
+    statement: &mut sqlite::Statement<'_>,
+    values: &[String; 4],
+) -> sqlite::Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        statement.bind((index + 1, value.as_str()))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Error {
+    #[error("Radicle node error: {0}")]
+    Node(#[from] radicle::node::Error),
+    #[error("publisher task failed: {0}")]
+    Task(String),
 }

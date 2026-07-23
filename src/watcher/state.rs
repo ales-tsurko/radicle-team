@@ -1,15 +1,14 @@
-//! Persistent activity-delivery deduplication for idempotent watcher rescans.
+//! Persistent activity-delivery deduplication for watcher rescans.
 
 use std::path::Path;
 
 use radicle::{
     cob::{EntryId, ObjectId},
-    crypto::PublicKey,
     identity::RepoId,
 };
 use sqlite::{ConnectionThreadSafe, State};
 
-use crate::{agent::Reply, database::Database, watcher::Error};
+use crate::{agent::LegacyPendingReply, database::Database, watcher::Error};
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS processed_operations (
@@ -39,12 +38,6 @@ pub(super) struct ProcessedActivities {
     database: Database,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(super) struct PendingReply {
-    pub(super) reply: Reply,
-    pub(super) author: PublicKey,
-}
-
 impl ProcessedActivities {
     pub(super) async fn open(path: &Path) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
@@ -70,7 +63,7 @@ impl ProcessedActivities {
         operation: EntryId,
         action: usize,
     ) -> Result<bool, Error> {
-        self.flag_operation(repository, object, operation, action, Operation::Contains)
+        self.operation(repository, object, operation, action, Operation::Contains)
             .await
     }
 
@@ -81,25 +74,8 @@ impl ProcessedActivities {
         operation: EntryId,
         action: usize,
     ) -> Result<bool, Error> {
-        self.flag_operation(repository, object, operation, action, Operation::Insert)
+        self.operation(repository, object, operation, action, Operation::Insert)
             .await
-    }
-
-    async fn flag_operation(
-        &self,
-        repository: RepoId,
-        object: ObjectId,
-        operation: EntryId,
-        action: usize,
-        kind: Operation,
-    ) -> Result<bool, Error> {
-        match self
-            .operation(repository, object, operation, action, kind)
-            .await?
-        {
-            OperationResult::Flag(value) => Ok(value),
-            OperationResult::Reply(_) => Err(Self::invalid_operation()),
-        }
     }
 
     pub(super) async fn pending_reply(
@@ -108,62 +84,27 @@ impl ProcessedActivities {
         object: ObjectId,
         operation: EntryId,
         action: usize,
-    ) -> Result<Option<PendingReply>, Error> {
-        let reply = match self
-            .operation(repository, object, operation, action, Operation::LoadReply)
-            .await?
-        {
-            OperationResult::Reply(reply) => reply,
-            OperationResult::Flag(_) => return Err(Self::invalid_operation()),
-        };
+    ) -> Result<Option<LegacyPendingReply>, Error> {
+        let values = operation_values(repository, object, operation, action);
+        let reply = self
+            .database
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT reply FROM pending_replies
+                     WHERE repository = ?1 AND object = ?2
+                       AND operation = ?3 AND action = ?4",
+                )?;
+                bind_operation(&mut statement, &values)?;
+                match statement.next()? {
+                    State::Row => statement.read::<String, _>(0).map(Some),
+                    State::Done => Ok(None),
+                }
+            })
+            .await?;
         reply
             .map(|reply| serde_json::from_str(&reply))
             .transpose()
-            .map_err(|error| Error::ReplyState(error.to_string()))
-    }
-
-    pub(super) async fn store_reply(
-        &self,
-        repository: RepoId,
-        object: ObjectId,
-        operation: EntryId,
-        action: usize,
-        reply: &Reply,
-        author: PublicKey,
-    ) -> Result<(), Error> {
-        let values = operation_values(repository, object, operation, action);
-        let reply = serde_json::to_string(&PendingReply {
-            reply: reply.clone(),
-            author,
-        })
-        .map_err(|error| Error::ReplyState(error.to_string()))?;
-        self.database
-            .call(move |connection| {
-                let mut statement = connection.prepare(
-                    "INSERT OR REPLACE INTO pending_replies
-                         (repository, object, operation, action, reply)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                )?;
-                bind_operation(&mut statement, &values)?;
-                statement.bind((5, reply.as_str()))?;
-                statement.next()?;
-                Ok(())
-            })
-            .await
-            .map_err(Error::from)
-    }
-
-    pub(super) async fn clear_reply(
-        &self,
-        repository: RepoId,
-        object: ObjectId,
-        operation: EntryId,
-        action: usize,
-    ) -> Result<(), Error> {
-        let _cleared = self
-            .operation(repository, object, operation, action, Operation::ClearReply)
-            .await?;
-        Ok(())
+            .map_err(|error| Error::Database(error.to_string()))
     }
 
     async fn operation(
@@ -173,34 +114,18 @@ impl ProcessedActivities {
         operation: EntryId,
         action: usize,
         kind: Operation,
-    ) -> Result<OperationResult, Error> {
+    ) -> Result<bool, Error> {
         let values = operation_values(repository, object, operation, action);
         self.database
-            .call(move |connection| match kind {
-                Operation::Contains => {
-                    let mut statement = connection.prepare(kind.query())?;
-                    bind_operation(&mut statement, &values)?;
-                    Ok(OperationResult::Flag(statement.next()? == State::Row))
-                }
-                Operation::Insert => {
-                    Self::checkpoint(connection, &values).map(OperationResult::Flag)
-                }
-                Operation::LoadReply => {
-                    let mut statement = connection.prepare(kind.query())?;
-                    bind_operation(&mut statement, &values)?;
-                    match statement.next()? {
-                        State::Row => statement
-                            .read::<String, _>(0)
-                            .map(Some)
-                            .map(OperationResult::Reply),
-                        State::Done => Ok(OperationResult::Reply(None)),
+            .call(move |connection| {
+                let mut statement = connection.prepare(kind.query())?;
+                bind_operation(&mut statement, &values)?;
+                match kind {
+                    Operation::Contains => Ok(statement.next()? == State::Row),
+                    Operation::Insert => {
+                        drop(statement);
+                        Self::checkpoint(connection, &values)
                     }
-                }
-                Operation::ClearReply => {
-                    let mut statement = connection.prepare(kind.query())?;
-                    bind_operation(&mut statement, &values)?;
-                    statement.next()?;
-                    Ok(OperationResult::Reply(None))
                 }
             })
             .await
@@ -228,14 +153,13 @@ impl ProcessedActivities {
         insert.next()?;
         let inserted = connection.change_count() == 1;
         drop(insert);
-        let mut clear = connection.prepare(Operation::ClearReply.query())?;
+        let mut clear = connection.prepare(
+            "DELETE FROM pending_replies
+             WHERE repository = ?1 AND object = ?2 AND operation = ?3 AND action = ?4",
+        )?;
         bind_operation(&mut clear, values)?;
         clear.next()?;
         Ok(inserted)
-    }
-
-    fn invalid_operation() -> Error {
-        Error::ReplyState("invalid internal watcher state operation".to_owned())
     }
 }
 
@@ -243,13 +167,6 @@ impl ProcessedActivities {
 enum Operation {
     Contains,
     Insert,
-    LoadReply,
-    ClearReply,
-}
-
-enum OperationResult {
-    Flag(bool),
-    Reply(Option<String>),
 }
 
 impl Operation {
@@ -269,14 +186,6 @@ impl Operation {
                 "INSERT OR IGNORE INTO processed_activities
                      (repository, object, operation, action)
                  VALUES (?1, ?2, ?3, ?4)"
-            }
-            Self::LoadReply => {
-                "SELECT reply FROM pending_replies
-                 WHERE repository = ?1 AND object = ?2 AND operation = ?3 AND action = ?4"
-            }
-            Self::ClearReply => {
-                "DELETE FROM pending_replies
-                 WHERE repository = ?1 AND object = ?2 AND operation = ?3 AND action = ?4"
             }
         }
     }
@@ -317,137 +226,123 @@ mod tests {
     };
 
     use crate::{
-        agent::{Reply, ReplyTarget},
-        watcher::state::{PendingReply, ProcessedActivities},
+        agent::{LegacyPendingReply, LegacyReply, LegacyReplyTarget},
+        database::Database,
+        watcher::state::{ProcessedActivities, bind_operation, operation_values},
     };
 
     #[tokio::test]
-    async fn distinguishes_actions_within_an_operation() {
-        let store = ProcessedActivities::memory()
+    async fn tracks_each_action_once() {
+        let state = ProcessedActivities::memory()
             .await
-            .expect("in-memory store should open");
-        let repository = RepoId::from_str("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc")
-            .expect("repository ID should be valid");
-        let object = ObjectId::from_str("1111111111111111111111111111111111111111")
-            .expect("object ID should be valid");
-        let operation = EntryId::from_str("2222222222222222222222222222222222222222")
-            .expect("operation ID should be valid");
+            .expect("state should open");
+        let repository =
+            RepoId::from_str("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc").expect("valid repository");
+        let object =
+            ObjectId::from_str("1111111111111111111111111111111111111111").expect("valid object");
+        let operation =
+            EntryId::from_str("2222222222222222222222222222222222222222").expect("valid operation");
 
         assert!(
-            !store
+            !state
                 .contains(repository, object, operation, 0)
                 .await
-                .expect("lookup")
+                .expect("contains should work")
         );
         assert!(
-            store
+            state
                 .insert(repository, object, operation, 0)
                 .await
-                .expect("insert")
+                .expect("insert should work")
         );
         assert!(
-            !store
+            !state
                 .insert(repository, object, operation, 0)
                 .await
-                .expect("duplicate")
+                .expect("duplicate should work")
         );
         assert!(
-            store
+            state
                 .contains(repository, object, operation, 0)
                 .await
-                .expect("lookup")
+                .expect("contains should work")
         );
         assert!(
-            !store
+            !state
                 .contains(repository, object, operation, 1)
                 .await
-                .expect("distinct action lookup")
-        );
-        assert!(
-            store
-                .insert(repository, object, operation, 1)
-                .await
-                .expect("distinct action insert")
+                .expect("contains should work")
         );
     }
 
     #[tokio::test]
-    async fn persists_pending_replies_until_delivery_completes() {
-        let store = ProcessedActivities::memory()
-            .await
-            .expect("in-memory store should open");
-        let repository = RepoId::from_str("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc")
-            .expect("repository ID should be valid");
-        let object = ObjectId::from_str("1111111111111111111111111111111111111111")
-            .expect("object ID should be valid");
-        let operation = EntryId::from_str("2222222222222222222222222222222222222222")
-            .expect("operation ID should be valid");
-        let reply = Reply {
-            body: "Reply".to_owned(),
-            target: ReplyTarget::Issue { reply_to: None },
+    async fn loads_and_clears_legacy_pending_replies_on_checkpoint() {
+        let repository =
+            RepoId::from_str("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc").expect("valid repository");
+        let object =
+            ObjectId::from_str("1111111111111111111111111111111111111111").expect("valid object");
+        let operation =
+            EntryId::from_str("2222222222222222222222222222222222222222").expect("valid operation");
+        let pending = LegacyPendingReply {
+            reply: LegacyReply {
+                body: "Recovered reply".to_owned(),
+                target: LegacyReplyTarget::Issue { reply_to: None },
+            },
+            author: PublicKey::from_str("z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7")
+                .expect("valid key"),
         };
-        let author = PublicKey::from_str("z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7")
-            .expect("author should be valid");
-
-        store
-            .store_reply(repository, object, operation, 0, &reply, author)
-            .await
-            .expect("reply should be stored");
-        assert_eq!(
-            store
-                .pending_reply(repository, object, operation, 0)
-                .await
-                .expect("reply should load"),
-            Some(PendingReply {
-                reply: reply.clone(),
-                author
-            })
-        );
-        store
-            .database
+        let values = operation_values(repository, object, operation, 0);
+        let encoded = serde_json::to_string(&pending).expect("pending reply should serialize");
+        let database = Database::memory().await.expect("database should open");
+        database
             .execute(
-                "CREATE TRIGGER reject_pending_reply_cleanup
-                 BEFORE DELETE ON pending_replies
-                 BEGIN
-                     SELECT RAISE(FAIL, 'cleanup rejected');
-                 END",
+                "CREATE TABLE pending_replies (
+                    repository TEXT NOT NULL,
+                    object TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    reply TEXT NOT NULL,
+                    PRIMARY KEY (repository, object, operation, action)
+                ) STRICT;",
             )
             .await
-            .expect("failure trigger should be installed");
-        store
-            .insert(repository, object, operation, 0)
-            .await
-            .expect_err("checkpoint cleanup should fail");
-        assert!(
-            !store
-                .contains(repository, object, operation, 0)
-                .await
-                .expect("failed checkpoint should roll back")
-        );
-        assert_eq!(
-            store
-                .pending_reply(repository, object, operation, 0)
-                .await
-                .expect("reply should survive a failed checkpoint"),
-            Some(PendingReply {
-                reply: reply.clone(),
-                author
+            .expect("legacy schema should initialize");
+        database
+            .call(move |connection| {
+                let mut insert = connection.prepare(
+                    "INSERT INTO pending_replies
+                         (repository, object, operation, action, reply)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                bind_operation(&mut insert, &values)?;
+                insert.bind((5, encoded.as_str()))?;
+                insert.next()?;
+                Ok(())
             })
-        );
-        store
-            .database
-            .execute("DROP TRIGGER reject_pending_reply_cleanup")
             .await
-            .expect("failure trigger should be removed");
-        store
-            .insert(repository, object, operation, 0)
+            .expect("legacy row should insert");
+        let state = ProcessedActivities::from_database(database)
             .await
-            .expect("delivery should complete");
+            .expect("upgraded state should open");
+
         assert_eq!(
-            store
+            state
                 .pending_reply(repository, object, operation, 0)
                 .await
-                .expect("reply lookup should succeed"),
+                .expect("pending reply should load"),
+            Some(pending)
+        );
+        assert!(
+            state
+                .insert(repository, object, operation, 0)
+                .await
+                .expect("checkpoint should insert")
+        );
+        assert_eq!(
+            state
+                .pending_reply(repository, object, operation, 0)
+                .await
+                .expect("pending reply lookup should work"),
             None
         );
     }

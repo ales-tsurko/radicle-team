@@ -1,4 +1,4 @@
-//! Radicle activity watcher and agent-outcome publisher.
+//! Radicle activity watcher and agent delivery.
 //!
 //! A [`Watcher`](crate::watcher::Watcher) observes one repository as one
 //! [`Member`](crate::member::Member), classifies interactions requiring that member's attention,
@@ -37,7 +37,7 @@
 //! - `activity` defines the public activity, subject, target, and change model.
 //! - `classification` contains the normalized action model and generic reducer.
 //! - `issue` and `patch` adapt Radicle action enums into normalized actions.
-//! - the agent publisher validates and writes typed reply outcomes.
+//! - repository actions are performed through delivery-scoped MCP methods.
 //! - `runtime` owns scanning and node-event orchestration.
 //! - `state` persists processed operation IDs for idempotent rescanning.
 
@@ -52,3 +52,5 @@ mod issue;
 mod patch;
 mod runtime;
 mod state;
+#[cfg(test)]
+mod tests;

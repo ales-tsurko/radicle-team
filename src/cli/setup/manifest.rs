@@ -5,13 +5,14 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::{fs, io, io::Write as _, path::Path};
 
 use radicle::identity::Did;
-use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 
-use super::Error;
-use crate::{Application, Setup, SetupStatus, manifest::Manifest, member::Member};
+use crate::{
+    Application, Setup, SetupStatus, cli::setup::Error, manifest::Manifest, member::Member,
+};
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ManifestEntry {
+pub(crate) struct ManifestEntry {
     pub(super) member: Member,
     pub(super) did: Did,
     pub(super) generation: u64,
@@ -95,6 +96,7 @@ impl ManifestEntry {
         let _previous = binding.insert("signing_did", value(self.did.to_string()));
         let _previous = binding.insert("generation", value(self.generation()?));
         let _previous = binding.insert("state", value("active"));
+        let _previous = binding.insert("mcp_allow", value(self.mcp_allow()));
 
         Ok(binding)
     }
@@ -104,12 +106,17 @@ impl ManifestEntry {
         let _previous = binding.insert("signing_did", self.did.to_string().into());
         let _previous = binding.insert("generation", self.generation()?.into());
         let _previous = binding.insert("state", "active".into());
+        let _previous = binding.insert("mcp_allow", self.mcp_allow().into());
 
         Ok(binding.into())
     }
 
     fn generation(self) -> Result<i64, Error> {
         Ok(i64::try_from(self.generation)?)
+    }
+
+    fn mcp_allow(self) -> Array {
+        self.member.profile().mcp_allow.iter().copied().collect()
     }
 
     fn write(path: &Path, contents: &str, create: bool) -> Result<(), io::Error> {
@@ -165,10 +172,17 @@ impl std::fmt::Display for ManifestEntry {
         write!(
             formatter,
             "[members.{member}]\nsigning_did = \"{did}\"\ngeneration = {generation}\nstate = \
-             \"active\"",
+             \"active\"\nmcp_allow = [",
             member = self.member,
             did = self.did,
             generation = self.generation,
-        )
+        )?;
+        for (index, permission) in self.member.profile().mcp_allow.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "\"{permission}\"")?;
+        }
+        formatter.write_str("]")
     }
 }

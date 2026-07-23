@@ -1,3 +1,5 @@
+//! Setup workflow tests.
+
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::{fs, path::PathBuf, process::Command};
@@ -93,6 +95,7 @@ fn reports_the_explicit_manifest_path_noninteractively() {
     assert!(missing.contains("config/team-policy.toml"));
     assert!(missing.contains("create explicit manifest"));
     assert!(missing.contains("version = 1"));
+    assert!(missing.contains("mcp_allow = [\"read\", \"comments\", \"patches\", \"reviews\"]"));
     assert!(!missing.contains("canonical branch"));
 
     let binding = SetupWizard::explicit_manifest_output(
@@ -102,6 +105,29 @@ fn reports_the_explicit_manifest_path_noninteractively() {
     );
     assert!(binding.contains("add this binding to explicit manifest"));
     assert!(binding.contains("config/team-policy.toml"));
+}
+
+#[test]
+fn includes_member_permissions_in_repository_output() {
+    let output = SetupWizard::repository_manifest_output(
+        Fixture::entry(Member::Nico, NICO),
+        SetupStatus::ManifestMissing { generation: 1 },
+    );
+
+    assert!(output.contains("canonical branch"));
+    assert!(output.contains("version = 1"));
+    assert!(output.contains("mcp_allow = [\"read\", \"comments\", \"patches\", \"reviews\"]"));
+}
+
+#[test]
+fn emits_each_members_preconfigured_mcp_groups() {
+    let nico = Fixture::entry(Member::Nico, NICO).to_string();
+    let maya = Fixture::entry(Member::Maya, MAYA).to_string();
+
+    assert!(nico.contains("mcp_allow = [\"read\", \"comments\", \"patches\", \"reviews\"]"));
+    assert!(
+        maya.contains("mcp_allow = [\"read\", \"comments\", \"issues\", \"patches\", \"reviews\"]")
+    );
 }
 
 #[test]
@@ -150,6 +176,11 @@ fn prepares_and_extends_a_manifest_safely() {
     assert!(contents.contains("[members.nico]"));
     assert!(contents.contains("[members.maya]"));
     assert!(contents.contains("generation = 4"));
+    assert!(contents.contains("mcp_allow = [\"read\", \"comments\", \"patches\", \"reviews\"]"));
+    assert!(
+        contents
+            .contains("mcp_allow = [\"read\", \"comments\", \"issues\", \"patches\", \"reviews\"]")
+    );
 }
 
 #[test]

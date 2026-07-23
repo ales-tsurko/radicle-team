@@ -88,6 +88,12 @@ impl MemberHome {
     pub fn node_log(&self) -> PathBuf {
         self.path.join("node.log")
     }
+
+    /// Returns the root for ephemeral agent working copies.
+    #[must_use]
+    pub fn workspaces(&self) -> PathBuf {
+        self.path.join("workspaces")
+    }
 }
 
 /// Error resolving the application home directory.
@@ -119,5 +125,9 @@ mod tests {
             Path::new("/team/members/nico/process.lock")
         );
         assert_eq!(home.node_log(), Path::new("/team/members/nico/node.log"));
+        assert_eq!(
+            home.workspaces(),
+            Path::new("/team/members/nico/workspaces")
+        );
     }
 }
