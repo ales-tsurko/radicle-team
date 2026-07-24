@@ -48,22 +48,17 @@ impl Member {
     pub const fn profile(self) -> Profile {
         match self {
             Self::Nico => Profile {
+                member: self,
                 name: "Nico",
                 role: "Junior Developer",
-                description: "A little silly, endlessly curious, and always eager to try \
-                              something. Works fast, occasionally breaks things, and learns even \
-                              faster.",
-                stats: Stats::new(3, 5, 1, 4, 2),
-                special_trait: "Beginner's Luck",
+                tuning: ModelTuning::new(3, 5, 1, 4, 2),
                 mcp_allow: &["read", "comments", "patches", "reactions", "reviews"],
             },
             Self::Maya => Profile {
+                member: self,
                 name: "Maya",
                 role: "Senior Developer",
-                description: "Calm, capable, and difficult to surprise. Turns vague ideas and \
-                              messy code into something that actually ships.",
-                stats: Stats::new(5, 3, 5, 4, 4),
-                special_trait: "Gets It Done",
+                tuning: ModelTuning::new(5, 3, 5, 4, 4),
                 mcp_allow: &[
                     "read",
                     "comments",
@@ -74,30 +69,24 @@ impl Member {
                 ],
             },
             Self::Leon => Profile {
+                member: self,
                 name: "Leon",
                 role: "Software Architect",
-                description: "Sees the whole system while everyone else is looking at one file. \
-                              Thoughtful and patient, but deeply suspicious of shortcuts.",
-                stats: Stats::new(5, 2, 5, 4, 5),
-                special_trait: "Sees Three Moves Ahead",
+                tuning: ModelTuning::new(5, 2, 5, 4, 5),
                 mcp_allow: &["read", "comments", "issues", "reactions", "reviews"],
             },
             Self::Vera => Profile {
+                member: self,
                 name: "Vera",
                 role: "Security Engineer",
-                description: "Sharp, skeptical, and armed with very dry humor. Notices the \
-                              unlocked door everyone else has already walked through.",
-                stats: Stats::new(5, 2, 5, 3, 5),
-                special_trait: "Trust Nothing",
+                tuning: ModelTuning::new(5, 2, 5, 3, 5),
                 mcp_allow: &["read", "comments", "issues", "reactions", "reviews"],
             },
             Self::Nora => Profile {
+                member: self,
                 name: "Nora",
                 role: "UX/UI Designer & Frontend Developer",
-                description: "Empathetic, expressive, and unafraid to challenge the team. Knows \
-                              that technically working is not the same as being usable.",
-                stats: Stats::new(4, 4, 4, 5, 3),
-                special_trait: "Human Perspective",
+                tuning: ModelTuning::new(4, 4, 4, 5, 3),
                 mcp_allow: &[
                     "read",
                     "comments",
@@ -108,13 +97,10 @@ impl Member {
                 ],
             },
             Self::Theo => Profile {
+                member: self,
                 name: "Theo",
                 role: "Researcher",
-                description: "A patient investigator who happily follows strange clues. Sometimes \
-                              disappears down a rabbit hole, but usually returns with the missing \
-                              answer.",
-                stats: Stats::new(5, 1, 5, 4, 5),
-                special_trait: "Leave No Stone Unturned",
+                tuning: ModelTuning::new(5, 1, 5, 4, 5),
                 mcp_allow: &["read", "comments", "issues", "reactions", "reviews"],
             },
         }
@@ -153,39 +139,37 @@ impl FromStr for Member {
     }
 }
 
-/// A member's fixed character profile.
+/// Provider-neutral configuration for one fixed team member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
+    /// Stable team member identity.
+    pub member: Member,
     /// Display name.
     pub name: &'static str,
     /// Team role.
     pub role: &'static str,
-    /// Short character description.
-    pub description: &'static str,
-    /// Character statistics.
-    pub stats: Stats,
-    /// Unique character trait.
-    pub special_trait: &'static str,
+    /// Model behavior preferences interpreted by the agent adapter.
+    pub tuning: ModelTuning,
     /// MCP permission groups used when setup creates this member's binding.
     pub mcp_allow: &'static [&'static str],
 }
 
-/// Character statistics rated from 1 to 5.
+/// Provider-neutral model behavior preferences rated from 1 to 5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stats {
-    /// Model capability and reasoning quality.
+pub struct ModelTuning {
+    /// Preferred model capability and reasoning quality.
     pub intelligence: u8,
-    /// Response and execution speed.
+    /// Preference for response and execution speed.
     pub speed: u8,
-    /// Engineering judgment and autonomy.
+    /// Preferred engineering autonomy and verification depth.
     pub experience: u8,
-    /// Breadth of solution exploration.
+    /// Preferred breadth of solution exploration.
     pub creativity: u8,
-    /// Deliberation and risk awareness.
+    /// Preferred deliberation and risk awareness.
     pub caution: u8,
 }
 
-impl Stats {
+impl ModelTuning {
     const fn new(intelligence: u8, speed: u8, experience: u8, creativity: u8, caution: u8) -> Self {
         Self {
             intelligence,
@@ -243,8 +227,18 @@ mod tests {
 
         for (member, name, role) in expected {
             let profile = member.profile();
+            assert_eq!(profile.member, member);
             assert_eq!(profile.name, name);
             assert_eq!(profile.role, role);
+            for value in [
+                profile.tuning.intelligence,
+                profile.tuning.speed,
+                profile.tuning.experience,
+                profile.tuning.creativity,
+                profile.tuning.caution,
+            ] {
+                assert!((1..=5).contains(&value));
+            }
         }
     }
 

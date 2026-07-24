@@ -695,7 +695,7 @@ mod tests {
 
     use crate::{
         agent::{Agent, Context, McpEndpoint},
-        member::Member,
+        member::{Member, Profile as MemberProfile},
         watcher::{
             Change, Comment, Subject, Target,
             activity::{Activity, Kind},
@@ -775,7 +775,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Agent for NoopAgent {
-        async fn start(&mut self, _mcp: &McpEndpoint) -> Result<(), crate::agent::Error> {
+        async fn start(
+            &mut self,
+            _profile: MemberProfile,
+            _mcp: &McpEndpoint,
+        ) -> Result<(), crate::agent::Error> {
             Ok(())
         }
 

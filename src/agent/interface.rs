@@ -9,15 +9,16 @@ use radicle::{
 };
 use url::Url;
 
-use crate::watcher::{Change, Comment, Subject, Target};
+use crate::{
+    member::Profile,
+    watcher::{Change, Comment, Subject, Target},
+};
 
 /// A backend capable of handling activity addressed to one team member.
 #[async_trait]
 pub trait Agent: Send {
-    /// Starts the adapter with access to the run-scoped MCP server.
-    async fn start(&mut self, _mcp: &McpEndpoint) -> Result<(), Error> {
-        Ok(())
-    }
+    /// Configures and starts the adapter for one member and run-scoped MCP server.
+    async fn start(&mut self, profile: Profile, mcp: &McpEndpoint) -> Result<(), Error>;
 
     /// Handles assignment to an issue or patch review.
     async fn assigned(&mut self, context: Context) -> Result<(), Error>;

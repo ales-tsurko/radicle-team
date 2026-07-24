@@ -225,7 +225,8 @@ mod tests {
     };
 
     use crate::{
-        agent::{Agent, Context, DeliveryId, Error},
+        agent::{Agent, Context, DeliveryId, Error, McpEndpoint},
+        member::Profile,
         watcher::activity::{Activity, Change, Comment, Kind, Subject, Target},
     };
 
@@ -250,6 +251,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Agent for RecordingAgent {
+        async fn start(&mut self, _profile: Profile, _mcp: &McpEndpoint) -> Result<(), Error> {
+            Ok(())
+        }
+
         async fn assigned(&mut self, context: Context) -> Result<(), Error> {
             self.calls.push(Call::Assigned(context));
             Ok(())

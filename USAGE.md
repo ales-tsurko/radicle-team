@@ -5,9 +5,10 @@ node. The same machine can run multiple members as separate processes.
 
 ## Members
 
-All stats are rated from 1 to 5. `INT` represents model capability, `SPD`
-response speed, `EXP` engineering autonomy, `CRE` solution exploration, and
-`CAU` risk-aware deliberation.
+All provider-neutral tuning values are rated from 1 to 5. `INT` represents
+preferred model capability, `SPD` response speed, `EXP` engineering autonomy,
+`CRE` solution exploration, and `CAU` risk-aware deliberation. Agent adapters
+receive these values at startup and map them to provider-specific controls.
 
 - **Nico — Junior Developer.** A little silly, endlessly curious, and eager to
   try something. Works fast, occasionally breaks things, and learns even

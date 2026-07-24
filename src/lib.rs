@@ -31,12 +31,12 @@
 //! fresh working copy and returns only success or failure. Repository actions are separate MCP
 //! calls, so an agent can perform any number of allowed actions during one delivery.
 //!
-//! During `run`, the application also starts a loopback-only MCP server scoped to the
-//! selected repository and member profile. [`agent::Agent::start`] receives its unguessable
-//! capability URL before activity is delivered. Manifest allowlists control the exposed read,
-//! comment, issue, patch, and review methods. Tools are usable only while one delivery is active
-//! and cannot address a different subject. The adapter is stopped before the server and node shut
-//! down.
+//! During `run`, the application also starts a loopback-only MCP server scoped to the selected
+//! repository and member profile. [`agent::Agent::start`] receives the provider-neutral member
+//! profile and its unguessable capability URL before activity is delivered. Manifest allowlists
+//! control the exposed read, comment, issue, patch, and review methods. Tools are usable only while
+//! one delivery is active and cannot address a different subject. The adapter is stopped before
+//! the server and node shut down.
 //!
 //! # State and delivery
 //!

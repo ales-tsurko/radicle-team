@@ -436,6 +436,23 @@ struct LoggingAgent;
 
 #[async_trait::async_trait]
 impl Agent for LoggingAgent {
+    async fn start(
+        &mut self,
+        profile: crate::member::Profile,
+        _mcp: &agent::McpEndpoint,
+    ) -> Result<(), agent::Error> {
+        tracing::info!(
+            member = profile.member.id(),
+            intelligence = profile.tuning.intelligence,
+            speed = profile.tuning.speed,
+            experience = profile.tuning.experience,
+            creativity = profile.tuning.creativity,
+            caution = profile.tuning.caution,
+            "agent adapter started"
+        );
+        Ok(())
+    }
+
     async fn assigned(&mut self, context: AgentContext) -> Result<(), agent::Error> {
         tracing::info!(?context, "assignment received");
         Ok(())
@@ -590,7 +607,10 @@ impl AgentRuntime {
                 );
             }
         };
-        if let Err(error) = agent.start(mcp.endpoint()).await {
+        if let Err(error) = agent
+            .start(application.member.profile(), mcp.endpoint())
+            .await
+        {
             Application::warn_agent_stop(agent.stop().await);
             Application::warn_mcp_stop(mcp.stop().await);
             return Application::finish_after_stop(
