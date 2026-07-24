@@ -209,7 +209,6 @@ pub struct Binding {
     signing_did: Did,
     generation: u64,
     state: BindingState,
-    #[serde(default = "McpAllowlist::legacy")]
     mcp_allow: McpAllowlist,
 }
 
@@ -254,10 +253,6 @@ pub enum BindingState {
 pub struct McpAllowlist(BTreeSet<String>);
 
 impl McpAllowlist {
-    fn legacy() -> Self {
-        Self::from_group("read")
-    }
-
     fn from_entries(entries: Vec<String>) -> Result<Self, UnknownMcpPermission> {
         let mut allowlist = Self::default();
         for entry in entries {
@@ -273,12 +268,6 @@ impl McpAllowlist {
             }
         }
         Ok(allowlist)
-    }
-
-    fn from_group(group: &str) -> Self {
-        let mut allowlist = Self::default();
-        allowlist.extend_group(group);
-        allowlist
     }
 
     fn extend_group(&mut self, group: &str) {
@@ -307,7 +296,7 @@ impl McpAllowlist {
     fn is_group(value: &str) -> bool {
         matches!(
             value,
-            "read" | "comments" | "issues" | "patches" | "reviews"
+            "read" | "comments" | "issues" | "patches" | "reactions" | "reviews"
         )
     }
 
@@ -320,6 +309,7 @@ impl McpAllowlist {
             "comments" => !read && names("comment"),
             "issues" => !read && names("issue"),
             "patches" => !read && method != "merge_patch" && names("patch"),
+            "reactions" => !read && names("reaction"),
             "reviews" => !read && names("review"),
             _ => false,
         }
@@ -519,7 +509,7 @@ mod tests {
     fn parses_repository_manifest() {
         let manifest = Fixture::parse(&format!(
             "version = 1\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
-             \"active\"\n"
+             \"active\"\nmcp_allow = [\"read\"]\n"
         ))
         .expect("manifest should parse");
         let binding = manifest
@@ -538,8 +528,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_missing_mcp_allowlist() {
+        assert!(matches!(
+            Fixture::parse(&format!(
+                "version = 1\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
+                 \"active\"\n"
+            )),
+            Err(Error::Parse(_))
+        ));
+    }
+
+    #[test]
     fn expands_explicit_mcp_groups_without_implicitly_allowing_merge() {
-        for group in ["read", "comments", "issues", "patches", "reviews"] {
+        for group in [
+            "read",
+            "comments",
+            "issues",
+            "patches",
+            "reactions",
+            "reviews",
+        ] {
             let allowlist =
                 McpAllowlist::from_entries(vec![group.to_owned()]).expect("group should be known");
             assert_eq!(
@@ -593,9 +601,16 @@ mod tests {
             assert!(allowlist.allows(method));
             assert!(
                 method == "merge_patch"
-                    || ["read", "comments", "issues", "patches", "reviews"]
-                        .into_iter()
-                        .any(|group| McpAllowlist::belongs_to_group(method, group)),
+                    || [
+                        "read",
+                        "comments",
+                        "issues",
+                        "patches",
+                        "reactions",
+                        "reviews",
+                    ]
+                    .into_iter()
+                    .any(|group| McpAllowlist::belongs_to_group(method, group)),
                 "registered tool '{method}' must follow a permission-group naming convention"
             );
         }
@@ -617,7 +632,7 @@ mod tests {
         assert!(matches!(
             Fixture::parse(&format!(
                 "version = 1\n[members.alice]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
-                 \"active\"\n"
+                 \"active\"\nmcp_allow = []\n"
             )),
             Err(Error::UnknownMember(_))
         ));
@@ -643,8 +658,8 @@ mod tests {
     fn detects_duplicate_active_dids() {
         let bindings = Fixture::parse(&format!(
             "version = 1\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
-             \"active\"\n[members.maya]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
-             \"active\"\n"
+             \"active\"\nmcp_allow = []\n[members.maya]\nsigning_did = \"{NICO}\"\ngeneration = \
+             1\nstate = \"active\"\nmcp_allow = []\n"
         ))
         .expect("bindings should parse");
 
@@ -662,8 +677,8 @@ mod tests {
     fn permits_distinct_active_dids() {
         let bindings = Fixture::parse(&format!(
             "version = 1\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
-             \"active\"\n[members.maya]\nsigning_did = \"{MAYA}\"\ngeneration = 1\nstate = \
-             \"active\"\n"
+             \"active\"\nmcp_allow = []\n[members.maya]\nsigning_did = \"{MAYA}\"\ngeneration = \
+             1\nstate = \"active\"\nmcp_allow = []\n"
         ))
         .expect("bindings should parse");
 
@@ -676,7 +691,7 @@ mod tests {
     fn validates_the_selected_member() {
         let bindings = Fixture::parse(&format!(
             "version = 1\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 3\nstate = \
-             \"active\"\n"
+             \"active\"\nmcp_allow = []\n"
         ))
         .expect("bindings should parse");
         let binding = bindings
@@ -692,7 +707,7 @@ mod tests {
     fn rejects_missing_inactive_and_mismatched_bindings() {
         let bindings = Fixture::parse(&format!(
             "version = 1\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
-             \"inactive\"\n"
+             \"inactive\"\nmcp_allow = []\n"
         ))
         .expect("bindings should parse");
         let nico = NICO.parse().expect("Nico DID should parse");
@@ -712,7 +727,7 @@ mod tests {
 
         let active = Fixture::parse(&format!(
             "version = 1\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
-             \"active\"\n"
+             \"active\"\nmcp_allow = []\n"
         ))
         .expect("bindings should parse");
         assert!(matches!(

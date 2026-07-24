@@ -4,11 +4,7 @@ use std::{error::Error as StdError, fmt, path::PathBuf};
 
 use async_trait::async_trait;
 use radicle::{
-    cob::{
-        EntryId,
-        patch::{ReviewId, RevisionId},
-    },
-    crypto::PublicKey,
+    cob::EntryId,
     identity::{Did, RepoId},
 };
 use url::Url;
@@ -119,33 +115,6 @@ impl Error {
             source: Box::new(source),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LegacyPendingReply {
-    pub(crate) reply: LegacyReply,
-    pub(crate) author: PublicKey,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LegacyReply {
-    pub(crate) body: String,
-    pub(crate) target: LegacyReplyTarget,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum LegacyReplyTarget {
-    Issue {
-        reply_to: Option<EntryId>,
-    },
-    Revision {
-        revision: RevisionId,
-        reply_to: Option<EntryId>,
-    },
-    Review {
-        review: ReviewId,
-        reply_to: Option<EntryId>,
-    },
 }
 
 #[cfg(test)]

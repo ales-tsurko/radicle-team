@@ -5,8 +5,8 @@ use std::{fmt, path::Path, str::FromStr as _, sync::Arc};
 use radicle::{
     cob::{
         EntryId, Op,
-        issue::{self, IssueStream, Issues},
-        patch::{self, PatchStream, Patches},
+        issue::{IssueStream, Issues},
+        patch::{PatchStream, Patches},
         store::access::ReadOnly,
         stream::CobStream as _,
     },
@@ -18,11 +18,7 @@ use radicle::{
 };
 use sqlite::State;
 
-use crate::{
-    agent::{DeliveryId, LegacyReply, LegacyReplyTarget},
-    database::Database,
-    watcher::Subject,
-};
+use crate::{agent::DeliveryId, database::Database};
 
 const JOURNAL_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS mcp_mutations (
@@ -149,40 +145,6 @@ impl Publisher {
                 )
                 .await?;
             self.finish_recovery(author).await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn reconcile_legacy(
-        &self,
-        subject: Subject,
-        delivery: DeliveryId,
-        author: PublicKey,
-        reply: &LegacyReply,
-    ) -> Result<(), String> {
-        let _mutation_guard = self.mutation_lock.lock().await;
-        let pending_reply = reply.clone();
-        let publisher = self.clone();
-        let reply = pending_reply.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            publisher.reconcile_legacy_blocking(subject, delivery, author, reply, false)
-        })
-        .await
-        .map_err(stringify)??;
-        let outcome = if matches!(outcome, LegacyReconciliation::NeedsAuthorization) {
-            self.authorizer.authorize("create_comment").await?;
-            let publisher = self.clone();
-            let reply = pending_reply;
-            tokio::task::spawn_blocking(move || {
-                publisher.reconcile_legacy_blocking(subject, delivery, author, reply, true)
-            })
-            .await
-            .map_err(stringify)??
-        } else {
-            outcome
-        };
-        if let LegacyReconciliation::Ready(author) = outcome {
-            self.announce(author).await.map_err(stringify)?;
         }
         Ok(())
     }
@@ -315,197 +277,6 @@ impl Publisher {
                 "radicle-team mcp {}:{}:{}",
                 key.delivery, key.invocation, key.request
             )
-        }
-    }
-
-    fn reconcile_legacy_blocking(
-        &self,
-        subject: Subject,
-        delivery: DeliveryId,
-        author: PublicKey,
-        reply: LegacyReply,
-        publish: bool,
-    ) -> Result<LegacyReconciliation, String> {
-        let repository = self
-            .profile
-            .storage
-            .repository(self.repository)
-            .map_err(stringify)?;
-        let signer = match self.signer.clone() {
-            Some(signer) => Device::from(signer).boxed(),
-            None => self.profile.signer().map_err(stringify)?,
-        };
-        let current = self.author();
-        let marker = format!("radicle-team reply {delivery}");
-        let recovered = match self.find_legacy(&repository, subject, &marker, author, &reply)? {
-            Some(_operation) if author == current => true,
-            Some(operation) => Self::is_signed(&repository, author, operation)?,
-            None => false,
-        };
-        let author = if recovered {
-            author
-        } else {
-            if !self.legacy_target_exists(&repository, subject, &reply)? {
-                return Ok(LegacyReconciliation::Discard);
-            }
-            if !publish {
-                return Ok(LegacyReconciliation::NeedsAuthorization);
-            }
-            self.publish_legacy(&repository, &signer, subject, &marker, reply)?;
-            current
-        };
-        if author == current {
-            repository.sign_refs(&signer).map_err(stringify)?;
-        }
-        Ok(LegacyReconciliation::Ready(author))
-    }
-
-    fn legacy_target_exists(
-        &self,
-        repository: &radicle::storage::git::Repository,
-        subject: Subject,
-        reply: &LegacyReply,
-    ) -> Result<bool, String> {
-        match (subject, reply.target) {
-            (Subject::Issue(id), LegacyReplyTarget::Issue { reply_to }) => {
-                let issue = Issues::open(repository, ReadOnly)
-                    .map_err(stringify)?
-                    .get(&id)
-                    .map_err(stringify)?;
-                Ok(issue.is_some_and(|issue| {
-                    issue.thread().comment(&reply_to.unwrap_or(*id)).is_some()
-                }))
-            }
-            (Subject::Patch(id), LegacyReplyTarget::Revision { revision, reply_to }) => {
-                let patch = Patches::open(repository, ReadOnly)
-                    .map_err(stringify)?
-                    .get(&id)
-                    .map_err(stringify)?;
-                Ok(patch.is_some_and(|patch| {
-                    LegacyPatchTarget::Revision { revision, reply_to }.exists(&patch)
-                }))
-            }
-            (Subject::Patch(id), LegacyReplyTarget::Review { review, reply_to }) => {
-                let patch = Patches::open(repository, ReadOnly)
-                    .map_err(stringify)?
-                    .get(&id)
-                    .map_err(stringify)?;
-                Ok(patch.is_some_and(|patch| {
-                    LegacyPatchTarget::Review { review, reply_to }.exists(&patch)
-                }))
-            }
-            _ => Ok(false),
-        }
-    }
-
-    fn publish_legacy(
-        &self,
-        repository: &radicle::storage::git::Repository,
-        signer: &radicle::node::device::BoxedDevice,
-        subject: Subject,
-        marker: &str,
-        reply: LegacyReply,
-    ) -> Result<EntryId, String> {
-        match (subject, reply.target) {
-            (Subject::Issue(id), LegacyReplyTarget::Issue { reply_to }) => {
-                let mut issues = issue::Cache::no_cache(repository, signer).map_err(stringify)?;
-                let mut issue = issues.get_mut(&id).map_err(stringify)?;
-                let parent = reply_to.unwrap_or(*id);
-                if issue.thread().comment(&parent).is_none() {
-                    return Err("legacy reply parent is unavailable".to_owned());
-                }
-                issue
-                    .transaction(marker, |tx| tx.comment(reply.body, parent, Vec::new()))
-                    .map_err(stringify)
-            }
-            (Subject::Patch(id), LegacyReplyTarget::Revision { revision, reply_to }) => {
-                let mut patches = patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                let mut patch = patches.get_mut(&id).map_err(stringify)?;
-                let target = LegacyPatchTarget::Revision { revision, reply_to };
-                if !target.exists(&patch) {
-                    return Err("legacy revision reply target is unavailable".to_owned());
-                }
-                patch
-                    .transaction(marker, |tx| {
-                        tx.comment(revision, reply.body, reply_to, None, Vec::new())
-                    })
-                    .map_err(stringify)
-            }
-            (Subject::Patch(id), LegacyReplyTarget::Review { review, reply_to }) => {
-                let mut patches = patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                let mut patch = patches.get_mut(&id).map_err(stringify)?;
-                let target = LegacyPatchTarget::Review { review, reply_to };
-                if !target.exists(&patch) {
-                    return Err("legacy review reply target is unavailable".to_owned());
-                }
-                patch
-                    .transaction(marker, |tx| {
-                        tx.review_comment(review, reply.body, None, reply_to, Vec::new())
-                    })
-                    .map_err(stringify)
-            }
-            _ => Err("legacy reply target does not match its subject".to_owned()),
-        }
-    }
-
-    fn find_legacy(
-        &self,
-        repository: &radicle::storage::git::Repository,
-        subject: Subject,
-        marker: &str,
-        author: PublicKey,
-        reply: &LegacyReply,
-    ) -> Result<Option<EntryId>, String> {
-        match subject {
-            Subject::Issue(id) => {
-                let LegacyReplyTarget::Issue { reply_to } = reply.target else {
-                    return Err("legacy reply target does not match its subject".to_owned());
-                };
-                let expected = issue::Action::Comment {
-                    body: reply.body.clone(),
-                    reply_to: Some(reply_to.unwrap_or(*id)),
-                    embeds: Vec::new(),
-                };
-                self.find_matching_in(
-                    repository,
-                    IssueStream::init(id, repository).all(),
-                    marker,
-                    author,
-                    |operation| operation.actions.len() == 1 && operation.actions.head == expected,
-                )
-            }
-            Subject::Patch(id) => {
-                let expected = match reply.target {
-                    LegacyReplyTarget::Revision { revision, reply_to } => {
-                        patch::Action::RevisionComment {
-                            revision,
-                            location: None,
-                            body: reply.body.clone(),
-                            reply_to,
-                            embeds: Vec::new(),
-                        }
-                    }
-                    LegacyReplyTarget::Review { review, reply_to } => {
-                        patch::Action::ReviewComment {
-                            review,
-                            body: reply.body.clone(),
-                            location: None,
-                            reply_to,
-                            embeds: Vec::new(),
-                        }
-                    }
-                    LegacyReplyTarget::Issue { .. } => {
-                        return Err("legacy reply target does not match its subject".to_owned());
-                    }
-                };
-                self.find_matching_in(
-                    repository,
-                    PatchStream::init(id, repository).all(),
-                    marker,
-                    author,
-                    |operation| operation.actions.len() == 1 && operation.actions.head == expected,
-                )
-            }
         }
     }
 
@@ -653,47 +424,6 @@ pub(crate) struct MutationKey {
 pub(crate) enum MutationValidation {
     Fresh,
     Recovery,
-}
-
-#[derive(Clone, Copy)]
-enum LegacyPatchTarget {
-    Revision {
-        revision: patch::RevisionId,
-        reply_to: Option<EntryId>,
-    },
-    Review {
-        review: patch::ReviewId,
-        reply_to: Option<EntryId>,
-    },
-}
-
-enum LegacyReconciliation {
-    Discard,
-    NeedsAuthorization,
-    Ready(PublicKey),
-}
-
-impl LegacyPatchTarget {
-    fn exists(self, patch: &patch::Patch) -> bool {
-        match self {
-            Self::Revision { revision, reply_to } => {
-                patch.revision(&revision).is_some_and(|revision| {
-                    reply_to.is_none_or(|parent| revision.discussion().comment(&parent).is_some())
-                })
-            }
-            Self::Review { review, reply_to } => patch
-                .revisions()
-                .flat_map(|(_id, revision)| revision.reviews())
-                .find_map(|(_author, candidate)| (candidate.id() == review).then_some(candidate))
-                .is_some_and(|review| {
-                    reply_to.is_none_or(|parent| {
-                        review
-                            .comments()
-                            .any(|(comment, _value)| *comment == parent)
-                    })
-                }),
-        }
-    }
 }
 
 pub(crate) trait Announcer: fmt::Debug + Send + Sync + 'static {

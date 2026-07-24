@@ -8,10 +8,7 @@ pub use crate::{
     agent::interface::{Agent, Context, DeliveryId, Error, McpEndpoint},
     watcher::{Change, Comment, Subject, Target},
 };
-pub(crate) use crate::agent::{
-    interface::{LegacyPendingReply, LegacyReply, LegacyReplyTarget},
-    publisher::{Authorizer, MutationKey, MutationValidation, Publisher},
-};
+pub(crate) use crate::agent::publisher::{Authorizer, MutationKey, MutationValidation, Publisher};
 #[cfg(all(test, not(miri)))]
 pub(crate) use crate::agent::publisher::{Announcer, Error as PublishError};
 

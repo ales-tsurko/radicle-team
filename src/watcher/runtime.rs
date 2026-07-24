@@ -544,9 +544,6 @@ impl PendingActivities {
         agent: &mut (impl Agent + ?Sized),
         runtime: &DeliveryRuntime,
     ) -> Result<(), Error> {
-        if Self::recover_legacy(&activity, scope, state, runtime).await? {
-            return Ok(());
-        }
         Self::deliver_fresh(activity, scope, state, agent, runtime).await
     }
 
@@ -584,38 +581,8 @@ impl PendingActivities {
         state: &ProcessedActivities,
         runtime: &DeliveryRuntime,
     ) -> Result<(), Error> {
-        if Self::recover_legacy(&activity, scope, state, runtime).await? {
-            return Ok(());
-        }
         let delivery = activity.delivery_id();
         Self::checkpoint_delivery(delivery, scope, state, runtime).await
-    }
-
-    async fn recover_legacy(
-        activity: &Activity,
-        scope: ScanScope,
-        state: &ProcessedActivities,
-        runtime: &DeliveryRuntime,
-    ) -> Result<bool, Error> {
-        let delivery = activity.delivery_id();
-        let Some(pending) = state
-            .pending_reply(
-                scope.repository,
-                scope.object,
-                delivery.operation,
-                delivery.action,
-            )
-            .await?
-        else {
-            return Ok(false);
-        };
-        runtime
-            .scope
-            .reconcile_legacy(activity.subject, delivery, &pending)
-            .await
-            .map_err(Error::PublicationRecovery)?;
-        Self::checkpoint_delivery(delivery, scope, state, runtime).await?;
-        Ok(true)
     }
 
     async fn checkpoint_delivery(

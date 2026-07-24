@@ -155,20 +155,6 @@ impl DeliveryScope {
         Ok(())
     }
 
-    pub(crate) async fn reconcile_legacy(
-        &self,
-        subject: Subject,
-        delivery: crate::agent::DeliveryId,
-        pending: &crate::agent::LegacyPendingReply,
-    ) -> Result<(), String> {
-        let publisher = self
-            .publisher
-            .as_ref()
-            .ok_or_else(|| "publisher is unavailable".to_owned())?;
-        Box::pin(publisher.reconcile_legacy(subject, delivery, pending.author, &pending.reply))
-            .await
-    }
-
     pub(super) async fn access(&self, request: &SubjectRequest) -> Result<DeliveryAccess, String> {
         let access = self.access_current().await?;
         let context = access.context();
@@ -249,6 +235,8 @@ pub(super) enum ServiceError {
     InvalidThread,
     #[error("diff exceeds the response size limit")]
     DiffLimit,
+    #[error("embed exceeds the response size limit")]
+    EmbedLimit,
     #[error("failed to open Radicle repository: {0}")]
     Repository(#[from] radicle::storage::RepositoryError),
     #[error("failed to read Radicle collaborative objects: {0}")]

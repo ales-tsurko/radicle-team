@@ -141,17 +141,17 @@ version = 1
 signing_did = "did:key:z6Mk..."
 generation = 1
 state = "active"
-mcp_allow = ["read", "comments", "patches", "reviews"]
+mcp_allow = ["read", "comments", "patches", "reactions", "reviews"]
 ```
 
 `mcp_allow` accepts exact MCP method names and the fixed `read`, `comments`,
-`issues`, `patches`, and `reviews` groups. The `patches` group does not include
-`merge_patch`; allow that method explicitly. Omitting `mcp_allow` preserves the
-legacy read tools, while an empty list disables every tool.
+`issues`, `patches`, `reactions`, and `reviews` groups. The `patches` group does
+not include `merge_patch`; allow that method explicitly. `mcp_allow` is required,
+while an empty list disables every tool.
 
 Groups are derived from the tools registered by the MCP server: `get_*` and
 `list_*` tools are reads; non-read tools are grouped by the `comment`, `issue`,
-`patch`, or `review` component in their name. MCP `tools/list` is the
+`patch`, `reaction`, or `review` component in their name. MCP `tools/list` is the
 authoritative method list.
 
 Invocation-specific options remain command-line arguments:

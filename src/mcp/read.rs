@@ -2,9 +2,11 @@
 
 use std::str::FromStr as _;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use radicle::{
     cob::{
-        EntryId, ObjectId, Op,
+        Embed, EntryId, ObjectId, Op,
+        common::Uri,
         issue::{Action as IssueAction, IssueStream, Issues, TYPENAME as ISSUE_TYPENAME},
         patch::{self, Action as PatchAction, PatchStream, Patches, TYPENAME as PATCH_TYPENAME},
         store::access::ReadOnly,
@@ -17,9 +19,10 @@ use serde_json::Value;
 
 use crate::mcp::{
     protocol::{
-        DiffDocument, DiffFile, DiffLine, DiffRequest, EntityRequest, EntryRequest, PatchEntity,
-        PatchEntityRequest, SubjectDocument, SubjectKind, SubjectRequest, ThreadKind, TimelinePage,
-        TimelineRequest, parse_entry, parse_object,
+        DiffDocument, DiffFile, DiffLine, DiffRequest, EmbedDocument, EmbedReadRequest,
+        EntityRequest, EntryRequest, MAX_EMBED_BYTES, PatchEntity, PatchEntityRequest,
+        SubjectDocument, SubjectKind, SubjectRequest, ThreadKind, TimelinePage, TimelineRequest,
+        parse_entry, parse_object,
     },
     server::ServiceError,
     tools::ToolService,
@@ -316,6 +319,83 @@ impl ToolService {
             head: revision.head().to_string(),
             files,
         })
+    }
+
+    pub(super) fn embed(&self, request: EmbedReadRequest) -> Result<EmbedDocument, ServiceError> {
+        let oid = request.oid()?;
+        let (repository, subject) =
+            self.operation_source(&request.subject, request.subject.kind)?;
+        let reference = EmbedReference(Uri::from(oid));
+        let referenced = match request.subject.kind {
+            SubjectKind::Issue => {
+                reference.exists_in_issues(IssueStream::init(subject, &repository).all()?)?
+            }
+            SubjectKind::Patch => {
+                reference.exists_in_patches(PatchStream::init(subject, &repository).all()?)?
+            }
+        };
+        if !referenced {
+            return Err(ServiceError::NotFound(request.content));
+        }
+        let raw_oid = oid.into();
+        let (size, kind) = repository.backend.odb()?.read_header(raw_oid)?;
+        if kind != git2::ObjectType::Blob {
+            return Err(ServiceError::NotFound(request.content));
+        }
+        if size > MAX_EMBED_BYTES {
+            return Err(ServiceError::EmbedLimit);
+        }
+        let blob = repository.backend.find_blob(raw_oid)?;
+        Ok(EmbedDocument {
+            content_base64: BASE64_STANDARD.encode(blob.content()),
+        })
+    }
+}
+
+struct EmbedReference(Uri);
+
+impl EmbedReference {
+    fn exists_in_issues(
+        &self,
+        operations: impl Iterator<Item = Result<Op<IssueAction>, radicle::cob::stream::error::Ops>>,
+    ) -> Result<bool, ServiceError> {
+        self.exists_in(operations, |action| match action {
+            IssueAction::Comment { embeds, .. } | IssueAction::CommentEdit { embeds, .. } => embeds,
+            _ => &[],
+        })
+    }
+
+    fn exists_in_patches(
+        &self,
+        operations: impl Iterator<Item = Result<Op<PatchAction>, radicle::cob::stream::error::Ops>>,
+    ) -> Result<bool, ServiceError> {
+        self.exists_in(operations, |action| match action {
+            PatchAction::ReviewComment { embeds, .. }
+            | PatchAction::ReviewCommentEdit { embeds, .. }
+            | PatchAction::RevisionComment { embeds, .. }
+            | PatchAction::RevisionCommentEdit { embeds, .. }
+            | PatchAction::RevisionEdit { embeds, .. } => embeds,
+            PatchAction::ReviewEdit(edit) => edit.embeds().map(Vec::as_slice).unwrap_or_default(),
+            _ => &[],
+        })
+    }
+
+    fn exists_in<A>(
+        &self,
+        operations: impl Iterator<Item = Result<Op<A>, radicle::cob::stream::error::Ops>>,
+        embeds: for<'a> fn(&'a A) -> &'a [Embed<Uri>],
+    ) -> Result<bool, ServiceError> {
+        for operation in operations {
+            if operation
+                .map_err(ServiceError::Operation)?
+                .actions
+                .iter()
+                .any(|action| embeds(action).iter().any(|embed| embed.content == self.0))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 

@@ -17,16 +17,16 @@ use crate::mcp::{
     protocol::{
         CommentOperation, CommentTargetKind, CommentWriteRequest, CreateIssueRequest,
         CreatePatchRequest, Document, EditIssueRequest, EditPatchRequest, IssueUpdate,
-        MergePatchRequest, PatchCommitAction, PatchCommits, PatchUpdate, ResolveCommentRequest,
-        ReviewWriteRequest, SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind,
-        SubjectRequest, SubjectUpdate, UpdatePatchRequest, import_commits, mutation_identity,
-        parse_dids, parse_entry_string, parse_issue_state, parse_labels, parse_location,
-        parse_object_string, parse_patch_commits, parse_patch_state, parse_review, parse_revision,
-        parse_subject_request, parse_verdict, require_kind, stringify, validate_code_location,
-        validate_merge, write_result,
+        MergePatchRequest, PatchCommitAction, PatchCommits, PatchUpdate, PreparedEmbed,
+        ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest, SetStateRequest,
+        SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest, SubjectUpdate,
+        UpdatePatchRequest, import_commits, mutation_identity, parse_dids, parse_entry_string,
+        parse_issue_state, parse_labels, parse_location, parse_object_string, parse_patch_commits,
+        parse_patch_state, parse_review, parse_revision, parse_subject_request, parse_verdict,
+        require_kind, stringify, validate_code_location, validate_merge, write_result,
     },
     recovery::{
-        CommentRecovery, comment_applied, comment_operation, find_review, issue_create_operation,
+        CommentRecovery, ReactionRecovery, find_review, issue_create_operation,
         issue_edit_operation, issue_update_operation, merge_operation, patch_commit_operation,
         patch_edit_operation, patch_update_operation, review_mutation_operation,
         review_resolution_operation,
@@ -111,6 +111,7 @@ impl ToolService {
             .transpose()?;
         let body = request.body.clone();
         let location = request.location.map(parse_location).transpose()?;
+        let embeds = PreparedEmbed::prepare(request.embeds)?;
         if matches!(operation, CommentOperation::Create | CommentOperation::Edit) && body.is_none()
         {
             return Err("body is required".to_owned());
@@ -120,9 +121,13 @@ impl ToolService {
         {
             return Err("comment is required".to_owned());
         }
+        if matches!(operation, CommentOperation::Redact) && !embeds.is_empty() {
+            return Err("redacted comments cannot include embeds".to_owned());
+        }
         let kind = request.subject.kind;
         let target = request.target;
         let expected_body = body.clone();
+        let expected_embeds = PreparedEmbed::references(&embeds);
         let id = self
             .mutate(
                 method,
@@ -144,17 +149,18 @@ impl ToolService {
                         {
                             return Err("reply parent was not found".to_owned());
                         }
+                        let embeds = PreparedEmbed::store(&embeds, repository)?;
                         issue
                             .transaction(marker, |tx| match operation {
                                 CommentOperation::Create => tx.comment(
                                     body.expect("body was validated"),
                                     reply_to.unwrap_or(*subject),
-                                    Vec::new(),
+                                    embeds,
                                 ),
                                 CommentOperation::Edit => tx.edit_comment(
                                     comment.expect("comment was validated"),
                                     body.expect("body was validated"),
-                                    Vec::new(),
+                                    embeds,
                                 ),
                                 CommentOperation::Redact => {
                                     tx.redact_comment(comment.expect("comment was validated"))
@@ -187,6 +193,7 @@ impl ToolService {
                         if let Some(location) = location.as_ref() {
                             validate_code_location(repository, revision_value, location)?;
                         }
+                        let embeds = PreparedEmbed::store(&embeds, repository)?;
                         patch
                             .transaction(marker, |tx| match operation {
                                 CommentOperation::Create => tx.comment(
@@ -194,13 +201,13 @@ impl ToolService {
                                     body.expect("body was validated"),
                                     reply_to,
                                     location,
-                                    Vec::new(),
+                                    embeds,
                                 ),
                                 CommentOperation::Edit => tx.comment_edit(
                                     revision,
                                     comment.expect("comment was validated"),
                                     body.expect("body was validated"),
-                                    Vec::new(),
+                                    embeds,
                                 ),
                                 CommentOperation::Redact => tx.comment_redact(
                                     revision,
@@ -251,6 +258,7 @@ impl ToolService {
                                 .ok_or_else(|| "review was not found".to_owned())?;
                             validate_code_location(repository, revision, location)?;
                         }
+                        let embeds = PreparedEmbed::store(&embeds, repository)?;
                         patch
                             .transaction(marker, |tx| match operation {
                                 CommentOperation::Create => tx.review_comment(
@@ -258,13 +266,13 @@ impl ToolService {
                                     body.expect("body was validated"),
                                     location,
                                     reply_to,
-                                    Vec::new(),
+                                    embeds,
                                 ),
                                 CommentOperation::Edit => tx.edit_review_comment(
                                     review,
                                     comment.expect("comment was validated"),
                                     body.expect("body was validated"),
-                                    Vec::new(),
+                                    embeds,
                                 ),
                                 CommentOperation::Redact => tx.redact_review_comment(
                                     review,
@@ -289,13 +297,12 @@ impl ToolService {
                         },
                         operation,
                         body: expected_body.as_deref(),
+                        embeds: &expected_embeds,
                     };
                     match validation {
-                        crate::agent::MutationValidation::Fresh => {
-                            comment_applied(repository, recovery)
-                        }
+                        crate::agent::MutationValidation::Fresh => recovery.applied(repository),
                         crate::agent::MutationValidation::Recovery => {
-                            comment_operation(repository, recovered, recovery)
+                            recovery.operation_recorded(repository, recovered)
                         }
                     }
                 },
@@ -356,6 +363,137 @@ impl ToolService {
                             })
                             .is_some_and(|comment| comment.is_resolved() == resolved)
                     }))
+                },
+            )
+            .await?;
+        write_result(id)
+    }
+
+    pub(super) async fn reaction_write(
+        &self,
+        request: ReactionWriteRequest,
+    ) -> Result<Json<Document>, String> {
+        let request_id = mutation_identity("set_reaction", &request)?;
+        let subject = parse_object_string(&request.subject.subject)?;
+        let entity = request
+            .entity
+            .as_deref()
+            .map(parse_entry_string)
+            .transpose()?;
+        let comment = request
+            .comment
+            .as_deref()
+            .map(parse_entry_string)
+            .transpose()?;
+        let reaction = request.parsed_reaction()?;
+        let location = request.location.map(parse_location).transpose()?;
+        let kind = request.subject.kind;
+        let target = request.target;
+        let active = request.active;
+        let expected_location = location.clone();
+        let id = self
+            .mutate(
+                "set_reaction",
+                request_id,
+                move |repository, signer, marker| match (kind, target) {
+                    (SubjectKind::Issue, CommentTargetKind::Issue) => {
+                        if entity.is_some() || location.is_some() {
+                            return Err(
+                                "issue reactions do not accept entity or location".to_owned()
+                            );
+                        }
+                        let comment = comment.unwrap_or(*subject);
+                        let mut issues =
+                            issue::Cache::no_cache(repository, signer).map_err(stringify)?;
+                        let mut issue = issues.get_mut(&subject).map_err(stringify)?;
+                        if issue.thread().comment(&comment).is_none() {
+                            return Err("reaction target was not found".to_owned());
+                        }
+                        issue
+                            .transaction(marker, |tx| tx.react(comment, reaction, active))
+                            .map_err(stringify)
+                    }
+                    (SubjectKind::Patch, CommentTargetKind::Revision) => {
+                        let revision = parse_revision(
+                            entity.ok_or_else(|| "entity revision is required".to_owned())?,
+                        )?;
+                        if comment.is_some() && location.is_some() {
+                            return Err(
+                                "revision comment reactions do not accept location".to_owned()
+                            );
+                        }
+                        let mut patches =
+                            patch::Cache::no_cache(repository, signer).map_err(stringify)?;
+                        let mut patch = patches.get_mut(&subject).map_err(stringify)?;
+                        let revision_value = patch
+                            .revision(&revision)
+                            .ok_or_else(|| "revision was not found".to_owned())?;
+                        if let Some(comment) = comment
+                            && revision_value.discussion().comment(&comment).is_none()
+                        {
+                            return Err("reaction target was not found".to_owned());
+                        }
+                        if let Some(location) = location.as_ref() {
+                            validate_code_location(repository, revision_value, location)?;
+                        }
+                        patch
+                            .transaction(marker, |tx| match comment {
+                                Some(comment) => {
+                                    tx.comment_react(revision, comment, reaction, active)
+                                }
+                                None => tx.react(revision, reaction, location, active),
+                            })
+                            .map_err(stringify)
+                    }
+                    (SubjectKind::Patch, CommentTargetKind::Review) => {
+                        if location.is_some() {
+                            return Err("review reactions do not accept location".to_owned());
+                        }
+                        let review = parse_review(
+                            entity.ok_or_else(|| "entity review is required".to_owned())?,
+                        )?;
+                        let mut patches =
+                            patch::Cache::no_cache(repository, signer).map_err(stringify)?;
+                        let mut patch = patches.get_mut(&subject).map_err(stringify)?;
+                        let review_value = find_review(&patch, review)
+                            .ok_or_else(|| "review was not found".to_owned())?;
+                        if let Some(comment) = comment
+                            && !review_value
+                                .comments()
+                                .any(|(candidate, _value)| *candidate == comment)
+                        {
+                            return Err("reaction target was not found".to_owned());
+                        }
+                        patch
+                            .transaction(marker, |tx| match comment {
+                                Some(comment) => {
+                                    tx.react_review_comment(review, comment, reaction, active)
+                                }
+                                None => tx.review_react(review, reaction, active),
+                            })
+                            .map_err(stringify)
+                    }
+                    _ => Err("reaction target does not match subject".to_owned()),
+                },
+                move |repository, author, operation, validation| {
+                    let recovery = ReactionRecovery {
+                        kind,
+                        target,
+                        subject,
+                        entity,
+                        comment,
+                        reaction,
+                        location: expected_location.as_ref(),
+                        active,
+                    };
+                    match validation {
+                        crate::agent::MutationValidation::Fresh => {
+                            recovery.applied(repository, author)
+                        }
+                        crate::agent::MutationValidation::Recovery => {
+                            recovery.operation_recorded(repository, operation)
+                        }
+                    }
                 },
             )
             .await?;
@@ -902,10 +1040,12 @@ impl ToolService {
         let verdict = parse_verdict(request.verdict.as_deref())?;
         let summary = request.summary;
         let labels = parse_labels(request.labels)?;
+        let embeds = PreparedEmbed::prepare(request.embeds)?;
         let expected_review = review;
         let expected_verdict = verdict;
         let expected_summary = summary.clone();
         let expected_labels = labels.clone();
+        let expected_embeds = PreparedEmbed::references(&embeds);
         if edit && review.is_none() {
             return Err("review is required".to_owned());
         }
@@ -917,6 +1057,11 @@ impl ToolService {
         }
         if !edit && verdict.is_none() && summary.is_none() {
             return Err("verdict or summary is required".to_owned());
+        }
+        if !edit && !embeds.is_empty() {
+            return Err(
+                "create_review cannot include embeds; create it, then use edit_review".to_owned(),
+            );
         }
         let id = self
             .mutate(
@@ -945,15 +1090,17 @@ impl ToolService {
                             return Err("revision was already reviewed by this author".to_owned());
                         }
                     }
+                    let embeds = PreparedEmbed::store(&embeds, repository)?;
                     patch
                         .transaction(marker, |tx| {
                             if edit {
+                                tx.embed(embeds.clone())?;
                                 tx.review_edit(
                                     review.expect("review was validated"),
                                     verdict,
                                     summary.expect("summary was validated"),
                                     labels,
-                                    Vec::new(),
+                                    embeds,
                                 )
                             } else {
                                 tx.review(
@@ -978,6 +1125,7 @@ impl ToolService {
                             expected_verdict,
                             expected_summary.as_deref(),
                             &expected_labels,
+                            &expected_embeds,
                         );
                     }
                     let patch = Patches::open(repository, ReadOnly)
@@ -1001,6 +1149,7 @@ impl ToolService {
                             review.verdict() == expected_verdict
                                 && review.summary()
                                     == expected_summary.as_deref().unwrap_or_default()
+                                && review.embeds() == expected_embeds
                                 && review.labels().count() == expected_labels.len()
                                 && expected_labels
                                     .iter()

@@ -1,7 +1,8 @@
 //! Validation of journaled mutations during replay.
 
 use radicle::cob::{
-    EntryId, ObjectId, Op,
+    Embed, EntryId, ObjectId, Op,
+    common::Uri,
     issue::{self, Action as IssueAction, IssueStream, Issues},
     patch::{self, Action as PatchAction, PatchStream, Patches},
     store::access::ReadOnly,
@@ -123,80 +124,415 @@ pub(super) struct CommentRecovery<'a> {
     pub(super) comment: EntryId,
     pub(super) operation: CommentOperation,
     pub(super) body: Option<&'a str>,
+    pub(super) embeds: &'a [Embed<Uri>],
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ReactionRecovery<'a> {
+    pub(super) kind: SubjectKind,
+    pub(super) target: CommentTargetKind,
+    pub(super) subject: ObjectId,
+    pub(super) entity: Option<EntryId>,
+    pub(super) comment: Option<EntryId>,
+    pub(super) reaction: radicle::cob::Reaction,
+    pub(super) location: Option<&'a radicle::cob::CodeLocation>,
+    pub(super) active: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PatchReactionTarget {
+    Revision(patch::RevisionId),
+    Review(patch::ReviewId),
+}
+
+#[derive(Clone, Copy)]
+enum ReactionOperationTarget {
+    Issue(EntryId),
+    Patch(PatchReactionTarget),
+    Missing(&'static str),
+    Invalid,
+}
+
+impl ReactionOperationTarget {
+    fn revision(entity: Option<EntryId>) -> Self {
+        entity
+            .map(patch::RevisionId::from)
+            .map(PatchReactionTarget::Revision)
+            .map(Self::Patch)
+            .unwrap_or(Self::Missing("entity revision is required"))
+    }
+
+    fn review(entity: Option<EntryId>) -> Self {
+        entity
+            .map(patch::ReviewId::from)
+            .map(PatchReactionTarget::Review)
+            .map(Self::Patch)
+            .unwrap_or(Self::Missing("entity review is required"))
+    }
+
+    fn recorded(
+        self,
+        recovery: &ReactionRecovery<'_>,
+        repository: &CobRepository,
+        operation: EntryId,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Issue(comment) => operation_has_action(
+                find_issue_operation(repository, recovery.subject, operation),
+                |action| recovery.issue_action_matches(action, comment),
+            ),
+            Self::Patch(target) => operation_has_action(
+                find_patch_operation(repository, recovery.subject, operation),
+                |action| recovery.patch_action_matches(action, target),
+            ),
+            Self::Missing(message) => Err(message.to_owned()),
+            Self::Invalid => Ok(false),
+        }
+    }
 }
 
 type CobRepository = radicle::storage::git::Repository;
-type CommentBody = Result<Option<String>, String>;
+type CommentStateResult = Result<Option<CommentState>, String>;
 
-pub(super) fn comment_applied(
-    repository: &CobRepository,
-    recovery: CommentRecovery<'_>,
-) -> Result<bool, String> {
-    let actual = match (recovery.kind, recovery.target) {
-        (SubjectKind::Issue, CommentTargetKind::Issue) => issue_body(repository, &recovery),
-        (SubjectKind::Patch, CommentTargetKind::Revision) => revision_body(repository, &recovery),
-        (SubjectKind::Patch, CommentTargetKind::Review) => review_body(repository, &recovery),
-        _ => return Ok(false),
-    };
-    actual.map(|actual| comment_body_applied(recovery.operation, recovery.body, actual.as_deref()))
+struct CommentState {
+    body: String,
+    embeds: Vec<Embed<Uri>>,
 }
 
-pub(super) fn comment_operation(
-    repository: &CobRepository,
-    operation: EntryId,
-    recovery: CommentRecovery<'_>,
-) -> Result<bool, String> {
-    match (recovery.kind, recovery.target) {
-        (SubjectKind::Issue, CommentTargetKind::Issue) => {
-            let expected = recorded_comment(&recovery);
-            Ok(
-                find_issue_operation(repository, recovery.subject, operation)?.is_some_and(
-                    |operation| {
-                        operation
-                            .actions
-                            .iter()
-                            .filter_map(issue_comment)
-                            .any(|actual| actual == expected)
-                    },
-                ),
-            )
+impl CommentState {
+    fn from_comment<L>(comment: &radicle::cob::thread::Comment<L>) -> Self {
+        Self {
+            body: comment.body().to_owned(),
+            embeds: comment.embeds().to_vec(),
         }
-        (SubjectKind::Patch, CommentTargetKind::Revision) => patch_comment_operation(
-            repository,
-            operation,
-            &recovery,
-            PatchCommentTarget::Revision,
-        ),
-        (SubjectKind::Patch, CommentTargetKind::Review) => {
-            patch_comment_operation(repository, operation, &recovery, PatchCommentTarget::Review)
+    }
+}
+
+impl<'a> CommentRecovery<'a> {
+    pub(super) fn applied(&self, repository: &CobRepository) -> Result<bool, String> {
+        let actual = match (self.kind, self.target) {
+            (SubjectKind::Issue, CommentTargetKind::Issue) => self.issue_state(repository),
+            (SubjectKind::Patch, CommentTargetKind::Revision) => self.revision_state(repository),
+            (SubjectKind::Patch, CommentTargetKind::Review) => self.review_state(repository),
+            _ => return Ok(false),
+        };
+        actual.map(|actual| self.state_matches(actual.as_ref()))
+    }
+
+    pub(super) fn operation_recorded(
+        &self,
+        repository: &CobRepository,
+        operation: EntryId,
+    ) -> Result<bool, String> {
+        match (self.kind, self.target) {
+            (SubjectKind::Issue, CommentTargetKind::Issue) => {
+                let expected = self.recorded();
+                Ok(
+                    find_issue_operation(repository, self.subject, operation)?.is_some_and(
+                        |operation| {
+                            operation
+                                .actions
+                                .iter()
+                                .filter_map(issue_comment)
+                                .any(|actual| actual == expected)
+                        },
+                    ),
+                )
+            }
+            (SubjectKind::Patch, CommentTargetKind::Revision) => {
+                self.patch_operation(repository, operation, PatchCommentTarget::Revision)
+            }
+            (SubjectKind::Patch, CommentTargetKind::Review) => {
+                self.patch_operation(repository, operation, PatchCommentTarget::Review)
+            }
+            _ => Ok(false),
         }
-        _ => Ok(false),
+    }
+
+    fn recorded(&self) -> RecordedComment<'_> {
+        match self.operation {
+            CommentOperation::Create => {
+                RecordedComment::Create(self.body.expect("body was validated"), self.embeds)
+            }
+            CommentOperation::Edit => RecordedComment::Edit(
+                self.comment,
+                self.body.expect("body was validated"),
+                self.embeds,
+            ),
+            CommentOperation::Redact => RecordedComment::Redact(self.comment),
+        }
+    }
+
+    fn patch_operation(
+        &self,
+        repository: &CobRepository,
+        operation: EntryId,
+        target: PatchCommentTarget,
+    ) -> Result<bool, String> {
+        let entity = self
+            .entity
+            .ok_or_else(|| "comment entity is required".to_owned())?;
+        let expected = RecordedPatchComment {
+            entity: match target {
+                PatchCommentTarget::Revision => {
+                    PatchCommentEntity::Revision(patch::RevisionId::from(entity))
+                }
+                PatchCommentTarget::Review => {
+                    PatchCommentEntity::Review(patch::ReviewId::from(entity))
+                }
+            },
+            comment: self.recorded(),
+        };
+        Ok(
+            find_patch_operation(repository, self.subject, operation)?.is_some_and(|operation| {
+                operation
+                    .actions
+                    .iter()
+                    .filter_map(|action| {
+                        revision_comment(action).or_else(|| review_comment(action))
+                    })
+                    .any(|actual| actual == expected)
+            }),
+        )
+    }
+
+    fn state_matches(&self, actual: Option<&CommentState>) -> bool {
+        match self.operation {
+            CommentOperation::Create | CommentOperation::Edit => actual.is_some_and(|actual| {
+                actual.body == self.body.expect("body was validated")
+                    && actual.embeds == self.embeds
+            }),
+            CommentOperation::Redact => actual.is_none(),
+        }
+    }
+
+    fn issue_state(&self, repository: &CobRepository) -> CommentStateResult {
+        Ok(load_issue(repository, self.subject)?.and_then(|issue| {
+            issue
+                .thread()
+                .comment(&self.comment)
+                .map(CommentState::from_comment)
+        }))
+    }
+
+    fn revision_state(&self, repository: &CobRepository) -> CommentStateResult {
+        let revision = self
+            .entity
+            .ok_or_else(|| "entity revision is required".to_owned())?;
+        Ok(load_patch(repository, self.subject)?.and_then(|patch| {
+            patch
+                .revision(&patch::RevisionId::from(revision))
+                .and_then(|value| value.discussion().comment(&self.comment))
+                .map(CommentState::from_comment)
+        }))
+    }
+
+    fn review_state(&self, repository: &CobRepository) -> CommentStateResult {
+        let review = self
+            .entity
+            .ok_or_else(|| "entity review is required".to_owned())?;
+        Ok(load_patch(repository, self.subject)?.and_then(|patch| {
+            find_review(&patch, patch::ReviewId::from(review)).and_then(|review| {
+                review
+                    .comments()
+                    .find(|(candidate, _value)| **candidate == self.comment)
+                    .map(|(_candidate, value)| CommentState::from_comment(value))
+            })
+        }))
+    }
+}
+
+impl ReactionRecovery<'_> {
+    pub(super) fn operation_recorded(
+        &self,
+        repository: &CobRepository,
+        operation: EntryId,
+    ) -> Result<bool, String> {
+        self.operation_target()
+            .recorded(self, repository, operation)
+    }
+
+    fn operation_target(&self) -> ReactionOperationTarget {
+        match (self.kind, self.target) {
+            (SubjectKind::Issue, CommentTargetKind::Issue) => {
+                ReactionOperationTarget::Issue(self.comment.unwrap_or(*self.subject))
+            }
+            (SubjectKind::Patch, CommentTargetKind::Revision) => {
+                ReactionOperationTarget::revision(self.entity)
+            }
+            (SubjectKind::Patch, CommentTargetKind::Review) => {
+                ReactionOperationTarget::review(self.entity)
+            }
+            _ => ReactionOperationTarget::Invalid,
+        }
+    }
+
+    fn issue_action_matches(&self, action: &IssueAction, comment: EntryId) -> bool {
+        matches!(
+            action,
+            IssueAction::CommentReact {
+                id,
+                reaction,
+                active,
+            } if *id == comment
+                && *reaction == self.reaction
+                && *active == self.active
+        )
+    }
+
+    fn patch_action_matches(&self, action: &PatchAction, target: PatchReactionTarget) -> bool {
+        match (target, self.comment) {
+            (PatchReactionTarget::Revision(revision), Some(comment)) => matches!(
+                action,
+                PatchAction::RevisionCommentReact {
+                    revision: actual_revision,
+                    comment: actual_comment,
+                    reaction,
+                    active,
+                } if *actual_revision == revision
+                    && *actual_comment == comment
+                    && *reaction == self.reaction
+                    && *active == self.active
+            ),
+            (PatchReactionTarget::Revision(revision), None) => matches!(
+                action,
+                PatchAction::RevisionReact {
+                    revision: actual_revision,
+                    location,
+                    reaction,
+                    active,
+                } if *actual_revision == revision
+                    && location.as_ref() == self.location
+                    && *reaction == self.reaction
+                    && *active == self.active
+            ),
+            (PatchReactionTarget::Review(review), Some(comment)) => matches!(
+                    action,
+                    PatchAction::ReviewCommentReact {
+                        review: actual_review,
+                        comment: actual_comment,
+                        reaction,
+                        active,
+                    } if *actual_review == review
+                        && *actual_comment == comment
+                        && *reaction == self.reaction
+                        && *active == self.active
+            ),
+            (PatchReactionTarget::Review(review), None) => matches!(
+                action,
+                PatchAction::ReviewReact {
+                    review: actual_review,
+                    reaction,
+                    active,
+                } if *actual_review == review
+                    && *reaction == self.reaction
+                    && *active == self.active
+            ),
+        }
+    }
+
+    pub(super) fn applied(
+        &self,
+        repository: &CobRepository,
+        author: radicle::crypto::PublicKey,
+    ) -> Result<bool, String> {
+        match (self.kind, self.target) {
+            (SubjectKind::Issue, CommentTargetKind::Issue) => {
+                let comment = self.comment.unwrap_or(*self.subject);
+                Ok(load_issue(repository, self.subject)?
+                    .and_then(|issue| {
+                        issue.thread().comment(&comment).map(|comment| {
+                            comment
+                                .reactions()
+                                .get(&self.reaction)
+                                .is_some_and(|authors| authors.contains(&&author))
+                                == self.active
+                        })
+                    })
+                    .unwrap_or(false))
+            }
+            (SubjectKind::Patch, CommentTargetKind::Revision) => {
+                let revision = patch::RevisionId::from(
+                    self.entity
+                        .ok_or_else(|| "entity revision is required".to_owned())?,
+                );
+                Ok(load_patch(repository, self.subject)?
+                    .and_then(|patch| {
+                        patch
+                            .revision(&revision)
+                            .map(|revision| match self.comment {
+                                Some(comment) => revision
+                                    .discussion()
+                                    .comment(&comment)
+                                    .is_some_and(|comment| {
+                                        comment
+                                            .reactions()
+                                            .get(&self.reaction)
+                                            .is_some_and(|authors| authors.contains(&&author))
+                                            == self.active
+                                    }),
+                                None => {
+                                    revision
+                                        .reactions()
+                                        .iter()
+                                        .find_map(|(location, reactions)| {
+                                            (location.as_ref() == self.location)
+                                                .then_some(reactions)
+                                        })
+                                        .is_some_and(|reactions| {
+                                            reactions.contains(&(author, self.reaction))
+                                        })
+                                        == self.active
+                                }
+                            })
+                    })
+                    .unwrap_or(false))
+            }
+            (SubjectKind::Patch, CommentTargetKind::Review) => {
+                let review = patch::ReviewId::from(
+                    self.entity
+                        .ok_or_else(|| "entity review is required".to_owned())?,
+                );
+                Ok(load_patch(repository, self.subject)?
+                    .and_then(|patch| {
+                        find_review(&patch, review).map(|review| match self.comment {
+                            Some(comment) => review
+                                .comments()
+                                .find_map(|(candidate, value)| {
+                                    (*candidate == comment).then_some(value)
+                                })
+                                .is_some_and(|comment| {
+                                    comment
+                                        .reactions()
+                                        .get(&self.reaction)
+                                        .is_some_and(|authors| authors.contains(&&author))
+                                        == self.active
+                                }),
+                            None => {
+                                review.reactions().contains(&(author, self.reaction)) == self.active
+                            }
+                        })
+                    })
+                    .unwrap_or(false))
+            }
+            _ => Ok(false),
+        }
     }
 }
 
 #[derive(PartialEq, Eq)]
 enum RecordedComment<'a> {
-    Create(&'a str),
-    Edit(EntryId, &'a str),
+    Create(&'a str, &'a [Embed<Uri>]),
+    Edit(EntryId, &'a str, &'a [Embed<Uri>]),
     Redact(EntryId),
-}
-
-fn recorded_comment<'a>(recovery: &'a CommentRecovery<'a>) -> RecordedComment<'a> {
-    match recovery.operation {
-        CommentOperation::Create => {
-            RecordedComment::Create(recovery.body.expect("body was validated"))
-        }
-        CommentOperation::Edit => {
-            RecordedComment::Edit(recovery.comment, recovery.body.expect("body was validated"))
-        }
-        CommentOperation::Redact => RecordedComment::Redact(recovery.comment),
-    }
 }
 
 fn issue_comment(action: &IssueAction) -> Option<RecordedComment<'_>> {
     match action {
-        IssueAction::Comment { body, .. } => Some(RecordedComment::Create(body)),
-        IssueAction::CommentEdit { id, body, .. } => Some(RecordedComment::Edit(*id, body)),
+        IssueAction::Comment { body, embeds, .. } => Some(RecordedComment::Create(body, embeds)),
+        IssueAction::CommentEdit {
+            id, body, embeds, ..
+        } => Some(RecordedComment::Edit(*id, body, embeds)),
         IssueAction::CommentRedact { id } => Some(RecordedComment::Redact(*id)),
         _ => None,
     }
@@ -220,35 +556,6 @@ struct RecordedPatchComment<'a> {
     comment: RecordedComment<'a>,
 }
 
-fn patch_comment_operation<'a>(
-    repository: &CobRepository,
-    operation: EntryId,
-    recovery: &'a CommentRecovery<'a>,
-    target: PatchCommentTarget,
-) -> Result<bool, String> {
-    let entity = recovery
-        .entity
-        .ok_or_else(|| "comment entity is required".to_owned())?;
-    let expected = RecordedPatchComment {
-        entity: match target {
-            PatchCommentTarget::Revision => {
-                PatchCommentEntity::Revision(patch::RevisionId::from(entity))
-            }
-            PatchCommentTarget::Review => PatchCommentEntity::Review(patch::ReviewId::from(entity)),
-        },
-        comment: recorded_comment(recovery),
-    };
-    Ok(
-        find_patch_operation(repository, recovery.subject, operation)?.is_some_and(|operation| {
-            operation
-                .actions
-                .iter()
-                .filter_map(|action| revision_comment(action).or_else(|| review_comment(action)))
-                .any(|actual| actual == expected)
-        }),
-    )
-}
-
 macro_rules! patch_comment_extractor {
     (
         $name:ident,
@@ -260,18 +567,24 @@ macro_rules! patch_comment_extractor {
     ) => {
         fn $name(action: &PatchAction) -> Option<RecordedPatchComment<'_>> {
             match action {
-                PatchAction::$create { $entity, body, .. } => Some(RecordedPatchComment {
+                PatchAction::$create {
+                    $entity,
+                    body,
+                    embeds,
+                    ..
+                } => Some(RecordedPatchComment {
                     entity: PatchCommentEntity::$entity_variant(*$entity),
-                    comment: RecordedComment::Create(body),
+                    comment: RecordedComment::Create(body, embeds),
                 }),
                 PatchAction::$edit {
                     $entity,
                     comment,
                     body,
+                    embeds,
                     ..
                 } => Some(RecordedPatchComment {
                     entity: PatchCommentEntity::$entity_variant(*$entity),
-                    comment: RecordedComment::Edit(*comment, body),
+                    comment: RecordedComment::Edit(*comment, body, embeds),
                 }),
                 PatchAction::$redact { $entity, comment } => Some(RecordedPatchComment {
                     entity: PatchCommentEntity::$entity_variant(*$entity),
@@ -465,6 +778,7 @@ pub(super) fn review_mutation_operation(
     verdict: Option<patch::Verdict>,
     summary: Option<&str>,
     labels: &[radicle::cob::Label],
+    embeds: &[Embed<Uri>],
 ) -> Result<bool, String> {
     let recorded = find_patch_operation(repository, patch, operation)?.is_some_and(|operation| {
         operation.actions.iter().any(|action| match action {
@@ -484,6 +798,7 @@ pub(super) fn review_mutation_operation(
                     && actual.verdict().copied() == verdict
                     && actual.summary().map(String::as_str) == summary
                     && actual.labels() == labels
+                    && actual.embeds().is_some_and(|actual| actual == embeds)
             }
             _ => false,
         })
@@ -501,54 +816,6 @@ pub(super) fn find_review(patch: &patch::Patch, id: patch::ReviewId) -> Option<&
         .revisions()
         .flat_map(|(_revision, value)| value.reviews())
         .find_map(|(_author, candidate)| (candidate.id() == id).then_some(candidate))
-}
-
-fn comment_body_applied(
-    operation: CommentOperation,
-    expected: Option<&str>,
-    actual: Option<&str>,
-) -> bool {
-    match operation {
-        CommentOperation::Create | CommentOperation::Edit => {
-            actual.is_some_and(|actual| actual == expected.expect("body was validated"))
-        }
-        CommentOperation::Redact => actual.is_none(),
-    }
-}
-
-fn issue_body(repository: &CobRepository, recovery: &CommentRecovery<'_>) -> CommentBody {
-    Ok(load_issue(repository, recovery.subject)?.and_then(|issue| {
-        issue
-            .thread()
-            .comment(&recovery.comment)
-            .map(|value| value.body().to_owned())
-    }))
-}
-
-fn revision_body(repository: &CobRepository, recovery: &CommentRecovery<'_>) -> CommentBody {
-    let revision = recovery
-        .entity
-        .ok_or_else(|| "entity revision is required".to_owned())?;
-    Ok(load_patch(repository, recovery.subject)?.and_then(|patch| {
-        patch
-            .revision(&patch::RevisionId::from(revision))
-            .and_then(|value| value.discussion().comment(&recovery.comment))
-            .map(|value| value.body().to_owned())
-    }))
-}
-
-fn review_body(repository: &CobRepository, recovery: &CommentRecovery<'_>) -> CommentBody {
-    let review = recovery
-        .entity
-        .ok_or_else(|| "entity review is required".to_owned())?;
-    Ok(load_patch(repository, recovery.subject)?.and_then(|patch| {
-        find_review(&patch, patch::ReviewId::from(review)).and_then(|review| {
-            review
-                .comments()
-                .find(|(candidate, _value)| **candidate == recovery.comment)
-                .map(|(_candidate, value)| value.body().to_owned())
-        })
-    }))
 }
 
 fn load_issue(

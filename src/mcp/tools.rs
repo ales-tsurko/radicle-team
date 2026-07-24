@@ -11,6 +11,7 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     tool, tool_handler, tool_router,
 };
+use serde::Serialize;
 
 use crate::{
     agent::Publisher,
@@ -18,13 +19,14 @@ use crate::{
     mcp::{
         protocol::{
             CommentOperation, CommentWriteRequest, CreateIssueRequest, CreatePatchRequest,
-            DiffRequest, Document, EditIssueRequest, EditPatchRequest, EntityRequest, EntryRequest,
-            MergePatchRequest, PatchEntity, PatchEntityRequest, ResolveCommentRequest,
-            ReviewWriteRequest, SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind,
-            SubjectRequest, TimelinePage, TimelineRequest, UpdatePatchRequest,
+            DiffRequest, Document, EditIssueRequest, EditPatchRequest, EmbedReadRequest,
+            EntityRequest, EntryRequest, MergePatchRequest, PatchEntity, PatchEntityRequest,
+            ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest, SetStateRequest,
+            SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest, TimelinePage,
+            TimelineRequest, UpdatePatchRequest,
         },
         read::serialize,
-        server::{DeliveryAccess, DeliveryScope},
+        server::{DeliveryAccess, DeliveryScope, ServiceError},
     },
 };
 
@@ -85,6 +87,18 @@ impl ToolService {
         service.mutation_delivery = Some(access.context().delivery);
         service.mutation_invocations = Some(Arc::clone(access.invocations()));
         service
+    }
+
+    async fn document<T, F>(&self, operation: F) -> Result<Json<Document>, String>
+    where
+        T: Serialize + Send + 'static,
+        F: FnOnce(Self) -> Result<T, ServiceError> + Send + 'static,
+    {
+        self.blocking(operation)
+            .await
+            .and_then(|value| serialize(&value))
+            .map(|data| Json(Document { data }))
+            .map_err(|error| error.to_string())
     }
 
     /// Return the current materialized state of an issue or patch.
@@ -178,11 +192,18 @@ impl ToolService {
     ) -> Result<Json<Document>, String> {
         self.publisher.authorize("get_diff").await?;
         let _active = self.delivery.access(&request.subject).await?;
-        self.blocking(move |service| service.diff(request))
-            .await
-            .and_then(|diff| serialize(&diff))
-            .map(|data| Json(Document { data }))
-            .map_err(|error| error.to_string())
+        self.document(move |service| service.diff(request)).await
+    }
+
+    /// Return base64 content for a Git-backed comment embed.
+    #[tool(description = "Return the content of a Git-backed comment embed")]
+    async fn get_embed(
+        &self,
+        Parameters(request): Parameters<EmbedReadRequest>,
+    ) -> Result<Json<Document>, String> {
+        self.publisher.authorize("get_embed").await?;
+        let _active = self.delivery.access(&request.subject).await?;
+        self.document(move |service| service.embed(request)).await
     }
 
     #[tool(description = "Create a comment on the active issue, patch revision, or review")]
@@ -227,6 +248,16 @@ impl ToolService {
         self.for_delivery(&active)
             .resolve_review_comment(request)
             .await
+    }
+
+    /// Add or remove an emoji reaction.
+    #[tool(description = "Add or remove a reaction on an issue, revision, review, or comment")]
+    async fn set_reaction(
+        &self,
+        Parameters(request): Parameters<ReactionWriteRequest>,
+    ) -> Result<Json<Document>, String> {
+        let active = self.delivery.access(&request.subject).await?;
+        self.for_delivery(&active).reaction_write(request).await
     }
 
     #[tool(description = "Create an issue in the active repository")]

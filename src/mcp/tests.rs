@@ -22,7 +22,8 @@ use radicle::{
 #[cfg(not(miri))]
 use radicle::{
     cob::{
-        ObjectId,
+        Embed, ObjectId,
+        common::Uri,
         issue::{self, Issues},
         patch::{self, Patches},
         store::access::ReadOnly,
@@ -39,12 +40,13 @@ use crate::mcp::{
     protocol::{
         CommentOperation, CommentTargetKind, CommentWriteRequest, CreateIssueRequest,
         CreatePatchRequest, DiffRequest, Document, EditIssueRequest, EditPatchRequest,
-        LocationRequest, MergePatchRequest, ResolveCommentRequest, ReviewWriteRequest,
+        EmbedReadRequest, EmbedWriteRequest, LocationRequest, MAX_EMBED_BYTES, MergePatchRequest,
+        PreparedEmbed, ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest,
         SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest,
         mutation_identity, parse_location, parse_object, stringify, validate_code_location,
     },
     read::MAX_DIFF_BYTES,
-    recovery::review_mutation_operation,
+    recovery::{ReactionRecovery, find_review, review_mutation_operation},
     server::Server,
 };
 #[cfg(not(miri))]
@@ -244,6 +246,34 @@ fn mutation_identity_is_stable_and_payload_sensitive() {
 }
 
 #[test]
+#[cfg(not(miri))]
+fn rejects_duplicate_embed_names() {
+    PreparedEmbed::prepare(vec![
+        EmbedWriteRequest {
+            name: "preview.png".to_owned(),
+            content_base64: "Zmlyc3Q=".to_owned(),
+        },
+        EmbedWriteRequest {
+            name: "preview.png".to_owned(),
+            content_base64: "c2Vjb25k".to_owned(),
+        },
+    ])
+    .expect_err("duplicate names should be rejected");
+}
+
+#[test]
+#[cfg(not(miri))]
+fn rejects_oversized_embed_before_base64_decoding() {
+    let error = PreparedEmbed::prepare(vec![EmbedWriteRequest {
+        name: "oversized.bin".to_owned(),
+        content_base64: "!".repeat(14_000_000),
+    }])
+    .expect_err("oversized content should be rejected");
+
+    assert!(error.contains("exceeds"));
+}
+
+#[test]
 fn exposes_the_complete_mcp_tool_set() {
     let names = ToolService::registered_tools();
 
@@ -355,18 +385,6 @@ struct TestAuthorizer;
 impl crate::agent::Authorizer for TestAuthorizer {
     async fn authorize(&self, _method: &str) -> Result<(), String> {
         Ok(())
-    }
-}
-
-#[cfg(not(miri))]
-#[derive(Debug, Clone, Copy)]
-struct DenyAuthorizer;
-
-#[cfg(not(miri))]
-#[async_trait::async_trait]
-impl crate::agent::Authorizer for DenyAuthorizer {
-    async fn authorize(&self, _method: &str) -> Result<(), String> {
-        Err("writes disabled".to_owned())
     }
 }
 
@@ -648,6 +666,10 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
         body: Some("Created comment".to_owned()),
         reply_to: None,
         location: None,
+        embeds: vec![EmbedWriteRequest {
+            name: "recovery.txt".to_owned(),
+            content_base64: "cmVjb3Zlcnk=".to_owned(),
+        }],
     };
     delivery_service
         .write_comment(comment_request(), CommentOperation::Create)
@@ -720,6 +742,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
         verdict: Some("accept".to_owned()),
         summary: Some("Looks good".to_owned()),
         labels: Vec::new(),
+        embeds: Vec::new(),
     };
     delivery_service
         .review_write(review_request(), false)
@@ -1115,94 +1138,6 @@ async fn preserves_and_signs_workspace_only_patch_commits() {
 
 #[tokio::test]
 #[cfg(not(miri))]
-async fn migrates_legacy_pending_replies_without_duplicates() {
-    let fixture = RepositoryFixture::new();
-    let service = fixture.service();
-    let issue = result_id(
-        service
-            .create_issue_write(CreateIssueRequest {
-                title: "Legacy recovery".to_owned(),
-                description: "Issue description".to_owned(),
-                labels: Vec::new(),
-                assignees: Vec::new(),
-            })
-            .await
-            .expect("issue should be created"),
-    );
-    let issue = parse_object(&issue).expect("issue id should parse");
-    let delivery = crate::agent::DeliveryId {
-        operation: EntryId::from_str("2222222222222222222222222222222222222222")
-            .expect("operation should parse"),
-        action: 4,
-    };
-    let reply = crate::agent::LegacyReply {
-        body: "Reply from the previous runtime".to_owned(),
-        target: crate::agent::LegacyReplyTarget::Issue { reply_to: None },
-    };
-    let publisher = crate::agent::Publisher::new(
-        fixture.profile.clone(),
-        fixture.repository,
-        None,
-        TestAnnouncer,
-        TestAuthorizer,
-    );
-    publisher
-        .reconcile_legacy(
-            crate::watcher::Subject::Issue(issue),
-            delivery,
-            *fixture.profile.id(),
-            &reply,
-        )
-        .await
-        .expect("authorized legacy reply should publish");
-    let denied = crate::agent::Publisher::new(
-        fixture.profile.clone(),
-        fixture.repository,
-        None,
-        TestAnnouncer,
-        DenyAuthorizer,
-    );
-    denied
-        .reconcile_legacy(
-            crate::watcher::Subject::Issue(issue),
-            delivery,
-            *fixture.profile.id(),
-            &reply,
-        )
-        .await
-        .expect("an existing legacy operation should recover without reauthorization");
-    denied
-        .reconcile_legacy(
-            crate::watcher::Subject::Issue(issue),
-            crate::agent::DeliveryId {
-                operation: delivery.operation,
-                action: delivery.action + 1,
-            },
-            *fixture.profile.id(),
-            &crate::agent::LegacyReply {
-                body: "Unauthorized fallback".to_owned(),
-                target: reply.target,
-            },
-        )
-        .await
-        .expect_err("a new legacy operation should require current authorization");
-
-    let repository = fixture
-        .profile
-        .storage
-        .repository(fixture.repository)
-        .expect("repository should open");
-    let issue =
-        radicle::cob::issue::Issues::open(&repository, radicle::cob::store::access::ReadOnly)
-            .expect("issues should open")
-            .get(&issue)
-            .expect("issue should load")
-            .expect("issue should exist");
-    assert_eq!(issue.replies().count(), 1);
-}
-
-#[tokio::test]
-#[cfg(not(miri))]
 async fn manages_issues_and_their_comments() {
     let fixture = RepositoryFixture::new();
     let service = fixture.service();
@@ -1291,6 +1226,7 @@ async fn manages_issues_and_their_comments() {
                     body: Some("Invalid reply".to_owned()),
                     reply_to: Some("8888888888888888888888888888888888888888".to_owned()),
                     location: None,
+                    embeds: Vec::new(),
                 },
                 CommentOperation::Create,
             )
@@ -1315,12 +1251,107 @@ async fn manages_issues_and_their_comments() {
                     body: Some("Finding".to_owned()),
                     reply_to: None,
                     location: None,
+                    embeds: Vec::new(),
                 },
                 CommentOperation::Create,
             )
             .await
             .expect("comment should be created"),
     );
+    let attachment = result_id(
+        service
+            .write_comment(
+                CommentWriteRequest {
+                    subject: subject.clone(),
+                    target: CommentTargetKind::Issue,
+                    entity: None,
+                    comment: None,
+                    body: Some("Design".to_owned()),
+                    reply_to: None,
+                    location: None,
+                    embeds: vec![EmbedWriteRequest {
+                        name: "mockup.txt".to_owned(),
+                        content_base64: "aGVsbG8=".to_owned(),
+                    }],
+                },
+                CommentOperation::Create,
+            )
+            .await
+            .expect("comment embed should be created"),
+    );
+    let issue_id = ObjectId::from_str(&issue).expect("issue should parse");
+    let issue_state = Issues::open(&repository, ReadOnly)
+        .expect("issues should open")
+        .get(&issue_id)
+        .expect("issue should load")
+        .expect("issue should exist");
+    let embed = issue_state
+        .thread()
+        .comment(&EntryId::from_str(&attachment).expect("comment should parse"))
+        .expect("comment should exist")
+        .embeds()
+        .first()
+        .expect("embed should exist");
+    assert_eq!(embed.name, "mockup.txt");
+    assert_eq!(
+        service
+            .embed(EmbedReadRequest {
+                subject: subject.clone(),
+                content: embed.content.to_string(),
+            })
+            .expect("embed should load")
+            .content_base64,
+        "aGVsbG8="
+    );
+    drop(issue_state);
+    let oversized = repository
+        .backend
+        .blob(&vec![0; MAX_EMBED_BYTES + 1])
+        .expect("oversized blob should be stored");
+    let oversized = Uri::from(radicle::git::Oid::from(oversized));
+    {
+        let signer = fixture.profile.signer().expect("signer should load");
+        let mut issues =
+            issue::Cache::no_cache(&repository, &signer).expect("issue cache should open");
+        let mut issue = issues.get_mut(&issue_id).expect("issue should load");
+        issue
+            .transaction("External oversized embed", |tx| {
+                tx.comment(
+                    "Oversized",
+                    *issue_id,
+                    vec![Embed {
+                        name: "oversized.bin".to_owned(),
+                        content: oversized.clone(),
+                    }],
+                )
+            })
+            .expect("external embed should be committed");
+    }
+    assert!(matches!(
+        service.embed(EmbedReadRequest {
+            subject: subject.clone(),
+            content: oversized.to_string(),
+        }),
+        Err(ServiceError::EmbedLimit)
+    ));
+    for (comment, active) in [
+        (None, true),
+        (Some(attachment.clone()), true),
+        (Some(attachment), false),
+    ] {
+        service
+            .reaction_write(ReactionWriteRequest {
+                subject: subject.clone(),
+                target: CommentTargetKind::Issue,
+                entity: None,
+                comment,
+                reaction: "👍".to_owned(),
+                active,
+                location: None,
+            })
+            .await
+            .expect("issue reaction should update");
+    }
     service
         .write_comment(
             CommentWriteRequest {
@@ -1331,6 +1362,7 @@ async fn manages_issues_and_their_comments() {
                 body: Some("Updated finding".to_owned()),
                 reply_to: None,
                 location: None,
+                embeds: Vec::new(),
             },
             CommentOperation::Edit,
         )
@@ -1346,6 +1378,7 @@ async fn manages_issues_and_their_comments() {
                 body: None,
                 reply_to: None,
                 location: None,
+                embeds: Vec::new(),
             },
             CommentOperation::Redact,
         )
@@ -1364,6 +1397,7 @@ async fn manages_issues_and_their_comments() {
                             .then(|| "Too late".to_owned()),
                         reply_to: None,
                         location: None,
+                        embeds: Vec::new(),
                     },
                     operation,
                 )
@@ -1372,27 +1406,23 @@ async fn manages_issues_and_their_comments() {
             "redacted comments must not be mutated"
         );
     }
-    service
-        .publisher
-        .reconcile_legacy(
-            crate::watcher::Subject::Issue(
-                ObjectId::from_str(&subject.subject).expect("issue should parse"),
-            ),
-            crate::agent::DeliveryId {
-                operation: EntryId::from_str("9999999999999999999999999999999999999999")
-                    .expect("operation should parse"),
-                action: 0,
-            },
-            *fixture.profile.id(),
-            &crate::agent::LegacyReply {
-                body: "Stale recovery".to_owned(),
-                target: crate::agent::LegacyReplyTarget::Issue {
-                    reply_to: Some(EntryId::from_str(&comment).expect("comment should parse")),
-                },
-            },
-        )
-        .await
-        .expect("an unavailable legacy target should be discarded");
+    for active in [true, false] {
+        assert!(
+            !ReactionRecovery {
+                kind: SubjectKind::Issue,
+                target: CommentTargetKind::Issue,
+                subject: issue_id,
+                entity: None,
+                comment: Some(EntryId::from_str(&comment).expect("comment should parse")),
+                reaction: "👍".parse().expect("reaction should parse"),
+                location: None,
+                active,
+            }
+            .applied(&repository, *fixture.profile.id())
+            .expect("reaction state should load"),
+            "a missing target must not validate a fresh reaction"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1536,6 +1566,7 @@ async fn manages_patch_reviews_and_inline_comments() {
                 verdict: None,
                 summary: None,
                 labels: Vec::new(),
+                embeds: Vec::new(),
             },
             false,
         )
@@ -1552,6 +1583,7 @@ async fn manages_patch_reviews_and_inline_comments() {
                     verdict: Some("reject".to_owned()),
                     summary: Some("Needs work".to_owned()),
                     labels: Vec::new(),
+                    embeds: Vec::new(),
                 },
                 false,
             )
@@ -1574,6 +1606,7 @@ async fn manages_patch_reviews_and_inline_comments() {
                         body: Some("Invalid reply".to_owned()),
                         reply_to: Some("8888888888888888888888888888888888888888".to_owned()),
                         location: None,
+                        embeds: Vec::new(),
                     },
                     CommentOperation::Create,
                 )
@@ -1616,6 +1649,7 @@ async fn manages_patch_reviews_and_inline_comments() {
             Some(patch::Verdict::Accept),
             Some("Duplicate"),
             &[],
+            &[],
         )
         .expect("recovery should be checked"),
         "an ignored review operation must not be recovered as successful"
@@ -1630,6 +1664,7 @@ async fn manages_patch_reviews_and_inline_comments() {
                     verdict: Some("accept".to_owned()),
                     summary: Some("Duplicate".to_owned()),
                     labels: Vec::new(),
+                    embeds: Vec::new(),
                 },
                 false,
             )
@@ -1637,20 +1672,68 @@ async fn manages_patch_reviews_and_inline_comments() {
             .err()
             .expect("a duplicate review must not be reported as created");
     }
-    service
-        .review_write(
-            ReviewWriteRequest {
-                subject: subject.clone(),
-                revision: None,
-                review: Some(review.clone()),
-                verdict: Some("accept".to_owned()),
-                summary: Some("Addressed".to_owned()),
-                labels: Vec::new(),
-            },
-            true,
+    let review_edit = result_id(
+        service
+            .review_write(
+                ReviewWriteRequest {
+                    subject: subject.clone(),
+                    revision: None,
+                    review: Some(review.clone()),
+                    verdict: Some("accept".to_owned()),
+                    summary: Some("Addressed".to_owned()),
+                    labels: Vec::new(),
+                    embeds: vec![EmbedWriteRequest {
+                        name: "review.png".to_owned(),
+                        content_base64: "cHJldmlldw==".to_owned(),
+                    }],
+                },
+                true,
+            )
+            .await
+            .expect("review should be edited"),
+    );
+    let review_commit = repository
+        .backend
+        .find_commit(
+            EntryId::from_str(&review_edit)
+                .expect("review edit should parse")
+                .into(),
         )
-        .await
-        .expect("review should be edited");
+        .expect("review edit commit should exist");
+    let review_tree = review_commit.tree().expect("review edit tree should load");
+    let review_blob = review_tree
+        .get_path(Path::new("embeds/review.png"))
+        .expect("review embed should be reachable");
+    assert_eq!(
+        repository
+            .backend
+            .find_blob(review_blob.id())
+            .expect("review embed blob should exist")
+            .content(),
+        b"preview"
+    );
+    let patch_state = Patches::open(&repository, ReadOnly)
+        .expect("patches should open")
+        .get(&patch_id)
+        .expect("patch should load")
+        .expect("patch should exist");
+    let review_id = patch::ReviewId::from(EntryId::from_str(&review).expect("review should parse"));
+    let review_embed = find_review(&patch_state, review_id)
+        .expect("review should exist")
+        .embeds()
+        .first()
+        .expect("review embed should exist");
+    assert_eq!(review_embed.name, "review.png");
+    assert_eq!(
+        service
+            .embed(EmbedReadRequest {
+                subject: subject.clone(),
+                content: review_embed.content.to_string(),
+            })
+            .expect("review embed should load")
+            .content_base64,
+        "cHJldmlldw=="
+    );
 
     let comment = result_id(
         service
@@ -1663,6 +1746,7 @@ async fn manages_patch_reviews_and_inline_comments() {
                     body: Some("Inline finding".to_owned()),
                     reply_to: None,
                     location: Some(location),
+                    embeds: Vec::new(),
                 },
                 CommentOperation::Create,
             )
@@ -1681,54 +1765,63 @@ async fn manages_patch_reviews_and_inline_comments() {
             .expect("review comment resolution should change");
     }
 
-    service
-        .write_comment(
-            CommentWriteRequest {
-                subject: subject.clone(),
-                target: CommentTargetKind::Revision,
-                entity: Some(revision.clone()),
-                comment: None,
-                body: Some("Revision note".to_owned()),
-                reply_to: None,
-                location: None,
-            },
-            CommentOperation::Create,
-        )
-        .await
-        .expect("revision comment should be created");
-    let legacy_targets = [
-        crate::agent::LegacyReplyTarget::Revision {
-            revision: radicle::cob::patch::RevisionId::from(
-                EntryId::from_str(&revision).expect("revision should parse"),
-            ),
-            reply_to: None,
-        },
-        crate::agent::LegacyReplyTarget::Review {
-            review: radicle::cob::patch::ReviewId::from(
-                EntryId::from_str(&review).expect("review should parse"),
-            ),
-            reply_to: None,
-        },
-    ];
-    for (action, target) in legacy_targets.into_iter().enumerate() {
+    let revision_comment = result_id(
         service
-            .publisher
-            .reconcile_legacy(
-                crate::watcher::Subject::Patch(patch_id),
-                crate::agent::DeliveryId {
-                    operation: EntryId::from_str("6666666666666666666666666666666666666666")
-                        .expect("operation should parse"),
-                    action,
+            .write_comment(
+                CommentWriteRequest {
+                    subject: subject.clone(),
+                    target: CommentTargetKind::Revision,
+                    entity: Some(revision.clone()),
+                    comment: None,
+                    body: Some("Revision note".to_owned()),
+                    reply_to: None,
+                    location: None,
+                    embeds: Vec::new(),
                 },
-                *fixture.profile.id(),
-                &crate::agent::LegacyReply {
-                    body: format!("Legacy patch reply {action}"),
-                    target,
-                },
+                CommentOperation::Create,
             )
             .await
-            .expect("legacy patch reply should migrate");
+            .expect("revision comment should be created"),
+    );
+    for (target, entity, comment) in [
+        (CommentTargetKind::Revision, revision.clone(), None),
+        (
+            CommentTargetKind::Revision,
+            revision.clone(),
+            Some(revision_comment),
+        ),
+        (CommentTargetKind::Review, review.clone(), None),
+        (
+            CommentTargetKind::Review,
+            review.clone(),
+            Some(comment.clone()),
+        ),
+    ] {
+        service
+            .reaction_write(ReactionWriteRequest {
+                subject: subject.clone(),
+                target,
+                entity: Some(entity),
+                comment,
+                reaction: "🚀".to_owned(),
+                active: true,
+                location: None,
+            })
+            .await
+            .expect("patch reaction should update");
     }
+    service
+        .reaction_write(ReactionWriteRequest {
+            subject: subject.clone(),
+            target: CommentTargetKind::Review,
+            entity: Some(review.clone()),
+            comment: Some(comment),
+            reaction: "🚀".to_owned(),
+            active: false,
+            location: None,
+        })
+        .await
+        .expect("patch reaction should be removed");
     assert!(
         service
             .merge_patch_write(MergePatchRequest {

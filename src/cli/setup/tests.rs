@@ -95,7 +95,11 @@ fn reports_the_explicit_manifest_path_noninteractively() {
     assert!(missing.contains("config/team-policy.toml"));
     assert!(missing.contains("create explicit manifest"));
     assert!(missing.contains("version = 1"));
-    assert!(missing.contains("mcp_allow = [\"read\", \"comments\", \"patches\", \"reviews\"]"));
+    assert!(
+        missing.contains(
+            "mcp_allow = [\"read\", \"comments\", \"patches\", \"reactions\", \"reviews\"]"
+        )
+    );
     assert!(!missing.contains("canonical branch"));
 
     let binding = SetupWizard::explicit_manifest_output(
@@ -116,7 +120,11 @@ fn includes_member_permissions_in_repository_output() {
 
     assert!(output.contains("canonical branch"));
     assert!(output.contains("version = 1"));
-    assert!(output.contains("mcp_allow = [\"read\", \"comments\", \"patches\", \"reviews\"]"));
+    assert!(
+        output.contains(
+            "mcp_allow = [\"read\", \"comments\", \"patches\", \"reactions\", \"reviews\"]"
+        )
+    );
 }
 
 #[test]
@@ -124,10 +132,14 @@ fn emits_each_members_preconfigured_mcp_groups() {
     let nico = Fixture::entry(Member::Nico, NICO).to_string();
     let maya = Fixture::entry(Member::Maya, MAYA).to_string();
 
-    assert!(nico.contains("mcp_allow = [\"read\", \"comments\", \"patches\", \"reviews\"]"));
     assert!(
-        maya.contains("mcp_allow = [\"read\", \"comments\", \"issues\", \"patches\", \"reviews\"]")
+        nico.contains(
+            "mcp_allow = [\"read\", \"comments\", \"patches\", \"reactions\", \"reviews\"]"
+        )
     );
+    assert!(maya.contains(
+        "mcp_allow = [\"read\", \"comments\", \"issues\", \"patches\", \"reactions\", \"reviews\"]"
+    ));
 }
 
 #[test]
@@ -176,11 +188,14 @@ fn prepares_and_extends_a_manifest_safely() {
     assert!(contents.contains("[members.nico]"));
     assert!(contents.contains("[members.maya]"));
     assert!(contents.contains("generation = 4"));
-    assert!(contents.contains("mcp_allow = [\"read\", \"comments\", \"patches\", \"reviews\"]"));
     assert!(
-        contents
-            .contains("mcp_allow = [\"read\", \"comments\", \"issues\", \"patches\", \"reviews\"]")
+        contents.contains(
+            "mcp_allow = [\"read\", \"comments\", \"patches\", \"reactions\", \"reviews\"]"
+        )
     );
+    assert!(contents.contains(
+        "mcp_allow = [\"read\", \"comments\", \"issues\", \"patches\", \"reactions\", \"reviews\"]"
+    ));
 }
 
 #[test]
@@ -190,7 +205,7 @@ fn rejects_a_conflicting_local_binding() {
     fs::write(
         &manifest,
         "version = 1\n\n[members.nico]\nsigning_did = \"did:key:different\"\ngeneration = \
-         1\nstate = \"active\"\n",
+         1\nstate = \"active\"\nmcp_allow = []\n",
     )
     .expect("manifest should be written");
 
@@ -204,7 +219,7 @@ fn rejects_a_conflicting_local_binding() {
         &manifest,
         format!(
             "version = 1\n\n# [members.nico]\n[members.maya]\nsigning_did = \
-             \"{MAYA}\"\ngeneration = 1\nstate = \"active\"\n"
+             \"{MAYA}\"\ngeneration = 1\nstate = \"active\"\nmcp_allow = []\n"
         ),
     )
     .expect("commented manifest should be written");
@@ -222,7 +237,7 @@ fn extends_inline_and_dotted_member_maps() {
     let nico = Fixture::entry(Member::Nico, NICO);
     let inline = format!(
         "version = 1\nmembers = {{ maya = {{ signing_did = \"{MAYA}\", generation = 1, state = \
-         \"active\" }} }}\n"
+         \"active\", mcp_allow = [] }} }}\n"
     );
     fs::write(&manifest, inline).expect("inline manifest should be written");
 
@@ -237,7 +252,7 @@ fn extends_inline_and_dotted_member_maps() {
 
     let dotted = format!(
         "version = 1\nmembers.maya.signing_did = \"{MAYA}\"\nmembers.maya.generation = \
-         1\nmembers.maya.state = \"active\"\n"
+         1\nmembers.maya.state = \"active\"\nmembers.maya.mcp_allow = []\n"
     );
     fs::write(&manifest, dotted).expect("dotted manifest should be written");
     assert!(matches!(
@@ -270,7 +285,7 @@ fn validates_a_checkout_manifest_before_writing_it() {
 
     let duplicate = format!(
         "version = 1\n\n[members.maya]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
-         \"active\"\n"
+         \"active\"\nmcp_allow = []\n"
     );
     fs::write(&manifest, &duplicate).expect("manifest should be written");
     assert!(matches!(
@@ -292,7 +307,7 @@ fn rejects_a_symlink_when_writing_an_explicit_manifest() {
     let manifest = fixture.manifest();
     let original = format!(
         "version = 1\n\n[members.maya]\nsigning_did = \"{MAYA}\"\ngeneration = 1\nstate = \
-         \"active\"\n"
+         \"active\"\nmcp_allow = []\n"
     );
     fs::write(&target, &original).expect("target manifest should be written");
     symlink("target.toml", &manifest).expect("manifest symlink should be created");

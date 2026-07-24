@@ -55,7 +55,7 @@ impl Member {
                               faster.",
                 stats: Stats::new(3, 5, 1, 4, 2),
                 special_trait: "Beginner's Luck",
-                mcp_allow: &["read", "comments", "patches", "reviews"],
+                mcp_allow: &["read", "comments", "patches", "reactions", "reviews"],
             },
             Self::Maya => Profile {
                 name: "Maya",
@@ -64,7 +64,14 @@ impl Member {
                               messy code into something that actually ships.",
                 stats: Stats::new(5, 3, 5, 4, 4),
                 special_trait: "Gets It Done",
-                mcp_allow: &["read", "comments", "issues", "patches", "reviews"],
+                mcp_allow: &[
+                    "read",
+                    "comments",
+                    "issues",
+                    "patches",
+                    "reactions",
+                    "reviews",
+                ],
             },
             Self::Leon => Profile {
                 name: "Leon",
@@ -73,7 +80,7 @@ impl Member {
                               Thoughtful and patient, but deeply suspicious of shortcuts.",
                 stats: Stats::new(5, 2, 5, 4, 5),
                 special_trait: "Sees Three Moves Ahead",
-                mcp_allow: &["read", "comments", "issues", "reviews"],
+                mcp_allow: &["read", "comments", "issues", "reactions", "reviews"],
             },
             Self::Vera => Profile {
                 name: "Vera",
@@ -82,7 +89,7 @@ impl Member {
                               unlocked door everyone else has already walked through.",
                 stats: Stats::new(5, 2, 5, 3, 5),
                 special_trait: "Trust Nothing",
-                mcp_allow: &["read", "comments", "issues", "reviews"],
+                mcp_allow: &["read", "comments", "issues", "reactions", "reviews"],
             },
             Self::Nora => Profile {
                 name: "Nora",
@@ -91,7 +98,14 @@ impl Member {
                               that technically working is not the same as being usable.",
                 stats: Stats::new(4, 4, 4, 5, 3),
                 special_trait: "Human Perspective",
-                mcp_allow: &["read", "comments", "issues", "patches", "reviews"],
+                mcp_allow: &[
+                    "read",
+                    "comments",
+                    "issues",
+                    "patches",
+                    "reactions",
+                    "reviews",
+                ],
             },
             Self::Theo => Profile {
                 name: "Theo",
@@ -101,7 +115,7 @@ impl Member {
                               answer.",
                 stats: Stats::new(5, 1, 5, 4, 5),
                 special_trait: "Leave No Stone Unturned",
-                mcp_allow: &["read", "comments", "issues", "reviews"],
+                mcp_allow: &["read", "comments", "issues", "reactions", "reviews"],
             },
         }
     }
@@ -238,11 +252,18 @@ mod tests {
     fn provides_setup_mcp_defaults_as_profile_data() {
         assert_eq!(
             Member::Nico.profile().mcp_allow,
-            ["read", "comments", "patches", "reviews"]
+            ["read", "comments", "patches", "reactions", "reviews"]
         );
         assert_eq!(
             Member::Maya.profile().mcp_allow,
-            ["read", "comments", "issues", "patches", "reviews"]
+            [
+                "read",
+                "comments",
+                "issues",
+                "patches",
+                "reactions",
+                "reviews"
+            ]
         );
         assert!(
             !Member::ALL

@@ -2,8 +2,9 @@
 
 use std::{collections::BTreeSet, str::FromStr as _};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use radicle::{
-    cob::{EntryId, ObjectId, issue, patch},
+    cob::{Embed, EntryId, ObjectId, common::Uri, issue, patch},
     storage::ReadRepository as _,
 };
 use rmcp::Json;
@@ -12,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::mcp::server::ServiceError;
+
+pub(super) const MAX_EMBED_BYTES: usize = 10_000_000;
+const MAX_EMBEDS: usize = 16;
+const MAX_ENCODED_EMBED_BYTES: usize = (MAX_EMBED_BYTES + 2 * MAX_EMBEDS).div_ceil(3) * 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(super) struct SubjectRequest {
@@ -194,6 +199,8 @@ pub(super) struct CommentWriteRequest {
     pub(super) body: Option<String>,
     pub(super) reply_to: Option<String>,
     pub(super) location: Option<LocationRequest>,
+    #[serde(default)]
+    pub(super) embeds: Vec<EmbedWriteRequest>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -201,6 +208,136 @@ pub(super) enum CommentOperation {
     Create,
     Edit,
     Redact,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct EmbedWriteRequest {
+    pub(super) name: String,
+    pub(super) content_base64: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct EmbedReadRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) content: String,
+}
+
+impl EmbedReadRequest {
+    pub(super) fn oid(&self) -> Result<radicle::git::Oid, ServiceError> {
+        let uri = Uri::from_str(&self.content)
+            .map_err(|_error| ServiceError::InvalidId(self.content.clone()))?;
+        radicle::git::Oid::try_from(&uri)
+            .map_err(|_error| ServiceError::InvalidId(self.content.clone()))
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct EmbedDocument {
+    pub(super) content_base64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct ReactionWriteRequest {
+    #[serde(flatten)]
+    pub(super) subject: SubjectRequest,
+    pub(super) target: CommentTargetKind,
+    pub(super) entity: Option<String>,
+    pub(super) comment: Option<String>,
+    pub(super) reaction: String,
+    pub(super) active: bool,
+    pub(super) location: Option<LocationRequest>,
+}
+
+impl ReactionWriteRequest {
+    pub(super) fn parsed_reaction(&self) -> Result<radicle::cob::Reaction, String> {
+        radicle::cob::Reaction::from_str(&self.reaction).map_err(stringify)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PreparedEmbed {
+    content: Vec<u8>,
+    oid: radicle::git::Oid,
+    reference: Embed<Uri>,
+}
+
+impl PreparedEmbed {
+    pub(super) fn prepare(requests: Vec<EmbedWriteRequest>) -> Result<Vec<Self>, String> {
+        if requests.len() > MAX_EMBEDS {
+            return Err(format!("at most {MAX_EMBEDS} embeds are allowed"));
+        }
+        let encoded_bytes = requests.iter().try_fold(0usize, |total, request| {
+            total
+                .checked_add(request.content_base64.len())
+                .ok_or_else(|| "embed size overflow".to_owned())
+        })?;
+        if encoded_bytes > MAX_ENCODED_EMBED_BYTES {
+            return Err(format!(
+                "combined embed content exceeds {MAX_EMBED_BYTES} bytes"
+            ));
+        }
+        let mut bytes = 0usize;
+        let mut names = BTreeSet::new();
+        requests
+            .into_iter()
+            .map(|request| {
+                if request.name.is_empty()
+                    || request.name.len() > 255
+                    || matches!(request.name.as_str(), "." | "..")
+                    || request.name.chars().any(|character| {
+                        character.is_control() || matches!(character, '/' | '\\' | ':' | '\0')
+                    })
+                {
+                    return Err(
+                        "embed name must be a safe file name of at most 255 bytes".to_owned()
+                    );
+                }
+                if !names.insert(request.name.clone()) {
+                    return Err(format!("duplicate embed name '{}'", request.name));
+                }
+                let content = BASE64_STANDARD
+                    .decode(request.content_base64)
+                    .map_err(|error| format!("invalid base64 embed content: {error}"))?;
+                bytes = bytes
+                    .checked_add(content.len())
+                    .ok_or_else(|| "embed size overflow".to_owned())?;
+                if bytes > MAX_EMBED_BYTES {
+                    return Err(format!(
+                        "combined embed content exceeds {MAX_EMBED_BYTES} bytes"
+                    ));
+                }
+                let oid = git2::Oid::hash_object(git2::ObjectType::Blob, &content)
+                    .map(radicle::git::Oid::from)
+                    .map_err(stringify)?;
+                Ok(Self {
+                    content,
+                    oid,
+                    reference: Embed {
+                        name: request.name,
+                        content: Uri::from(oid),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn references(embeds: &[Self]) -> Vec<Embed<Uri>> {
+        embeds.iter().map(|embed| embed.reference.clone()).collect()
+    }
+
+    pub(super) fn store(
+        embeds: &[Self],
+        repository: &radicle::storage::git::Repository,
+    ) -> Result<Vec<Embed<Uri>>, String> {
+        for embed in embeds {
+            let stored = repository.backend.blob(&embed.content).map_err(stringify)?;
+            if radicle::git::Oid::from(stored) != embed.oid {
+                return Err("stored embed hash does not match its reference".to_owned());
+            }
+        }
+        Ok(Self::references(embeds))
+    }
 }
 
 #[derive(Clone)]
@@ -338,6 +475,8 @@ pub(super) struct ReviewWriteRequest {
     pub(super) summary: Option<String>,
     #[serde(default)]
     pub(super) labels: Vec<String>,
+    #[serde(default)]
+    pub(super) embeds: Vec<EmbedWriteRequest>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
