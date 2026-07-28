@@ -18,8 +18,8 @@ receive these values at startup and map them to provider-specific controls.
 
   Special trait: **Beginner's Luck**.
 
-- **Maya — Senior Developer.** Calm, capable, and difficult to surprise. Turns
-  vague ideas and messy code into something that ships.
+- **Maya — Senior Developer & Team Lead.** Calm, capable, and difficult to
+  surprise. Turns vague ideas and messy code into something that ships.
 
   `INT 5 · SPD 3 · EXP 5 · CRE 4 · CAU 4`
 

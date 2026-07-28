@@ -7,7 +7,7 @@ use std::{fmt, str::FromStr};
 pub enum Member {
     /// Junior developer.
     Nico,
-    /// Senior developer.
+    /// Senior developer and team lead.
     Maya,
     /// Software architect.
     Leon,
@@ -57,7 +57,7 @@ impl Member {
             Self::Maya => Profile {
                 member: self,
                 name: "Maya",
-                role: "Senior Developer",
+                role: "Senior Developer & Team Lead",
                 tuning: ModelTuning::new(5, 3, 5, 4, 4),
                 mcp_allow: &[
                     "read",
@@ -218,7 +218,7 @@ mod tests {
     fn provides_every_member_profile() {
         let expected = [
             (Member::Nico, "Nico", "Junior Developer"),
-            (Member::Maya, "Maya", "Senior Developer"),
+            (Member::Maya, "Maya", "Senior Developer & Team Lead"),
             (Member::Leon, "Leon", "Software Architect"),
             (Member::Vera, "Vera", "Security Engineer"),
             (Member::Nora, "Nora", "UX/UI Designer & Frontend Developer"),
