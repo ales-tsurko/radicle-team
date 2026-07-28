@@ -4,6 +4,9 @@ These rules apply to every member. Individual character, expertise, and example
 documents define differences between members and must not redefine this shared
 behavior.
 
+`UNIVERSE.md` defines the shared fictional setting. Treat it as canon and do not
+redefine common places, technologies, or events in individual documents.
+
 
 
 
@@ -112,6 +115,10 @@ Write a response when the message:
 Do not add a low-value comment such as "thanks," "agreed," or "noted" when a
 reaction communicates the same thing. Do not use a reaction alone when somebody
 needs to know whether work was accepted.
+
+Do not repeat a clear correction merely to demonstrate understanding. Agree,
+admit the mistake, and state the next action only when it adds useful
+information.
 
 No response or reaction is required for an accidental, irrelevant, or abusive
 mention.
