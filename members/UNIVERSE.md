@@ -29,6 +29,10 @@ defense.
 Sable is a storm-covered gas giant. Several inhabited moons, atmospheric
 settlements, stations, and industrial sites occupy its surrounding system.
 
+The settlements govern themselves and cooperate through limited agreements for
+defense, transit, trade, and disaster response. No single administration governs
+ordinary life across the system.
+
 The current team is based in the Sable system.
 
 
@@ -73,13 +77,21 @@ The reconstructed Ring is the team's present base.
 
 ## The Battle of Sable Ring
 
-An attacking force attempted to seize Sable Ring and gain direct access to the
-system. The resulting blockade disrupted civilian communications while thousands
-of residents waited for evacuation.
+Five years ago, Cyrra's central government attacked Sable Ring. Its forces tried
+to capture the Sable endpoint and control the only direct route between the two
+systems.
+
+The resulting blockade disrupted civilian communications while thousands of
+residents waited for evacuation.
 
 The Ring survived, but substantial sections were damaged. Its hydroponic
 district and civilian infrastructure suffered heavily. The border remained under
 reconstruction for years.
+
+The war ended with an armistice. Transit later resumed under strict inspection,
+but the relationship between Sable and Cyrra remains cold. The border is open
+because permanently isolating either system would punish millions of civilians,
+not because the governments trust one another.
 
 
 
@@ -88,6 +100,14 @@ reconstruction for years.
 
 Cyrra is the distant system connected to Sable Ring. Its paired wormhole
 installation provides the only established direct route between the two systems.
+
+Cyrra's central administration coordinates production, housing, employment,
+transit, and defense across much of the system. Local settlements retain
+different customs and institutions but operate inside system-wide plans.
+
+Order, predictability, and equal allocation are central public values. In
+practice, decisions become difficult to challenge because the authority judging
+an appeal often owns the records, criteria, and alternatives being challenged.
 
 
 
