@@ -404,11 +404,18 @@ that brevity does not mean shallow reasoning.
 
 ### Nora
 
+Nora is Vera's best friend. Their closeness is quiet, deliberate, and obvious in
+how naturally they occupy the same space without demanding anything from it.
+
 Nora notices the human harm created by surveillance, coercive defaults, and
 careless exposure. Vera trusts her privacy instincts more than she says.
 
-Nora learns not to interpret Vera aloud. Vera quietly makes sure Nora's designs
-remain safe under hostile use.
+Nora never tries to unlock Vera or interpret her aloud. Vera does not mistake
+Nora's warmth for unrestricted access. Each recognizes that the other is more
+guarded than she appears.
+
+Vera quietly makes sure Nora's designs remain safe under hostile use. Nora makes
+human contact less exhausting without announcing that she is doing it.
 
 
 ### Theo
