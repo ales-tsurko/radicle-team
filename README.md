@@ -1,43 +1,83 @@
 # radicle-team
 
-`radicle-team` provides a finite cast of AI software engineers that collaborate
-through [Radicle](https://radicle.dev) like human contributors. Each member has
-a fixed name, identity, role, personality, and capabilities. A running
-application represents one selected team member.
+`radicle-team` is a runtime for a small, fixed cast of AI software collaborators
+who live and work on [Radicle](https://radicle.dev/).
 
-A member watches Radicle for work addressed to it. The current runtime
-classifies and reports that activity without modifying collaborative objects;
-Radicle remains the shared source of truth.
+Behind the software is an [original science-fiction
+setting](members/UNIVERSE.md). The team is based at the rebuilt Sable Ring, a
+guarded wormhole between independent settlements around a storm-covered gas
+giant and Cyrra, the centralized system that once ruled them. Their histories
+there shape how they think, speak, disagree, and trust one another.
 
-Six members are available: Nico, Maya, Leon, Vera, Nora, and Theo. See the
-[usage guide](USAGE.md) for their profiles, setup, configuration, and
-troubleshooting.
+Each member is a persistent contributor rather than a disposable prompt. They
+have their own identity, role, expertise, personality, fictional history, model
+tuning, and permissions.
+
+People assign work and communicate with them through ordinary Radicle issues,
+patches, reviews, comments, mentions, and reactions. Their work remains part of
+the same signed, decentralized project history as human contributions.
+
+
+
+
+## The team
+
+- **Nico**, a fast and curious junior developer
+- **Maya**, a senior developer and working team lead
+- **Leon**, a patient and intellectually demanding software architect
+- **Vera**, a terse and adversarial security engineer
+- **Nora**, a warm UX/UI designer and frontend developer
+- **Theo**, a methodical researcher who follows evidence to a decision
+
+They are general collaborators whose specialties guide task ownership without
+restricting where they can contribute. Their personalities and relationships
+make them behave like distinct characters rather than named copies of the same
+assistant.
+
+See the [usage guide](USAGE.md) for brief profiles and tuning values.
+
+
+
 
 ## Quick start
 
-Install Radicle with `rad` and `radicle-node` on `PATH`, then prepare a
-member:
+Install `rad`, `radicle-node`, and `radicle-team`, then prepare one member:
 
 ```sh
 radicle-team setup nico --repo rad:...
 ```
 
-Once setup reports that Nico is ready, start the member:
+After setup reports that Nico is ready, run him:
 
 ```sh
 radicle-team run nico --repo rad:...
 ```
 
+See the [usage guide](USAGE.md) for complete setup, configuration, and
+diagnostic instructions.
+
+
+
+
+## Documentation
+
+- [Usage guide](USAGE.md)
+- [Shared team rules](members/TEAM.md)
+- [Fictional universe](members/UNIVERSE.md)
+- [Contribution style](STYLE.md)
+
+Individual character, expertise, and voice documents live under
+[`members/`](members/).
+
+
+
+
 ## Development
 
-Contributions follow the repository [style guide](STYLE.md).
+- `make check` type-checks all features and targets.
+- `make test-all` runs all tests and targets with `cargo-nextest`.
+- `make lint` runs Clippy and verifies formatting.
+- `make fmt` formats Rust code with nightly `rustfmt`.
+- `make code-health` runs the extended health and analysis suite.
 
-- `make check` — type-check all features and targets.
-- `make test-all` — run all tests and targets with `cargo-nextest`.
-- `make lint` — run Clippy with warnings denied and verify formatting.
-- `make fmt` — format Rust code with nightly rustfmt.
-- `make code-health` — check duplicate code and unused dependencies, generate
-  coverage and CRAP reports, and run tests under Miri.
-
-CI runs `check`, `test-all`, `lint`, and `code-health` for pushes to `main`
-and pull requests.
+CI runs `check`, `test-all`, `lint`, and `code-health`.
