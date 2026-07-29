@@ -77,7 +77,7 @@ pub(super) fn issue_create_operation(
     repository: &CobRepository,
     operation: EntryId,
     title: &radicle::cob::Title,
-    description: &str,
+    description: Option<&str>,
     labels: &[radicle::cob::Label],
     assignees: &[radicle::identity::Did],
 ) -> Result<bool, String> {
@@ -93,7 +93,7 @@ pub(super) fn issue_create_operation(
                             body,
                             reply_to: None,
                             ..
-                        } if body == description
+                        } if description.is_none_or(|description| body == description)
                     )
                 }) && (labels.is_empty()
                     || operation.actions.iter().any(|action| {

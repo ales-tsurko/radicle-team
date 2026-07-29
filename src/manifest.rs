@@ -17,13 +17,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
-    str,
+    str::{self, FromStr as _},
 };
 
+use age::x25519;
 use config::{Config as ConfigLoader, File, FileFormat};
 use radicle::{
     git::{Oid, raw},
-    identity::Did,
+    identity::{Did, RepoId},
     storage::{ReadRepository as _, RepositoryError, git::Repository},
 };
 use serde::{Deserialize, Deserializer, de};
@@ -41,10 +42,17 @@ const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     members: BTreeMap<Member, Binding>,
+    security: SecurityPolicy,
     revision: Revision,
 }
 
 impl Manifest {
+    /// Returns the security-reporting policy.
+    #[must_use]
+    pub const fn security(&self) -> &SecurityPolicy {
+        &self.security
+    }
+
     /// Loads the manifest from the repository's canonical branch.
     ///
     /// # Errors
@@ -160,8 +168,9 @@ impl Manifest {
             binding.signing_did,
             binding.generation,
             self.revision,
-        )
-        .with_mcp_allow(binding.mcp_allow.clone()))
+            binding.mcp_allow.clone(),
+            self.security.clone(),
+        ))
     }
 
     fn parse(contents: &str, revision: Revision) -> Result<Self, Error> {
@@ -180,7 +189,11 @@ impl Manifest {
             .map(|(name, binding)| Ok((name.parse()?, binding)))
             .collect::<Result<_, Error>>()?;
 
-        Ok(Self { members, revision })
+        Ok(Self {
+            members,
+            security: document.security,
+            revision,
+        })
     }
 
     fn validate_unique_active_dids(&self) -> Result<(), Error> {
@@ -258,9 +271,10 @@ impl McpAllowlist {
         for entry in entries {
             if Self::is_group(&entry) {
                 allowlist.extend_group(&entry);
-            } else if crate::mcp::ToolService::registered_tools()
-                .iter()
-                .any(|method| method == &entry)
+            } else if entry != "report_security_issue"
+                && crate::mcp::ToolService::registered_tools()
+                    .iter()
+                    .any(|method| method == &entry)
             {
                 allowlist.insert(&entry);
             } else {
@@ -301,12 +315,15 @@ impl McpAllowlist {
     }
 
     fn belongs_to_group(method: &str, group: &str) -> bool {
+        if method == "report_security_issue" {
+            return false;
+        }
         let read = method.starts_with("get_") || method.starts_with("list_");
         let names = |entity| method.split('_').any(|part| part == entity);
 
         match group {
             "read" => read,
-            "comments" => !read && names("comment"),
+            "comments" => !read && method != "comment_issue" && names("comment"),
             "issues" => !read && names("issue"),
             "patches" => !read && method != "merge_patch" && names("patch"),
             "reactions" => !read && names("reaction"),
@@ -342,22 +359,26 @@ pub struct ValidatedBinding {
     generation: u64,
     revision: Revision,
     mcp_allow: McpAllowlist,
+    security: SecurityPolicy,
 }
 
 impl ValidatedBinding {
-    pub(super) const fn new(member: Member, did: Did, generation: u64, revision: Revision) -> Self {
+    pub(super) const fn new(
+        member: Member,
+        did: Did,
+        generation: u64,
+        revision: Revision,
+        mcp_allow: McpAllowlist,
+        security: SecurityPolicy,
+    ) -> Self {
         Self {
             member,
             did,
             generation,
             revision,
-            mcp_allow: McpAllowlist(BTreeSet::new()),
+            mcp_allow,
+            security,
         }
-    }
-
-    fn with_mcp_allow(mut self, mcp_allow: McpAllowlist) -> Self {
-        self.mcp_allow = mcp_allow;
-        self
     }
 
     /// Returns the bound member.
@@ -389,13 +410,96 @@ impl ValidatedBinding {
     pub fn mcp_allow(&self) -> &McpAllowlist {
         &self.mcp_allow
     }
+
+    /// Returns the security-reporting policy.
+    #[must_use]
+    pub const fn security(&self) -> &SecurityPolicy {
+        &self.security
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Document {
     version: u32,
+    security: SecurityPolicy,
     members: BTreeMap<String, Binding>,
+}
+
+/// Private repository and encryption recipients for security reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityPolicy {
+    repository: RepoId,
+    recipients: Vec<String>,
+}
+
+impl SecurityPolicy {
+    /// Returns the private repository receiving encrypted security reports.
+    #[must_use]
+    pub const fn repository(&self) -> RepoId {
+        self.repository
+    }
+
+    /// Returns the age recipients allowed to decrypt security reports.
+    pub fn recipients(&self) -> &[String] {
+        &self.recipients
+    }
+
+    #[cfg(all(test, not(miri)))]
+    pub(crate) fn test(repository: RepoId) -> Self {
+        Self::test_with_recipients(
+            repository,
+            vec!["age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa".to_owned()],
+        )
+    }
+
+    #[cfg(all(test, not(miri)))]
+    pub(crate) fn test_with_recipients(repository: RepoId, recipients: Vec<String>) -> Self {
+        Self {
+            repository,
+            recipients,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SecurityPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Policy {
+            repository: RepoId,
+            recipients: Vec<String>,
+        }
+
+        let policy = Policy::deserialize(deserializer)?;
+        if policy.recipients.is_empty() {
+            return Err(de::Error::custom(
+                "security reporting must contain at least one age recipient",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        let recipients = policy
+            .recipients
+            .into_iter()
+            .map(|value| {
+                x25519::Recipient::from_str(&value).map_err(de::Error::custom)?;
+                if !seen.insert(value.clone()) {
+                    return Err(de::Error::custom(format!(
+                        "duplicate security-reporting recipient '{value}'"
+                    )));
+                }
+                Ok(value)
+            })
+            .collect::<Result<_, _>>()?;
+
+        Ok(Self {
+            repository: policy.repository,
+            recipients,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -488,12 +592,18 @@ mod tests {
 
     const NICO: &str = "did:key:z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
     const MAYA: &str = "did:key:z6MkvUJtYD9dHDJfpevWRT98mzDDpdAtmUjwyDSkyqksUr7C";
+    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+    const RECIPIENT: &str = "age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa";
 
     struct Fixture;
 
     impl Fixture {
         fn parse(body: &str) -> Result<Manifest, Error> {
-            Manifest::parse(body, Revision::External)
+            let policy = format!(
+                "\n[security]\nrepository = \"{REPOSITORY}\"\nrecipients = [\"{RECIPIENT}\"]\n"
+            );
+            let body = body.replacen('\n', &policy, 1);
+            Manifest::parse(&body, Revision::External)
         }
     }
 
@@ -536,6 +646,34 @@ mod tests {
             )),
             Err(Error::Parse(_))
         ));
+    }
+
+    #[test]
+    fn rejects_a_missing_security_policy() {
+        assert!(matches!(
+            Manifest::parse("version = 1\n[members]\n", Revision::External),
+            Err(Error::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_duplicate_and_invalid_security_recipients() {
+        for recipients in [
+            "[]".to_owned(),
+            format!("[\"{RECIPIENT}\", \"{RECIPIENT}\"]"),
+            "[\"security@example.com\"]".to_owned(),
+        ] {
+            assert!(matches!(
+                Manifest::parse(
+                    &format!(
+                        "version = 1\n[security]\nrepository = \"{REPOSITORY}\"\nrecipients = \
+                         {recipients}\n[members]\n"
+                    ),
+                    Revision::External,
+                ),
+                Err(Error::Parse(_))
+            ));
+        }
     }
 
     #[test]
@@ -596,6 +734,11 @@ mod tests {
     #[test]
     fn accepts_every_registered_tool_without_a_manifest_method_registry() {
         for method in crate::mcp::ToolService::registered_tools() {
+            if method == "report_security_issue" {
+                McpAllowlist::from_entries(vec![method.clone()])
+                    .expect_err("security reporting must not be an MCP permission");
+                continue;
+            }
             let allowlist = McpAllowlist::from_entries(vec![method.clone()])
                 .expect("registered tool should be accepted");
             assert!(allowlist.allows(method));

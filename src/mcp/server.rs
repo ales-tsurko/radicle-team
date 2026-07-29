@@ -16,6 +16,7 @@ use crate::{
     manifest::McpAllowlist,
     mcp::{
         protocol::{SubjectKind, SubjectRequest},
+        security::SecurityReporting,
         tools::ToolService,
     },
     watcher::Subject,
@@ -50,10 +51,18 @@ impl Server {
         let cancellation = CancellationToken::new();
         let server_cancellation = cancellation.child_token();
         let delivery = DeliveryScope::new(publisher.clone());
+        let security = SecurityReporting::new(&publisher);
         let task = tokio::spawn(Self::serve(
             listener,
             route,
-            ToolService::new(storage, repository, delivery.clone(), publisher, allowlist),
+            ToolService::new(
+                storage,
+                repository,
+                delivery.clone(),
+                publisher,
+                allowlist,
+                security,
+            ),
             server_cancellation,
         ));
 

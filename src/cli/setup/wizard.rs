@@ -6,7 +6,9 @@ use radicle::identity::Did;
 
 use crate::{
     Application, Setup, SetupStatus,
-    cli::setup::{ManifestEntry, RepositoryCheckout},
+    cli::setup::{
+        ManifestEntry, ManifestUpdate, RepositoryCheckout, SecurityManifest, SecuritySetup,
+    },
     manifest::FILE_NAME,
     member::Member,
 };
@@ -39,14 +41,14 @@ impl SetupWizard {
                 Some(path),
                 status @ (SetupStatus::ManifestMissing { .. } | SetupStatus::BindingMissing { .. }),
             ) => {
-                let entry = ManifestEntry::new(&self.application, setup);
+                let entry = ManifestEntry::new(&self.application, &setup);
                 Self::explicit_manifest_output(path, entry, status)
             }
             (
                 None,
                 status @ (SetupStatus::ManifestMissing { .. } | SetupStatus::BindingMissing { .. }),
             ) => Self::repository_manifest_output(
-                ManifestEntry::new(&self.application, setup),
+                ManifestEntry::new(&self.application, &setup),
                 status,
             ),
             _ => setup.to_string(),
@@ -56,7 +58,8 @@ impl SetupWizard {
     pub(super) fn repository_manifest_output(entry: ManifestEntry, status: SetupStatus) -> String {
         let action = match status {
             SetupStatus::ManifestMissing { .. } => {
-                "add .radicle-team.toml to the repository's canonical branch:\n\nversion = 1\n\n"
+                "add .radicle-team.toml to the repository's canonical branch:\n\nversion = \
+                 1\n\n[security]\nrepository = \"rad:...\"\nrecipients = [\"age1...\"]\n\n"
             }
             SetupStatus::BindingMissing { .. } => "add this binding to .radicle-team.toml:\n\n",
             SetupStatus::Ready { .. } => {
@@ -78,7 +81,8 @@ impl SetupWizard {
         let action = match status {
             SetupStatus::ManifestMissing { .. } => {
                 format!(
-                    "create explicit manifest '{}':\n\nversion = 1\n\n",
+                    "create explicit manifest '{}':\n\nversion = 1\n\n[security]\nrepository = \
+                     \"rad:...\"\nrecipients = [\"age1...\"]\n\n",
                     path.display()
                 )
             }
@@ -144,28 +148,126 @@ impl SetupWizard {
     }
 
     async fn prepare_manifest(&self, setup: Setup) -> Result<(), Error> {
-        let entry = self.show_manifest(setup)?;
+        let update = self.manifest_update(&setup).await?;
+        self.show_manifest(update.entry())?;
         if let Some(path) = self.application.manifest_file() {
-            return self
-                .prepare_explicit_manifest(path, entry, setup.status())
-                .await;
+            return self.prepare_explicit_manifest(path, update).await;
         }
 
-        self.prepare_repository_manifest(entry, setup.status())
-            .await
+        self.prepare_repository_manifest(update).await
     }
 
-    async fn prepare_repository_manifest(
+    async fn manifest_update(&self, setup: &Setup) -> Result<ManifestUpdate, Error> {
+        match setup.status() {
+            SetupStatus::ManifestMissing { .. } => self.create_manifest_update(setup).await,
+            SetupStatus::BindingMissing { .. } => self.extend_manifest_update(setup).await,
+            SetupStatus::Ready { .. } => Err(Error::ReadyManifest),
+        }
+    }
+
+    async fn create_manifest_update(&self, setup: &Setup) -> Result<ManifestUpdate, Error> {
+        let security = self.provision_security(setup.did()).await?;
+        let entry = ManifestEntry::new(&self.application, setup);
+
+        Ok(ManifestUpdate::create(entry, security))
+    }
+
+    async fn extend_manifest_update(&self, setup: &Setup) -> Result<ManifestUpdate, Error> {
+        self.grant_security_access(setup).await?;
+        let entry = ManifestEntry::new(&self.application, setup);
+
+        Ok(ManifestUpdate::extend(entry))
+    }
+
+    async fn provision_security(&self, did: Did) -> Result<SecurityManifest, Error> {
+        let choice = Self::security_repository_choice()?;
+        let setup = self.prepare_security_repository(choice, did).await?;
+        self.show_security_recovery_key(&setup)?;
+
+        Ok(setup.manifest())
+    }
+
+    fn security_repository_choice() -> Result<SecurityRepositoryChoice, Error> {
+        cliclack::select("Configure the private security-report repository")
+            .initial_value(SecurityRepositoryChoice::Create)
+            .item(
+                SecurityRepositoryChoice::Create,
+                "Create a repository",
+                "recommended",
+            )
+            .item(
+                SecurityRepositoryChoice::Existing,
+                "Use an existing repository",
+                "",
+            )
+            .interact()
+            .map_err(Error::from)
+    }
+
+    async fn prepare_security_repository(
         &self,
-        entry: ManifestEntry,
-        status: SetupStatus,
-    ) -> Result<(), Error> {
+        choice: SecurityRepositoryChoice,
+        did: Did,
+    ) -> Result<SecuritySetup, Error> {
+        match choice {
+            SecurityRepositoryChoice::Create => self.provision_security_repository(did).await,
+            SecurityRepositoryChoice::Existing => self.select_security_repository(did).await,
+        }
+    }
+
+    async fn provision_security_repository(&self, did: Did) -> Result<SecuritySetup, Error> {
+        tokio::task::spawn_blocking(move || SecuritySetup::provision(did))
+            .await
+            .map_err(|error| Error::Task(error.to_string()))?
+    }
+
+    async fn select_security_repository(&self, did: Did) -> Result<SecuritySetup, Error> {
+        let repository: radicle::identity::RepoId =
+            cliclack::input("Existing security repository RID")
+                .placeholder("rad:...")
+                .interact()?;
+        tokio::task::spawn_blocking(move || SecuritySetup::existing(repository, did))
+            .await
+            .map_err(|error| Error::Task(error.to_string()))?
+    }
+
+    fn show_security_recovery_key(&self, setup: &SecuritySetup) -> Result<(), Error> {
+        cliclack::note(
+            "Security recovery key",
+            format!(
+                "{}\n\nSave this key outside the agent environment. It is shown only once.",
+                setup.recovery_key()
+            ),
+        )
+        .map_err(Error::from)
+    }
+
+    async fn grant_security_access(&self, setup: &Setup) -> Result<(), Error> {
+        let Some(policy) = setup.security() else {
+            return Ok(());
+        };
+        let repository = policy.repository();
+        let did = setup.did();
+        let granted = cliclack::confirm("Grant this member access to the security repository?")
+            .initial_value(true)
+            .interact()?;
+        if !granted {
+            return Err(Error::Cancelled);
+        }
+        tokio::task::spawn_blocking(move || SecuritySetup::grant(repository, did))
+            .await
+            .map_err(|error| Error::Task(error.to_string()))??;
+
+        Ok(())
+    }
+
+    async fn prepare_repository_manifest(&self, update: ManifestUpdate) -> Result<(), Error> {
         let repository = self.application.repository();
         let checkout = tokio::task::spawn_blocking(move || RepositoryCheckout::current(repository))
             .await
             .map_err(|error| Error::Task(error.to_string()))??;
         match checkout {
-            Some(checkout) => self.prepare_checkout(checkout, entry, status).await,
+            Some(checkout) => self.prepare_checkout(checkout, update).await,
             None => self.missing_checkout(),
         }
     }
@@ -173,11 +275,10 @@ impl SetupWizard {
     async fn prepare_explicit_manifest(
         &self,
         path: &Path,
-        entry: ManifestEntry,
-        status: SetupStatus,
+        update: ManifestUpdate,
     ) -> Result<(), Error> {
         if self.confirm_explicit_manifest(path)? {
-            Self::update_explicit_manifest(path, entry, status).await
+            Self::update_explicit_manifest(path, update).await
         } else {
             self.wait_for_manifest()
         }
@@ -191,13 +292,9 @@ impl SetupWizard {
             .map_err(Error::from)
     }
 
-    async fn update_explicit_manifest(
-        path: &Path,
-        entry: ManifestEntry,
-        status: SetupStatus,
-    ) -> Result<(), Error> {
+    async fn update_explicit_manifest(path: &Path, update: ManifestUpdate) -> Result<(), Error> {
         let path = path.to_owned();
-        let changed = tokio::task::spawn_blocking(move || entry.prepare(&path, status))
+        let changed = tokio::task::spawn_blocking(move || update.prepare(&path))
             .await
             .map_err(|error| Error::Task(error.to_string()))??;
         if changed {
@@ -206,22 +303,18 @@ impl SetupWizard {
         Ok(())
     }
 
-    fn show_manifest(&self, setup: Setup) -> Result<ManifestEntry, Error> {
-        let entry = ManifestEntry::new(&self.application, setup);
-        cliclack::note("Member identity", setup.did())?;
-        cliclack::note("Required manifest entry", entry)?;
-
-        Ok(entry)
+    fn show_manifest(&self, entry: &ManifestEntry) -> Result<(), Error> {
+        cliclack::note("Member identity", entry.did)?;
+        cliclack::note("Required manifest entry", entry).map_err(Error::from)
     }
 
     async fn prepare_checkout(
         &self,
         checkout: RepositoryCheckout,
-        entry: ManifestEntry,
-        status: SetupStatus,
+        update: ManifestUpdate,
     ) -> Result<(), Error> {
         if self.confirm_publish(&checkout).await? {
-            Self::publish_manifest(checkout, entry, status).await?;
+            Self::publish_manifest(checkout, update).await?;
         }
         self.wait_for_manifest()
     }
@@ -241,10 +334,9 @@ impl SetupWizard {
 
     async fn publish_manifest(
         checkout: RepositoryCheckout,
-        entry: ManifestEntry,
-        status: SetupStatus,
+        update: ManifestUpdate,
     ) -> Result<(), Error> {
-        let published = tokio::task::spawn_blocking(move || checkout.publish(entry, status))
+        let published = tokio::task::spawn_blocking(move || checkout.publish(update))
             .await
             .map_err(|error| Error::Task(error.to_string()))??;
         if published {
@@ -323,6 +415,12 @@ enum Step {
     Complete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityRepositoryChoice {
+    Create,
+    Existing,
+}
+
 /// Error running interactive setup.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -335,6 +433,9 @@ pub enum Error {
     /// The working manifest is not valid editable TOML.
     #[error("invalid editable repository manifest: {0}")]
     Toml(#[from] toml_edit::TomlError),
+    /// A new manifest could not be serialized as TOML.
+    #[error("failed to serialize repository manifest: {0}")]
+    TomlSerialization(#[from] toml_edit::ser::Error),
     /// A binding generation cannot be represented as a TOML integer.
     #[error("binding generation is too large: {0}")]
     Generation(#[from] std::num::TryFromIntError),
@@ -380,6 +481,12 @@ pub enum Error {
     /// A binding cannot be appended because the working manifest is absent.
     #[error("'{FILE_NAME}' is missing from the current checkout")]
     MissingManifest,
+    /// A manifest appeared while the wizard was preparing to create it.
+    #[error("the repository manifest appeared during setup; rerun setup")]
+    ExistingManifest,
+    /// An existing security-report repository must not be public.
+    #[error("security-report repository {0} is public; select a private repository")]
+    PublicSecurityRepository(radicle::identity::RepoId),
     /// The wizard was asked to modify an already valid manifest.
     #[error("the repository manifest is already ready")]
     ReadyManifest,

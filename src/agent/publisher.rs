@@ -18,18 +18,25 @@ use radicle::{
 };
 use sqlite::State;
 
-use crate::{agent::DeliveryId, database::Database};
+use crate::{agent::DeliveryId, database::Database, manifest::SecurityPolicy};
 
 const JOURNAL_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS mcp_mutations (
         repository TEXT NOT NULL,
+        delivery_repository TEXT NOT NULL,
         operation TEXT NOT NULL,
         action TEXT NOT NULL,
         invocation TEXT NOT NULL,
         method TEXT NOT NULL,
         author TEXT NOT NULL,
         result TEXT,
-        PRIMARY KEY (repository, operation, action, invocation)
+        PRIMARY KEY (
+            repository,
+            delivery_repository,
+            operation,
+            action,
+            invocation
+        )
     ) STRICT;
 ";
 
@@ -78,6 +85,13 @@ impl Publisher {
         Ok(self)
     }
 
+    pub(crate) fn for_repository(&self, repository: RepoId) -> Self {
+        let mut publisher = self.clone();
+        publisher.repository = repository;
+        publisher.mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
+        publisher
+    }
+
     #[cfg(all(test, not(miri)))]
     pub(crate) async fn with_memory_journal(mut self) -> Result<Self, String> {
         self.journal = Some(MutationJournal::memory().await?);
@@ -101,12 +115,35 @@ impl Publisher {
         self.authorizer.authorize(method).await
     }
 
+    pub(crate) async fn security_policy(&self) -> Result<SecurityPolicy, String> {
+        self.authorizer.security_policy().await
+    }
+
     pub(crate) async fn reconcile(&self, delivery: DeliveryId) -> Result<(), String> {
         let Some(journal) = &self.journal else {
             return Ok(());
         };
+        for repository in journal.repositories(self.repository, delivery).await? {
+            self.for_repository(repository)
+                .reconcile_repository(self.repository, delivery)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_repository(
+        &self,
+        delivery_repository: RepoId,
+        delivery: DeliveryId,
+    ) -> Result<(), String> {
+        let Some(journal) = &self.journal else {
+            return Ok(());
+        };
         let _mutation_guard = self.mutation_lock.lock().await;
-        for entry in journal.entries(self.repository, delivery).await? {
+        for entry in journal
+            .entries(self.repository, delivery_repository, delivery)
+            .await?
+        {
             if entry.result.is_some() {
                 self.finish_recovery(entry.author).await?;
                 continue;
@@ -415,6 +452,7 @@ impl Publisher {
 
 #[derive(Debug, Clone)]
 pub(crate) struct MutationKey {
+    pub(crate) repository: RepoId,
     pub(crate) delivery: DeliveryId,
     pub(crate) invocation: usize,
     pub(crate) request: String,
@@ -441,6 +479,8 @@ impl Announcer for Node {
 #[async_trait::async_trait]
 pub(crate) trait Authorizer: fmt::Debug + Send + Sync + 'static {
     async fn authorize(&self, method: &str) -> Result<(), String>;
+
+    async fn security_policy(&self) -> Result<SecurityPolicy, String>;
 }
 
 #[derive(Clone)]
@@ -476,19 +516,20 @@ impl MutationJournal {
             .call(move |connection| {
                 let mut insert = connection.prepare(
                     "INSERT OR IGNORE INTO mcp_mutations
-                         (repository, operation, action, invocation, method, author)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                         (repository, delivery_repository, operation, action, invocation,
+                          method, author)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )?;
                 bind_mutation(&mut insert, &values)?;
-                insert.bind((5, method))?;
-                insert.bind((6, author.as_str()))?;
+                insert.bind((6, method))?;
+                insert.bind((7, author.as_str()))?;
                 insert.next()?;
                 drop(insert);
 
                 let mut select = connection.prepare(
                     "SELECT method, author, result FROM mcp_mutations
-                     WHERE repository = ?1 AND operation = ?2
-                       AND action = ?3 AND invocation = ?4",
+                     WHERE repository = ?1 AND delivery_repository = ?2
+                       AND operation = ?3 AND action = ?4 AND invocation = ?5",
                 )?;
                 bind_mutation(&mut select, &values)?;
                 if select.next()? != State::Row {
@@ -543,10 +584,12 @@ impl MutationJournal {
     async fn entries(
         &self,
         repository: RepoId,
+        delivery_repository: RepoId,
         delivery: DeliveryId,
     ) -> Result<Vec<DeliveryJournalEntry>, String> {
         let values = [
             repository.to_string(),
+            delivery_repository.to_string(),
             delivery.operation.to_string(),
             delivery.action.to_string(),
         ];
@@ -554,8 +597,8 @@ impl MutationJournal {
             .call(move |connection| {
                 let mut select = connection.prepare(
                     "SELECT invocation, method, author, result FROM mcp_mutations
-                     WHERE repository = ?1 AND operation = ?2
-                       AND action = ?3",
+                     WHERE repository = ?1 AND delivery_repository = ?2
+                       AND operation = ?3 AND action = ?4",
                 )?;
                 for (index, value) in values.iter().enumerate() {
                     select.bind((index + 1, value.as_str()))?;
@@ -572,6 +615,7 @@ impl MutationJournal {
                     })?;
                     entries.push(DeliveryJournalEntry {
                         key: MutationKey {
+                            repository: delivery_repository,
                             delivery,
                             invocation,
                             request,
@@ -587,13 +631,46 @@ impl MutationJournal {
             .map_err(stringify)
     }
 
+    async fn repositories(
+        &self,
+        delivery_repository: RepoId,
+        delivery: DeliveryId,
+    ) -> Result<Vec<RepoId>, String> {
+        let delivery_repository = delivery_repository.to_string();
+        let operation = delivery.operation.to_string();
+        let action = delivery.action.to_string();
+        self.database
+            .call(move |connection| {
+                let mut select = connection.prepare(
+                    "SELECT DISTINCT repository FROM mcp_mutations
+                     WHERE delivery_repository = ?1
+                       AND operation = ?2 AND action = ?3",
+                )?;
+                select.bind((1, delivery_repository.as_str()))?;
+                select.bind((2, operation.as_str()))?;
+                select.bind((3, action.as_str()))?;
+                let mut repositories = Vec::new();
+                while select.next()? == State::Row {
+                    let value = select.read::<String, _>(0)?;
+                    repositories.push(RepoId::from_str(&value).map_err(|error| sqlite::Error {
+                        code: None,
+                        message: Some(error.to_string()),
+                    })?);
+                }
+                Ok(repositories)
+            })
+            .await
+            .map_err(stringify)
+    }
+
     async fn discard(&self, repository: RepoId, key: &MutationKey) -> Result<(), String> {
         self.update_entry(
             repository,
             key,
             "DELETE FROM mcp_mutations
-             WHERE repository = ?1 AND operation = ?2
-               AND action = ?3 AND invocation = ?4 AND result IS NULL",
+             WHERE repository = ?1 AND delivery_repository = ?2
+               AND operation = ?3 AND action = ?4
+               AND invocation = ?5 AND result IS NULL",
         )
         .await
     }
@@ -604,8 +681,8 @@ impl MutationJournal {
             repository,
             key,
             "UPDATE mcp_mutations SET result = NULL
-             WHERE repository = ?1 AND operation = ?2
-               AND action = ?3 AND invocation = ?4",
+             WHERE repository = ?1 AND delivery_repository = ?2
+               AND operation = ?3 AND action = ?4 AND invocation = ?5",
         )
         .await
     }
@@ -660,27 +737,29 @@ fn stringify(error: impl fmt::Display) -> String {
 
 fn complete_mutation(
     connection: &sqlite::ConnectionThreadSafe,
-    values: &[String; 4],
+    values: &[String; 5],
     method: &str,
     author: &str,
     result: &str,
 ) -> sqlite::Result<()> {
     let mut update = connection.prepare(
-        "UPDATE mcp_mutations SET author = ?6, result = ?7
-         WHERE repository = ?1 AND operation = ?2
-           AND action = ?3 AND invocation = ?4 AND method = ?5",
+        "UPDATE mcp_mutations SET author = ?7, result = ?8
+         WHERE repository = ?1 AND delivery_repository = ?2
+           AND operation = ?3 AND action = ?4
+           AND invocation = ?5 AND method = ?6",
     )?;
     bind_mutation(&mut update, values)?;
-    update.bind((5, method))?;
-    update.bind((6, author))?;
-    update.bind((7, result))?;
+    update.bind((6, method))?;
+    update.bind((7, author))?;
+    update.bind((8, result))?;
     update.next()?;
     Ok(())
 }
 
-fn mutation_values(repository: RepoId, key: &MutationKey) -> [String; 4] {
+fn mutation_values(repository: RepoId, key: &MutationKey) -> [String; 5] {
     [
         repository.to_string(),
+        key.repository.to_string(),
         key.delivery.operation.to_string(),
         key.delivery.action.to_string(),
         encode_invocation(key),
@@ -706,7 +785,7 @@ fn decode_invocation(value: String) -> sqlite::Result<(usize, String)> {
 
 fn bind_mutation(
     statement: &mut sqlite::Statement<'_>,
-    values: &[String; 4],
+    values: &[String; 5],
 ) -> sqlite::Result<()> {
     for (index, value) in values.iter().enumerate() {
         statement.bind((index + 1, value.as_str()))?;

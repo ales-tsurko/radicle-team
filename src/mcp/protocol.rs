@@ -136,6 +136,32 @@ pub(super) struct TimelinePage {
     pub(super) next_cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct ListIssuesRequest {
+    pub(super) query: Option<String>,
+    pub(super) state: Option<IssueStateFilter>,
+    pub(super) cursor: Option<String>,
+    pub(super) limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum IssueStateFilter {
+    Open,
+    Closed,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct IssuePage {
+    pub(super) issues: Vec<SubjectDocument>,
+    pub(super) next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct IssueRequest {
+    pub(super) issue: String,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub(super) struct Document {
     pub(super) data: Value,
@@ -411,6 +437,45 @@ pub(super) struct CreateIssueRequest {
     pub(super) labels: Vec<String>,
     #[serde(default)]
     pub(super) assignees: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct CommentIssueRequest {
+    pub(super) issue: String,
+    pub(super) body: String,
+    pub(super) reply_to: Option<String>,
+    #[serde(default)]
+    pub(super) embeds: Vec<EmbedWriteRequest>,
+}
+
+impl CommentIssueRequest {
+    pub(super) fn comment(self) -> CommentWriteRequest {
+        CommentWriteRequest {
+            subject: SubjectRequest {
+                kind: SubjectKind::Issue,
+                subject: self.issue,
+            },
+            target: CommentTargetKind::Issue,
+            entity: None,
+            comment: None,
+            body: Some(self.body),
+            reply_to: self.reply_to,
+            location: None,
+            embeds: self.embeds,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct SecurityIssueRequest {
+    pub(super) title: String,
+    pub(super) description: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct SecurityIssueResult {
+    pub(super) repository: String,
+    pub(super) issue: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]

@@ -15,15 +15,16 @@ use rmcp::Json;
 
 use crate::mcp::{
     protocol::{
-        CommentOperation, CommentTargetKind, CommentWriteRequest, CreateIssueRequest,
-        CreatePatchRequest, Document, EditIssueRequest, EditPatchRequest, IssueUpdate,
-        MergePatchRequest, PatchCommitAction, PatchCommits, PatchUpdate, PreparedEmbed,
-        ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest, SetStateRequest,
-        SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest, SubjectUpdate,
-        UpdatePatchRequest, import_commits, mutation_identity, parse_dids, parse_entry_string,
-        parse_issue_state, parse_labels, parse_location, parse_object_string, parse_patch_commits,
-        parse_patch_state, parse_review, parse_revision, parse_subject_request, parse_verdict,
-        require_kind, stringify, validate_code_location, validate_merge, write_result,
+        CommentIssueRequest, CommentOperation, CommentTargetKind, CommentWriteRequest,
+        CreateIssueRequest, CreatePatchRequest, Document, EditIssueRequest, EditPatchRequest,
+        IssueUpdate, MergePatchRequest, PatchCommitAction, PatchCommits, PatchUpdate,
+        PreparedEmbed, ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest,
+        SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest,
+        SubjectUpdate, UpdatePatchRequest, import_commits, mutation_identity, parse_dids,
+        parse_entry_string, parse_issue_state, parse_labels, parse_location, parse_object_string,
+        parse_patch_commits, parse_patch_state, parse_review, parse_revision,
+        parse_subject_request, parse_verdict, require_kind, stringify, validate_code_location,
+        validate_merge, write_result,
     },
     recovery::{
         CommentRecovery, ReactionRecovery, find_review, issue_create_operation,
@@ -68,6 +69,9 @@ impl ToolService {
             let mut invocations = invocations.lock().await;
             let invocation = invocations.entry(request.clone()).or_default();
             let key = crate::agent::MutationKey {
+                repository: self
+                    .mutation_repository
+                    .expect("delivery repository should be configured"),
                 delivery,
                 invocation: *invocation,
                 request,
@@ -93,6 +97,31 @@ impl ToolService {
             CommentOperation::Redact => "redact_comment",
         };
         let request_id = mutation_identity(method, &request)?;
+        self.write_comment_as(request, operation, method, request_id)
+            .await
+    }
+
+    pub(super) async fn comment_issue_write(
+        &self,
+        request: CommentIssueRequest,
+    ) -> Result<Json<Document>, String> {
+        let request_id = mutation_identity("comment_issue", &request)?;
+        self.write_comment_as(
+            request.comment(),
+            CommentOperation::Create,
+            "comment_issue",
+            request_id,
+        )
+        .await
+    }
+
+    async fn write_comment_as(
+        &self,
+        request: CommentWriteRequest,
+        operation: CommentOperation,
+        method: &'static str,
+        request_id: String,
+    ) -> Result<Json<Document>, String> {
         let subject = parse_object_string(&request.subject.subject)?;
         let entity = request
             .entity
@@ -505,6 +534,26 @@ impl ToolService {
         request: CreateIssueRequest,
     ) -> Result<Json<Document>, String> {
         let request_id = mutation_identity("create_issue", &request)?;
+        self.create_issue_as(request, "create_issue", request_id, true)
+            .await
+    }
+
+    pub(super) async fn create_security_issue_write(
+        &self,
+        request: CreateIssueRequest,
+        request_id: String,
+    ) -> Result<Json<Document>, String> {
+        self.create_issue_as(request, "report_security_issue", request_id, false)
+            .await
+    }
+
+    async fn create_issue_as(
+        &self,
+        request: CreateIssueRequest,
+        method: &'static str,
+        request_id: String,
+        recover_description: bool,
+    ) -> Result<Json<Document>, String> {
         let title = radicle::cob::Title::try_from(request.title).map_err(stringify)?;
         let labels = parse_labels(request.labels)?;
         let assignees = parse_dids(request.assignees)?;
@@ -515,7 +564,7 @@ impl ToolService {
         let expected_description = description.clone();
         let id = self
             .mutate(
-                "create_issue",
+                method,
                 request_id,
                 move |repository, signer, marker| {
                     let identity = repository.identity_head().map_err(stringify)?;
@@ -558,7 +607,7 @@ impl ToolService {
                             repository,
                             operation,
                             &expected_title,
-                            &expected_description,
+                            recover_description.then_some(expected_description.as_str()),
                             &expected_labels,
                             &expected_assignees,
                         );

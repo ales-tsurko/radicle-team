@@ -38,15 +38,17 @@ use radicle::{
 #[cfg(not(miri))]
 use crate::mcp::{
     protocol::{
-        CommentOperation, CommentTargetKind, CommentWriteRequest, CreateIssueRequest,
-        CreatePatchRequest, DiffRequest, Document, EditIssueRequest, EditPatchRequest,
-        EmbedReadRequest, EmbedWriteRequest, LocationRequest, MAX_EMBED_BYTES, MergePatchRequest,
-        PreparedEmbed, ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest,
+        CommentIssueRequest, CommentOperation, CommentTargetKind, CommentWriteRequest,
+        CreateIssueRequest, CreatePatchRequest, DiffRequest, Document, EditIssueRequest,
+        EditPatchRequest, EmbedReadRequest, EmbedWriteRequest, IssueRequest, IssueStateFilter,
+        ListIssuesRequest, LocationRequest, MAX_EMBED_BYTES, MergePatchRequest, PreparedEmbed,
+        ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest, SecurityIssueRequest,
         SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest,
         mutation_identity, parse_location, parse_object, stringify, validate_code_location,
     },
     read::MAX_DIFF_BYTES,
     recovery::{ReactionRecovery, find_review, review_mutation_operation},
+    security::SecurityReporting,
     server::Server,
 };
 #[cfg(not(miri))]
@@ -114,20 +116,63 @@ impl RepositoryFixture {
         }
     }
 
+    fn additional_repository(&self, name: &str) -> RepoId {
+        let working = self._root.path().join(name);
+        let checkout = git2::Repository::init(&working).expect("repository should initialize");
+        checkout
+            .set_head("refs/heads/main")
+            .expect("main should become HEAD");
+        let tree = {
+            let oid = checkout
+                .treebuilder(None)
+                .expect("tree builder should initialize")
+                .write()
+                .expect("tree should be written");
+            checkout.find_tree(oid).expect("tree should be found")
+        };
+        let signature =
+            git2::Signature::now("MCP Test", "mcp@example.com").expect("signature should be valid");
+        checkout
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "Initial",
+                &tree,
+                &[],
+            )
+            .expect("commit should be created");
+        let signer = self.profile.signer().expect("signer should load");
+        let (repository, _document, _refs) = radicle::rad::init(
+            &checkout,
+            name.try_into().expect("project name should be valid"),
+            "Additional MCP fixture",
+            "main".try_into().expect("branch should be valid"),
+            Visibility::private([]),
+            &signer,
+            &self.profile.storage,
+        )
+        .expect("Radicle repository should initialize");
+
+        repository
+    }
+
     fn service(&self) -> ToolService {
         let publisher = crate::agent::Publisher::new(
             self.profile.clone(),
             self.repository,
             None,
             TestAnnouncer,
-            TestAuthorizer,
+            TestAuthorizer(self.repository),
         );
+        let security = SecurityReporting::new(&publisher);
         ToolService::new(
             self.profile.storage.clone(),
             self.repository,
             super::DeliveryScope::default(),
             publisher,
             crate::manifest::McpAllowlist::default(),
+            security,
         )
     }
 
@@ -141,17 +186,19 @@ impl RepositoryFixture {
             self.repository,
             None,
             announcer,
-            TestAuthorizer,
+            TestAuthorizer(self.repository),
         )
         .with_memory_journal()
         .await
         .expect("mutation journal should initialize");
+        let security = SecurityReporting::new(&publisher);
         ToolService::new(
             self.profile.storage.clone(),
             self.repository,
             scope,
             publisher,
             crate::manifest::McpAllowlist::default(),
+            security,
         )
     }
 
@@ -294,7 +341,7 @@ async fn starts_on_a_loopback_capability_url_and_stops() {
         repository,
         None,
         TestAnnouncer,
-        TestAuthorizer,
+        TestAuthorizer(repository),
     );
     let server = Server::start(
         profile.storage.clone(),
@@ -378,13 +425,33 @@ impl crate::agent::Announcer for TestAnnouncer {
 
 #[cfg(not(miri))]
 #[derive(Debug, Clone, Copy)]
-struct TestAuthorizer;
+struct TestAuthorizer(RepoId);
 
 #[cfg(not(miri))]
 #[async_trait::async_trait]
 impl crate::agent::Authorizer for TestAuthorizer {
     async fn authorize(&self, _method: &str) -> Result<(), String> {
         Ok(())
+    }
+
+    async fn security_policy(&self) -> Result<crate::manifest::SecurityPolicy, String> {
+        Ok(crate::manifest::SecurityPolicy::test(self.0))
+    }
+}
+
+#[cfg(not(miri))]
+#[derive(Debug, Clone)]
+struct RotatingAuthorizer(Arc<tokio::sync::RwLock<crate::manifest::SecurityPolicy>>);
+
+#[cfg(not(miri))]
+#[async_trait::async_trait]
+impl crate::agent::Authorizer for RotatingAuthorizer {
+    async fn authorize(&self, _method: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn security_policy(&self) -> Result<crate::manifest::SecurityPolicy, String> {
+        Ok(self.0.read().await.clone())
     }
 }
 
@@ -438,6 +505,7 @@ async fn recovers_a_completed_write_when_the_delivery_is_replayed() {
         assignees: Vec::new(),
     };
     let mutation = crate::agent::MutationKey {
+        repository: fixture.repository,
         delivery: context.delivery,
         invocation: 0,
         request: mutation_identity("create_issue", &request()).expect("request should serialize"),
@@ -507,6 +575,87 @@ async fn recovers_a_completed_write_when_the_delivery_is_replayed() {
 
 #[tokio::test]
 #[cfg(not(miri))]
+async fn reconciles_security_writes_from_the_delivery_journal() {
+    let fixture = RepositoryFixture::new();
+    let security_repository = fixture.additional_repository("security-recovery");
+    let announcements = Arc::new(AtomicUsize::new(0));
+    let publisher = crate::agent::Publisher::new(
+        fixture.profile.clone(),
+        fixture.repository,
+        None,
+        FlakyAnnouncer(Arc::clone(&announcements)),
+        TestAuthorizer(security_repository),
+    )
+    .with_memory_journal()
+    .await
+    .expect("mutation journal should initialize");
+    let scope = super::DeliveryScope::new(publisher.clone());
+    let reporting = SecurityReporting::new(&publisher);
+    let service = ToolService::new(
+        fixture.profile.storage.clone(),
+        fixture.repository,
+        scope.clone(),
+        publisher,
+        crate::manifest::McpAllowlist::default(),
+        reporting.clone(),
+    );
+    let context = crate::agent::Context {
+        repository: fixture.repository,
+        subject: crate::watcher::Subject::Issue(
+            ObjectId::from_str("1111111111111111111111111111111111111111")
+                .expect("subject should be valid"),
+        ),
+        delivery: crate::agent::DeliveryId {
+            operation: EntryId::from_str("2222222222222222222222222222222222222222")
+                .expect("operation should be valid"),
+            action: 0,
+        },
+        author: fixture.profile.did(),
+        workspace: fixture.working.clone(),
+    };
+    scope
+        .activate(context.clone())
+        .await
+        .expect("delivery should activate");
+    let access = scope
+        .access_current()
+        .await
+        .expect("delivery should be accessible");
+    let delivery_service = service.for_delivery(&access);
+
+    let _announcement = reporting
+        .report(
+            &delivery_service,
+            SecurityIssueRequest {
+                title: "Interrupted report".to_owned(),
+                description: "Announce this once".to_owned(),
+            },
+        )
+        .await
+        .expect_err("the first announcement should fail");
+    drop(access);
+    scope
+        .reconcile(context.delivery)
+        .await
+        .expect("security write should reconcile");
+
+    let repository = fixture
+        .profile
+        .storage
+        .repository(security_repository)
+        .expect("security repository should open");
+    assert_eq!(
+        issue::Issues::open(&repository, radicle::cob::store::access::ReadOnly)
+            .expect("issues should open")
+            .count()
+            .expect("issues should count"),
+        1
+    );
+    assert_eq!(announcements.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+#[cfg(not(miri))]
 async fn recovers_an_unsigned_local_write_without_duplication() {
     let fixture = RepositoryFixture::new();
     let scope = super::DeliveryScope::default();
@@ -534,6 +683,7 @@ async fn recovers_an_unsigned_local_write_without_duplication() {
         assignees: Vec::new(),
     };
     let mutation = crate::agent::MutationKey {
+        repository: fixture.repository,
         delivery: context.delivery,
         invocation: 0,
         request: mutation_identity("create_issue", &request()).expect("request should serialize"),
@@ -678,6 +828,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
     service
         .publisher
         .forget_completion(&crate::agent::MutationKey {
+            repository: fixture.repository,
             delivery,
             invocation: 0,
             request: mutation_identity("create_comment", &comment_request())
@@ -751,6 +902,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
     service
         .publisher
         .forget_completion(&crate::agent::MutationKey {
+            repository: fixture.repository,
             delivery,
             invocation: 0,
             request: mutation_identity("create_review", &review_request())
@@ -873,6 +1025,7 @@ async fn replays_stale_mutations_and_distinguishes_repeated_invocations() {
     service
         .publisher
         .forget_completion(&crate::agent::MutationKey {
+            repository: fixture.repository,
             delivery,
             invocation: 0,
             request: mutation_identity("edit_issue", &stale()).expect("request should serialize"),
@@ -1154,6 +1307,34 @@ async fn manages_issues_and_their_comments() {
     );
     let subject = RepositoryFixture::subject(SubjectKind::Issue, &issue);
 
+    let page = service
+        .issues(ListIssuesRequest {
+            query: Some("bug".to_owned()),
+            state: Some(IssueStateFilter::Open),
+            cursor: None,
+            limit: Some(1),
+        })
+        .expect("issues should be listed");
+    assert_eq!(page.issues.len(), 1);
+    assert_eq!(page.issues[0].subject, issue);
+    assert_eq!(
+        service
+            .issue(IssueRequest {
+                issue: issue.clone(),
+            })
+            .expect("issue should load")["title"],
+        "Bug"
+    );
+    service
+        .comment_issue_write(CommentIssueRequest {
+            issue: issue.clone(),
+            body: "Repository-wide finding".to_owned(),
+            reply_to: None,
+            embeds: Vec::new(),
+        })
+        .await
+        .expect("repository-wide issue comment should be created");
+
     service
         .set_state_write(
             SetStateRequest {
@@ -1423,6 +1604,99 @@ async fn manages_issues_and_their_comments() {
             "a missing target must not validate a fresh reaction"
         );
     }
+}
+
+#[tokio::test]
+#[cfg(not(miri))]
+async fn reports_security_issues_independently_of_the_issue_allowlist() {
+    let fixture = RepositoryFixture::new();
+    let service = fixture.service();
+    let report = SecurityReporting::new(&service.publisher)
+        .report(
+            &service,
+            SecurityIssueRequest {
+                title: "Credential exposure".to_owned(),
+                description: "A token is written to logs.".to_owned(),
+            },
+        )
+        .await
+        .expect("security issue should be reported");
+
+    assert_eq!(report.repository, fixture.repository.to_string());
+    assert!(!report.issue.is_empty());
+    let issue = service
+        .issue(IssueRequest {
+            issue: report.issue,
+        })
+        .expect("encrypted issue should be readable in the fixture");
+    let description = issue
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .expect("security issue should have a description");
+    assert!(description.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"));
+    assert!(!description.contains("token"));
+}
+
+#[tokio::test]
+#[cfg(not(miri))]
+async fn reloads_the_security_policy_before_reporting() {
+    let fixture = RepositoryFixture::new();
+    let old_identity = age::x25519::Identity::generate();
+    let current_identity = age::x25519::Identity::generate();
+    let policy = Arc::new(tokio::sync::RwLock::new(
+        crate::manifest::SecurityPolicy::test_with_recipients(
+            fixture.repository,
+            vec![old_identity.to_public().to_string()],
+        ),
+    ));
+    let publisher = crate::agent::Publisher::new(
+        fixture.profile.clone(),
+        fixture.repository,
+        None,
+        TestAnnouncer,
+        RotatingAuthorizer(Arc::clone(&policy)),
+    );
+    let reporting = SecurityReporting::new(&publisher);
+    let service = ToolService::new(
+        fixture.profile.storage.clone(),
+        fixture.repository,
+        super::DeliveryScope::default(),
+        publisher,
+        crate::manifest::McpAllowlist::default(),
+        reporting.clone(),
+    );
+    *policy.write().await = crate::manifest::SecurityPolicy::test_with_recipients(
+        fixture.repository,
+        vec![current_identity.to_public().to_string()],
+    );
+
+    let report = reporting
+        .report(
+            &service,
+            SecurityIssueRequest {
+                title: "Rotated policy".to_owned(),
+                description: "Current recipient only".to_owned(),
+            },
+        )
+        .await
+        .expect("security issue should be reported");
+    let issue = service
+        .issue(IssueRequest {
+            issue: report.issue,
+        })
+        .expect("security issue should be readable");
+    let description = issue
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .expect("security issue should have a description");
+
+    let _removed = age::decrypt(&old_identity, description.as_bytes())
+        .expect_err("removed recipient must not decrypt the report");
+    let plaintext = age::decrypt(&current_identity, description.as_bytes())
+        .expect("current recipient should decrypt the report");
+    let plaintext: SecurityIssueRequest =
+        serde_json::from_slice(&plaintext).expect("report should contain its request");
+    assert_eq!(plaintext.description, "Current recipient only");
 }
 
 #[tokio::test]

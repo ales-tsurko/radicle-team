@@ -143,7 +143,7 @@ impl Application {
 
     async fn prepare_setup(&self, runtime: &Runtime) -> Result<Setup, Error> {
         self.synchronize(&runtime.identity).await?;
-        let status = self.setup_status(&runtime.home, &runtime.identity).await?;
+        let (status, security) = self.setup_status(runtime).await?;
         let did = runtime.identity.did();
 
         Ok(Setup {
@@ -151,6 +151,7 @@ impl Application {
             repository: self.repository,
             did,
             status,
+            security,
         })
     }
 
@@ -231,8 +232,13 @@ impl Application {
 
     async fn prepare_run(&self, runtime: &Runtime) -> Result<manifest::ValidatedBinding, Error> {
         self.synchronize(&runtime.identity).await?;
-        self.validate_binding(&runtime.home, &runtime.identity)
-            .await
+        let binding = self
+            .validate_binding(&runtime.home, &runtime.identity)
+            .await?;
+        self.prepare_security_repository(runtime, binding.security())
+            .await?;
+
+        Ok(binding)
     }
 
     fn member_home(&self) -> Result<MemberHome, home::Error> {
@@ -249,17 +255,29 @@ impl Application {
     }
 
     async fn synchronize(&self, identity: &identity::Identity) -> Result<(), Error> {
+        self.synchronize_repository(identity, self.repository).await
+    }
+
+    async fn synchronize_repository(
+        &self,
+        identity: &identity::Identity,
+        repository: RepoId,
+    ) -> Result<(), Error> {
         self.ensure_running()?;
         let output = self
-            .sync_command(identity)
+            .sync_command(identity, repository)
             .output()
             .await
             .map_err(Error::SyncSpawn)?;
         self.ensure_running()?;
-        self.validate_sync_output(identity, output)
+        self.validate_sync_output(identity, repository, output)
     }
 
-    fn sync_command(&self, identity: &identity::Identity) -> tokio::process::Command {
+    fn sync_command(
+        &self,
+        identity: &identity::Identity,
+        repository: RepoId,
+    ) -> tokio::process::Command {
         let mut command = tokio::process::Command::new("rad");
         command
             .arg("sync")
@@ -271,7 +289,7 @@ impl Application {
         for seed in &self.seeds {
             command.arg("--seed").arg(seed.to_string());
         }
-        command.arg(self.repository.to_string());
+        command.arg(repository.to_string());
         identity.configure_radicle_command(command.as_std_mut());
 
         command
@@ -280,6 +298,7 @@ impl Application {
     fn validate_sync_output(
         &self,
         identity: &identity::Identity,
+        repository: RepoId,
         output: std::process::Output,
     ) -> Result<(), Error> {
         if output.status.success() {
@@ -291,7 +310,7 @@ impl Application {
                 String::from_utf8_lossy(&output.stderr).trim().to_owned()
             };
             Err(Error::Sync {
-                repository: self.repository,
+                repository,
                 did: identity.did(),
                 status: output.status,
                 details,
@@ -304,13 +323,41 @@ impl Application {
         identity: &identity::Identity,
         node: &Node,
     ) -> Result<(), Error> {
+        self.seed(identity, node, self.repository).await
+    }
+
+    async fn seed(
+        &self,
+        identity: &identity::Identity,
+        node: &Node,
+        repository: RepoId,
+    ) -> Result<(), Error> {
         let profile = identity.profile().clone();
-        let repository = self.repository;
         let mut node = node.clone();
         tokio::task::spawn_blocking(move || profile.seed(repository, Scope::All, &mut node))
             .await
             .map_err(|error| Error::Task(error.to_string()))??;
         Ok(())
+    }
+
+    async fn prepare_security_repository(
+        &self,
+        runtime: &Runtime,
+        policy: &manifest::SecurityPolicy,
+    ) -> Result<(), Error> {
+        let repository = policy.repository();
+        self.seed(&runtime.identity, runtime.node.node(), repository)
+            .await?;
+        self.synchronize_repository(&runtime.identity, repository)
+            .await?;
+        let storage = runtime.identity.profile().storage.clone();
+        let did = runtime.identity.did();
+        tokio::task::spawn_blocking(move || {
+            let stored = storage.repository(repository)?;
+            Self::validate_private_repository_access(&stored, repository, did)
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))?
     }
 
     fn ensure_running(&self) -> Result<(), Error> {
@@ -323,11 +370,13 @@ impl Application {
 
     async fn setup_status(
         &self,
-        home: &MemberHome,
-        identity: &identity::Identity,
-    ) -> Result<SetupStatus, Error> {
-        let validation = self.load_setup_validation(identity).await?;
-        validation.record(self, home).await
+        runtime: &Runtime,
+    ) -> Result<(SetupStatus, Option<manifest::SecurityPolicy>), Error> {
+        let validation = self.load_setup_validation(&runtime.identity).await?;
+        if let Some(policy) = validation.ready_security() {
+            self.prepare_security_repository(runtime, policy).await?;
+        }
+        validation.record(self, &runtime.home).await
     }
 
     async fn load_setup_validation(
@@ -428,6 +477,41 @@ impl Application {
                 did,
             })
         }
+    }
+
+    fn validate_private_repository_access(
+        repository: &radicle::storage::git::Repository,
+        repository_id: RepoId,
+        did: Did,
+    ) -> Result<(), Error> {
+        let identity = repository.identity_doc()?;
+        if identity.is_public() {
+            return Err(Error::PublicSecurityRepository(repository_id));
+        }
+        if identity.is_visible_to(&did) {
+            Ok(())
+        } else {
+            Err(Error::RepositoryAccess {
+                repository: repository_id,
+                did,
+            })
+        }
+    }
+
+    async fn validate_security_policy(
+        &self,
+        profile: &RadicleProfile,
+        did: Did,
+        policy: &manifest::SecurityPolicy,
+    ) -> Result<(), Error> {
+        let storage = profile.storage.clone();
+        let repository = policy.repository();
+        tokio::task::spawn_blocking(move || {
+            let stored = storage.repository(repository)?;
+            Self::validate_private_repository_access(&stored, repository, did)
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))?
     }
 }
 
@@ -695,6 +779,9 @@ impl agent::Authorizer for WriteAuthorizer {
             .validate_profile_binding(&self.home, &self.profile, self.did)
             .await
             .and_then(|binding| {
+                if method == "report_security_issue" {
+                    return Ok(());
+                }
                 binding
                     .mcp_allow()
                     .allows(method)
@@ -704,6 +791,20 @@ impl agent::Authorizer for WriteAuthorizer {
                     })
             })
             .map_err(|error| error.to_string())
+    }
+
+    async fn security_policy(&self) -> Result<manifest::SecurityPolicy, String> {
+        let binding = self
+            .application
+            .validate_profile_binding(&self.home, &self.profile, self.did)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.application
+            .validate_security_policy(&self.profile, self.did, binding.security())
+            .await
+            .map_err(|error| error.to_string())?;
+
+        Ok(binding.security().clone())
     }
 }
 
@@ -763,7 +864,7 @@ impl RunCleanup {
 enum SetupValidation {
     Ready(manifest::ValidatedBinding),
     ManifestMissing,
-    BindingMissing,
+    BindingMissing(manifest::SecurityPolicy),
 }
 
 impl SetupValidation {
@@ -773,8 +874,17 @@ impl SetupValidation {
         };
         match manifest.validate_member(member, did) {
             Ok(binding) => Ok(Self::Ready(binding)),
-            Err(manifest::Error::Missing { .. }) => Ok(Self::BindingMissing),
+            Err(manifest::Error::Missing { .. }) => {
+                Ok(Self::BindingMissing(manifest.security().clone()))
+            }
             Err(error) => Err(error),
+        }
+    }
+
+    const fn ready_security(&self) -> Option<&manifest::SecurityPolicy> {
+        match self {
+            Self::Ready(binding) => Some(binding.security()),
+            Self::ManifestMissing | Self::BindingMissing(_) => None,
         }
     }
 
@@ -782,31 +892,38 @@ impl SetupValidation {
         self,
         application: &Application,
         home: &MemberHome,
-    ) -> Result<SetupStatus, Error> {
+    ) -> Result<(SetupStatus, Option<manifest::SecurityPolicy>), Error> {
         match self {
             Self::Ready(binding) => {
                 application.record_binding(home, binding.clone()).await?;
-                Ok(SetupStatus::Ready {
-                    generation: binding.generation(),
-                })
+                let generation = binding.generation();
+                let security = binding.security().clone();
+                Ok((SetupStatus::Ready { generation }, Some(security)))
             }
-            Self::ManifestMissing => Ok(SetupStatus::ManifestMissing {
-                generation: application.next_binding_generation(home).await?,
-            }),
-            Self::BindingMissing => Ok(SetupStatus::BindingMissing {
-                generation: application.next_binding_generation(home).await?,
-            }),
+            Self::ManifestMissing => Ok((
+                SetupStatus::ManifestMissing {
+                    generation: application.next_binding_generation(home).await?,
+                },
+                None,
+            )),
+            Self::BindingMissing(security) => Ok((
+                SetupStatus::BindingMissing {
+                    generation: application.next_binding_generation(home).await?,
+                },
+                Some(security),
+            )),
         }
     }
 }
 
 /// Result of preparing one member and repository.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Setup {
     member: Member,
     repository: RepoId,
     did: Did,
     status: SetupStatus,
+    security: Option<manifest::SecurityPolicy>,
 }
 
 impl Setup {
@@ -821,6 +938,12 @@ impl Setup {
     pub const fn status(&self) -> SetupStatus {
         self.status
     }
+
+    /// Returns existing security policy, if the manifest already exists.
+    #[must_use]
+    pub const fn security(&self) -> Option<&manifest::SecurityPolicy> {
+        self.security.as_ref()
+    }
 }
 
 impl fmt::Display for Setup {
@@ -834,9 +957,8 @@ impl fmt::Display for Setup {
             ),
             SetupStatus::ManifestMissing { generation } => write!(
                 formatter,
-                "add .radicle-team.toml to the repository's canonical branch:\n\nversion = \
-                 1\n\n[members.{}]\nsigning_did = \"{}\"\ngeneration = {generation}\nstate = \
-                 \"active\"",
+                "run interactive setup to provision the private security repository, then bind {} \
+                 to {} with generation {generation}",
                 self.member, self.did,
             ),
             SetupStatus::BindingMissing { generation } => write!(
@@ -928,6 +1050,9 @@ pub enum Error {
         /// Rejected member identity.
         did: Did,
     },
+    /// Security reports must never be written to a public repository.
+    #[error("security-report repository {0} is public")]
+    PublicSecurityRepository(RepoId),
     /// Loading or validating the repository manifest failed.
     #[error("repository manifest error: {0}")]
     Manifest(#[from] manifest::Error),
@@ -955,7 +1080,14 @@ mod tests {
     use std::str::FromStr as _;
 
     #[cfg(not(miri))]
-    use radicle::git::Oid;
+    use radicle::{
+        crypto::Seed,
+        git::Oid,
+        identity::doc::Visibility,
+        node::Alias,
+        profile::{Home, Profile},
+        storage::ReadStorage as _,
+    };
     use radicle::identity::RepoId;
 
     #[cfg(not(miri))]
@@ -1012,6 +1144,66 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
+    fn rejects_a_public_security_repository() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let home = Home::new(root.path().join("home")).expect("Radicle home should be created");
+        let profile = Profile::init(home, Alias::new("security-test"), None, Seed::generate())
+            .expect("Radicle profile should initialize");
+        let working = root.path().join("working");
+        let checkout = git2::Repository::init(&working).expect("Git repository should initialize");
+        checkout
+            .set_head("refs/heads/main")
+            .expect("main should become HEAD");
+        let tree = {
+            let oid = checkout
+                .treebuilder(None)
+                .expect("tree builder should initialize")
+                .write()
+                .expect("tree should be written");
+            checkout.find_tree(oid).expect("tree should be found")
+        };
+        let signature = git2::Signature::now("Security Test", "security@example.com")
+            .expect("signature should be valid");
+        checkout
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "Initial",
+                &tree,
+                &[],
+            )
+            .expect("commit should be created");
+        let signer = profile.signer().expect("signer should load");
+        let (repository, _document, _refs) = radicle::rad::init(
+            &checkout,
+            "security-test"
+                .try_into()
+                .expect("project name should be valid"),
+            "Security test",
+            "main".try_into().expect("branch should be valid"),
+            Visibility::Public,
+            &signer,
+            &profile.storage,
+        )
+        .expect("Radicle repository should initialize");
+        let stored = profile
+            .storage
+            .repository(repository)
+            .expect("stored repository should open");
+
+        assert!(matches!(
+            Application::validate_private_repository_access(
+                &stored,
+                repository,
+                profile.did(),
+            ),
+            Err(super::Error::PublicSecurityRepository(actual)) if actual == repository
+        ));
+    }
+
+    #[test]
     fn setup_explains_a_missing_manifest() {
         let repository = RepoId::from_str("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc")
             .expect("repository ID should be valid");
@@ -1023,12 +1215,13 @@ mod tests {
             repository,
             did,
             status: SetupStatus::ManifestMissing { generation: 1 },
+            security: None,
         };
         let output = setup.to_string();
 
         assert!(output.contains("nico identity: did:key:"));
-        assert!(output.contains("[members.nico]"));
-        assert!(output.contains("version = 1"));
+        assert!(output.contains("run interactive setup"));
+        assert!(output.contains("generation 1"));
     }
 
     #[tokio::test]
@@ -1048,13 +1241,15 @@ mod tests {
             did,
             i64::MAX.unsigned_abs(),
             Revision::Repository(Oid::from_sha1([0; 20])),
+            crate::manifest::McpAllowlist::default(),
+            crate::manifest::SecurityPolicy::test(repository),
         );
         application
             .record_binding(&home, binding.clone())
             .await
             .expect("maximum generation should be recorded");
 
-        let status = SetupValidation::Ready(binding)
+        let (status, security) = SetupValidation::Ready(binding)
             .record(&application, &home)
             .await
             .expect("a ready maximum generation should not be incremented");
@@ -1065,6 +1260,7 @@ mod tests {
                 generation: i64::MAX.unsigned_abs()
             }
         );
+        assert!(security.is_some());
         fs::remove_dir_all(root).expect("fixture should be removed");
     }
 }

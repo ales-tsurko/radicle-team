@@ -12,8 +12,7 @@ use git2::{
 use radicle::identity::RepoId;
 
 use crate::{
-    SetupStatus,
-    cli::setup::{Error, ManifestEntry},
+    cli::setup::{Error, ManifestUpdate},
     manifest::FILE_NAME,
     member::Member,
 };
@@ -72,11 +71,11 @@ impl RepositoryCheckout {
         ))
     }
 
-    pub(super) fn publish(&self, entry: ManifestEntry, status: SetupStatus) -> Result<bool, Error> {
+    pub(super) fn publish(&self, update: ManifestUpdate) -> Result<bool, Error> {
         self.validate_manifest_change()?;
         let base = self.revision("HEAD")?;
         let manifest_existed = self.path.join(FILE_NAME).try_exists()?;
-        let committed = match self.commit_manifest(entry, status) {
+        let committed = match self.commit_manifest(update) {
             Ok(committed) => committed,
             Err(operation) => {
                 if let Err(recovery) = self.restore_checkout(&base, &base, manifest_existed) {
@@ -151,23 +150,16 @@ impl RepositoryCheckout {
         }
     }
 
-    pub(super) fn commit_manifest(
-        &self,
-        entry: ManifestEntry,
-        status: SetupStatus,
-    ) -> Result<bool, Error> {
-        if !entry.prepare(&self.path.join(FILE_NAME), status)? {
+    pub(super) fn commit_manifest(&self, update: ManifestUpdate) -> Result<bool, Error> {
+        if !update.prepare(&self.path.join(FILE_NAME))? {
             return Ok(false);
         }
+        let member = update.entry().member;
         let repository = self.repository()?;
         let mut index = repository.index()?;
         index.add_path(Path::new(FILE_NAME))?;
         index.write()?;
-        self.git_cli([
-            "commit",
-            "-m",
-            &format!("Bind {} to radicle-team", entry.member),
-        ])?;
+        self.git_cli(["commit", "-m", &format!("Bind {member} to radicle-team")])?;
 
         Ok(true)
     }

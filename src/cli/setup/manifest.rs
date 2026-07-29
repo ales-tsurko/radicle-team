@@ -2,16 +2,20 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::{fs, io, io::Write as _, path::Path};
+use std::{collections::BTreeMap, fs, io, io::Write as _, path::Path};
 
 use radicle::identity::Did;
+use serde::Serialize;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 
 use crate::{
-    Application, Setup, SetupStatus, cli::setup::Error, manifest::Manifest, member::Member,
+    Application, Setup,
+    cli::setup::{Error, SecurityManifest},
+    manifest::Manifest,
+    member::Member,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ManifestEntry {
     pub(super) member: Member,
     pub(super) did: Did,
@@ -19,40 +23,114 @@ pub(crate) struct ManifestEntry {
 }
 
 impl ManifestEntry {
-    pub(super) const fn new(application: &Application, setup: Setup) -> Self {
+    pub(super) fn new(application: &Application, setup: &Setup) -> Self {
         Self {
             member: application.member(),
             did: setup.did(),
             generation: setup.status().generation(),
         }
     }
+}
 
-    pub(super) fn prepare(self, path: &Path, status: SetupStatus) -> Result<bool, Error> {
+#[derive(Debug, Clone)]
+pub(crate) enum ManifestUpdate {
+    Create {
+        entry: ManifestEntry,
+        security: SecurityManifest,
+    },
+    Extend(ManifestEntry),
+}
+
+#[derive(Serialize)]
+struct SetupDocument<'a> {
+    version: u32,
+    security: SetupSecurity<'a>,
+    members: BTreeMap<&'static str, SetupBinding>,
+}
+
+impl<'a> SetupDocument<'a> {
+    fn new(entry: &ManifestEntry, security: &'a SecurityManifest) -> Self {
+        Self {
+            version: 1,
+            security: SetupSecurity {
+                repository: security.repository,
+                recipients: [&security.recipient],
+            },
+            members: BTreeMap::from([(
+                entry.member.id(),
+                SetupBinding {
+                    signing_did: entry.did,
+                    generation: entry.generation,
+                    state: "active",
+                    mcp_allow: entry.member.profile().mcp_allow,
+                },
+            )]),
+        }
+    }
+
+    fn serialize(&self) -> Result<String, Error> {
+        toml_edit::ser::to_string_pretty(self).map_err(Error::from)
+    }
+}
+
+#[derive(Serialize)]
+struct SetupSecurity<'a> {
+    repository: radicle::identity::RepoId,
+    recipients: [&'a str; 1],
+}
+
+#[derive(Serialize)]
+struct SetupBinding {
+    signing_did: Did,
+    generation: u64,
+    state: &'static str,
+    mcp_allow: &'static [&'static str],
+}
+
+impl ManifestUpdate {
+    pub(super) const fn create(entry: ManifestEntry, security: SecurityManifest) -> Self {
+        Self::Create { entry, security }
+    }
+
+    pub(super) const fn extend(entry: ManifestEntry) -> Self {
+        Self::Extend(entry)
+    }
+
+    pub(super) const fn entry(&self) -> &ManifestEntry {
+        match self {
+            Self::Create { entry, .. } | Self::Extend(entry) => entry,
+        }
+    }
+
+    pub(super) fn prepare(&self, path: &Path) -> Result<bool, Error> {
         let existing = match fs::read_to_string(path) {
             Ok(contents) => Some(contents),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
         let create = existing.is_none();
-        let contents = match status {
-            SetupStatus::ManifestMissing { .. } if existing.is_none() => {
-                format!("version = 1\n\n{self}\n")
+        let contents = match self {
+            Self::Create { entry, security } if existing.is_none() => {
+                SetupDocument::new(entry, security).serialize()?
             }
-            SetupStatus::ManifestMissing { .. } | SetupStatus::BindingMissing { .. } => {
-                self.extend(existing.as_deref().ok_or(Error::MissingManifest)?)?
+            Self::Create { .. } => return Err(Error::ExistingManifest),
+            Self::Extend(entry) => {
+                entry.extend(existing.as_deref().ok_or(Error::MissingManifest)?)?
             }
-            SetupStatus::Ready { .. } => return Err(Error::ReadyManifest),
         };
         if existing.as_deref() == Some(contents.as_str()) {
             return Ok(false);
         }
-        Manifest::validate_candidate(&contents, self.member, self.did)?;
-        Self::write(path, &contents, create)?;
+        let entry = self.entry();
+        Manifest::validate_candidate(&contents, entry.member, entry.did)?;
+        ManifestEntry::write(path, &contents, create)?;
 
         Ok(true)
     }
+}
 
-    fn extend(self, contents: &str) -> Result<String, Error> {
+impl ManifestEntry {
+    fn extend(&self, contents: &str) -> Result<String, Error> {
         let mut document = contents.parse::<DocumentMut>()?;
         let has_member = document
             .get("members")
@@ -91,7 +169,7 @@ impl ManifestEntry {
         Ok(document.to_string())
     }
 
-    fn table(self) -> Result<Table, Error> {
+    fn table(&self) -> Result<Table, Error> {
         let mut binding = Table::new();
         let _previous = binding.insert("signing_did", value(self.did.to_string()));
         let _previous = binding.insert("generation", value(self.generation()?));
@@ -101,7 +179,7 @@ impl ManifestEntry {
         Ok(binding)
     }
 
-    fn inline_table(self) -> Result<Value, Error> {
+    fn inline_table(&self) -> Result<Value, Error> {
         let mut binding = InlineTable::new();
         let _previous = binding.insert("signing_did", self.did.to_string().into());
         let _previous = binding.insert("generation", self.generation()?.into());
@@ -111,11 +189,11 @@ impl ManifestEntry {
         Ok(binding.into())
     }
 
-    fn generation(self) -> Result<i64, Error> {
+    fn generation(&self) -> Result<i64, Error> {
         Ok(i64::try_from(self.generation)?)
     }
 
-    fn mcp_allow(self) -> Array {
+    fn mcp_allow(&self) -> Array {
         self.member.profile().mcp_allow.iter().copied().collect()
     }
 

@@ -18,14 +18,16 @@ use crate::{
     manifest::McpAllowlist,
     mcp::{
         protocol::{
-            CommentOperation, CommentWriteRequest, CreateIssueRequest, CreatePatchRequest,
-            DiffRequest, Document, EditIssueRequest, EditPatchRequest, EmbedReadRequest,
-            EntityRequest, EntryRequest, MergePatchRequest, PatchEntity, PatchEntityRequest,
-            ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest, SetStateRequest,
-            SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest, TimelinePage,
-            TimelineRequest, UpdatePatchRequest,
+            CommentIssueRequest, CommentOperation, CommentWriteRequest, CreateIssueRequest,
+            CreatePatchRequest, DiffRequest, Document, EditIssueRequest, EditPatchRequest,
+            EmbedReadRequest, EntityRequest, EntryRequest, IssuePage, IssueRequest,
+            ListIssuesRequest, MergePatchRequest, PatchEntity, PatchEntityRequest,
+            ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest, SecurityIssueRequest,
+            SecurityIssueResult, SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind,
+            SubjectRequest, TimelinePage, TimelineRequest, UpdatePatchRequest,
         },
         read::serialize,
+        security::SecurityReporting,
         server::{DeliveryAccess, DeliveryScope, ServiceError},
     },
 };
@@ -37,6 +39,8 @@ pub(crate) struct ToolService {
     tool_router: ToolRouter<Self>,
     pub(super) delivery: DeliveryScope,
     pub(super) publisher: Publisher,
+    security: SecurityReporting,
+    pub(super) mutation_repository: Option<RepoId>,
     pub(super) mutation_delivery: Option<crate::agent::DeliveryId>,
     pub(super) mutation_invocations: Option<Arc<tokio::sync::Mutex<BTreeMap<String, usize>>>>,
 }
@@ -64,10 +68,11 @@ impl ToolService {
         delivery: DeliveryScope,
         publisher: Publisher,
         allowlist: McpAllowlist,
+        security: SecurityReporting,
     ) -> Self {
         let mut tool_router = Self::tool_router();
         for method in Self::registered_tools() {
-            if !allowlist.allows(method) {
+            if method != "report_security_issue" && !allowlist.allows(method) {
                 let _disabled = tool_router.disable_route(method.clone());
             }
         }
@@ -77,15 +82,51 @@ impl ToolService {
             tool_router,
             delivery,
             publisher,
+            security,
+            mutation_repository: None,
             mutation_delivery: None,
             mutation_invocations: None,
         }
     }
 
+    #[tool(description = "List or search issues in the active repository")]
+    async fn list_issues(
+        &self,
+        Parameters(request): Parameters<ListIssuesRequest>,
+    ) -> Result<Json<IssuePage>, String> {
+        self.publisher.authorize("list_issues").await?;
+        let _active = self.delivery.access_current().await?;
+        self.blocking(move |service| service.issues(request))
+            .await
+            .map(Json)
+            .map_err(|error| error.to_string())
+    }
+
+    #[tool(description = "Return an issue from the active repository")]
+    async fn get_issue(
+        &self,
+        Parameters(request): Parameters<IssueRequest>,
+    ) -> Result<Json<Document>, String> {
+        self.publisher.authorize("get_issue").await?;
+        let _active = self.delivery.access_current().await?;
+        self.blocking(move |service| service.issue(request))
+            .await
+            .map(|data| Json(Document { data }))
+            .map_err(|error| error.to_string())
+    }
+
     pub(super) fn for_delivery(&self, access: &DeliveryAccess) -> Self {
         let mut service = self.clone();
+        service.mutation_repository = Some(access.context().repository);
         service.mutation_delivery = Some(access.context().delivery);
         service.mutation_invocations = Some(Arc::clone(access.invocations()));
+        service
+    }
+
+    pub(super) fn for_repository(&self, repository: RepoId, publisher: Publisher) -> Self {
+        let mut service = self.clone();
+        service.repository = repository;
+        service.publisher = publisher;
         service
     }
 
@@ -267,6 +308,27 @@ impl ToolService {
     ) -> Result<Json<Document>, String> {
         let active = self.delivery.access_current().await?;
         self.for_delivery(&active).create_issue_write(request).await
+    }
+
+    #[tool(description = "Comment on an issue in the active repository")]
+    async fn comment_issue(
+        &self,
+        Parameters(request): Parameters<CommentIssueRequest>,
+    ) -> Result<Json<Document>, String> {
+        let active = self.delivery.access_current().await?;
+        self.for_delivery(&active)
+            .comment_issue_write(request)
+            .await
+    }
+
+    #[tool(description = "Encrypt a report into the private security repository")]
+    async fn report_security_issue(
+        &self,
+        Parameters(request): Parameters<SecurityIssueRequest>,
+    ) -> Result<Json<SecurityIssueResult>, String> {
+        let active = self.delivery.access_current().await?;
+        let service = self.for_delivery(&active);
+        self.security.report(&service, request).await.map(Json)
     }
 
     #[tool(description = "Edit an active issue title or description")]

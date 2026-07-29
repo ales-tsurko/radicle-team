@@ -7,6 +7,7 @@ edition = "2024"
 resolver = "3"
 
 [dependencies]
+age = { version = "0.12.1", features = ["armor"] }
 async-trait = "0.1.89"
 axum = "0.8.8"
 base64 = "0.22.1"
@@ -28,7 +29,7 @@ tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-util = "0.7.19"
-toml_edit = "0.25.13"
+toml_edit = { version = "0.25.13", features = ["serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"

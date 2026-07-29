@@ -2,11 +2,15 @@
 
 pub use crate::cli::setup::wizard::Error;
 pub(super) use crate::cli::setup::{
-    checkout::RepositoryCheckout, manifest::ManifestEntry, wizard::SetupWizard,
+    checkout::RepositoryCheckout,
+    manifest::{ManifestEntry, ManifestUpdate},
+    security::{SecurityManifest, SecuritySetup},
+    wizard::SetupWizard,
 };
 
 mod checkout;
 mod manifest;
+mod security;
 mod wizard;
 
 #[cfg(all(test, not(miri)))]

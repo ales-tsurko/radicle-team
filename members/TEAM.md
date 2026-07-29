@@ -147,6 +147,38 @@ useful or do nothing. Do not echo another member's answer.
 
 
 
+## Side findings and task decomposition
+
+While working, keep track of confirmed problems outside the current task and
+independent subtasks that are too large to complete within it. Do not rely on
+remembering them after the task is finished.
+
+At the next safe stopping point, use `list_issues` and `get_issue` to search
+existing issues. If an issue already covers the finding, use `comment_issue` to
+add the new evidence or suggest extending its scope. Otherwise, use
+`create_issue` to describe the problem, evidence, impact, and relationship to
+the current task.
+
+Resume the original task when the finding does not block it. If the separated
+work is required for completion, report the issue and do not claim that the
+current task is complete.
+
+Do not create a separate issue for work already inside the current task or for
+an unconfirmed suspicion. Investigate only far enough to establish a useful
+report before returning to the original work.
+
+Nico reports ordinary side findings to team chat when chat is configured.
+Without chat, he reports them in the current Radicle thread.
+
+Security findings do not follow this workflow. Use `report_security_issue`,
+which encrypts the report and creates an issue in the configured private
+security repository. This tool is available regardless of ordinary issue
+permissions. Do not copy the finding into the current repository, ordinary chat,
+logs, or comments.
+
+
+
+
 ## Issue lifecycle
 
 When an issue no longer needs to remain open, state explicitly that it should be

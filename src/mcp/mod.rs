@@ -11,6 +11,7 @@ pub(crate) use crate::mcp::{
 mod protocol;
 mod read;
 mod recovery;
+mod security;
 mod server;
 mod tools;
 mod write;

@@ -57,9 +57,9 @@ receive these values at startup and map them to provider-specific controls.
 
   Special trait: **Beginner's Luck**.
 
-- **Maya — Senior Developer & Team Lead.** Concise, warm, and decisive. She is a
-  working senior engineer who owns difficult delivery and delegates only when
-  another member is materially better suited.
+- **Maya — Senior Developer & Team Lead.** Concise, warm, and decisive. She is
+  a working senior engineer who owns difficult delivery and delegates only
+  when another member is materially better suited.
 
   `INT 5 · SPD 3 · EXP 5 · CRE 4 · CAU 4`
 
@@ -136,8 +136,20 @@ member's Radicle home.
 If the repository manifest or member binding is missing, run setup from the
 repository checkout. It shows the exact Git commands and asks before writing
 `.radicle-team.toml`, creating a commit, and opening a Radicle patch with the
-user's identity. After that patch reaches the canonical branch, the wizard
-validates it and finishes with:
+user's identity.
+
+For a new manifest, the wizard asks whether to create a private security-report
+repository with the user's Radicle identity or use an existing repository RID.
+It grants the member DID access, generates an age encryption identity, and
+shows its recovery key once. Save that key outside every agent environment.
+Later member setup grants each new DID access through the same repository
+authority.
+
+The user's regular Radicle node must be running so the wizard can initialize
+and announce the security repository. A selected repository must be private
+and the user's Radicle identity must be able to update its access list. After
+the manifest patch reaches the canonical branch, the wizard validates it and
+finishes with:
 
 ```text
 nico is ready for rad:... with binding generation 1
@@ -196,6 +208,10 @@ logs, locks, and watcher state remain under `~/.radicle-team`.
 ```toml
 version = 1
 
+[security]
+repository = "rad:z3Security..."
+recipients = ["age1..."]
+
 [members.nico]
 signing_did = "did:key:z6Mk..."
 generation = 1
@@ -211,7 +227,19 @@ required, while an empty list disables every tool.
 Groups are derived from the tools registered by the MCP server: `get_*` and
 `list_*` tools are reads; non-read tools are grouped by the `comment`, `issue`,
 `patch`, `reaction`, or `review` component in their name. MCP `tools/list` is
-the authoritative method list.
+the authoritative method list. `comment_issue` belongs only to `issues`.
+`report_security_issue` is controlled by the security policy instead of
+`mcp_allow` and is available to every member.
+
+The security repository and at least one valid age X25519 recipient are
+required. `report_security_issue` encrypts the complete report before creating
+a generically titled issue in that private repository. It is available even
+when the member lacks ordinary issue permission.
+
+The security repository is not watched and none of its read operations are
+exposed to agents. Agent adapters receive only the scoped MCP endpoint; trusted
+adapter code must also keep the host Radicle profile and recovery keys outside
+model subprocesses.
 
 Invocation-specific options remain command-line arguments:
 

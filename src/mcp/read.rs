@@ -20,9 +20,9 @@ use serde_json::Value;
 use crate::mcp::{
     protocol::{
         DiffDocument, DiffFile, DiffLine, DiffRequest, EmbedDocument, EmbedReadRequest,
-        EntityRequest, EntryRequest, MAX_EMBED_BYTES, PatchEntity, PatchEntityRequest,
-        SubjectDocument, SubjectKind, SubjectRequest, ThreadKind, TimelinePage, TimelineRequest,
-        parse_entry, parse_object,
+        EntityRequest, EntryRequest, IssuePage, IssueRequest, IssueStateFilter, ListIssuesRequest,
+        MAX_EMBED_BYTES, PatchEntity, PatchEntityRequest, SubjectDocument, SubjectKind,
+        SubjectRequest, ThreadKind, TimelinePage, TimelineRequest, parse_entry, parse_object,
     },
     server::ServiceError,
     tools::ToolService,
@@ -112,6 +112,61 @@ impl ToolService {
             SubjectKind::Patch => self.patch_subject(request),
         }?;
         serialize(&document)
+    }
+
+    pub(super) fn issue(&self, request: IssueRequest) -> Result<Value, ServiceError> {
+        serialize(&self.issue_subject(SubjectRequest {
+            kind: SubjectKind::Issue,
+            subject: request.issue,
+        })?)
+    }
+
+    pub(super) fn issues(&self, request: ListIssuesRequest) -> Result<IssuePage, ServiceError> {
+        let repository = self.repository()?;
+        let issues = Issues::open(&repository, ReadOnly)?;
+        let query = request.query.map(|query| query.to_lowercase());
+        let mut documents = issues
+            .all()?
+            .map(|result| {
+                let (id, issue) = result?;
+                Ok(SubjectDocument::issue(id.to_string(), &issue))
+            })
+            .collect::<Result<Vec<_>, ServiceError>>()?;
+        documents.retain(|issue| {
+            let state_matches = request.state.is_none_or(|state| match state {
+                IssueStateFilter::Open => issue.state == "open",
+                IssueStateFilter::Closed => issue.state == "closed",
+            });
+            let query_matches = query.as_ref().is_none_or(|query| {
+                issue.title.to_lowercase().contains(query)
+                    || issue.description.to_lowercase().contains(query)
+            });
+            state_matches && query_matches
+        });
+        documents.sort_unstable_by(|left, right| left.subject.cmp(&right.subject));
+
+        let start = match request.cursor.as_deref() {
+            Some(cursor) => documents
+                .iter()
+                .position(|issue| issue.subject == cursor)
+                .map(|index| index + 1)
+                .ok_or_else(|| ServiceError::InvalidCursor(cursor.to_owned()))?,
+            None => 0,
+        };
+        let limit = request
+            .limit
+            .map_or(DEFAULT_PAGE_SIZE, |limit| limit as usize)
+            .clamp(1, MAX_PAGE_SIZE);
+        let end = start.saturating_add(limit).min(documents.len());
+        let next_cursor = (end < documents.len())
+            .then(|| documents.get(end.saturating_sub(1)))
+            .flatten()
+            .map(|issue| issue.subject.clone());
+
+        Ok(IssuePage {
+            issues: documents.drain(start..end).collect(),
+            next_cursor,
+        })
     }
 
     fn issue_subject(&self, request: SubjectRequest) -> Result<SubjectDocument, ServiceError> {

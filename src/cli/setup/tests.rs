@@ -2,19 +2,26 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, process::Command, str::FromStr as _};
 
-use radicle::identity::Did;
+use radicle::identity::{Did, RepoId};
 
 use crate::{
     SetupStatus,
-    cli::setup::{Error, ManifestEntry, RepositoryCheckout, SetupWizard},
+    cli::setup::{
+        Error, ManifestEntry, ManifestUpdate, RepositoryCheckout, SecurityManifest, SetupWizard,
+    },
     manifest::{FILE_NAME, Manifest},
     member::Member,
 };
 
 const NICO: &str = "did:key:z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
 const MAYA: &str = "did:key:z6MkvUJtYD9dHDJfpevWRT98mzDDpdAtmUjwyDSkyqksUr7C";
+const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+const RECIPIENT: &str = "age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa";
+const SECURITY: &str = "version = 1\n\n[security]\nrepository = \
+                        \"rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc\"\nrecipients = \
+                        [\"age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa\"]\n\n";
 
 struct Fixture(PathBuf);
 
@@ -74,6 +81,20 @@ impl Fixture {
             generation: 1,
         }
     }
+
+    fn create(entry: ManifestEntry) -> ManifestUpdate {
+        ManifestUpdate::create(
+            entry,
+            SecurityManifest {
+                repository: RepoId::from_str(REPOSITORY).expect("repository ID should parse"),
+                recipient: RECIPIENT.to_owned(),
+            },
+        )
+    }
+
+    const fn extend(entry: ManifestEntry) -> ManifestUpdate {
+        ManifestUpdate::extend(entry)
+    }
 }
 
 impl Drop for Fixture {
@@ -88,7 +109,7 @@ fn reports_the_explicit_manifest_path_noninteractively() {
     let entry = Fixture::entry(Member::Nico, NICO);
     let missing = SetupWizard::explicit_manifest_output(
         &path,
-        entry,
+        entry.clone(),
         SetupStatus::ManifestMissing { generation: 1 },
     );
 
@@ -151,7 +172,7 @@ fn prepares_and_extends_a_manifest_safely() {
     maya.generation = 4;
 
     assert!(matches!(
-        nico.prepare(&manifest, SetupStatus::ManifestMissing { generation: 1 }),
+        Fixture::create(nico.clone()).prepare(&manifest),
         Ok(true)
     ));
     #[cfg(unix)]
@@ -168,13 +189,10 @@ fn prepares_and_extends_a_manifest_safely() {
         0o600
     );
     assert!(matches!(
-        nico.prepare(&manifest, SetupStatus::BindingMissing { generation: 1 }),
+        Fixture::extend(nico).prepare(&manifest),
         Ok(false)
     ));
-    assert!(matches!(
-        maya.prepare(&manifest, SetupStatus::BindingMissing { generation: 1 }),
-        Ok(true)
-    ));
+    assert!(matches!(Fixture::extend(maya).prepare(&manifest), Ok(true)));
     #[cfg(unix)]
     assert_ne!(
         fs::metadata(&manifest)
@@ -188,13 +206,36 @@ fn prepares_and_extends_a_manifest_safely() {
     assert!(contents.contains("[members.nico]"));
     assert!(contents.contains("[members.maya]"));
     assert!(contents.contains("generation = 4"));
-    assert!(
-        contents.contains(
-            "mcp_allow = [\"read\", \"comments\", \"patches\", \"reactions\", \"reviews\"]"
-        )
-    );
-    assert!(contents.contains(
-        "mcp_allow = [\"read\", \"comments\", \"issues\", \"patches\", \"reactions\", \"reviews\"]"
+    let nico = Manifest::validate_candidate(
+        &contents,
+        Member::Nico,
+        NICO.parse().expect("Nico DID should parse"),
+    )
+    .expect("Nico binding should validate");
+    let maya = Manifest::validate_candidate(
+        &contents,
+        Member::Maya,
+        MAYA.parse().expect("Maya DID should parse"),
+    )
+    .expect("Maya binding should validate");
+    assert!(!nico.mcp_allow().allows("create_issue"));
+    assert!(maya.mcp_allow().allows("create_issue"));
+}
+
+#[test]
+fn rejects_manifest_state_changes_during_preparation() {
+    let fixture = Fixture::new("manifest-state-change");
+    let manifest = fixture.manifest();
+    let entry = Fixture::entry(Member::Nico, NICO);
+
+    assert!(matches!(
+        Fixture::extend(entry.clone()).prepare(&manifest),
+        Err(Error::MissingManifest)
+    ));
+    fs::write(&manifest, SECURITY).expect("manifest should be written");
+    assert!(matches!(
+        Fixture::create(entry).prepare(&manifest),
+        Err(Error::ExistingManifest)
     ));
 }
 
@@ -204,28 +245,31 @@ fn rejects_a_conflicting_local_binding() {
     let manifest = fixture.manifest();
     fs::write(
         &manifest,
-        "version = 1\n\n[members.nico]\nsigning_did = \"did:key:different\"\ngeneration = \
-         1\nstate = \"active\"\nmcp_allow = []\n",
+        format!(
+            "{SECURITY}[members.nico]\nsigning_did = \"did:key:different\"\ngeneration = 1\nstate \
+             = \"active\"\nmcp_allow = []\n"
+        ),
     )
     .expect("manifest should be written");
 
     assert!(matches!(
-        Fixture::entry(Member::Nico, NICO)
-            .prepare(&manifest, SetupStatus::BindingMissing { generation: 1 }),
+        Fixture::extend(Fixture::entry(Member::Nico, NICO)).prepare(&manifest),
         Err(Error::ConflictingBinding(Member::Nico))
     ));
 
     fs::write(
         &manifest,
         format!(
-            "version = 1\n\n# [members.nico]\n[members.maya]\nsigning_did = \
-             \"{MAYA}\"\ngeneration = 1\nstate = \"active\"\nmcp_allow = []\n"
+            "version = 1\n\n[security]\nrepository = \
+             \"rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc\"\nrecipients = \
+             [\"age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa\"]\n\n# \
+             [members.nico]\n[members.maya]\nsigning_did = \"{MAYA}\"\ngeneration = 1\nstate = \
+             \"active\"\nmcp_allow = []\n"
         ),
     )
     .expect("commented manifest should be written");
     assert!(matches!(
-        Fixture::entry(Member::Nico, NICO)
-            .prepare(&manifest, SetupStatus::BindingMissing { generation: 1 }),
+        Fixture::extend(Fixture::entry(Member::Nico, NICO)).prepare(&manifest),
         Ok(true)
     ));
 }
@@ -236,13 +280,15 @@ fn extends_inline_and_dotted_member_maps() {
     let manifest = fixture.manifest();
     let nico = Fixture::entry(Member::Nico, NICO);
     let inline = format!(
-        "version = 1\nmembers = {{ maya = {{ signing_did = \"{MAYA}\", generation = 1, state = \
-         \"active\", mcp_allow = [] }} }}\n"
+        "version = 1\nsecurity = {{ repository = \"rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc\", \
+         recipients = [\"age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa\"] \
+         }}\nmembers = {{ maya = {{ signing_did = \"{MAYA}\", generation = 1, state = \"active\", \
+         mcp_allow = [] }} }}\n"
     );
     fs::write(&manifest, inline).expect("inline manifest should be written");
 
     assert!(matches!(
-        nico.prepare(&manifest, SetupStatus::BindingMissing { generation: 1 }),
+        Fixture::extend(nico.clone()).prepare(&manifest),
         Ok(true)
     ));
     let contents = fs::read_to_string(&manifest).expect("manifest should be readable");
@@ -251,12 +297,15 @@ fn extends_inline_and_dotted_member_maps() {
         .expect("inline manifest should validate");
 
     let dotted = format!(
-        "version = 1\nmembers.maya.signing_did = \"{MAYA}\"\nmembers.maya.generation = \
-         1\nmembers.maya.state = \"active\"\nmembers.maya.mcp_allow = []\n"
+        "version = 1\nsecurity.repository = \
+         \"rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc\"\nsecurity.recipients = \
+         [\"age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa\"]\nmembers.maya.\
+         signing_did = \"{MAYA}\"\nmembers.maya.generation = 1\nmembers.maya.state = \
+         \"active\"\nmembers.maya.mcp_allow = []\n"
     );
     fs::write(&manifest, dotted).expect("dotted manifest should be written");
     assert!(matches!(
-        nico.prepare(&manifest, SetupStatus::BindingMissing { generation: 1 }),
+        Fixture::extend(nico.clone()).prepare(&manifest),
         Ok(true)
     ));
     let contents = fs::read_to_string(&manifest).expect("manifest should be readable");
@@ -268,12 +317,13 @@ fn extends_inline_and_dotted_member_maps() {
 fn validates_a_checkout_manifest_before_writing_it() {
     let fixture = Fixture::new("invalid-checkout-manifest");
     let manifest = fixture.manifest();
-    let unsupported = "version = 2\n[members]\n";
+    let unsupported =
+        "version = 2\n[security]\nrepository = \"rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc\"\nrecipients \
+         = [\"age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa\"]\n[members]\n";
     fs::write(&manifest, unsupported).expect("manifest should be written");
 
     assert!(matches!(
-        Fixture::entry(Member::Nico, NICO)
-            .prepare(&manifest, SetupStatus::BindingMissing { generation: 1 }),
+        Fixture::extend(Fixture::entry(Member::Nico, NICO)).prepare(&manifest),
         Err(Error::Manifest(crate::manifest::Error::Schema {
             actual: 2
         }))
@@ -284,13 +334,12 @@ fn validates_a_checkout_manifest_before_writing_it() {
     );
 
     let duplicate = format!(
-        "version = 1\n\n[members.maya]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
+        "{SECURITY}[members.maya]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
          \"active\"\nmcp_allow = []\n"
     );
     fs::write(&manifest, &duplicate).expect("manifest should be written");
     assert!(matches!(
-        Fixture::entry(Member::Nico, NICO)
-            .prepare(&manifest, SetupStatus::BindingMissing { generation: 1 }),
+        Fixture::extend(Fixture::entry(Member::Nico, NICO)).prepare(&manifest),
         Err(Error::Manifest(crate::manifest::Error::DuplicateDid { .. }))
     ));
     assert_eq!(
@@ -306,15 +355,14 @@ fn rejects_a_symlink_when_writing_an_explicit_manifest() {
     let target = fixture.0.join("target.toml");
     let manifest = fixture.manifest();
     let original = format!(
-        "version = 1\n\n[members.maya]\nsigning_did = \"{MAYA}\"\ngeneration = 1\nstate = \
+        "{SECURITY}[members.maya]\nsigning_did = \"{MAYA}\"\ngeneration = 1\nstate = \
          \"active\"\nmcp_allow = []\n"
     );
     fs::write(&target, &original).expect("target manifest should be written");
     symlink("target.toml", &manifest).expect("manifest symlink should be created");
 
     assert!(matches!(
-        Fixture::entry(Member::Nico, NICO)
-            .prepare(&manifest, SetupStatus::BindingMissing { generation: 1 }),
+        Fixture::extend(Fixture::entry(Member::Nico, NICO)).prepare(&manifest),
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput
     ));
     assert_eq!(
@@ -328,11 +376,8 @@ fn skips_a_commit_when_the_manifest_entry_exists() {
     let fixture = Fixture::new("unchanged-manifest");
     fixture.initialize_repository();
     let entry = Fixture::entry(Member::Nico, NICO);
-    entry
-        .prepare(
-            &fixture.manifest(),
-            SetupStatus::ManifestMissing { generation: 1 },
-        )
+    Fixture::create(entry.clone())
+        .prepare(&fixture.manifest())
         .expect("manifest should be created");
     fixture.git(&["add", FILE_NAME]);
     fixture.git(&[
@@ -350,7 +395,7 @@ fn skips_a_commit_when_the_manifest_entry_exists() {
     };
 
     assert!(matches!(
-        checkout.publish(entry, SetupStatus::BindingMissing { generation: 1 }),
+        checkout.publish(Fixture::extend(entry)),
         Ok(false)
     ));
 }
@@ -362,18 +407,15 @@ fn rejects_an_ignored_repository_manifest() {
     fs::write(fixture.0.join(".gitignore"), format!("{FILE_NAME}\n"))
         .expect("ignore rule should be written");
     let entry = Fixture::entry(Member::Nico, NICO);
-    entry
-        .prepare(
-            &fixture.manifest(),
-            SetupStatus::ManifestMissing { generation: 1 },
-        )
+    Fixture::create(entry.clone())
+        .prepare(&fixture.manifest())
         .expect("ignored manifest should be created locally");
     let checkout = RepositoryCheckout {
         path: fixture.0.clone(),
     };
 
     assert!(matches!(
-        checkout.publish(entry, SetupStatus::BindingMissing { generation: 1 }),
+        checkout.publish(Fixture::extend(entry)),
         Err(Error::IgnoredManifest)
     ));
     assert!(fixture.manifest().exists());
@@ -394,7 +436,7 @@ fn restores_the_checkout_after_a_failed_patch_push() {
     let entry = Fixture::entry(Member::Nico, NICO);
 
     assert!(matches!(
-        checkout.publish(entry, SetupStatus::ManifestMissing { generation: 1 }),
+        checkout.publish(Fixture::create(entry.clone())),
         Err(Error::Command { .. })
     ));
     assert_eq!(
@@ -415,7 +457,7 @@ fn restores_the_checkout_after_a_failed_patch_push() {
         .validate_manifest_change()
         .expect("retry should pass checkout validation");
     assert!(matches!(
-        checkout.commit_manifest(entry, SetupStatus::ManifestMissing { generation: 1 }),
+        checkout.commit_manifest(Fixture::create(entry)),
         Ok(true)
     ));
 }
@@ -433,7 +475,7 @@ fn restores_the_checkout_after_a_failed_commit() {
     let entry = Fixture::entry(Member::Nico, NICO);
 
     assert!(matches!(
-        checkout.publish(entry, SetupStatus::ManifestMissing { generation: 1 }),
+        checkout.publish(Fixture::create(entry.clone())),
         Err(Error::Command { .. })
     ));
     assert_eq!(
@@ -453,7 +495,7 @@ fn restores_the_checkout_after_a_failed_commit() {
         .validate_manifest_change()
         .expect("retry should pass checkout validation");
     assert!(matches!(
-        checkout.commit_manifest(entry, SetupStatus::ManifestMissing { generation: 1 }),
+        checkout.commit_manifest(Fixture::create(entry)),
         Ok(true)
     ));
 }
