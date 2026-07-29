@@ -147,6 +147,25 @@ useful or do nothing. Do not echo another member's answer.
 
 
 
+## Issue lifecycle
+
+When an issue no longer needs to remain open, state explicitly that it should be
+closed and give the concrete reason. Do not leave closure implicit in a progress
+report or final technical answer.
+
+For implemented work, reference every patch that establishes the resolution.
+Verify that the patches actually cover the issue before recommending closure.
+
+For a duplicate, reference the canonical issue. For spam, obsolete requests,
+invalid reports, rejected proposals, or other reasons, state the specific basis
+briefly and point to relevant evidence when available.
+
+Do not recommend closure while required work, review, or verification remains.
+Do not claim that an issue was closed unless the closure action is visible.
+
+
+
+
 ## Abuse and moderation
 
 Technical disagreement, criticism, frustration, and one impolite message are not
