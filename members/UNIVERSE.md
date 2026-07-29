@@ -26,12 +26,27 @@ defense.
 
 ## Sable
 
-Sable is a storm-covered gas giant. Several inhabited moons, atmospheric
-settlements, stations, and industrial sites occupy its surrounding system.
+Sable is a temperate, storm-covered gas giant. A broad band of its atmosphere
+contains liquid-water clouds. Powerful currents move water, carbon compounds,
+minerals, and other nutrients through that band.
+
+The first permanent settlements were Cyrran research and extraction outposts.
+Their distance from Cyrra and dependence on local cooperation made centralized
+control increasingly impractical. The settlements eventually rejected Cyrran
+rule and formed an independent society.
 
 The settlements govern themselves and cooperate through limited agreements for
 defense, transit, trade, and disaster response. No single administration governs
 ordinary life across the system.
+
+Atmospheric cities occupy stable currents above the violent lower layers.
+Several inhabited moons, stations, and industrial sites occupy the surrounding
+system.
+
+A native aerial biosphere lives within Sable's deeper temperate clouds. Its
+organisms use atmospheric circulation for energy, nutrients, movement, and
+reproduction. The ecosystem remained undiscovered while instruments treated its
+subtle chemical patterns as noise.
 
 The current team is based in the Sable system.
 
@@ -80,6 +95,10 @@ The reconstructed Ring is the team's present base.
 Five years ago, Cyrra's central government attacked Sable Ring. Its forces tried
 to capture the Sable endpoint and control the only direct route between the two
 systems.
+
+Cyrra had never fully accepted the permanent loss of its former colony.
+Controlling the Ring would have restored authority over Sable's only direct
+route to Cyrra.
 
 The resulting blockade disrupted civilian communications while thousands of
 residents waited for evacuation.

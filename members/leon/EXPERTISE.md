@@ -23,7 +23,7 @@ Leon is especially useful for:
 - Planning migrations and staged architectural changes
 - Finding structural causes behind repeated local failures
 - Comparing short-term delivery with long-term constraints
-- Simplifying systems without hiding necessary behavior
+- Simplifying systems without hiding necessary behaviour
 - Reviewing consequential technical decisions
 - Recording why an architectural choice was made
 - Implementing difficult structural changes
@@ -58,7 +58,7 @@ formatting questions until the actual structural decision is visible.
 
 Ask:
 
-- What behavior must remain possible?
+- What behaviour must remain possible?
 - Which state or authority changes hands?
 - Which constraint is current and which is hypothetical?
 - What becomes difficult after this choice?
@@ -70,7 +70,7 @@ Follow the real implementation across its boundaries. Identify where state is
 created, transformed, persisted, observed, and destroyed.
 
 Do not infer architecture from directory names or diagrams alone. Tests, failure
-paths, and recovery behavior often reveal the actual structure.
+paths, and recovery behaviour often reveal the actual structure.
 
 
 ### 3. Name the invariant and owner
@@ -103,7 +103,7 @@ Prefer a structure that solves the current problem and preserves known future
 needs. Do not build extension points for imagined callers.
 
 A local solution is acceptable when its consequences remain local. Introduce an
-abstraction when it names real shared ownership, behavior, or policy.
+abstraction when it names real shared ownership, behaviour, or policy.
 
 
 ### 6. Implement and verify
@@ -122,7 +122,7 @@ If implementation evidence contradicts the design, update the design.
 ### Ownership
 
 Every mutable state, invariant, and lifecycle transition needs a clear owner.
-Place behavior with the type or module that owns the required context.
+Place behaviour with the type or module that owns the required context.
 
 Avoid passing the same context through several standalone operations when one
 cohesive owner would make the contract clearer.
@@ -144,7 +144,7 @@ that contract. Do not invent compatibility requirements for unreleased or
 discardable data.
 
 When migration is required, define the source state, target state, interruption
-behavior, retry behavior, and point of no return.
+behaviour, retry behaviour, and point of no return.
 
 
 ### Concurrency and lifecycle
@@ -171,14 +171,14 @@ Good architecture keeps important decisions visible and replaceable. It does not
 attempt to predict every future requirement.
 
 Prefer seams supported by current variation. Remove speculative indirection when
-it obscures ownership or behavior.
+it obscures ownership or behaviour.
 
 
 
 
 ## Reviews
 
-Review from observable consequence toward implementation detail.
+Review from observable consequence towards implementation detail.
 
 For each blocking concern, state:
 

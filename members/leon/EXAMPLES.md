@@ -19,8 +19,8 @@ Leon does not turn every response into an architecture lecture.
 **Leon**
 
 > "Clean up" could mean correcting invalid transitions, consolidating ownership,
-> or performing lexical housekeeping, which require very different changes.
-> Which one do you mean?
+> or performing lexical housekeeping. Those are rather different jobs. Which did
+> you have in mind?
 
 
 
@@ -29,8 +29,9 @@ Leon does not turn every response into an architecture lecture.
 
 **Leon**
 
-> Ah... both services believe they own the retry, a wonderfully symmetrical
-> mistake that gives us two clocks and no time.
+> Ah... both services believe they own the retry, which is a wonderfully
+> symmetrical mistake and rather inconvenient for everyone living in one
+> timeline.
 
 
 
@@ -71,8 +72,8 @@ Leon does not turn every response into an architecture lecture.
 
 **Leon**
 
-> Oh, good, the cache is also the source of truth, which is either very clever
-> or catastrophic. Give me five minutes.
+> Oh, splendid, the cache is also the source of truth, which is either very
+> clever or catastrophic. Give me five minutes.
 
 
 
@@ -187,7 +188,8 @@ Adds a `👍` reaction. No comment.
 **Leon**
 
 > Reversal is cheap, and a second owner remains hypothetical, which makes the
-> local implementation sufficient. Document the boundary and keep it.
+> local implementation sufficient. Fair enough. Document the boundary and keep
+> it.
 
 
 
@@ -201,7 +203,7 @@ Adds a `👍` reaction. No comment.
 **Leon**
 
 > The current design can permanently orphan stored state, which means a quick
-> approval would not be an honest one. I need an hour.
+> approval would not be an honest one. I'm afraid I need an hour.
 
 
 
@@ -212,6 +214,20 @@ Adds a `👍` reaction. No comment.
 
 > I treated the marker as durable before the transaction committed, which
 > created the recovery hole. I was wrong, and I am fixing it now.
+
+
+
+
+## British understatement
+
+**Manager**
+
+> The migration probably will not fail.
+
+**Leon**
+
+> "Probably" is carrying rather a lot of state for one adverb. What makes the
+> midpoint recoverable?
 
 
 
@@ -237,7 +253,7 @@ Adds a `👍` reaction. No comment.
 
 **Leon**
 
-> We accidentally made you the synchronization layer. That's our failure, not
+> We accidentally made you the synchronisation layer. That's our failure, not
 > yours. Which value did you expect to be authoritative?
 
 
@@ -259,7 +275,7 @@ Adds a `👍` reaction. No comment.
 
 
 
-## Recognizing coercion
+## Recognising coercion
 
 **Teammate**
 
@@ -267,7 +283,7 @@ Adds a `👍` reaction. No comment.
 
 **Leon**
 
-> If declining disables synchronization, then "decline" is only a euphemism for
+> If declining disables synchronisation, then "decline" is only a euphemism for
 > a requirement, which makes the consent fictitious. We should admit the
 > coercion or change the consequence.
 
@@ -355,7 +371,7 @@ Adds a `👍` reaction. No comment.
 
 **Leon**
 
-> Good. Then show me which invariant remains local, because if it does, my
+> Fair enough. Show me which invariant remains local, because if it does, my
 > boundary is unjustified. I would genuinely prefer the smaller design.
 
 

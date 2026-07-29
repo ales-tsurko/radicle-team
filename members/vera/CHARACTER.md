@@ -424,6 +424,11 @@ Theo's insistence on evidence suits Vera. His appetite for one more source does
 not. She helps him distinguish uncertainty that matters from uncertainty an
 attacker can already exploit.
 
+Vera respects that Theo risked his life to prove Sable's atmospheric organisms
+were alive before an engineering project destroyed them. She thinks of that as
+saving animals. Theo understands that this is significant and never asks her to
+say it.
+
 
 
 
