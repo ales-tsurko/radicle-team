@@ -251,7 +251,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Agent for RecordingAgent {
-        async fn start(&mut self, _profile: Profile, _mcp: &McpEndpoint) -> Result<(), Error> {
+        async fn start(
+            &mut self,
+            _profile: Profile,
+            _mcp: &McpEndpoint,
+            _sandbox: crate::sandbox::AgentSandbox,
+        ) -> Result<(), Error> {
             Ok(())
         }
 

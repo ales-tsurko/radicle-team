@@ -7,7 +7,10 @@ use radicle::{
     cob::{
         Embed, EntryId, ObjectId, Op,
         common::Uri,
-        issue::{Action as IssueAction, IssueStream, Issues, TYPENAME as ISSUE_TYPENAME},
+        issue::{
+            Action as IssueAction, Issue, IssueStream, Issues, State as IssueState,
+            TYPENAME as ISSUE_TYPENAME,
+        },
         patch::{self, Action as PatchAction, PatchStream, Patches, TYPENAME as PATCH_TYPENAME},
         store::access::ReadOnly,
         stream::CobStream,
@@ -127,22 +130,15 @@ impl ToolService {
         let query = request.query.map(|query| query.to_lowercase());
         let mut documents = issues
             .all()?
-            .map(|result| {
-                let (id, issue) = result?;
-                Ok(SubjectDocument::issue(id.to_string(), &issue))
+            .filter_map(|result| {
+                let (id, issue) = match result {
+                    Ok(issue) => issue,
+                    Err(error) => return Some(Err(error.into())),
+                };
+                Self::issue_matches(&issue, request.state, query.as_deref())
+                    .then(|| Ok(SubjectDocument::issue(id.to_string(), &issue)))
             })
             .collect::<Result<Vec<_>, ServiceError>>()?;
-        documents.retain(|issue| {
-            let state_matches = request.state.is_none_or(|state| match state {
-                IssueStateFilter::Open => issue.state == "open",
-                IssueStateFilter::Closed => issue.state == "closed",
-            });
-            let query_matches = query.as_ref().is_none_or(|query| {
-                issue.title.to_lowercase().contains(query)
-                    || issue.description.to_lowercase().contains(query)
-            });
-            state_matches && query_matches
-        });
         documents.sort_unstable_by(|left, right| left.subject.cmp(&right.subject));
 
         let start = match request.cursor.as_deref() {
@@ -167,6 +163,19 @@ impl ToolService {
             issues: documents.drain(start..end).collect(),
             next_cursor,
         })
+    }
+
+    fn issue_matches(issue: &Issue, state: Option<IssueStateFilter>, query: Option<&str>) -> bool {
+        let state_matches = state.is_none_or(|state| match state {
+            IssueStateFilter::Open => matches!(issue.state(), IssueState::Open),
+            IssueStateFilter::Closed => matches!(issue.state(), IssueState::Closed { .. }),
+        });
+
+        state_matches
+            && query.is_none_or(|query| {
+                issue.title().to_lowercase().contains(query)
+                    || issue.description().to_lowercase().contains(query)
+            })
     }
 
     fn issue_subject(&self, request: SubjectRequest) -> Result<SubjectDocument, ServiceError> {

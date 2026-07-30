@@ -191,6 +191,68 @@ resolutions, lifecycle changes, and merges until stopped. `SIGINT` and
 
 
 
+## Local sandbox
+
+Setup creates an administrator-owned sandbox configuration for each member:
+
+```text
+~/.radicle-team/members/<member>/sandbox.toml
+```
+
+The interactive wizard optionally adds readable, writable, and denied filesystem
+paths and selects the network policy. The file can also be edited manually.
+Changes take effect when the member process restarts.
+
+Radicle Team loads Zerobox's embedded platform and sensitive-path policies
+directly, so user-defined Zerobox profiles cannot replace them. It also enables
+common Rust, Node.js, Python, Go, and Nix toolchain paths and grants the
+member's ephemeral workspaces. Local path entries extend or restrict those
+defaults; denied paths take precedence. Paths in the file must be absolute.
+
+```toml
+version = 1
+allow_read = ["/custom/toolchain"]
+deny_read = ["/private/project"]
+allow_write = ["/custom/build-cache"]
+deny_write = ["/custom/build-cache/protected"]
+external_network = "all"
+```
+
+External network access can be unrestricted, disabled, or limited to domains:
+
+```toml
+external_network = "disabled"
+```
+
+```toml
+external_network = ["api.openai.com", "crates.io", "github.com"]
+```
+
+Omitting `external_network` defaults to `"all"`. Disabled and domain-restricted
+modes route external traffic through the managed proxy, which accepts only the
+capability-protected MCP endpoint.
+
+This setting governs traffic leaving the host only. **Loopback is always
+reachable, under every setting.** Sandboxed agents need to bind and reach local
+ports for development servers and language servers, so the sandbox permits
+loopback directly rather than through the proxy. A sandboxed agent can therefore
+connect to any service listening on localhost, including ones this application
+does not operate. Do not rely on the sandbox to isolate a local service; bind it
+elsewhere, or require authentication.
+
+Agent adapters select commands and arguments but cannot weaken this policy.
+Every subprocess inherits the same sandbox.
+
+Agent execution currently fails closed outside macOS and Linux because Zerobox
+does not provide an enforcing backend there.
+
+Executables embedding the library on Linux must call
+`radicle_team::sandbox::dispatch_linux_helper()` as the first statement in
+`main`. Sandbox startup fails if this entrypoint was omitted.
+
+
+
+
 ## Repository manifest
 
 Exactly one `.radicle-team.toml` file is active. The default is the file on the

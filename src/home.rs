@@ -94,6 +94,12 @@ impl MemberHome {
     pub fn workspaces(&self) -> PathBuf {
         self.path.join("workspaces")
     }
+
+    /// Returns the local agent sandbox configuration path.
+    #[must_use]
+    pub fn sandbox_config(&self) -> PathBuf {
+        self.path.join("sandbox.toml")
+    }
 }
 
 /// Error resolving the application home directory.
@@ -128,6 +134,10 @@ mod tests {
         assert_eq!(
             home.workspaces(),
             Path::new("/team/members/nico/workspaces")
+        );
+        assert_eq!(
+            home.sandbox_config(),
+            Path::new("/team/members/nico/sandbox.toml")
         );
     }
 }

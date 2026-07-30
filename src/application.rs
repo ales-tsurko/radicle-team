@@ -22,6 +22,7 @@ use crate::{
     mcp,
     member::Member,
     node::{self, NodeManager},
+    sandbox::AgentSandbox,
     shutdown::Shutdown,
     watcher,
 };
@@ -185,6 +186,10 @@ impl Application {
 
     /// Runs the team member and dispatches relevant activity to `agent`.
     ///
+    /// Linux executables must call
+    /// [`sandbox::dispatch_linux_helper`](crate::sandbox::dispatch_linux_helper) as the first
+    /// statement in `main`.
+    ///
     /// # Errors
     ///
     /// Returns an error if preparation, watching, or agent dispatch fails.
@@ -246,6 +251,10 @@ impl Application {
             Some(root) => Ok(MemberHome::at(root, self.member)),
             None => MemberHome::discover(self.member),
         }
+    }
+
+    pub(crate) fn sandbox_config_path(&self) -> Result<PathBuf, Error> {
+        Ok(self.member_home()?.sandbox_config())
     }
 
     fn load_identity(&self, home: &MemberHome) -> Result<identity::Identity, Error> {
@@ -524,6 +533,7 @@ impl Agent for LoggingAgent {
         &mut self,
         profile: crate::member::Profile,
         _mcp: &agent::McpEndpoint,
+        _sandbox: AgentSandbox,
     ) -> Result<(), agent::Error> {
         tracing::info!(
             member = profile.member.id(),
@@ -675,7 +685,19 @@ impl AgentRuntime {
         };
         let (runtime, publisher) =
             Self::initialize_publisher(application, runtime, authorizer).await?;
-        let mcp = match mcp::Server::start(
+        let (runtime, mcp) = Self::start_mcp(application, runtime, publisher, allowlist).await?;
+        let (runtime, mcp) = Self::start_agent(application, runtime, mcp, agent).await?;
+
+        Ok(Self { runtime, mcp })
+    }
+
+    async fn start_mcp(
+        application: &Application,
+        runtime: Runtime,
+        publisher: agent::Publisher,
+        allowlist: manifest::McpAllowlist,
+    ) -> Result<(Runtime, mcp::Server), Error> {
+        match mcp::Server::start(
             runtime.identity.profile().storage.clone(),
             application.repository,
             publisher,
@@ -683,16 +705,32 @@ impl AgentRuntime {
         )
         .await
         {
-            Ok(mcp) => mcp,
+            Ok(mcp) => Ok((runtime, mcp)),
+            Err(error) => Application::finish_after_stop(
+                Err(Error::Mcp(error.to_string())),
+                runtime.stop(&application.shutdown).await,
+            ),
+        }
+    }
+
+    async fn start_agent(
+        application: &Application,
+        runtime: Runtime,
+        mcp: mcp::Server,
+        agent: &mut (impl Agent + ?Sized),
+    ) -> Result<(Runtime, mcp::Server), Error> {
+        let sandbox = match AgentSandbox::load(&runtime.home, mcp.endpoint()) {
+            Ok(sandbox) => sandbox,
             Err(error) => {
+                Application::warn_mcp_stop(mcp.stop().await);
                 return Application::finish_after_stop(
-                    Err(Error::Mcp(error.to_string())),
+                    Err(error.into()),
                     runtime.stop(&application.shutdown).await,
                 );
             }
         };
         if let Err(error) = agent
-            .start(application.member.profile(), mcp.endpoint())
+            .start(application.member.profile(), mcp.endpoint(), sandbox)
             .await
         {
             Application::warn_agent_stop(agent.stop().await);
@@ -702,7 +740,8 @@ impl AgentRuntime {
                 runtime.stop(&application.shutdown).await,
             );
         }
-        Ok(Self { runtime, mcp })
+
+        Ok((runtime, mcp))
     }
 
     async fn initialize_publisher(
@@ -1065,6 +1104,9 @@ pub enum Error {
     /// Starting or stopping the run-scoped MCP server failed.
     #[error("MCP server error: {0}")]
     Mcp(String),
+    /// Loading the agent sandbox failed.
+    #[error("agent sandbox error: {0}")]
+    Sandbox(#[from] crate::sandbox::Error),
     /// Starting or stopping the agent adapter failed.
     #[error(transparent)]
     Agent(#[from] agent::Error),

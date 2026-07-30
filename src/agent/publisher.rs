@@ -88,7 +88,6 @@ impl Publisher {
     pub(crate) fn for_repository(&self, repository: RepoId) -> Self {
         let mut publisher = self.clone();
         publisher.repository = repository;
-        publisher.mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
         publisher
     }
 

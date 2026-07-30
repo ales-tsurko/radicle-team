@@ -11,6 +11,7 @@ use url::Url;
 
 use crate::{
     member::Profile,
+    sandbox::AgentSandbox,
     watcher::{Change, Comment, Subject, Target},
 };
 
@@ -18,7 +19,12 @@ use crate::{
 #[async_trait]
 pub trait Agent: Send {
     /// Configures and starts the adapter for one member and run-scoped MCP server.
-    async fn start(&mut self, profile: Profile, mcp: &McpEndpoint) -> Result<(), Error>;
+    async fn start(
+        &mut self,
+        profile: Profile,
+        mcp: &McpEndpoint,
+        sandbox: AgentSandbox,
+    ) -> Result<(), Error>;
 
     /// Handles assignment to an issue or patch review.
     async fn assigned(&mut self, context: Context) -> Result<(), Error>;

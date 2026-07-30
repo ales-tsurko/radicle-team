@@ -8,8 +8,24 @@ use crate::logging::Logging;
 
 mod logging;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    radicle_team::sandbox::dispatch_linux_helper();
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("failed to initialize asynchronous runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    runtime.block_on(run())
+}
+
+async fn run() -> ExitCode {
     let cli = Cli::parse();
 
     if let Err(error) = Logging::init() {

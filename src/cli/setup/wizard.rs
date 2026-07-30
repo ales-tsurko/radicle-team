@@ -7,7 +7,8 @@ use radicle::identity::Did;
 use crate::{
     Application, Setup, SetupStatus,
     cli::setup::{
-        ManifestEntry, ManifestUpdate, RepositoryCheckout, SecurityManifest, SecuritySetup,
+        ManifestEntry, ManifestUpdate, RepositoryCheckout, SandboxSetup, SecurityManifest,
+        SecuritySetup,
     },
     manifest::FILE_NAME,
     member::Member,
@@ -27,6 +28,7 @@ impl SetupWizard {
     pub(crate) async fn run(self) -> Result<(), Error> {
         if !Self::is_interactive() {
             let setup = self.application.setup().await?;
+            self.initialize_sandbox()?;
             println!("{}", self.noninteractive_output(setup));
             return Ok(());
         }
@@ -104,26 +106,32 @@ impl SetupWizard {
     }
 
     async fn run_interactive(&self) -> Result<(), Error> {
+        let mut security = None;
         loop {
-            if self.step().await? == Step::Complete {
+            if self.step(&mut security).await? == Step::Complete {
                 return Ok(());
             }
         }
     }
 
-    async fn step(&self) -> Result<Step, Error> {
+    async fn step(&self, security: &mut Option<SecurityManifest>) -> Result<Step, Error> {
         match self.attempt().await {
-            Ok(setup) => self.handle_setup(setup).await,
+            Ok(setup) => self.handle_setup(setup, security).await,
             Err(error) => self.handle_error(error),
         }
     }
 
-    async fn handle_setup(&self, setup: Setup) -> Result<Step, Error> {
+    async fn handle_setup(
+        &self,
+        setup: Setup,
+        security: &mut Option<SecurityManifest>,
+    ) -> Result<Step, Error> {
         if matches!(setup.status(), SetupStatus::Ready { .. }) {
+            self.configure_sandbox()?;
             cliclack::outro(setup)?;
             Ok(Step::Complete)
         } else {
-            self.prepare_manifest(setup).await?;
+            self.prepare_manifest(setup, security).await?;
             Ok(Step::Retry)
         }
     }
@@ -147,8 +155,12 @@ impl SetupWizard {
             .inspect_err(|_| spinner.error("Setup needs attention"))
     }
 
-    async fn prepare_manifest(&self, setup: Setup) -> Result<(), Error> {
-        let update = self.manifest_update(&setup).await?;
+    async fn prepare_manifest(
+        &self,
+        setup: Setup,
+        security: &mut Option<SecurityManifest>,
+    ) -> Result<(), Error> {
+        let update = self.manifest_update(&setup, security).await?;
         self.show_manifest(update.entry())?;
         if let Some(path) = self.application.manifest_file() {
             return self.prepare_explicit_manifest(path, update).await;
@@ -157,16 +169,31 @@ impl SetupWizard {
         self.prepare_repository_manifest(update).await
     }
 
-    async fn manifest_update(&self, setup: &Setup) -> Result<ManifestUpdate, Error> {
+    async fn manifest_update(
+        &self,
+        setup: &Setup,
+        security: &mut Option<SecurityManifest>,
+    ) -> Result<ManifestUpdate, Error> {
         match setup.status() {
-            SetupStatus::ManifestMissing { .. } => self.create_manifest_update(setup).await,
+            SetupStatus::ManifestMissing { .. } => {
+                self.create_manifest_update(setup, security).await
+            }
             SetupStatus::BindingMissing { .. } => self.extend_manifest_update(setup).await,
             SetupStatus::Ready { .. } => Err(Error::ReadyManifest),
         }
     }
 
-    async fn create_manifest_update(&self, setup: &Setup) -> Result<ManifestUpdate, Error> {
-        let security = self.provision_security(setup.did()).await?;
+    async fn create_manifest_update(
+        &self,
+        setup: &Setup,
+        security: &mut Option<SecurityManifest>,
+    ) -> Result<ManifestUpdate, Error> {
+        let security = match security {
+            Some(security) => security.clone(),
+            None => security
+                .insert(self.provision_security(setup.did()).await?)
+                .clone(),
+        };
         let entry = ManifestEntry::new(&self.application, setup);
 
         Ok(ManifestUpdate::create(entry, security))
@@ -407,6 +434,14 @@ impl SetupWizard {
     fn is_interactive() -> bool {
         io::stdin().is_terminal() && io::stdout().is_terminal()
     }
+
+    fn initialize_sandbox(&self) -> Result<(), Error> {
+        SandboxSetup::load(self.application.sandbox_config_path()?)?.initialize()
+    }
+
+    fn configure_sandbox(&self) -> Result<(), Error> {
+        SandboxSetup::load(self.application.sandbox_config_path()?)?.configure()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,12 +471,21 @@ pub enum Error {
     /// A new manifest could not be serialized as TOML.
     #[error("failed to serialize repository manifest: {0}")]
     TomlSerialization(#[from] toml_edit::ser::Error),
+    /// Local sandbox configuration is unsafe or invalid.
+    #[error(transparent)]
+    Sandbox(#[from] crate::sandbox::ConfigError),
     /// A binding generation cannot be represented as a TOML integer.
     #[error("binding generation is too large: {0}")]
     Generation(#[from] std::num::TryFromIntError),
     /// The user cancelled setup.
     #[error("setup was cancelled")]
     Cancelled,
+    /// The operating-system home directory is unavailable for `~` expansion.
+    #[error("could not expand '~' because the operating-system home directory is unavailable")]
+    HomeUnavailable,
+    /// A domain allowlist was selected without any domains.
+    #[error("at least one sandbox external network domain is required")]
+    EmptySandboxDomains,
     /// A setup filesystem or subprocess operation failed.
     #[error("setup I/O failed: {0}")]
     Io(#[from] io::Error),

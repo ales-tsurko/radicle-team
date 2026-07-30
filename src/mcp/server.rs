@@ -1,6 +1,10 @@
 //! Loopback HTTP transport for the MCP endpoint.
 
-use std::{collections::BTreeMap, net::Ipv4Addr, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    net::{Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+};
 
 use radicle::{identity::RepoId, storage::git::Storage};
 use rand::distr::{Alphanumeric, SampleString as _};
@@ -43,7 +47,7 @@ impl Server {
         publisher: Publisher,
         allowlist: McpAllowlist,
     ) -> Result<Self, Error> {
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let listener = Self::bind_loopback().await?;
         let address = listener.local_addr()?;
         let capability = Alphanumeric.sample_string(&mut rand::rng(), 48);
         let route = format!("/mcp/{capability}");
@@ -76,6 +80,13 @@ impl Server {
 
     pub(crate) const fn endpoint(&self) -> &McpEndpoint {
         &self.endpoint
+    }
+
+    async fn bind_loopback() -> std::io::Result<tokio::net::TcpListener> {
+        match tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await {
+            Ok(listener) => Ok(listener),
+            Err(_ipv6_error) => tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await,
+        }
     }
 
     pub(crate) fn delivery_scope(&self) -> DeliveryScope {

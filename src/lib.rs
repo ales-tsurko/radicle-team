@@ -33,10 +33,10 @@
 //!
 //! During `run`, the application also starts a loopback-only MCP server scoped to the selected
 //! repository and member profile. [`agent::Agent::start`] receives the provider-neutral member
-//! profile and its unguessable capability URL before activity is delivered. Manifest allowlists
-//! control the exposed read, comment, issue, patch, and review methods. Tools are usable only while
-//! one delivery is active and cannot address a different subject. The adapter is stopped before
-//! the server and node shut down.
+//! profile, its unguessable capability URL, and a preconfigured [`sandbox::AgentSandbox`] before
+//! activity is delivered. Manifest allowlists control the exposed read, comment, issue, patch, and
+//! review methods. Tools are usable only while one delivery is active and cannot address a
+//! different subject. The adapter is stopped before the server and node shut down.
 //!
 //! # State and delivery
 //!
@@ -74,6 +74,8 @@ mod mcp;
 pub mod member;
 /// Supervised Radicle node lifecycle.
 pub mod node;
+/// Local process sandboxing for agent adapters.
+pub mod sandbox;
 mod shutdown;
 /// Radicle activity watching and agent delivery.
 pub mod watcher;

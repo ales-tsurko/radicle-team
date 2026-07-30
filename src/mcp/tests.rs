@@ -352,7 +352,17 @@ async fn starts_on_a_loopback_capability_url_and_stops() {
     .await
     .expect("MCP server should start");
 
-    assert_eq!(server.endpoint().url().host_str(), Some("127.0.0.1"));
+    assert!(
+        server
+            .endpoint()
+            .url()
+            .host()
+            .is_some_and(|host| match host {
+                url::Host::Ipv4(address) => address.is_loopback(),
+                url::Host::Ipv6(address) => address.is_loopback(),
+                url::Host::Domain(_) => false,
+            })
+    );
     assert!(server.endpoint().url().path().starts_with("/mcp/"));
     server.stop().await.expect("MCP server should stop");
 }
@@ -1286,6 +1296,85 @@ async fn preserves_and_signs_workspace_only_patch_commits() {
             .iter()
             .any(|(reference, oid)| reference.as_str() == name
                 && oid.to_string() == head.to_string())
+    );
+}
+
+#[tokio::test]
+#[cfg(not(miri))]
+async fn filters_listed_issues_by_state_and_query() {
+    let fixture = RepositoryFixture::new();
+    let service = fixture.service();
+    let matching = result_id(
+        service
+            .create_issue_write(CreateIssueRequest {
+                title: "Parser crash".to_owned(),
+                description: "Crashes on empty input".to_owned(),
+                labels: Vec::new(),
+                assignees: Vec::new(),
+            })
+            .await
+            .expect("matching issue should be created"),
+    );
+    let closed = result_id(
+        service
+            .create_issue_write(CreateIssueRequest {
+                title: "Parser rewrite".to_owned(),
+                description: "Long-term cleanup".to_owned(),
+                labels: Vec::new(),
+                assignees: Vec::new(),
+            })
+            .await
+            .expect("closed issue should be created"),
+    );
+    service
+        .set_state_write(
+            SetStateRequest {
+                subject: RepositoryFixture::subject(SubjectKind::Issue, &closed),
+                state: "closed".to_owned(),
+            },
+            SubjectKind::Issue,
+        )
+        .await
+        .expect("issue state should update");
+
+    let listed = |query: Option<&str>, state| {
+        let page = service
+            .issues(ListIssuesRequest {
+                query: query.map(ToOwned::to_owned),
+                state,
+                cursor: None,
+                limit: None,
+            })
+            .expect("issues should be listed");
+        page.issues
+            .into_iter()
+            .map(|issue| issue.subject)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        listed(Some("parser"), None).len(),
+        2,
+        "both issues share the queried word"
+    );
+    assert_eq!(
+        listed(None, Some(IssueStateFilter::Open)),
+        std::slice::from_ref(&matching),
+        "the closed issue must be excluded by state"
+    );
+    assert_eq!(
+        listed(None, Some(IssueStateFilter::Closed)),
+        [closed],
+        "the open issue must be excluded by state"
+    );
+    assert_eq!(
+        listed(Some("empty input"), None),
+        [matching],
+        "the description must be searched and non-matches excluded"
+    );
+    assert!(
+        listed(Some("no-such-issue"), None).is_empty(),
+        "a query matching nothing must return nothing"
     );
 }
 

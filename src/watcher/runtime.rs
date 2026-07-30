@@ -779,6 +779,7 @@ mod tests {
             &mut self,
             _profile: MemberProfile,
             _mcp: &McpEndpoint,
+            _sandbox: crate::sandbox::AgentSandbox,
         ) -> Result<(), crate::agent::Error> {
             Ok(())
         }
