@@ -138,8 +138,9 @@ repository checkout. It shows the exact Git commands and asks before writing
 `.radicle-team.toml`, creating a commit, and opening a Radicle patch with the
 user's identity.
 
-For a new manifest, the wizard asks who may trigger the repository's agents,
-then whether to create a private security-report repository with the user's Radicle identity or use an existing repository RID.
+For a new manifest, the wizard asks who may trigger the repository's agents, then
+whether to create a private security-report repository with the user's Radicle
+identity or use an existing repository RID.
 It grants the member DID access, generates an age encryption identity, and
 shows its recovery key once. Save that key outside every agent environment.
 Later member setup grants each new DID access through the same repository
@@ -201,7 +202,19 @@ Setup creates an administrator-owned sandbox configuration for each member:
 
 The interactive wizard optionally adds readable, writable, and denied filesystem
 paths and selects the network policy. The file can also be edited manually.
-Changes take effect when the member process restarts.
+
+This file is reloaded for every sandboxed command, so widening a denied path
+takes effect on the member's next command without a restart. Commands already
+running keep the policy they started with. An edit that leaves the file unsafe
+or invalid fails the next spawn rather than silently reusing the previous
+policy, so a typo surfaces immediately instead of appearing to apply.
+
+The repository manifest deliberately does **not** work this way: it is read once
+at startup, and changing `triggered_by`, `mcp_allow`, or a binding needs a
+restart. The asymmetry is intentional. A sandbox denial interrupts work already
+in progress, and the operator fixing it wants the running member to recover;
+manifest values do not block a running task, and reloading only some of them
+would leave a member acting on two different revisions of the same file at once.
 
 Radicle Team loads Zerobox's embedded platform and sensitive-path policies
 directly, so user-defined Zerobox profiles cannot replace them. It also enables
@@ -303,7 +316,9 @@ for it when it creates a manifest and leaves it alone when it later adds a
 member, so editing the value by hand is safe.
 
 Delegates are re-read on every scan, so granting or revoking one takes effect
-without restarting the member. Keep `triggered_by` above `[security]`: TOML
+without restarting the member. `triggered_by` itself does not: like every other
+manifest value it is read at startup, unlike the local sandbox configuration,
+which reloads for each command. Keep `triggered_by` above `[security]`: TOML
 assigns any key after a table header to that table.
 
 `mcp_allow` accepts exact MCP method names and the fixed `read`, `comments`,

@@ -34,6 +34,9 @@ const CHECKS: &[(&str, Check)] = &[
         "blocks_external_hosts",
         || Box::pin(blocks_external_hosts()),
     ),
+    ("reloads_configuration_between_commands", || {
+        Box::pin(reloads_configuration_between_commands())
+    }),
 ];
 
 fn main() {
@@ -172,6 +175,34 @@ async fn blocks_external_hosts() {
     );
 }
 
+/// Proves an operator can lift a denial without restarting the member.
+///
+/// The same sandbox is reused across both reads, so a change in outcome can only come from the
+/// configuration being reloaded for each spawn.
+async fn reloads_configuration_between_commands() {
+    let fixture = Fixture::new("reload");
+    let secrets = fixture.root().join("secrets");
+    fs::create_dir_all(&secrets).expect("secret directory should be created");
+    let secret = secrets.join("secret.txt");
+    fs::write(&secret, b"secret").expect("secret file should be written");
+
+    let mut config = Config::default();
+    config.set_deny_read(vec![secrets]);
+    let sandbox = fixture.sandbox(config);
+    check(
+        !read(&sandbox, &secret).await.success(),
+        "the denied file must start out unreadable",
+    );
+
+    fixture.write_config(&Config::default());
+
+    check(
+        read(&sandbox, &secret).await.success(),
+        "widening the configuration must take effect on the next command, without reloading the \
+         sandbox itself",
+    );
+}
+
 struct Fixture {
     directory: tempfile::TempDir,
     home: MemberHome,
@@ -200,13 +231,17 @@ impl Fixture {
 
     /// Writes `config` as the member's sandbox configuration and loads a sandbox using it.
     fn sandbox(&self, config: Config) -> AgentSandbox {
+        self.write_config(&config);
+
+        AgentSandbox::load(&self.home, &endpoint()).expect("sandbox should load")
+    }
+
+    fn write_config(&self, config: &Config) {
         let path = self.home.sandbox_config();
         let _removed = fs::remove_file(&path);
         config
             .write(&path)
             .expect("sandbox configuration should be written");
-
-        AgentSandbox::load(&self.home, &endpoint()).expect("sandbox should load")
     }
 }
 

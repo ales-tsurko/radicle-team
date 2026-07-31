@@ -41,7 +41,7 @@ const ENVIRONMENT: &[&str] = &["PATH", "HOME", "USER", "SHELL", "TERM", "LANG"];
 /// Zerobox launcher configured for one member's agent workspaces.
 #[derive(Debug, Clone)]
 pub struct AgentSandbox {
-    config: Config,
+    home: MemberHome,
     policy: Policy,
     workspaces: PathBuf,
     #[cfg(target_os = "linux")]
@@ -74,12 +74,13 @@ impl AgentSandbox {
             source,
         })?;
 
-        let config = Config::load(home)?;
         let policy = Policy::load(&workspaces, endpoint)?;
-        policy.validate(&config)?;
+        // Validated once here so an unusable configuration fails startup rather than the first
+        // command, even though `build` reloads it for every spawn.
+        policy.validate(&Config::load(home)?)?;
 
         Ok(Self {
-            config,
+            home: home.clone(),
             policy,
             workspaces,
             #[cfg(target_os = "linux")]
@@ -99,16 +100,23 @@ impl AgentSandbox {
         }
     }
 
+    /// Builds the launch policy for one command, re-reading the member's local configuration.
+    ///
+    /// Reloading here lets an operator widen a denied path and have the next command pick it up,
+    /// without restarting the member. A configuration that has become unsafe or invalid fails the
+    /// spawn instead of silently reusing the previous one.
     fn build(&self, command: &AgentCommand) -> Result<Launch, Error> {
         let current_dir = self.validate_current_dir(&command.current_dir)?;
+        let config = Config::load(&self.home)?;
+        self.policy.validate(&config)?;
         let file_system =
             self.policy
-                .file_system(&self.config, &self.workspaces, self.helper_executable())?;
+                .file_system(&config, &self.workspaces, self.helper_executable())?;
 
         Ok(Launch {
             current_dir,
             file_system,
-            network: self.policy.external_network(&self.config),
+            network: self.policy.external_network(&config),
             helper: self.helper_executable().map(Path::to_owned),
         })
     }
@@ -476,7 +484,10 @@ mod tests {
         ));
     }
 
+    // Not run under Miri: this writes a real configuration file, and Miri reports a synthetic user
+    // ID, so the administrator-ownership check rejects a file the test itself just created.
     #[test]
+    #[cfg(not(miri))]
     fn builds_every_configured_policy() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let home = MemberHome::at(directory.path(), Member::Nico);
@@ -488,18 +499,28 @@ mod tests {
             crate::sandbox::ExternalNetwork::Disabled,
             crate::sandbox::ExternalNetwork::Domains(vec!["example.com".to_owned()]),
         ] {
-            let mut configured = sandbox.clone();
-            configured.config.set_allow_read(vec![path.clone()]);
-            configured.config.set_deny_read(vec![path.clone()]);
-            configured.config.set_allow_write(vec![path.clone()]);
-            configured.config.set_deny_write(vec![path.clone()]);
-            configured.config.set_external_network(network);
-            let command = configured.command("true");
+            let mut config = crate::sandbox::Config::default();
+            config.set_allow_read(vec![path.clone()]);
+            config.set_deny_read(vec![path.clone()]);
+            config.set_allow_write(vec![path.clone()]);
+            config.set_deny_write(vec![path.clone()]);
+            config.set_external_network(network);
+            write_config(&home, &config);
+            let command = sandbox.command("true");
 
-            configured
+            sandbox
                 .build(&command)
                 .expect("configured policy should build");
         }
+    }
+
+    /// Replaces the member's configuration on disk, which `build` reloads for every command.
+    fn write_config(home: &MemberHome, config: &crate::sandbox::Config) {
+        let path = home.sandbox_config();
+        let _removed = std::fs::remove_file(&path);
+        config
+            .write(&path)
+            .expect("sandbox configuration should be written");
     }
 
     fn sandbox(home: &MemberHome) -> AgentSandbox {
