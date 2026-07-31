@@ -13,26 +13,30 @@ use radicle::{
 };
 use rmcp::Json;
 
-use crate::mcp::{
-    protocol::{
-        CommentIssueRequest, CommentOperation, CommentTargetKind, CommentWriteRequest,
-        CreateIssueRequest, CreatePatchRequest, Document, EditIssueRequest, EditPatchRequest,
-        IssueUpdate, MergePatchRequest, PatchCommitAction, PatchCommits, PatchUpdate,
-        PreparedEmbed, ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest,
-        SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest,
-        SubjectUpdate, UpdatePatchRequest, import_commits, mutation_identity, parse_dids,
-        parse_entry_string, parse_issue_state, parse_labels, parse_location, parse_object_string,
-        parse_patch_commits, parse_patch_state, parse_review, parse_revision,
-        parse_subject_request, parse_verdict, require_kind, stringify, validate_code_location,
-        validate_merge, write_result,
+use crate::{
+    agent::PublishError,
+    mcp::{
+        protocol::{
+            CommentIssueRequest, CommentOperation, CommentTargetKind, CommentWriteRequest,
+            CreateIssueRequest, CreatePatchRequest, Document, EditIssueRequest, EditPatchRequest,
+            IssueUpdate, MergePatchRequest, PatchCommitAction, PatchCommits, PatchUpdate,
+            PreparedEmbed, ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest,
+            SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest,
+            SubjectUpdate, UpdatePatchRequest, import_commits, mutation_identity, parse_dids,
+            parse_entry_string, parse_issue_state, parse_labels, parse_location,
+            parse_object_string, parse_patch_commits, parse_patch_state, parse_review,
+            parse_revision, parse_subject_request, parse_verdict, require_kind,
+            validate_code_location, validate_merge, write_result,
+        },
+        recovery::{
+            CommentRecovery, ReactionRecovery, find_review, issue_create_operation,
+            issue_edit_operation, issue_update_operation, merge_operation, patch_commit_operation,
+            patch_edit_operation, patch_update_operation, review_mutation_operation,
+            review_resolution_operation,
+        },
+        server::ServiceError,
+        tools::ToolService,
     },
-    recovery::{
-        CommentRecovery, ReactionRecovery, find_review, issue_create_operation,
-        issue_edit_operation, issue_update_operation, merge_operation, patch_commit_operation,
-        patch_edit_operation, patch_update_operation, review_mutation_operation,
-        review_resolution_operation,
-    },
-    tools::ToolService,
 };
 
 impl ToolService {
@@ -42,14 +46,14 @@ impl ToolService {
         request: String,
         operation: F,
         validate: V,
-    ) -> Result<String, String>
+    ) -> Result<String, ServiceError>
     where
         T: Send + ToString + 'static,
         F: FnOnce(
                 &radicle::storage::git::Repository,
                 &radicle::node::device::BoxedDevice,
                 &str,
-            ) -> Result<T, String>
+            ) -> Result<T, PublishError>
             + Send
             + 'static,
         V: Fn(
@@ -57,7 +61,7 @@ impl ToolService {
                 radicle::crypto::PublicKey,
                 EntryId,
                 crate::agent::MutationValidation,
-            ) -> Result<bool, String>
+            ) -> Result<bool, PublishError>
             + Send
             + 'static,
     {
@@ -84,13 +88,14 @@ impl ToolService {
         self.publisher
             .mutate(method, mutation, operation, validate)
             .await
+            .map_err(ServiceError::from)
     }
 
     pub(super) async fn write_comment(
         &self,
         request: CommentWriteRequest,
         operation: CommentOperation,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let method = match operation {
             CommentOperation::Create => "create_comment",
             CommentOperation::Edit => "edit_comment",
@@ -104,7 +109,7 @@ impl ToolService {
     pub(super) async fn comment_issue_write(
         &self,
         request: CommentIssueRequest,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let request_id = mutation_identity("comment_issue", &request)?;
         self.write_comment_as(
             request.comment(),
@@ -121,7 +126,7 @@ impl ToolService {
         operation: CommentOperation,
         method: &'static str,
         request_id: String,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let subject = parse_object_string(&request.subject.subject)?;
         let entity = request
             .entity
@@ -143,15 +148,17 @@ impl ToolService {
         let embeds = PreparedEmbed::prepare(request.embeds)?;
         if matches!(operation, CommentOperation::Create | CommentOperation::Edit) && body.is_none()
         {
-            return Err("body is required".to_owned());
+            return Err(ServiceError::Request("body is required".to_owned()));
         }
         if matches!(operation, CommentOperation::Edit | CommentOperation::Redact)
             && comment.is_none()
         {
-            return Err("comment is required".to_owned());
+            return Err(ServiceError::Request("comment is required".to_owned()));
         }
         if matches!(operation, CommentOperation::Redact) && !embeds.is_empty() {
-            return Err("redacted comments cannot include embeds".to_owned());
+            return Err(ServiceError::Request(
+                "redacted comments cannot include embeds".to_owned(),
+            ));
         }
         let kind = request.subject.kind;
         let target = request.target;
@@ -163,22 +170,24 @@ impl ToolService {
                 request_id,
                 move |repository, signer, marker| match (kind, target) {
                     (SubjectKind::Issue, CommentTargetKind::Issue) => {
-                        let mut issues =
-                            issue::Cache::no_cache(repository, signer).map_err(stringify)?;
-                        let mut issue = issues.get_mut(&subject).map_err(stringify)?;
+                        let mut issues = issue::Cache::no_cache(repository, signer)?;
+                        let mut issue = issues.get_mut(&subject)?;
                         if let Some(comment) = comment
                             && !matches!(operation, CommentOperation::Create)
                             && issue.thread().comment(&comment).is_none()
                         {
-                            return Err("comment was not found".to_owned());
+                            return Err(PublishError::Rejected("comment was not found".to_owned()));
                         }
                         if matches!(operation, CommentOperation::Create)
                             && let Some(parent) = reply_to
                             && issue.thread().comment(&parent).is_none()
                         {
-                            return Err("reply parent was not found".to_owned());
+                            return Err(PublishError::Rejected(
+                                "reply parent was not found".to_owned(),
+                            ));
                         }
-                        let embeds = PreparedEmbed::store(&embeds, repository)?;
+                        let embeds = PreparedEmbed::store(&embeds, repository)
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         issue
                             .transaction(marker, |tx| match operation {
                                 CommentOperation::Create => tx.comment(
@@ -195,34 +204,41 @@ impl ToolService {
                                     tx.redact_comment(comment.expect("comment was validated"))
                                 }
                             })
-                            .map_err(stringify)
+                            .map_err(PublishError::from)
                     }
                     (SubjectKind::Patch, CommentTargetKind::Revision) => {
-                        let revision = parse_revision(
-                            entity.ok_or_else(|| "entity revision is required".to_owned())?,
-                        )?;
-                        let mut patches =
-                            patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                        let mut patch = patches.get_mut(&subject).map_err(stringify)?;
+                        let revision = parse_revision(entity.ok_or_else(|| {
+                            PublishError::Rejected("entity revision is required".to_owned())
+                        })?)
+                        .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                        let mut patches = patch::Cache::no_cache(repository, signer)?;
+                        let mut patch = patches.get_mut(&subject)?;
                         let revision_value = patch
                             .revision(&revision)
-                            .ok_or_else(|| "revision was not found".to_owned())?;
+                            .ok_or_else(|| {
+                                ServiceError::Request("revision was not found".to_owned())
+                            })
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         if let Some(comment) = comment
                             && !matches!(operation, CommentOperation::Create)
                             && revision_value.discussion().comment(&comment).is_none()
                         {
-                            return Err("comment was not found".to_owned());
+                            return Err(PublishError::Rejected("comment was not found".to_owned()));
                         }
                         if matches!(operation, CommentOperation::Create)
                             && let Some(parent) = reply_to
                             && revision_value.discussion().comment(&parent).is_none()
                         {
-                            return Err("reply parent was not found".to_owned());
+                            return Err(PublishError::Rejected(
+                                "reply parent was not found".to_owned(),
+                            ));
                         }
                         if let Some(location) = location.as_ref() {
-                            validate_code_location(repository, revision_value, location)?;
+                            validate_code_location(repository, revision_value, location)
+                                .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         }
-                        let embeds = PreparedEmbed::store(&embeds, repository)?;
+                        let embeds = PreparedEmbed::store(&embeds, repository)
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         patch
                             .transaction(marker, |tx| match operation {
                                 CommentOperation::Create => tx.comment(
@@ -243,29 +259,30 @@ impl ToolService {
                                     comment.expect("comment was validated"),
                                 ),
                             })
-                            .map_err(stringify)
+                            .map_err(PublishError::from)
                     }
                     (SubjectKind::Patch, CommentTargetKind::Review) => {
-                        let review = parse_review(
-                            entity.ok_or_else(|| "entity review is required".to_owned())?,
-                        )?;
-                        let mut patches =
-                            patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                        let mut patch = patches.get_mut(&subject).map_err(stringify)?;
+                        let review = parse_review(entity.ok_or_else(|| {
+                            PublishError::Rejected("entity review is required".to_owned())
+                        })?)
+                        .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                        let mut patches = patch::Cache::no_cache(repository, signer)?;
+                        let mut patch = patches.get_mut(&subject)?;
                         let review_value = patch
                             .revisions()
                             .flat_map(|(_revision, value)| value.reviews())
                             .find_map(|(_author, candidate)| {
                                 (candidate.id() == review).then_some(candidate)
                             })
-                            .ok_or_else(|| "review was not found".to_owned())?;
+                            .ok_or_else(|| ServiceError::Request("review was not found".to_owned()))
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         if let Some(comment) = comment
                             && !matches!(operation, CommentOperation::Create)
                             && !review_value
                                 .comments()
                                 .any(|(candidate, _value)| *candidate == comment)
                         {
-                            return Err("comment was not found".to_owned());
+                            return Err(PublishError::Rejected("comment was not found".to_owned()));
                         }
                         if matches!(operation, CommentOperation::Create)
                             && let Some(parent) = reply_to
@@ -273,7 +290,9 @@ impl ToolService {
                                 .comments()
                                 .any(|(candidate, _value)| *candidate == parent)
                         {
-                            return Err("reply parent was not found".to_owned());
+                            return Err(PublishError::Rejected(
+                                "reply parent was not found".to_owned(),
+                            ));
                         }
                         if let Some(location) = location.as_ref() {
                             let revision = patch
@@ -284,10 +303,15 @@ impl ToolService {
                                         .any(|(candidate, _)| *candidate == review)
                                         .then_some(value)
                                 })
-                                .ok_or_else(|| "review was not found".to_owned())?;
-                            validate_code_location(repository, revision, location)?;
+                                .ok_or_else(|| {
+                                    ServiceError::Request("review was not found".to_owned())
+                                })
+                                .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                            validate_code_location(repository, revision, location)
+                                .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         }
-                        let embeds = PreparedEmbed::store(&embeds, repository)?;
+                        let embeds = PreparedEmbed::store(&embeds, repository)
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         patch
                             .transaction(marker, |tx| match operation {
                                 CommentOperation::Create => tx.review_comment(
@@ -308,9 +332,11 @@ impl ToolService {
                                     comment.expect("comment was validated"),
                                 ),
                             })
-                            .map_err(stringify)
+                            .map_err(PublishError::from)
                     }
-                    _ => Err("comment target does not match subject".to_owned()),
+                    _ => Err(PublishError::Rejected(
+                        "comment target does not match subject".to_owned(),
+                    )),
                 },
                 move |repository, _author, recovered, validation| {
                     let recovery = CommentRecovery {
@@ -343,7 +369,7 @@ impl ToolService {
     pub(super) async fn resolve_review_comment(
         &self,
         request: ResolveCommentRequest,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let request_id = mutation_identity("resolve_comment", &request)?;
         require_kind(request.subject.kind, SubjectKind::Patch)?;
         let patch_id = parse_object_string(&request.subject.subject)?;
@@ -355,9 +381,8 @@ impl ToolService {
                 "resolve_comment",
                 request_id,
                 move |repository, signer, marker| {
-                    let mut patches =
-                        patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                    let mut patch = patches.get_mut(&patch_id).map_err(stringify)?;
+                    let mut patches = patch::Cache::no_cache(repository, signer)?;
+                    let mut patch = patches.get_mut(&patch_id)?;
                     patch
                         .transaction(marker, |tx| {
                             if resolved {
@@ -366,7 +391,7 @@ impl ToolService {
                                 tx.review_comment_unresolve(review, comment)
                             }
                         })
-                        .map_err(stringify)
+                        .map_err(PublishError::from)
                 },
                 move |repository, _author, operation, validation| {
                     if matches!(validation, crate::agent::MutationValidation::Recovery) {
@@ -374,10 +399,7 @@ impl ToolService {
                             repository, patch_id, operation, review, comment, resolved,
                         );
                     }
-                    let patch = Patches::open(repository, ReadOnly)
-                        .map_err(stringify)?
-                        .get(&patch_id)
-                        .map_err(stringify)?;
+                    let patch = Patches::open(repository, ReadOnly)?.get(&patch_id)?;
                     Ok(patch.is_some_and(|patch| {
                         patch
                             .revisions()
@@ -401,7 +423,7 @@ impl ToolService {
     pub(super) async fn reaction_write(
         &self,
         request: ReactionWriteRequest,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let request_id = mutation_identity("set_reaction", &request)?;
         let subject = parse_object_string(&request.subject.subject)?;
         let entity = request
@@ -427,43 +449,50 @@ impl ToolService {
                 move |repository, signer, marker| match (kind, target) {
                     (SubjectKind::Issue, CommentTargetKind::Issue) => {
                         if entity.is_some() || location.is_some() {
-                            return Err(
-                                "issue reactions do not accept entity or location".to_owned()
-                            );
+                            return Err(PublishError::Rejected(
+                                "issue reactions do not accept entity or location".to_owned(),
+                            ));
                         }
                         let comment = comment.unwrap_or(*subject);
-                        let mut issues =
-                            issue::Cache::no_cache(repository, signer).map_err(stringify)?;
-                        let mut issue = issues.get_mut(&subject).map_err(stringify)?;
+                        let mut issues = issue::Cache::no_cache(repository, signer)?;
+                        let mut issue = issues.get_mut(&subject)?;
                         if issue.thread().comment(&comment).is_none() {
-                            return Err("reaction target was not found".to_owned());
+                            return Err(PublishError::Rejected(
+                                "reaction target was not found".to_owned(),
+                            ));
                         }
                         issue
                             .transaction(marker, |tx| tx.react(comment, reaction, active))
-                            .map_err(stringify)
+                            .map_err(PublishError::from)
                     }
                     (SubjectKind::Patch, CommentTargetKind::Revision) => {
-                        let revision = parse_revision(
-                            entity.ok_or_else(|| "entity revision is required".to_owned())?,
-                        )?;
+                        let revision = parse_revision(entity.ok_or_else(|| {
+                            PublishError::Rejected("entity revision is required".to_owned())
+                        })?)
+                        .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         if comment.is_some() && location.is_some() {
-                            return Err(
-                                "revision comment reactions do not accept location".to_owned()
-                            );
+                            return Err(PublishError::Rejected(
+                                "revision comment reactions do not accept location".to_owned(),
+                            ));
                         }
-                        let mut patches =
-                            patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                        let mut patch = patches.get_mut(&subject).map_err(stringify)?;
+                        let mut patches = patch::Cache::no_cache(repository, signer)?;
+                        let mut patch = patches.get_mut(&subject)?;
                         let revision_value = patch
                             .revision(&revision)
-                            .ok_or_else(|| "revision was not found".to_owned())?;
+                            .ok_or_else(|| {
+                                ServiceError::Request("revision was not found".to_owned())
+                            })
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         if let Some(comment) = comment
                             && revision_value.discussion().comment(&comment).is_none()
                         {
-                            return Err("reaction target was not found".to_owned());
+                            return Err(PublishError::Rejected(
+                                "reaction target was not found".to_owned(),
+                            ));
                         }
                         if let Some(location) = location.as_ref() {
-                            validate_code_location(repository, revision_value, location)?;
+                            validate_code_location(repository, revision_value, location)
+                                .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         }
                         patch
                             .transaction(marker, |tx| match comment {
@@ -472,26 +501,31 @@ impl ToolService {
                                 }
                                 None => tx.react(revision, reaction, location, active),
                             })
-                            .map_err(stringify)
+                            .map_err(PublishError::from)
                     }
                     (SubjectKind::Patch, CommentTargetKind::Review) => {
                         if location.is_some() {
-                            return Err("review reactions do not accept location".to_owned());
+                            return Err(PublishError::Rejected(
+                                "review reactions do not accept location".to_owned(),
+                            ));
                         }
-                        let review = parse_review(
-                            entity.ok_or_else(|| "entity review is required".to_owned())?,
-                        )?;
-                        let mut patches =
-                            patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                        let mut patch = patches.get_mut(&subject).map_err(stringify)?;
+                        let review = parse_review(entity.ok_or_else(|| {
+                            PublishError::Rejected("entity review is required".to_owned())
+                        })?)
+                        .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                        let mut patches = patch::Cache::no_cache(repository, signer)?;
+                        let mut patch = patches.get_mut(&subject)?;
                         let review_value = find_review(&patch, review)
-                            .ok_or_else(|| "review was not found".to_owned())?;
+                            .ok_or_else(|| ServiceError::Request("review was not found".to_owned()))
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         if let Some(comment) = comment
                             && !review_value
                                 .comments()
                                 .any(|(candidate, _value)| *candidate == comment)
                         {
-                            return Err("reaction target was not found".to_owned());
+                            return Err(PublishError::Rejected(
+                                "reaction target was not found".to_owned(),
+                            ));
                         }
                         patch
                             .transaction(marker, |tx| match comment {
@@ -500,9 +534,11 @@ impl ToolService {
                                 }
                                 None => tx.review_react(review, reaction, active),
                             })
-                            .map_err(stringify)
+                            .map_err(PublishError::from)
                     }
-                    _ => Err("reaction target does not match subject".to_owned()),
+                    _ => Err(PublishError::Rejected(
+                        "reaction target does not match subject".to_owned(),
+                    )),
                 },
                 move |repository, author, operation, validation| {
                     let recovery = ReactionRecovery {
@@ -532,7 +568,7 @@ impl ToolService {
     pub(super) async fn create_issue_write(
         &self,
         request: CreateIssueRequest,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let request_id = mutation_identity("create_issue", &request)?;
         self.create_issue_as(request, "create_issue", request_id, true)
             .await
@@ -542,7 +578,7 @@ impl ToolService {
         &self,
         request: CreateIssueRequest,
         request_id: String,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         self.create_issue_as(request, "report_security_issue", request_id, false)
             .await
     }
@@ -553,8 +589,8 @@ impl ToolService {
         method: &'static str,
         request_id: String,
         recover_description: bool,
-    ) -> Result<Json<Document>, String> {
-        let title = radicle::cob::Title::try_from(request.title).map_err(stringify)?;
+    ) -> Result<Json<Document>, ServiceError> {
+        let title = radicle::cob::Title::try_from(request.title)?;
         let labels = parse_labels(request.labels)?;
         let assignees = parse_dids(request.assignees)?;
         let description = request.description;
@@ -567,12 +603,11 @@ impl ToolService {
                 method,
                 request_id,
                 move |repository, signer, marker| {
-                    let identity = repository.identity_head().map_err(stringify)?;
+                    let identity = repository.identity_head()?;
                     let mut issues = radicle::cob::store::Store::<issue::Issue, _, _>::open(
                         repository,
                         radicle::cob::store::access::WriteAs::new(signer),
-                    )
-                    .map_err(stringify)?
+                    )?
                     .identity(identity);
                     let (id, _issue) = radicle::cob::store::Transaction::initial(
                         marker,
@@ -597,8 +632,7 @@ impl ToolService {
                             }
                             Ok(())
                         },
-                    )
-                    .map_err(stringify)?;
+                    )?;
                     Ok(id)
                 },
                 move |repository, _author, operation, validation| {
@@ -612,11 +646,10 @@ impl ToolService {
                             &expected_assignees,
                         );
                     }
-                    Issues::open(repository, ReadOnly)
-                        .map_err(stringify)?
+                    Issues::open(repository, ReadOnly)?
                         .get(&ObjectId::from(operation))
                         .map(|issue| issue.is_some())
-                        .map_err(stringify)
+                        .map_err(PublishError::from)
                 },
             )
             .await?;
@@ -626,29 +659,29 @@ impl ToolService {
     pub(super) async fn edit_issue_write(
         &self,
         request: EditIssueRequest,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let request_id = mutation_identity("edit_issue", &request)?;
         require_kind(request.subject.kind, SubjectKind::Issue)?;
         let issue_id = parse_object_string(&request.subject.subject)?;
         let title = request
             .title
             .map(radicle::cob::Title::try_from)
-            .transpose()
-            .map_err(stringify)?;
+            .transpose()?;
         let description = request.description;
         let expected_title = title.clone();
         let expected_description = description.clone();
         if title.is_none() && description.is_none() {
-            return Err("title or description is required".to_owned());
+            return Err(ServiceError::Request(
+                "title or description is required".to_owned(),
+            ));
         }
         let id = self
             .mutate(
                 "edit_issue",
                 request_id,
                 move |repository, signer, marker| {
-                    let mut issues =
-                        issue::Cache::no_cache(repository, signer).map_err(stringify)?;
-                    let mut issue = issues.get_mut(&issue_id).map_err(stringify)?;
+                    let mut issues = issue::Cache::no_cache(repository, signer)?;
+                    let mut issue = issues.get_mut(&issue_id)?;
                     issue
                         .transaction(marker, |tx| {
                             if let Some(title) = title {
@@ -659,7 +692,7 @@ impl ToolService {
                             }
                             Ok(())
                         })
-                        .map_err(stringify)
+                        .map_err(PublishError::from)
                 },
                 move |repository, _author, operation, _validation| {
                     issue_edit_operation(
@@ -679,9 +712,9 @@ impl ToolService {
         &self,
         request: CreatePatchRequest,
         workspace: std::path::PathBuf,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let request_id = mutation_identity("create_patch", &request)?;
-        let title = radicle::cob::Title::try_from(request.title).map_err(stringify)?;
+        let title = radicle::cob::Title::try_from(request.title)?;
         let labels = parse_labels(request.labels)?;
         let commits =
             parse_patch_commits(request.description, request.base, request.head, workspace)?;
@@ -702,7 +735,7 @@ impl ToolService {
         &self,
         request: UpdatePatchRequest,
         workspace: std::path::PathBuf,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let request_id = mutation_identity("update_patch", &request)?;
         require_kind(request.subject.kind, SubjectKind::Patch)?;
         let patch_id = parse_object_string(&request.subject.subject)?;
@@ -723,7 +756,7 @@ impl ToolService {
         request_id: String,
         commits: PatchCommits,
         action: PatchCommitAction,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let namespace = self.publisher.author();
         let expected_action = action.clone();
         let expected_description = commits.description.clone();
@@ -739,20 +772,20 @@ impl ToolService {
                         &commits.workspace,
                         namespace,
                         &[commits.base, commits.head],
-                    )?;
+                    )
+                    .map_err(|error| PublishError::Rejected(error.to_string()))?;
                     match action {
                         PatchCommitAction::Create {
                             title,
                             labels,
                             draft,
                         } => {
-                            let identity = repository.identity_head().map_err(stringify)?;
+                            let identity = repository.identity_head()?;
                             let mut patches =
                                 radicle::cob::store::Store::<patch::Patch, _, _>::open(
                                     repository,
                                     radicle::cob::store::access::WriteAs::new(signer),
-                                )
-                                .map_err(stringify)?
+                                )?
                                 .identity(identity);
                             let (id, _patch) = radicle::cob::store::Transaction::initial(
                                 marker,
@@ -772,20 +805,18 @@ impl ToolService {
                                     }
                                     Ok(())
                                 },
-                            )
-                            .map_err(stringify)?;
+                            )?;
                             Ok(id.to_string())
                         }
                         PatchCommitAction::Update(id) => {
-                            let mut patches =
-                                patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                            let mut patch = patches.get_mut(&id).map_err(stringify)?;
+                            let mut patches = patch::Cache::no_cache(repository, signer)?;
+                            let mut patch = patches.get_mut(&id)?;
                             patch
                                 .transaction(marker, |tx| {
                                     tx.revision(commits.description, commits.base, commits.head)
                                 })
                                 .map(|id| id.to_string())
-                                .map_err(stringify)
+                                .map_err(PublishError::from)
                         }
                     }
                 },
@@ -800,14 +831,14 @@ impl ToolService {
                             expected_head,
                         );
                     }
-                    let patches = Patches::open(repository, ReadOnly).map_err(stringify)?;
+                    let patches = Patches::open(repository, ReadOnly)?;
                     match expected_action {
                         PatchCommitAction::Create { .. } => patches
                             .get(&ObjectId::from(operation))
                             .map(|patch| patch.is_some())
-                            .map_err(stringify),
+                            .map_err(PublishError::from),
                         PatchCommitAction::Update(id) => {
-                            let patch = patches.get(&id).map_err(stringify)?;
+                            let patch = patches.get(&id)?;
                             Ok(patch.is_some_and(|patch| {
                                 patch
                                     .revision(&patch::RevisionId::from(operation))
@@ -828,15 +859,14 @@ impl ToolService {
     pub(super) async fn edit_patch_write(
         &self,
         request: EditPatchRequest,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let request_id = mutation_identity("edit_patch", &request)?;
         require_kind(request.subject.kind, SubjectKind::Patch)?;
         let patch_id = parse_object_string(&request.subject.subject)?;
         let title = request
             .title
             .map(radicle::cob::Title::try_from)
-            .transpose()
-            .map_err(stringify)?;
+            .transpose()?;
         let revision = request
             .revision
             .as_deref()
@@ -848,19 +878,22 @@ impl ToolService {
         let expected_revision = revision;
         let expected_description = description.clone();
         if title.is_none() && description.is_none() {
-            return Err("title or description is required".to_owned());
+            return Err(ServiceError::Request(
+                "title or description is required".to_owned(),
+            ));
         }
         if description.is_some() && revision.is_none() {
-            return Err("revision is required when editing a description".to_owned());
+            return Err(ServiceError::Request(
+                "revision is required when editing a description".to_owned(),
+            ));
         }
         let id = self
             .mutate(
                 "edit_patch",
                 request_id,
                 move |repository, signer, marker| {
-                    let mut patches =
-                        patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                    let mut patch = patches.get_mut(&patch_id).map_err(stringify)?;
+                    let mut patches = patch::Cache::no_cache(repository, signer)?;
+                    let mut patch = patches.get_mut(&patch_id)?;
                     patch
                         .transaction(marker, |tx| {
                             if let Some(title) = title {
@@ -871,7 +904,7 @@ impl ToolService {
                             }
                             Ok(())
                         })
-                        .map_err(stringify)
+                        .map_err(PublishError::from)
                 },
                 move |repository, _author, operation, validation| {
                     if matches!(validation, crate::agent::MutationValidation::Recovery) {
@@ -884,10 +917,7 @@ impl ToolService {
                             expected_description.as_deref(),
                         );
                     }
-                    let patch = Patches::open(repository, ReadOnly)
-                        .map_err(stringify)?
-                        .get(&patch_id)
-                        .map_err(stringify)?;
+                    let patch = Patches::open(repository, ReadOnly)?.get(&patch_id)?;
                     Ok(patch.is_some_and(|patch| {
                         expected_title
                             .as_ref()
@@ -910,7 +940,7 @@ impl ToolService {
         request_id: String,
         subject: SubjectRequest,
         update: SubjectUpdate,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let expected_subject = subject.clone();
         let expected_update = update.clone();
         let id = self
@@ -919,43 +949,42 @@ impl ToolService {
                 request_id,
                 move |repository, signer, marker| match update {
                     SubjectUpdate::Issue(update) => {
-                        let id = parse_subject_request(&subject, SubjectKind::Issue)?;
-                        let mut issues =
-                            issue::Cache::no_cache(repository, signer).map_err(stringify)?;
-                        let mut issue = issues.get_mut(&id).map_err(stringify)?;
+                        let id = parse_subject_request(&subject, SubjectKind::Issue)
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                        let mut issues = issue::Cache::no_cache(repository, signer)?;
+                        let mut issue = issues.get_mut(&id)?;
                         issue
                             .transaction(marker, |tx| match update {
                                 IssueUpdate::State(state) => tx.lifecycle(state),
                                 IssueUpdate::Labels(labels) => tx.label(labels),
                                 IssueUpdate::Assignees(assignees) => tx.assign(assignees),
                             })
-                            .map_err(stringify)
+                            .map_err(PublishError::from)
                     }
                     SubjectUpdate::Patch(update) => {
-                        let id = parse_subject_request(&subject, SubjectKind::Patch)?;
-                        let mut patches =
-                            patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                        let mut patch = patches.get_mut(&id).map_err(stringify)?;
+                        let id = parse_subject_request(&subject, SubjectKind::Patch)
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                        let mut patches = patch::Cache::no_cache(repository, signer)?;
+                        let mut patch = patches.get_mut(&id)?;
                         patch
                             .transaction(marker, |tx| match update {
                                 PatchUpdate::State(state) => tx.lifecycle(state),
                                 PatchUpdate::Labels(labels) => tx.label(labels),
                                 PatchUpdate::Assignees(assignees) => tx.assign(assignees),
                             })
-                            .map_err(stringify)
+                            .map_err(PublishError::from)
                     }
                 },
                 move |repository, _author, operation, validation| match &expected_update {
                     SubjectUpdate::Issue(update) => {
                         if matches!(validation, crate::agent::MutationValidation::Recovery) {
-                            let id = parse_subject_request(&expected_subject, SubjectKind::Issue)?;
+                            let id = parse_subject_request(&expected_subject, SubjectKind::Issue)
+                                .map_err(|error| PublishError::Rejected(error.to_string()))?;
                             return issue_update_operation(repository, id, operation, update);
                         }
-                        let id = parse_subject_request(&expected_subject, SubjectKind::Issue)?;
-                        let issue = Issues::open(repository, ReadOnly)
-                            .map_err(stringify)?
-                            .get(&id)
-                            .map_err(stringify)?;
+                        let id = parse_subject_request(&expected_subject, SubjectKind::Issue)
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                        let issue = Issues::open(repository, ReadOnly)?.get(&id)?;
                         Ok(issue.is_some_and(|issue| match update {
                             IssueUpdate::State(state) => issue.state() == state,
                             IssueUpdate::Labels(labels) => {
@@ -974,14 +1003,13 @@ impl ToolService {
                     }
                     SubjectUpdate::Patch(update) => {
                         if matches!(validation, crate::agent::MutationValidation::Recovery) {
-                            let id = parse_subject_request(&expected_subject, SubjectKind::Patch)?;
+                            let id = parse_subject_request(&expected_subject, SubjectKind::Patch)
+                                .map_err(|error| PublishError::Rejected(error.to_string()))?;
                             return patch_update_operation(repository, id, operation, update);
                         }
-                        let id = parse_subject_request(&expected_subject, SubjectKind::Patch)?;
-                        let patch = Patches::open(repository, ReadOnly)
-                            .map_err(stringify)?
-                            .get(&id)
-                            .map_err(stringify)?;
+                        let id = parse_subject_request(&expected_subject, SubjectKind::Patch)
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                        let patch = Patches::open(repository, ReadOnly)?.get(&id)?;
                         Ok(patch.is_some_and(|patch| match update {
                             PatchUpdate::State(state) => match state {
                                 patch::Lifecycle::Open => {
@@ -1018,7 +1046,7 @@ impl ToolService {
         &self,
         request: SetStateRequest,
         kind: SubjectKind,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let (method, update) = match kind {
             SubjectKind::Issue => (
                 "set_issue_state",
@@ -1039,7 +1067,7 @@ impl ToolService {
         request: SetStringsRequest,
         kind: SubjectKind,
         change: StringUpdate,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let method = match (kind, change) {
             (SubjectKind::Issue, StringUpdate::Labels) => "set_issue_labels",
             (SubjectKind::Issue, StringUpdate::Assignees) => "set_issue_assignees",
@@ -1069,7 +1097,7 @@ impl ToolService {
         &self,
         request: ReviewWriteRequest,
         edit: bool,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let method = if edit { "edit_review" } else { "create_review" };
         let request_id = mutation_identity(method, &request)?;
         require_kind(request.subject.kind, SubjectKind::Patch)?;
@@ -1096,50 +1124,60 @@ impl ToolService {
         let expected_labels = labels.clone();
         let expected_embeds = PreparedEmbed::references(&embeds);
         if edit && review.is_none() {
-            return Err("review is required".to_owned());
+            return Err(ServiceError::Request("review is required".to_owned()));
         }
         if edit && summary.is_none() {
-            return Err("summary is required".to_owned());
+            return Err(ServiceError::Request("summary is required".to_owned()));
         }
         if !edit && revision.is_none() {
-            return Err("revision is required".to_owned());
+            return Err(ServiceError::Request("revision is required".to_owned()));
         }
         if !edit && verdict.is_none() && summary.is_none() {
-            return Err("verdict or summary is required".to_owned());
+            return Err(ServiceError::Request(
+                "verdict or summary is required".to_owned(),
+            ));
         }
         if !edit && !embeds.is_empty() {
-            return Err(
+            return Err(ServiceError::Request(
                 "create_review cannot include embeds; create it, then use edit_review".to_owned(),
-            );
+            ));
         }
         let id = self
             .mutate(
                 method,
                 request_id,
                 move |repository, signer, marker| {
-                    let mut patches =
-                        patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                    let mut patch = patches.get_mut(&patch_id).map_err(stringify)?;
+                    let mut patches = patch::Cache::no_cache(repository, signer)?;
+                    let mut patch = patches.get_mut(&patch_id)?;
                     if edit {
                         let review = review.expect("review was validated");
                         let review = find_review(&patch, review)
-                            .ok_or_else(|| "review was not found".to_owned())?;
+                            .ok_or_else(|| ServiceError::Request("review was not found".to_owned()))
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         if review.author().public_key() != signer.public_key() {
-                            return Err("review belongs to another author".to_owned());
+                            return Err(PublishError::Rejected(
+                                "review belongs to another author".to_owned(),
+                            ));
                         }
                     } else {
                         let revision = revision.expect("revision was validated");
                         let revision = patch
                             .revision(&revision)
-                            .ok_or_else(|| "revision was not found".to_owned())?;
+                            .ok_or_else(|| {
+                                ServiceError::Request("revision was not found".to_owned())
+                            })
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         if revision
                             .reviews()
                             .any(|(author, _review)| author == signer.public_key())
                         {
-                            return Err("revision was already reviewed by this author".to_owned());
+                            return Err(PublishError::Rejected(
+                                "revision was already reviewed by this author".to_owned(),
+                            ));
                         }
                     }
-                    let embeds = PreparedEmbed::store(&embeds, repository)?;
+                    let embeds = PreparedEmbed::store(&embeds, repository)
+                        .map_err(|error| PublishError::Rejected(error.to_string()))?;
                     patch
                         .transaction(marker, |tx| {
                             if edit {
@@ -1160,7 +1198,7 @@ impl ToolService {
                                 )
                             }
                         })
-                        .map_err(stringify)
+                        .map_err(PublishError::from)
                 },
                 move |repository, _author, operation, validation| {
                     if matches!(validation, crate::agent::MutationValidation::Recovery) {
@@ -1177,10 +1215,7 @@ impl ToolService {
                             &expected_embeds,
                         );
                     }
-                    let patch = Patches::open(repository, ReadOnly)
-                        .map_err(stringify)?
-                        .get(&patch_id)
-                        .map_err(stringify)?;
+                    let patch = Patches::open(repository, ReadOnly)?.get(&patch_id)?;
                     let id = if edit {
                         expected_review.expect("review was validated")
                     } else {
@@ -1213,24 +1248,23 @@ impl ToolService {
     pub(super) async fn merge_patch_write(
         &self,
         request: MergePatchRequest,
-    ) -> Result<Json<Document>, String> {
+    ) -> Result<Json<Document>, ServiceError> {
         let request_id = mutation_identity("merge_patch", &request)?;
         require_kind(request.subject.kind, SubjectKind::Patch)?;
         let patch_id = parse_object_string(&request.subject.subject)?;
         let revision = patch::RevisionId::from(parse_entry_string(&request.revision)?);
-        let commit = radicle::git::Oid::from_str(&request.commit).map_err(stringify)?;
+        let commit = radicle::git::Oid::from_str(&request.commit)
+            .map_err(|error| ServiceError::Request(error.to_string()))?;
         let id = self
             .mutate(
                 "merge_patch",
                 request_id,
                 move |repository, signer, marker| {
-                    let mut patches =
-                        patch::Cache::no_cache(repository, signer).map_err(stringify)?;
-                    let mut patch = patches.get_mut(&patch_id).map_err(stringify)?;
-                    validate_merge(repository, &patch, signer, revision, commit)?;
-                    let id = patch
-                        .transaction(marker, |tx| tx.merge(revision, commit))
-                        .map_err(stringify)?;
+                    let mut patches = patch::Cache::no_cache(repository, signer)?;
+                    let mut patch = patches.get_mut(&patch_id)?;
+                    validate_merge(repository, &patch, signer, revision, commit)
+                        .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                    let id = patch.transaction(marker, |tx| tx.merge(revision, commit))?;
                     patch
                         .merges()
                         .any(|(author, merge)| {
@@ -1239,17 +1273,17 @@ impl ToolService {
                                 && merge.commit == commit
                         })
                         .then_some(id)
-                        .ok_or_else(|| "merge attestation was not applied".to_owned())
+                        .ok_or_else(|| {
+                            PublishError::Rejected("merge attestation was not applied".to_owned())
+                        })
                 },
                 move |repository, author, operation, validation| {
                     if matches!(validation, crate::agent::MutationValidation::Recovery) {
                         return merge_operation(repository, patch_id, operation, revision, commit);
                     }
-                    let patch = Patches::open(repository, ReadOnly)
-                        .map_err(stringify)?
-                        .get(&patch_id)
-                        .map_err(stringify)?
-                        .ok_or_else(|| "patch was not found".to_owned())?;
+                    let patch = Patches::open(repository, ReadOnly)?
+                        .get(&patch_id)?
+                        .ok_or_else(|| PublishError::Rejected("patch was not found".to_owned()))?;
                     Ok(patch.merges().any(|(candidate, merge)| {
                         candidate == &author && merge.revision == revision && merge.commit == commit
                     }))

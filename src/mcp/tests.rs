@@ -44,7 +44,7 @@ use crate::mcp::{
         ListIssuesRequest, LocationRequest, MAX_EMBED_BYTES, MergePatchRequest, PreparedEmbed,
         ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest, SecurityIssueRequest,
         SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest,
-        mutation_identity, parse_location, parse_object, stringify, validate_code_location,
+        mutation_identity, parse_location, parse_object, validate_code_location,
     },
     read::MAX_DIFF_BYTES,
     recovery::{ReactionRecovery, find_review, review_mutation_operation},
@@ -317,7 +317,7 @@ fn rejects_oversized_embed_before_base64_decoding() {
     }])
     .expect_err("oversized content should be rejected");
 
-    assert!(error.contains("exceeds"));
+    assert!(error.to_string().contains("exceeds"));
 }
 
 #[test]
@@ -440,11 +440,13 @@ struct TestAuthorizer(RepoId);
 #[cfg(not(miri))]
 #[async_trait::async_trait]
 impl crate::agent::Authorizer for TestAuthorizer {
-    async fn authorize(&self, _method: &str) -> Result<(), String> {
+    async fn authorize(&self, _method: &str) -> Result<(), crate::agent::PublishError> {
         Ok(())
     }
 
-    async fn security_policy(&self) -> Result<crate::manifest::SecurityPolicy, String> {
+    async fn security_policy(
+        &self,
+    ) -> Result<crate::manifest::SecurityPolicy, crate::agent::PublishError> {
         Ok(crate::manifest::SecurityPolicy::test(self.0))
     }
 }
@@ -456,11 +458,13 @@ struct RotatingAuthorizer(Arc<tokio::sync::RwLock<crate::manifest::SecurityPolic
 #[cfg(not(miri))]
 #[async_trait::async_trait]
 impl crate::agent::Authorizer for RotatingAuthorizer {
-    async fn authorize(&self, _method: &str) -> Result<(), String> {
+    async fn authorize(&self, _method: &str) -> Result<(), crate::agent::PublishError> {
         Ok(())
     }
 
-    async fn security_policy(&self) -> Result<crate::manifest::SecurityPolicy, String> {
+    async fn security_policy(
+        &self,
+    ) -> Result<crate::manifest::SecurityPolicy, crate::agent::PublishError> {
         Ok(self.0.read().await.clone())
     }
 }
@@ -709,12 +713,11 @@ async fn recovers_an_unsigned_local_write_without_duplication() {
             "create_issue",
             Some(mutation),
             move |repository, signer, marker| {
-                let identity = repository.identity_head().map_err(stringify)?;
+                let identity = repository.identity_head()?;
                 let mut issues = radicle::cob::store::Store::<issue::Issue, _, _>::open(
                     repository,
                     radicle::cob::store::access::WriteAs::new(signer),
-                )
-                .map_err(stringify)?
+                )?
                 .identity(identity);
                 let _created = radicle::cob::store::Transaction::initial(
                     marker,
@@ -730,16 +733,16 @@ async fn recovers_an_unsigned_local_write_without_duplication() {
                                 .expect("title should be valid"),
                         })
                     },
-                )
-                .map_err(stringify)?;
-                Err("simulated crash before signing".to_owned())
+                )?;
+                Err(crate::agent::PublishError::Rejected(
+                    "simulated crash before signing".to_owned(),
+                ))
             },
             move |repository, _author, operation, _validation| {
-                Issues::open(repository, ReadOnly)
-                    .map_err(stringify)?
+                Issues::open(repository, ReadOnly)?
                     .get(&ObjectId::from(operation))
                     .map(|issue| issue.is_some())
-                    .map_err(stringify)
+                    .map_err(crate::agent::PublishError::from)
             },
         )
         .await;

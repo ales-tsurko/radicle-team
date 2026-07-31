@@ -774,7 +774,7 @@ impl AgentRuntime {
             Ok(publisher) => publisher,
             Err(error) => {
                 return Application::finish_after_stop(
-                    Err(Error::Mcp(error)),
+                    Err(Error::Mcp(error.to_string())),
                     runtime.stop(&application.shutdown).await,
                 );
             }
@@ -829,7 +829,7 @@ struct WriteAuthorizer {
 
 #[async_trait::async_trait]
 impl agent::Authorizer for WriteAuthorizer {
-    async fn authorize(&self, method: &str) -> Result<(), String> {
+    async fn authorize(&self, method: &str) -> Result<(), agent::PublishError> {
         self.application
             .validate_profile_binding(&self.home, &self.profile, self.did)
             .await
@@ -845,19 +845,19 @@ impl agent::Authorizer for WriteAuthorizer {
                         Error::Mcp(format!("MCP method '{method}' is no longer allowed"))
                     })
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| agent::PublishError::Authorization(error.to_string()))
     }
 
-    async fn security_policy(&self) -> Result<manifest::SecurityPolicy, String> {
+    async fn security_policy(&self) -> Result<manifest::SecurityPolicy, agent::PublishError> {
         let binding = self
             .application
             .validate_profile_binding(&self.home, &self.profile, self.did)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| agent::PublishError::Authorization(error.to_string()))?;
         self.application
             .validate_security_policy(&self.profile, self.did, binding.security())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| agent::PublishError::Authorization(error.to_string()))?;
 
         Ok(binding.security().clone())
     }

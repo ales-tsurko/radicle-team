@@ -11,9 +11,11 @@ pub use crate::{
     sandbox::{AgentChild, AgentCommand, AgentSandbox},
     watcher::{Change, Comment, Subject, Target},
 };
-pub(crate) use crate::agent::publisher::{Authorizer, MutationKey, MutationValidation, Publisher};
+pub(crate) use crate::agent::publisher::{
+    Authorizer, Error as PublishError, MutationKey, MutationValidation, Publisher,
+};
 #[cfg(all(test, not(miri)))]
-pub(crate) use crate::agent::publisher::{Announcer, Error as PublishError};
+pub(crate) use crate::agent::publisher::Announcer;
 
 mod interface;
 mod publisher;

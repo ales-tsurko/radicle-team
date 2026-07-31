@@ -94,7 +94,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<ListIssuesRequest>,
     ) -> Result<Json<IssuePage>, String> {
-        self.publisher.authorize("list_issues").await?;
+        self.authorize("list_issues").await?;
         let _active = self.delivery.access_current().await?;
         self.blocking(move |service| service.issues(request))
             .await
@@ -107,11 +107,19 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<IssueRequest>,
     ) -> Result<Json<Document>, String> {
-        self.publisher.authorize("get_issue").await?;
+        self.authorize("get_issue").await?;
         let _active = self.delivery.access_current().await?;
         self.blocking(move |service| service.issue(request))
             .await
             .map(|data| Json(Document { data }))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Confirms the manifest still allows `method`, reporting failure as MCP tool output.
+    async fn authorize(&self, method: &'static str) -> Result<(), String> {
+        self.publisher
+            .authorize(method)
+            .await
             .map_err(|error| error.to_string())
     }
 
@@ -148,7 +156,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SubjectRequest>,
     ) -> Result<Json<Document>, String> {
-        self.publisher.authorize("get_subject").await?;
+        self.authorize("get_subject").await?;
         let _active = self.delivery.access(&request).await?;
         self.blocking(move |service| service.subject(request))
             .await
@@ -162,7 +170,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<EntryRequest>,
     ) -> Result<Json<Document>, String> {
-        self.publisher.authorize("get_entry").await?;
+        self.authorize("get_entry").await?;
         let _active = self.delivery.access(&request.subject).await?;
         self.blocking(move |service| service.entry(request))
             .await
@@ -176,7 +184,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<TimelineRequest>,
     ) -> Result<Json<TimelinePage>, String> {
-        self.publisher.authorize("list_timeline").await?;
+        self.authorize("list_timeline").await?;
         let _active = self.delivery.access(&request.subject).await?;
         self.blocking(move |service| service.timeline(request))
             .await
@@ -190,7 +198,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<EntityRequest>,
     ) -> Result<Json<TimelinePage>, String> {
-        self.publisher.authorize("get_thread").await?;
+        self.authorize("get_thread").await?;
         let _active = self.delivery.access(&request.subject).await?;
         self.blocking(move |service| service.thread(request))
             .await
@@ -204,7 +212,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<PatchEntityRequest>,
     ) -> Result<Json<TimelinePage>, String> {
-        self.publisher.authorize("get_review").await?;
+        self.authorize("get_review").await?;
         let _active = self.delivery.access(&request.subject).await?;
         self.blocking(move |service| service.patch_entity(request, PatchEntity::Review))
             .await
@@ -218,7 +226,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<PatchEntityRequest>,
     ) -> Result<Json<TimelinePage>, String> {
-        self.publisher.authorize("get_revision").await?;
+        self.authorize("get_revision").await?;
         let _active = self.delivery.access(&request.subject).await?;
         self.blocking(move |service| service.patch_entity(request, PatchEntity::Revision))
             .await
@@ -231,7 +239,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<DiffRequest>,
     ) -> Result<Json<Document>, String> {
-        self.publisher.authorize("get_diff").await?;
+        self.authorize("get_diff").await?;
         let _active = self.delivery.access(&request.subject).await?;
         self.document(move |service| service.diff(request)).await
     }
@@ -242,7 +250,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<EmbedReadRequest>,
     ) -> Result<Json<Document>, String> {
-        self.publisher.authorize("get_embed").await?;
+        self.authorize("get_embed").await?;
         let _active = self.delivery.access(&request.subject).await?;
         self.document(move |service| service.embed(request)).await
     }
@@ -256,6 +264,7 @@ impl ToolService {
         self.for_delivery(&active)
             .write_comment(request, CommentOperation::Create)
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Edit a comment on the active issue, patch revision, or review")]
@@ -267,6 +276,7 @@ impl ToolService {
         self.for_delivery(&active)
             .write_comment(request, CommentOperation::Edit)
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Redact a comment on the active issue, patch revision, or review")]
@@ -278,6 +288,7 @@ impl ToolService {
         self.for_delivery(&active)
             .write_comment(request, CommentOperation::Redact)
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Resolve or reopen a review comment")]
@@ -289,6 +300,7 @@ impl ToolService {
         self.for_delivery(&active)
             .resolve_review_comment(request)
             .await
+            .map_err(|error| error.to_string())
     }
 
     /// Add or remove an emoji reaction.
@@ -298,7 +310,10 @@ impl ToolService {
         Parameters(request): Parameters<ReactionWriteRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active).reaction_write(request).await
+        self.for_delivery(&active)
+            .reaction_write(request)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Create an issue in the active repository")]
@@ -307,7 +322,10 @@ impl ToolService {
         Parameters(request): Parameters<CreateIssueRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.delivery.access_current().await?;
-        self.for_delivery(&active).create_issue_write(request).await
+        self.for_delivery(&active)
+            .create_issue_write(request)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Comment on an issue in the active repository")]
@@ -319,6 +337,7 @@ impl ToolService {
         self.for_delivery(&active)
             .comment_issue_write(request)
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Encrypt a report into the private security repository")]
@@ -337,7 +356,10 @@ impl ToolService {
         Parameters(request): Parameters<EditIssueRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active).edit_issue_write(request).await
+        self.for_delivery(&active)
+            .edit_issue_write(request)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Open or close the active issue")]
@@ -349,6 +371,7 @@ impl ToolService {
         self.for_delivery(&active)
             .set_state_write(request, SubjectKind::Issue)
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Replace the active issue labels")]
@@ -360,6 +383,7 @@ impl ToolService {
         self.for_delivery(&active)
             .set_strings_write(request, SubjectKind::Issue, StringUpdate::Labels)
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Replace the active issue assignees")]
@@ -371,6 +395,7 @@ impl ToolService {
         self.for_delivery(&active)
             .set_strings_write(request, SubjectKind::Issue, StringUpdate::Assignees)
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Create a patch from commits in the active workspace")]
@@ -382,6 +407,7 @@ impl ToolService {
         self.for_delivery(&active)
             .create_patch_write(request, active.context().workspace.clone())
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Add a revision from commits in the active workspace")]
@@ -393,6 +419,7 @@ impl ToolService {
         self.for_delivery(&active)
             .update_patch_write(request, active.context().workspace.clone())
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Edit active patch metadata")]
@@ -401,7 +428,10 @@ impl ToolService {
         Parameters(request): Parameters<EditPatchRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active).edit_patch_write(request).await
+        self.for_delivery(&active)
+            .edit_patch_write(request)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Set the active patch lifecycle")]
@@ -413,6 +443,7 @@ impl ToolService {
         self.for_delivery(&active)
             .set_state_write(request, SubjectKind::Patch)
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Replace the active patch labels")]
@@ -424,6 +455,7 @@ impl ToolService {
         self.for_delivery(&active)
             .set_strings_write(request, SubjectKind::Patch, StringUpdate::Labels)
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Replace the active patch assignees")]
@@ -435,6 +467,7 @@ impl ToolService {
         self.for_delivery(&active)
             .set_strings_write(request, SubjectKind::Patch, StringUpdate::Assignees)
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Create a review for an active patch revision")]
@@ -446,6 +479,7 @@ impl ToolService {
         self.for_delivery(&active)
             .review_write(request, false)
             .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Edit an existing review on the active patch")]
@@ -454,7 +488,10 @@ impl ToolService {
         Parameters(request): Parameters<ReviewWriteRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active).review_write(request, true).await
+        self.for_delivery(&active)
+            .review_write(request, true)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Record a merge attestation for the active patch")]
@@ -463,7 +500,10 @@ impl ToolService {
         Parameters(request): Parameters<MergePatchRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active).merge_patch_write(request).await
+        self.for_delivery(&active)
+            .merge_patch_write(request)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 

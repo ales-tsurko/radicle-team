@@ -276,8 +276,9 @@ pub(super) struct ReactionWriteRequest {
 }
 
 impl ReactionWriteRequest {
-    pub(super) fn parsed_reaction(&self) -> Result<radicle::cob::Reaction, String> {
-        radicle::cob::Reaction::from_str(&self.reaction).map_err(stringify)
+    pub(super) fn parsed_reaction(&self) -> Result<radicle::cob::Reaction, ServiceError> {
+        radicle::cob::Reaction::from_str(&self.reaction)
+            .map_err(|error| ServiceError::Request(stringify(error)))
     }
 }
 
@@ -289,19 +290,21 @@ pub(super) struct PreparedEmbed {
 }
 
 impl PreparedEmbed {
-    pub(super) fn prepare(requests: Vec<EmbedWriteRequest>) -> Result<Vec<Self>, String> {
+    pub(super) fn prepare(requests: Vec<EmbedWriteRequest>) -> Result<Vec<Self>, ServiceError> {
         if requests.len() > MAX_EMBEDS {
-            return Err(format!("at most {MAX_EMBEDS} embeds are allowed"));
+            return Err(ServiceError::Request(format!(
+                "at most {MAX_EMBEDS} embeds are allowed"
+            )));
         }
         let encoded_bytes = requests.iter().try_fold(0usize, |total, request| {
             total
                 .checked_add(request.content_base64.len())
-                .ok_or_else(|| "embed size overflow".to_owned())
+                .ok_or_else(|| ServiceError::Request("embed size overflow".to_owned()))
         })?;
         if encoded_bytes > MAX_ENCODED_EMBED_BYTES {
-            return Err(format!(
+            return Err(ServiceError::Request(format!(
                 "combined embed content exceeds {MAX_EMBED_BYTES} bytes"
-            ));
+            )));
         }
         let mut bytes = 0usize;
         let mut names = BTreeSet::new();
@@ -315,27 +318,32 @@ impl PreparedEmbed {
                         character.is_control() || matches!(character, '/' | '\\' | ':' | '\0')
                     })
                 {
-                    return Err(
-                        "embed name must be a safe file name of at most 255 bytes".to_owned()
-                    );
+                    return Err(ServiceError::Request(
+                        "embed name must be a safe file name of at most 255 bytes".to_owned(),
+                    ));
                 }
                 if !names.insert(request.name.clone()) {
-                    return Err(format!("duplicate embed name '{}'", request.name));
+                    return Err(ServiceError::Request(format!(
+                        "duplicate embed name '{}'",
+                        request.name
+                    )));
                 }
                 let content = BASE64_STANDARD
                     .decode(request.content_base64)
-                    .map_err(|error| format!("invalid base64 embed content: {error}"))?;
+                    .map_err(|error| {
+                        ServiceError::Request(format!("invalid base64 embed content: {error}"))
+                    })?;
                 bytes = bytes
                     .checked_add(content.len())
-                    .ok_or_else(|| "embed size overflow".to_owned())?;
+                    .ok_or_else(|| ServiceError::Request("embed size overflow".to_owned()))?;
                 if bytes > MAX_EMBED_BYTES {
-                    return Err(format!(
+                    return Err(ServiceError::Request(format!(
                         "combined embed content exceeds {MAX_EMBED_BYTES} bytes"
-                    ));
+                    )));
                 }
                 let oid = git2::Oid::hash_object(git2::ObjectType::Blob, &content)
                     .map(radicle::git::Oid::from)
-                    .map_err(stringify)?;
+                    .map_err(|error| ServiceError::Request(stringify(error)))?;
                 Ok(Self {
                     content,
                     oid,
@@ -355,11 +363,16 @@ impl PreparedEmbed {
     pub(super) fn store(
         embeds: &[Self],
         repository: &radicle::storage::git::Repository,
-    ) -> Result<Vec<Embed<Uri>>, String> {
+    ) -> Result<Vec<Embed<Uri>>, ServiceError> {
         for embed in embeds {
-            let stored = repository.backend.blob(&embed.content).map_err(stringify)?;
+            let stored = repository
+                .backend
+                .blob(&embed.content)
+                .map_err(|error| ServiceError::Request(stringify(error)))?;
             if radicle::git::Oid::from(stored) != embed.oid {
-                return Err("stored embed hash does not match its reference".to_owned());
+                return Err(ServiceError::Request(
+                    "stored embed hash does not match its reference".to_owned(),
+                ));
             }
         }
         Ok(Self::references(embeds))
@@ -578,38 +591,42 @@ pub(super) fn stringify(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-pub(super) fn mutation_identity(method: &str, request: &impl Serialize) -> Result<String, String> {
-    let payload = serde_json::to_vec(&(method, request)).map_err(stringify)?;
+pub(super) fn mutation_identity(
+    method: &str,
+    request: &impl Serialize,
+) -> Result<String, ServiceError> {
+    let payload = serde_json::to_vec(&(method, request))
+        .map_err(|error| ServiceError::Request(stringify(error)))?;
     git2::Oid::hash_object(git2::ObjectType::Blob, &payload)
         .map(|id| id.to_string())
-        .map_err(stringify)
+        .map_err(|error| ServiceError::Request(stringify(error)))
 }
 
-pub(super) fn write_result(value: impl ToString) -> Result<Json<Document>, String> {
+pub(super) fn write_result(value: impl ToString) -> Result<Json<Document>, ServiceError> {
     Ok(Json(Document {
         data: serde_json::json!({ "id": value.to_string() }),
     }))
 }
 
-pub(super) fn require_kind(actual: SubjectKind, expected: SubjectKind) -> Result<(), String> {
+pub(super) fn require_kind(actual: SubjectKind, expected: SubjectKind) -> Result<(), ServiceError> {
     (actual == expected)
         .then_some(())
-        .ok_or_else(|| "subject kind does not match method".to_owned())
+        .ok_or_else(|| ServiceError::Request("subject kind does not match method".to_owned()))
 }
 
-pub(super) fn parse_object_string(value: &str) -> Result<ObjectId, String> {
-    parse_object(value).map_err(|error| error.to_string())
+pub(super) fn parse_object_string(value: &str) -> Result<ObjectId, ServiceError> {
+    parse_object(value).map_err(|error| ServiceError::Request(error.to_string()))
 }
 
 pub(super) fn parse_subject_request(
     subject: &SubjectRequest,
     expected: SubjectKind,
-) -> Result<ObjectId, String> {
+) -> Result<ObjectId, ServiceError> {
     require_kind(subject.kind, expected)?;
     parse_object_string(&subject.subject)
 }
 
-pub(super) fn parse_issue_state(value: &str) -> Result<issue::State, String> {
+pub(super) fn parse_issue_state(value: &str) -> Result<issue::State, ServiceError> {
     match value {
         "open" => Ok(issue::State::Open),
         "closed" | "closed_other" => Ok(issue::State::Closed {
@@ -618,16 +635,20 @@ pub(super) fn parse_issue_state(value: &str) -> Result<issue::State, String> {
         "solved" | "closed_solved" => Ok(issue::State::Closed {
             reason: issue::CloseReason::Solved,
         }),
-        _ => Err("state must be open, closed, or solved".to_owned()),
+        _ => Err(ServiceError::Request(
+            "state must be open, closed, or solved".to_owned(),
+        )),
     }
 }
 
-pub(super) fn parse_patch_state(value: &str) -> Result<patch::Lifecycle, String> {
+pub(super) fn parse_patch_state(value: &str) -> Result<patch::Lifecycle, ServiceError> {
     match value {
         "open" => Ok(patch::Lifecycle::Open),
         "draft" => Ok(patch::Lifecycle::Draft),
         "archived" => Ok(patch::Lifecycle::Archived),
-        _ => Err("state must be open, draft, or archived".to_owned()),
+        _ => Err(ServiceError::Request(
+            "state must be open, draft, or archived".to_owned(),
+        )),
     }
 }
 
@@ -636,71 +657,84 @@ pub(super) fn parse_patch_commits(
     base: String,
     head: String,
     workspace: std::path::PathBuf,
-) -> Result<PatchCommits, String> {
+) -> Result<PatchCommits, ServiceError> {
     Ok(PatchCommits {
         description,
-        base: radicle::git::Oid::from_str(&base).map_err(stringify)?,
-        head: radicle::git::Oid::from_str(&head).map_err(stringify)?,
+        base: radicle::git::Oid::from_str(&base)
+            .map_err(|error| ServiceError::Request(stringify(error)))?,
+        head: radicle::git::Oid::from_str(&head)
+            .map_err(|error| ServiceError::Request(stringify(error)))?,
         workspace,
     })
 }
 
-pub(super) fn parse_entry_string(value: &str) -> Result<EntryId, String> {
-    parse_entry(value).map_err(|error| error.to_string())
+pub(super) fn parse_entry_string(value: &str) -> Result<EntryId, ServiceError> {
+    parse_entry(value).map_err(|error| ServiceError::Request(error.to_string()))
 }
 
-pub(super) fn parse_revision(value: EntryId) -> Result<patch::RevisionId, String> {
+pub(super) fn parse_revision(value: EntryId) -> Result<patch::RevisionId, ServiceError> {
     Ok(patch::RevisionId::from(value))
 }
 
-pub(super) fn parse_review(value: EntryId) -> Result<patch::ReviewId, String> {
+pub(super) fn parse_review(value: EntryId) -> Result<patch::ReviewId, ServiceError> {
     Ok(patch::ReviewId::from(value))
 }
 
-pub(super) fn parse_labels(values: Vec<String>) -> Result<Vec<radicle::cob::Label>, String> {
+pub(super) fn parse_labels(values: Vec<String>) -> Result<Vec<radicle::cob::Label>, ServiceError> {
     values
         .into_iter()
-        .map(|value| radicle::cob::Label::from_str(&value).map_err(stringify))
+        .map(|value| {
+            radicle::cob::Label::from_str(&value)
+                .map_err(|error| ServiceError::Request(stringify(error)))
+        })
         .collect::<Result<BTreeSet<_>, _>>()
         .map(BTreeSet::into_iter)
         .map(Iterator::collect)
 }
 
-pub(super) fn parse_dids(values: Vec<String>) -> Result<Vec<radicle::identity::Did>, String> {
+pub(super) fn parse_dids(values: Vec<String>) -> Result<Vec<radicle::identity::Did>, ServiceError> {
     values
         .into_iter()
-        .map(|value| radicle::identity::Did::from_str(&value).map_err(stringify))
+        .map(|value| {
+            radicle::identity::Did::from_str(&value)
+                .map_err(|error| ServiceError::Request(stringify(error)))
+        })
         .collect::<Result<BTreeSet<_>, _>>()
         .map(BTreeSet::into_iter)
         .map(Iterator::collect)
 }
 
-pub(super) fn parse_verdict(value: Option<&str>) -> Result<Option<patch::Verdict>, String> {
+pub(super) fn parse_verdict(value: Option<&str>) -> Result<Option<patch::Verdict>, ServiceError> {
     match value {
         None | Some("none") => Ok(None),
         Some("accept") => Ok(Some(patch::Verdict::Accept)),
         Some("reject") => Ok(Some(patch::Verdict::Reject)),
-        Some(_) => Err("verdict must be accept, reject, or none".to_owned()),
+        Some(_) => Err(ServiceError::Request(
+            "verdict must be accept, reject, or none".to_owned(),
+        )),
     }
 }
 
 pub(super) fn parse_location(
     request: LocationRequest,
-) -> Result<radicle::cob::CodeLocation, String> {
+) -> Result<radicle::cob::CodeLocation, ServiceError> {
     fn range(
         start: Option<usize>,
         end: Option<usize>,
-    ) -> Result<Option<radicle::cob::CodeRange>, String> {
+    ) -> Result<Option<radicle::cob::CodeRange>, ServiceError> {
         match (start, end) {
             (None, None) => Ok(None),
             (Some(start), Some(end)) if start < end => {
                 Ok(Some(radicle::cob::CodeRange::Lines { range: start..end }))
             }
-            _ => Err("line ranges require start < end".to_owned()),
+            _ => Err(ServiceError::Request(
+                "line ranges require start < end".to_owned(),
+            )),
         }
     }
     Ok(radicle::cob::CodeLocation {
-        commit: radicle::git::Oid::from_str(&request.commit).map_err(stringify)?,
+        commit: radicle::git::Oid::from_str(&request.commit)
+            .map_err(|error| ServiceError::Request(stringify(error)))?,
         path: request.path.into(),
         old: range(request.old_start, request.old_end)?,
         new: range(request.new_start, request.new_end)?,
@@ -712,14 +746,19 @@ pub(super) fn import_commits(
     workspace: &std::path::Path,
     namespace: radicle::crypto::PublicKey,
     commits: &[radicle::git::Oid],
-) -> Result<(), String> {
-    let bare = git2::Repository::open_bare(repository.path()).map_err(stringify)?;
+) -> Result<(), ServiceError> {
+    let bare = git2::Repository::open_bare(repository.path())
+        .map_err(|error| ServiceError::Request(stringify(error)))?;
     let source = workspace.to_string_lossy();
-    let mut remote = bare.remote_anonymous(&source).map_err(stringify)?;
+    let mut remote = bare
+        .remote_anonymous(&source)
+        .map_err(|error| ServiceError::Request(stringify(error)))?;
     for commit in commits {
         let reference = format!("refs/namespaces/{namespace}/refs/radicle-team/commits/{commit}");
         let refspec = format!("+{commit}:{reference}");
-        remote.fetch(&[&refspec], None, None).map_err(stringify)?;
+        remote
+            .fetch(&[&refspec], None, None)
+            .map_err(|error| ServiceError::Request(stringify(error)))?;
     }
     Ok(())
 }
@@ -738,16 +777,26 @@ pub(super) fn validate_merge(
     signer: &radicle::node::device::BoxedDevice,
     revision: patch::RevisionId,
     commit: radicle::git::Oid,
-) -> Result<(), String> {
+) -> Result<(), ServiceError> {
     if patch.revision(&revision).is_none() {
-        return Err("patch revision is unavailable".to_owned());
+        return Err(ServiceError::Request(
+            "patch revision is unavailable".to_owned(),
+        ));
     }
-    let branch = repository.default_branch().map_err(stringify)?;
+    let branch = repository
+        .default_branch()
+        .map_err(|error| ServiceError::Request(stringify(error)))?;
     let head = repository
         .reference_oid(signer.public_key(), &branch)
-        .map_err(stringify)?;
-    if commit != head && !repository.is_ancestor_of(commit, head).map_err(stringify)? {
-        return Err("merge commit is not reachable from the delegate's default branch".to_owned());
+        .map_err(|error| ServiceError::Request(stringify(error)))?;
+    if commit != head
+        && !repository
+            .is_ancestor_of(commit, head)
+            .map_err(|error| ServiceError::Request(stringify(error)))?
+    {
+        return Err(ServiceError::Request(
+            "merge commit is not reachable from the delegate's default branch".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -756,29 +805,41 @@ pub(super) fn validate_code_location(
     repository: &radicle::storage::git::Repository,
     revision: &patch::Revision,
     location: &radicle::cob::CodeLocation,
-) -> Result<(), String> {
+) -> Result<(), ServiceError> {
     if location.commit != revision.head() {
-        return Err("location commit must be the reviewed revision head".to_owned());
+        return Err(ServiceError::Request(
+            "location commit must be the reviewed revision head".to_owned(),
+        ));
     }
     if location.old.is_none() && location.new.is_none() {
-        return Err("location must include an old or new line range".to_owned());
+        return Err(ServiceError::Request(
+            "location must include an old or new line range".to_owned(),
+        ));
     }
     let base = repository
         .backend
         .find_commit((*revision.base()).into())
-        .map_err(stringify)?;
+        .map_err(|error| ServiceError::Request(stringify(error)))?;
     let head = repository
         .backend
         .find_commit(revision.head().into())
-        .map_err(stringify)?;
+        .map_err(|error| ServiceError::Request(stringify(error)))?;
     let diff = repository
         .backend
         .diff_tree_to_tree(
-            Some(&base.tree().map_err(stringify)?),
-            Some(&head.tree().map_err(stringify)?),
+            Some(
+                &base
+                    .tree()
+                    .map_err(|error| ServiceError::Request(stringify(error)))?,
+            ),
+            Some(
+                &head
+                    .tree()
+                    .map_err(|error| ServiceError::Request(stringify(error)))?,
+            ),
             None,
         )
-        .map_err(stringify)?;
+        .map_err(|error| ServiceError::Request(stringify(error)))?;
     let mut matched = false;
     diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         let path_matches = delta.old_file().path() == Some(location.path.as_path())
@@ -790,10 +851,10 @@ pub(super) fn validate_code_location(
             || range_contains(location.new.as_ref(), line.new_lineno());
         true
     })
-    .map_err(stringify)?;
-    matched
-        .then_some(())
-        .ok_or_else(|| "location does not intersect the reviewed diff".to_owned())
+    .map_err(|error| ServiceError::Request(stringify(error)))?;
+    matched.then_some(()).ok_or_else(|| {
+        ServiceError::Request("location does not intersect the reviewed diff".to_owned())
+    })
 }
 
 fn range_contains(range: Option<&radicle::cob::CodeRange>, line: Option<u32>) -> bool {

@@ -32,8 +32,13 @@ impl SecurityReporting {
         service: &ToolService,
         request: SecurityIssueRequest,
     ) -> Result<SecurityIssueResult, String> {
-        let policy = self.publisher.security_policy().await?;
-        let request_id = mutation_identity("report_security_issue", &request)?;
+        let policy = self
+            .publisher
+            .security_policy()
+            .await
+            .map_err(|error| error.to_string())?;
+        let request_id = mutation_identity("report_security_issue", &request)
+            .map_err(|error| error.to_string())?;
         let description = Self::encrypt(&policy, &request)?;
         let publisher = self.publisher.for_repository(policy.repository());
         let issue = service
@@ -47,7 +52,8 @@ impl SecurityReporting {
                 },
                 request_id,
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
         let issue = issue
             .0
             .data

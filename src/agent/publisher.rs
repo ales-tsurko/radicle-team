@@ -80,7 +80,7 @@ impl Publisher {
         }
     }
 
-    pub(crate) async fn with_journal(mut self, path: &Path) -> Result<Self, String> {
+    pub(crate) async fn with_journal(mut self, path: &Path) -> Result<Self, Error> {
         self.journal = Some(MutationJournal::open(path).await?);
         Ok(self)
     }
@@ -92,16 +92,16 @@ impl Publisher {
     }
 
     #[cfg(all(test, not(miri)))]
-    pub(crate) async fn with_memory_journal(mut self) -> Result<Self, String> {
+    pub(crate) async fn with_memory_journal(mut self) -> Result<Self, Error> {
         self.journal = Some(MutationJournal::memory().await?);
         Ok(self)
     }
 
     #[cfg(all(test, not(miri)))]
-    pub(crate) async fn forget_completion(&self, key: &MutationKey) -> Result<(), String> {
+    pub(crate) async fn forget_completion(&self, key: &MutationKey) -> Result<(), Error> {
         self.journal
             .as_ref()
-            .ok_or_else(|| "mutation journal is disabled".to_owned())?
+            .ok_or(Error::JournalDisabled)?
             .forget_completion(self.repository, key)
             .await
     }
@@ -110,15 +110,15 @@ impl Publisher {
         *self.profile.id()
     }
 
-    pub(crate) async fn authorize(&self, method: &str) -> Result<(), String> {
+    pub(crate) async fn authorize(&self, method: &str) -> Result<(), Error> {
         self.authorizer.authorize(method).await
     }
 
-    pub(crate) async fn security_policy(&self) -> Result<SecurityPolicy, String> {
+    pub(crate) async fn security_policy(&self) -> Result<SecurityPolicy, Error> {
         self.authorizer.security_policy().await
     }
 
-    pub(crate) async fn reconcile(&self, delivery: DeliveryId) -> Result<(), String> {
+    pub(crate) async fn reconcile(&self, delivery: DeliveryId) -> Result<(), Error> {
         let Some(journal) = &self.journal else {
             return Ok(());
         };
@@ -134,7 +134,7 @@ impl Publisher {
         &self,
         delivery_repository: RepoId,
         delivery: DeliveryId,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         let Some(journal) = &self.journal else {
             return Ok(());
         };
@@ -151,22 +151,18 @@ impl Publisher {
             let marker = Self::marker(&entry.key);
             let author = entry.author;
             let operation = tokio::task::spawn_blocking(move || {
-                let repository = publisher
-                    .profile
-                    .storage
-                    .repository(publisher.repository)
-                    .map_err(stringify)?;
+                let repository = publisher.profile.storage.repository(publisher.repository)?;
                 let operation = publisher.find_marker(&repository, &marker, author)?;
                 if let Some(operation) = operation
                     && author != publisher.author()
                     && !Self::is_signed(&repository, author, operation)?
                 {
-                    return Err("unfinished mutation was not signed by its author".to_owned());
+                    return Err(Error::UnsignedRecovery);
                 }
                 Ok(operation)
             })
             .await
-            .map_err(stringify)??;
+            .map_err(|error| Error::Task(error.to_string()))??;
             let Some(operation) = operation else {
                 journal.discard(self.repository, &entry.key).await?;
                 continue;
@@ -191,14 +187,14 @@ impl Publisher {
         mutation: Option<MutationKey>,
         operation: F,
         validate: V,
-    ) -> Result<String, String>
+    ) -> Result<String, Error>
     where
         T: Send + ToString + 'static,
         F: FnOnce(
                 &radicle::storage::git::Repository,
                 &radicle::node::device::BoxedDevice,
                 &str,
-            ) -> Result<T, String>
+            ) -> Result<T, Error>
             + Send
             + 'static,
         V: Fn(
@@ -206,7 +202,7 @@ impl Publisher {
                 PublicKey,
                 EntryId,
                 MutationValidation,
-            ) -> Result<bool, String>
+            ) -> Result<bool, Error>
             + Send
             + 'static,
     {
@@ -238,17 +234,13 @@ impl Publisher {
         let publisher = self.clone();
         let recovery_marker = marker.clone();
         let (value, author) = tokio::task::spawn_blocking(move || {
-            let repository = publisher
-                .profile
-                .storage
-                .repository(publisher.repository)
-                .map_err(|error| error.to_string())?;
+            let repository = publisher.profile.storage.repository(publisher.repository)?;
             let signer = match publisher.signer.clone() {
                 Some(signer) => Device::from(signer).boxed(),
                 None => publisher
                     .profile
                     .signer()
-                    .map_err(|error| error.to_string())?,
+                    .map_err(|error| Error::Signer(error.to_string()))?,
             };
             let current = publisher.author();
             let recovered = match (recovery_marker.as_deref(), pending_author) {
@@ -278,9 +270,13 @@ impl Publisher {
                     } else {
                         operation(&repository, &signer, method)?.to_string()
                     };
-                    let operation = EntryId::from_str(&value).map_err(stringify)?;
+                    let operation =
+                        EntryId::from_str(&value).map_err(|source| Error::InvalidId {
+                            value: value.clone(),
+                            source: Box::new(source),
+                        })?;
                     if !validate(&repository, current, operation, MutationValidation::Fresh)? {
-                        return Err("mutation was not applied".to_owned());
+                        return Err(Error::NotApplied);
                     }
                     (value, current)
                 }
@@ -288,20 +284,18 @@ impl Publisher {
             if author == current {
                 repository
                     .sign_refs(&signer)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| Error::Signing(error.to_string()))?;
             }
-            Ok::<_, String>((value, author))
+            Ok::<_, Error>((value, author))
         })
         .await
-        .map_err(|error| error.to_string())??;
+        .map_err(|error| Error::Task(error.to_string()))??;
         if let (Some(journal), Some(key)) = (&self.journal, mutation.as_ref()) {
             journal
                 .complete(self.repository, key, method, author, &value)
                 .await?;
         }
-        self.announce(author)
-            .await
-            .map_err(|error| error.to_string())?;
+        self.announce(author).await?;
         Ok(value)
     }
 
@@ -316,36 +310,27 @@ impl Publisher {
         }
     }
 
-    async fn finish_recovery(&self, author: PublicKey) -> Result<(), String> {
+    async fn finish_recovery(&self, author: PublicKey) -> Result<(), Error> {
         if author != self.author() {
-            return self
-                .announce(author)
-                .await
-                .map_err(|error| error.to_string());
+            return self.announce(author).await;
         }
         let publisher = self.clone();
         tokio::task::spawn_blocking(move || {
-            let repository = publisher
-                .profile
-                .storage
-                .repository(publisher.repository)
-                .map_err(|error| error.to_string())?;
+            let repository = publisher.profile.storage.repository(publisher.repository)?;
             let signer = match publisher.signer.clone() {
                 Some(signer) => Device::from(signer).boxed(),
                 None => publisher
                     .profile
                     .signer()
-                    .map_err(|error| error.to_string())?,
+                    .map_err(|error| Error::Signer(error.to_string()))?,
             };
             repository
                 .sign_refs(&signer)
-                .map_err(|error| error.to_string())
+                .map_err(|error| Error::Signing(error.to_string()))
         })
         .await
-        .map_err(|error| error.to_string())??;
-        self.announce(author)
-            .await
-            .map_err(|error| error.to_string())
+        .map_err(|error| Error::Task(error.to_string()))??;
+        self.announce(author).await
     }
 
     fn find_marker(
@@ -353,10 +338,10 @@ impl Publisher {
         repository: &radicle::storage::git::Repository,
         marker: &str,
         author: PublicKey,
-    ) -> Result<Option<EntryId>, String> {
-        let issues = Issues::open(repository, ReadOnly).map_err(stringify)?;
-        for issue in issues.all().map_err(stringify)? {
-            let (id, _issue) = issue.map_err(stringify)?;
+    ) -> Result<Option<EntryId>, Error> {
+        let issues = Issues::open(repository, ReadOnly)?;
+        for issue in issues.all()? {
+            let (id, _issue) = issue?;
             if let Some(operation) = self.find_in(
                 repository,
                 IssueStream::init(id, repository).all(),
@@ -366,9 +351,9 @@ impl Publisher {
                 return Ok(Some(operation));
             }
         }
-        let patches = Patches::open(repository, ReadOnly).map_err(stringify)?;
-        for patch in patches.all().map_err(stringify)? {
-            let (id, _patch) = patch.map_err(stringify)?;
+        let patches = Patches::open(repository, ReadOnly)?;
+        for patch in patches.all()? {
+            let (id, _patch) = patch?;
             if let Some(operation) = self.find_in(
                 repository,
                 PatchStream::init(id, repository).all(),
@@ -390,7 +375,7 @@ impl Publisher {
         >,
         marker: &str,
         author: PublicKey,
-    ) -> Result<Option<EntryId>, String> {
+    ) -> Result<Option<EntryId>, Error> {
         self.find_matching_in(repository, operations, marker, author, |_| true)
     }
 
@@ -404,16 +389,13 @@ impl Publisher {
         marker: &str,
         author: PublicKey,
         matches: impl Fn(&Op<A>) -> bool,
-    ) -> Result<Option<EntryId>, String> {
-        for operation in operations.map_err(stringify)? {
-            let operation = operation.map_err(stringify)?;
+    ) -> Result<Option<EntryId>, Error> {
+        for operation in operations? {
+            let operation = operation?;
             if operation.author != author || !matches(&operation) {
                 continue;
             }
-            let commit = repository
-                .backend
-                .find_commit(operation.id.into())
-                .map_err(stringify)?;
+            let commit = repository.backend.find_commit(operation.id.into())?;
             if commit
                 .message()
                 .is_some_and(|message| message.lines().next() == Some(marker))
@@ -428,8 +410,8 @@ impl Publisher {
         repository: &radicle::storage::git::Repository,
         author: PublicKey,
         operation: EntryId,
-    ) -> Result<bool, String> {
-        let Some(signed) = SignedRefs::load(author, repository).map_err(stringify)? else {
+    ) -> Result<bool, Error> {
+        let Some(signed) = SignedRefs::load(author, repository).map_err(Error::from)? else {
             return Ok(false);
         };
         for (_name, tip) in signed.iter() {
@@ -477,9 +459,9 @@ impl Announcer for Node {
 
 #[async_trait::async_trait]
 pub(crate) trait Authorizer: fmt::Debug + Send + Sync + 'static {
-    async fn authorize(&self, method: &str) -> Result<(), String>;
+    async fn authorize(&self, method: &str) -> Result<(), Error>;
 
-    async fn security_policy(&self) -> Result<SecurityPolicy, String>;
+    async fn security_policy(&self) -> Result<SecurityPolicy, Error>;
 }
 
 #[derive(Clone)]
@@ -488,17 +470,17 @@ struct MutationJournal {
 }
 
 impl MutationJournal {
-    async fn open(path: &Path) -> Result<Self, String> {
-        Self::from_database(Database::open(path).await.map_err(stringify)?).await
+    async fn open(path: &Path) -> Result<Self, Error> {
+        Self::from_database(Database::open(path).await?).await
     }
 
     #[cfg(all(test, not(miri)))]
-    async fn memory() -> Result<Self, String> {
-        Self::from_database(Database::memory().await.map_err(stringify)?).await
+    async fn memory() -> Result<Self, Error> {
+        Self::from_database(Database::memory().await?).await
     }
 
-    async fn from_database(database: Database) -> Result<Self, String> {
-        database.execute(JOURNAL_SCHEMA).await.map_err(stringify)?;
+    async fn from_database(database: Database) -> Result<Self, Error> {
+        database.execute(JOURNAL_SCHEMA).await?;
         Ok(Self { database })
     }
 
@@ -508,7 +490,7 @@ impl MutationJournal {
         key: &MutationKey,
         method: &'static str,
         author: PublicKey,
-    ) -> Result<JournalEntry, String> {
+    ) -> Result<JournalEntry, Error> {
         let values = mutation_values(repository, key);
         let author = author.to_string();
         self.database
@@ -532,32 +514,31 @@ impl MutationJournal {
                 )?;
                 bind_mutation(&mut select, &values)?;
                 if select.next()? != State::Row {
-                    return Err(sqlite::Error {
-                        code: None,
-                        message: Some("mutation disappeared".to_owned()),
-                    });
+                    return Ok(None);
                 }
-                let stored = select.read::<String, _>(0)?;
-                if stored != method {
-                    return Err(sqlite::Error {
-                        code: None,
-                        message: Some(format!(
-                            "delivery mutation changed from '{stored}' to '{method}'"
-                        )),
-                    });
-                }
-                let author = select.read::<String, _>(1)?;
-                let author = PublicKey::from_str(&author).map_err(|error| sqlite::Error {
-                    code: None,
-                    message: Some(error.to_string()),
-                })?;
-                Ok(JournalEntry {
-                    author,
-                    result: select.read::<Option<String>, _>(2)?,
-                })
+
+                Ok(Some((
+                    select.read::<String, _>(0)?,
+                    select.read::<String, _>(1)?,
+                    select.read::<Option<String>, _>(2)?,
+                )))
             })
-            .await
-            .map_err(stringify)
+            .await?
+            .ok_or(Error::MutationMissing)
+            .and_then(|(recorded, author, result)| {
+                if recorded != method {
+                    return Err(Error::MutationChanged {
+                        recorded,
+                        requested: method.to_owned(),
+                    });
+                }
+                let author = PublicKey::from_str(&author).map_err(|source| Error::InvalidId {
+                    value: author.clone(),
+                    source: Box::new(source),
+                })?;
+
+                Ok(JournalEntry { author, result })
+            })
     }
 
     async fn complete(
@@ -567,7 +548,7 @@ impl MutationJournal {
         method: &str,
         author: PublicKey,
         result: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         let values = mutation_values(repository, key);
         let method = method.to_owned();
         let result = result.to_owned();
@@ -577,7 +558,7 @@ impl MutationJournal {
                 complete_mutation(connection, &values, &method, &author, &result)
             })
             .await
-            .map_err(stringify)
+            .map_err(Error::from)
     }
 
     async fn entries(
@@ -585,7 +566,7 @@ impl MutationJournal {
         repository: RepoId,
         delivery_repository: RepoId,
         delivery: DeliveryId,
-    ) -> Result<Vec<DeliveryJournalEntry>, String> {
+    ) -> Result<Vec<DeliveryJournalEntry>, Error> {
         let values = [
             repository.to_string(),
             delivery_repository.to_string(),
@@ -627,14 +608,14 @@ impl MutationJournal {
                 Ok(entries)
             })
             .await
-            .map_err(stringify)
+            .map_err(Error::from)
     }
 
     async fn repositories(
         &self,
         delivery_repository: RepoId,
         delivery: DeliveryId,
-    ) -> Result<Vec<RepoId>, String> {
+    ) -> Result<Vec<RepoId>, Error> {
         let delivery_repository = delivery_repository.to_string();
         let operation = delivery.operation.to_string();
         let action = delivery.action.to_string();
@@ -659,10 +640,10 @@ impl MutationJournal {
                 Ok(repositories)
             })
             .await
-            .map_err(stringify)
+            .map_err(Error::from)
     }
 
-    async fn discard(&self, repository: RepoId, key: &MutationKey) -> Result<(), String> {
+    async fn discard(&self, repository: RepoId, key: &MutationKey) -> Result<(), Error> {
         self.update_entry(
             repository,
             key,
@@ -675,7 +656,7 @@ impl MutationJournal {
     }
 
     #[cfg(all(test, not(miri)))]
-    async fn forget_completion(&self, repository: RepoId, key: &MutationKey) -> Result<(), String> {
+    async fn forget_completion(&self, repository: RepoId, key: &MutationKey) -> Result<(), Error> {
         self.update_entry(
             repository,
             key,
@@ -691,7 +672,7 @@ impl MutationJournal {
         repository: RepoId,
         key: &MutationKey,
         sql: &'static str,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         let values = mutation_values(repository, key);
         self.database
             .call(move |connection| {
@@ -701,7 +682,7 @@ impl MutationJournal {
                 Ok(())
             })
             .await
-            .map_err(stringify)
+            .map_err(Error::from)
     }
 }
 
@@ -722,16 +703,14 @@ fn signed_tip_reaches(
     repository: &radicle::storage::git::Repository,
     operation: EntryId,
     tip: radicle::git::Oid,
-) -> Result<bool, String> {
+) -> Result<bool, Error> {
     if tip == operation {
         Ok(true)
     } else {
-        repository.is_ancestor_of(operation, tip).map_err(stringify)
+        repository
+            .is_ancestor_of(operation, tip)
+            .map_err(Error::from)
     }
-}
-
-fn stringify(error: impl fmt::Display) -> String {
-    error.to_string()
 }
 
 fn complete_mutation(
@@ -792,10 +771,81 @@ fn bind_mutation(
     Ok(())
 }
 
+/// Error publishing an authorized Radicle write.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
+    /// The manifest no longer authorizes the requested method.
+    #[error("MCP authorization failed: {0}")]
+    Authorization(String),
+    /// A recovered mutation carries no signature from the author that produced it.
+    #[error("unfinished mutation was not signed by its author")]
+    UnsignedRecovery,
+    /// The operation completed without producing the expected Radicle change.
+    #[error("mutation was not applied")]
+    NotApplied,
+    /// The requested change cannot be applied to the Radicle object as given.
+    #[error("{0}")]
+    Rejected(String),
+    /// The same delivery previously recorded a different method.
+    #[error("delivery mutation changed from '{recorded}' to '{requested}'")]
+    MutationChanged {
+        /// Method stored by the earlier attempt.
+        recorded: String,
+        /// Method requested now.
+        requested: String,
+    },
+    /// A journal row vanished between insertion and lookup.
+    #[error("mutation disappeared from the journal")]
+    MutationMissing,
+    /// A journal operation was requested while journalling is disabled.
+    #[cfg(all(test, not(miri)))]
+    #[error("mutation journal is disabled")]
+    JournalDisabled,
+    /// Reading or writing the mutation journal failed.
+    #[error("mutation journal failed: {0}")]
+    Journal(#[from] crate::database::Error),
+    /// A stored identifier could not be parsed.
+    #[error("invalid stored identifier '{value}': {source}")]
+    InvalidId {
+        /// Malformed value.
+        value: String,
+        /// Underlying parse failure.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// Radicle node communication failed.
     #[error("Radicle node error: {0}")]
     Node(#[from] radicle::node::Error),
+    /// Opening the Radicle repository failed.
+    #[error("failed to open Radicle repository: {0}")]
+    Repository(#[from] radicle::storage::RepositoryError),
+    /// Reading or writing Radicle collaborative objects failed.
+    #[error("failed to access Radicle collaborative objects: {0}")]
+    Store(#[from] radicle::cob::store::Error),
+    /// An issue operation failed.
+    #[error("Radicle issue operation failed: {0}")]
+    Issue(#[from] radicle::issue::Error),
+    /// A patch operation failed.
+    #[error("Radicle patch operation failed: {0}")]
+    Patch(#[from] radicle::patch::Error),
+    /// Opening a collaborative object operation stream failed.
+    #[error("failed to open collaborative object operation stream: {0}")]
+    Stream(#[from] radicle::cob::stream::error::Stream),
+    /// Reading one collaborative object operation failed.
+    #[error("failed to read collaborative object operation: {0}")]
+    Operation(#[from] radicle::cob::stream::error::Ops),
+    /// A Git operation failed.
+    #[error("Git operation failed: {0}")]
+    Git(#[from] radicle::git::raw::Error),
+    /// Loading the signing device failed.
+    #[error("failed to load the signing key: {0}")]
+    Signer(String),
+    /// Signing Radicle references failed.
+    #[error("failed to sign Radicle references: {0}")]
+    Signing(String),
+    /// Reading an author's signed references failed.
+    #[error("failed to read signed Radicle references: {0}")]
+    SignedRefs(#[from] radicle::storage::refs::sigrefs::read::error::Read),
+    /// A blocking publisher task failed.
     #[error("publisher task failed: {0}")]
     Task(String),
 }

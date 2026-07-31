@@ -9,9 +9,12 @@ use radicle::cob::{
     stream::CobStream as _,
 };
 
-use crate::mcp::protocol::{
-    CommentOperation, CommentTargetKind, IssueUpdate, PatchCommitAction, PatchUpdate, SubjectKind,
-    stringify,
+use crate::{
+    agent::PublishError,
+    mcp::protocol::{
+        CommentOperation, CommentTargetKind, IssueUpdate, PatchCommitAction, PatchUpdate,
+        SubjectKind,
+    },
 };
 
 #[derive(Clone, Copy)]
@@ -32,7 +35,7 @@ pub(super) fn issue_edit_operation(
     operation: EntryId,
     title: Option<&radicle::cob::Title>,
     description: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     edit_operation(
         find_issue_operation(repository, issue, operation),
         title,
@@ -45,7 +48,7 @@ fn find_issue_operation(
     repository: &CobRepository,
     issue: ObjectId,
     operation: EntryId,
-) -> Result<Option<Op<IssueAction>>, String> {
+) -> Result<Option<Op<IssueAction>>, PublishError> {
     find_cob_operation(IssueStream::init(issue, repository).all(), operation)
 }
 
@@ -53,7 +56,7 @@ fn find_patch_operation(
     repository: &CobRepository,
     patch: ObjectId,
     operation: EntryId,
-) -> Result<Option<Op<PatchAction>>, String> {
+) -> Result<Option<Op<PatchAction>>, PublishError> {
     find_cob_operation(PatchStream::init(patch, repository).all(), operation)
 }
 
@@ -63,9 +66,9 @@ fn find_cob_operation<A>(
         radicle::cob::stream::error::Stream,
     >,
     operation: EntryId,
-) -> Result<Option<Op<A>>, String> {
-    for candidate in operations.map_err(stringify)? {
-        let candidate = candidate.map_err(stringify)?;
+) -> Result<Option<Op<A>>, PublishError> {
+    for candidate in operations? {
+        let candidate = candidate?;
         if candidate.id == operation {
             return Ok(Some(candidate));
         }
@@ -80,7 +83,7 @@ pub(super) fn issue_create_operation(
     description: Option<&str>,
     labels: &[radicle::cob::Label],
     assignees: &[radicle::identity::Did],
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     Ok(
         find_issue_operation(repository, ObjectId::from(operation), operation)?.is_some_and(
             |operation| {
@@ -175,7 +178,7 @@ impl ReactionOperationTarget {
         recovery: &ReactionRecovery<'_>,
         repository: &CobRepository,
         operation: EntryId,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, PublishError> {
         match self {
             Self::Issue(comment) => operation_has_action(
                 find_issue_operation(repository, recovery.subject, operation),
@@ -185,14 +188,14 @@ impl ReactionOperationTarget {
                 find_patch_operation(repository, recovery.subject, operation),
                 |action| recovery.patch_action_matches(action, target),
             ),
-            Self::Missing(message) => Err(message.to_owned()),
+            Self::Missing(message) => Err(PublishError::Rejected(message.to_owned())),
             Self::Invalid => Ok(false),
         }
     }
 }
 
 type CobRepository = radicle::storage::git::Repository;
-type CommentStateResult = Result<Option<CommentState>, String>;
+type CommentStateResult = Result<Option<CommentState>, PublishError>;
 
 struct CommentState {
     body: String,
@@ -209,7 +212,7 @@ impl CommentState {
 }
 
 impl<'a> CommentRecovery<'a> {
-    pub(super) fn applied(&self, repository: &CobRepository) -> Result<bool, String> {
+    pub(super) fn applied(&self, repository: &CobRepository) -> Result<bool, PublishError> {
         let actual = match (self.kind, self.target) {
             (SubjectKind::Issue, CommentTargetKind::Issue) => self.issue_state(repository),
             (SubjectKind::Patch, CommentTargetKind::Revision) => self.revision_state(repository),
@@ -223,7 +226,7 @@ impl<'a> CommentRecovery<'a> {
         &self,
         repository: &CobRepository,
         operation: EntryId,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, PublishError> {
         match (self.kind, self.target) {
             (SubjectKind::Issue, CommentTargetKind::Issue) => {
                 let expected = self.recorded();
@@ -268,10 +271,10 @@ impl<'a> CommentRecovery<'a> {
         repository: &CobRepository,
         operation: EntryId,
         target: PatchCommentTarget,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, PublishError> {
         let entity = self
             .entity
-            .ok_or_else(|| "comment entity is required".to_owned())?;
+            .ok_or_else(|| PublishError::Rejected("comment entity is required".to_owned()))?;
         let expected = RecordedPatchComment {
             entity: match target {
                 PatchCommentTarget::Revision => {
@@ -318,7 +321,7 @@ impl<'a> CommentRecovery<'a> {
     fn revision_state(&self, repository: &CobRepository) -> CommentStateResult {
         let revision = self
             .entity
-            .ok_or_else(|| "entity revision is required".to_owned())?;
+            .ok_or_else(|| PublishError::Rejected("entity revision is required".to_owned()))?;
         Ok(load_patch(repository, self.subject)?.and_then(|patch| {
             patch
                 .revision(&patch::RevisionId::from(revision))
@@ -330,7 +333,7 @@ impl<'a> CommentRecovery<'a> {
     fn review_state(&self, repository: &CobRepository) -> CommentStateResult {
         let review = self
             .entity
-            .ok_or_else(|| "entity review is required".to_owned())?;
+            .ok_or_else(|| PublishError::Rejected("entity review is required".to_owned()))?;
         Ok(load_patch(repository, self.subject)?.and_then(|patch| {
             find_review(&patch, patch::ReviewId::from(review)).and_then(|review| {
                 review
@@ -347,7 +350,7 @@ impl ReactionRecovery<'_> {
         &self,
         repository: &CobRepository,
         operation: EntryId,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, PublishError> {
         self.operation_target()
             .recorded(self, repository, operation)
     }
@@ -435,7 +438,7 @@ impl ReactionRecovery<'_> {
         &self,
         repository: &CobRepository,
         author: radicle::crypto::PublicKey,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, PublishError> {
         match (self.kind, self.target) {
             (SubjectKind::Issue, CommentTargetKind::Issue) => {
                 let comment = self.comment.unwrap_or(*self.subject);
@@ -452,10 +455,9 @@ impl ReactionRecovery<'_> {
                     .unwrap_or(false))
             }
             (SubjectKind::Patch, CommentTargetKind::Revision) => {
-                let revision = patch::RevisionId::from(
-                    self.entity
-                        .ok_or_else(|| "entity revision is required".to_owned())?,
-                );
+                let revision = patch::RevisionId::from(self.entity.ok_or_else(|| {
+                    PublishError::Rejected("entity revision is required".to_owned())
+                })?);
                 Ok(load_patch(repository, self.subject)?
                     .and_then(|patch| {
                         patch
@@ -489,10 +491,9 @@ impl ReactionRecovery<'_> {
                     .unwrap_or(false))
             }
             (SubjectKind::Patch, CommentTargetKind::Review) => {
-                let review = patch::ReviewId::from(
-                    self.entity
-                        .ok_or_else(|| "entity review is required".to_owned())?,
-                );
+                let review = patch::ReviewId::from(self.entity.ok_or_else(|| {
+                    PublishError::Rejected("entity review is required".to_owned())
+                })?);
                 Ok(load_patch(repository, self.subject)?
                     .and_then(|patch| {
                         find_review(&patch, review).map(|review| match self.comment {
@@ -620,7 +621,7 @@ pub(super) fn review_resolution_operation(
     review: patch::ReviewId,
     comment: EntryId,
     resolved: bool,
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     Ok(
         find_patch_operation(repository, patch, operation)?.is_some_and(|operation| {
             operation.actions.iter().any(|action| {
@@ -653,7 +654,7 @@ pub(super) fn patch_commit_operation(
     description: &str,
     base: radicle::git::Oid,
     head: radicle::git::Oid,
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     let patch = match action {
         PatchCommitAction::Create { .. } => ObjectId::from(operation),
         PatchCommitAction::Update(patch) => *patch,
@@ -708,7 +709,7 @@ pub(super) fn merge_operation(
     operation: EntryId,
     revision: patch::RevisionId,
     commit: radicle::git::Oid,
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     Ok(
         find_patch_operation(repository, patch, operation)?.is_some_and(|operation| {
             operation.actions.iter().any(|action| {
@@ -731,7 +732,7 @@ pub(super) fn patch_edit_operation(
     title: Option<&radicle::cob::Title>,
     revision: Option<patch::RevisionId>,
     description: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     edit_operation(
         find_patch_operation(repository, patch, operation),
         title,
@@ -745,7 +746,7 @@ pub(super) fn issue_update_operation(
     issue: ObjectId,
     operation: EntryId,
     update: &IssueUpdate,
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     operation_has_action(
         find_issue_operation(repository, issue, operation),
         |action| issue_update_matches(action, update),
@@ -757,7 +758,7 @@ pub(super) fn patch_update_operation(
     patch: ObjectId,
     operation: EntryId,
     update: &PatchUpdate,
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     operation_has_action(
         find_patch_operation(repository, patch, operation),
         |action| patch_update_matches(action, update),
@@ -779,7 +780,7 @@ pub(super) fn review_mutation_operation(
     summary: Option<&str>,
     labels: &[radicle::cob::Label],
     embeds: &[Embed<Uri>],
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     let recorded = find_patch_operation(repository, patch, operation)?.is_some_and(|operation| {
         operation.actions.iter().any(|action| match action {
             PatchAction::Review {
@@ -821,29 +822,27 @@ pub(super) fn find_review(patch: &patch::Patch, id: patch::ReviewId) -> Option<&
 fn load_issue(
     repository: &CobRepository,
     subject: ObjectId,
-) -> Result<Option<issue::Issue>, String> {
-    Issues::open(repository, ReadOnly)
-        .map_err(stringify)?
+) -> Result<Option<issue::Issue>, PublishError> {
+    Issues::open(repository, ReadOnly)?
         .get(&subject)
-        .map_err(stringify)
+        .map_err(PublishError::from)
 }
 
 fn load_patch(
     repository: &CobRepository,
     subject: ObjectId,
-) -> Result<Option<patch::Patch>, String> {
-    Patches::open(repository, ReadOnly)
-        .map_err(stringify)?
+) -> Result<Option<patch::Patch>, PublishError> {
+    Patches::open(repository, ReadOnly)?
         .get(&subject)
-        .map_err(stringify)
+        .map_err(PublishError::from)
 }
 
 fn edit_operation<A>(
-    operation: Result<Option<Op<A>>, String>,
+    operation: Result<Option<Op<A>>, PublishError>,
     title: Option<&radicle::cob::Title>,
     description: Option<&str>,
     record: impl Copy + for<'a> Fn(&'a A) -> RecordedEdit<'a>,
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     operation_matches(operation, |operation| {
         let actions = &operation.actions;
         title.is_none_or(|title| {
@@ -923,15 +922,15 @@ fn patch_update_matches(action: &PatchAction, update: &PatchUpdate) -> bool {
 }
 
 fn operation_matches<A>(
-    operation: Result<Option<Op<A>>, String>,
+    operation: Result<Option<Op<A>>, PublishError>,
     matches: impl FnOnce(&Op<A>) -> bool,
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     Ok(operation?.is_some_and(|operation| matches(&operation)))
 }
 
 fn operation_has_action<A>(
-    operation: Result<Option<Op<A>>, String>,
+    operation: Result<Option<Op<A>>, PublishError>,
     matches: impl Fn(&A) -> bool,
-) -> Result<bool, String> {
+) -> Result<bool, PublishError> {
     operation_matches(operation, |operation| operation.actions.iter().any(matches))
 }

@@ -170,7 +170,9 @@ impl DeliveryScope {
 
     pub(crate) async fn reconcile(&self, delivery: crate::agent::DeliveryId) -> Result<(), String> {
         if let Some(publisher) = &self.publisher {
-            Box::pin(publisher.reconcile(delivery)).await?;
+            Box::pin(publisher.reconcile(delivery))
+                .await
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -245,6 +247,9 @@ pub(super) enum ServiceError {
     Task(String),
     #[error("invalid Radicle identifier '{0}'")]
     InvalidId(String),
+    /// The request itself is malformed or outside a documented limit.
+    #[error("{0}")]
+    Request(String),
     #[error("object or entry '{0}' was not found")]
     NotFound(String),
     #[error("timeline cursor '{0}' was not found")]
@@ -269,4 +274,19 @@ pub(super) enum ServiceError {
     Operation(#[source] radicle::cob::stream::error::Ops),
     #[error("failed to encode an MCP response: {0}")]
     Encoding(#[source] serde_json::Error),
+    /// A collaborative object title is invalid.
+    #[error("invalid title: {0}")]
+    Title(#[from] radicle::cob::TitleError),
+    /// A Radicle object identifier is malformed.
+    #[error("invalid object identifier: {0}")]
+    ObjectId(#[from] radicle::cob::object::ParseObjectId),
+    /// Publishing an authorized Radicle write failed.
+    #[error(transparent)]
+    Publish(#[from] crate::agent::PublishError),
+}
+
+impl From<String> for ServiceError {
+    fn from(message: String) -> Self {
+        Self::Request(message)
+    }
 }
