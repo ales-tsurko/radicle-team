@@ -204,6 +204,11 @@ impl Watcher {
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error> {
         let triggers = self.resolve_triggers(storage).await?;
+        tracing::debug!(
+            member = %self.member,
+            repository = %self.repository,
+            "scanning repository histories"
+        );
         let issues = self.issue_histories(storage.clone());
         self.scan_objects(
             issues,
@@ -624,10 +629,27 @@ impl PendingActivities {
             .activate(activity.context(path.clone()))
             .await
             .map_err(Error::DeliveryScope)?;
+        tracing::info!(
+            member = %scope.member,
+            repository = %scope.repository,
+            ?subject,
+            operation = %delivery.operation,
+            action = delivery.action,
+            workspace = %path.display(),
+            "dispatching activity to the agent"
+        );
         let handled = activity.dispatch(agent, path).await;
         runtime.scope.deactivate().await;
         let cleaned = workspace.cleanup().await;
-        handled?;
+        handled.inspect_err(|error| {
+            tracing::warn!(
+                member = %scope.member,
+                operation = %delivery.operation,
+                action = delivery.action,
+                %error,
+                "agent failed to handle activity"
+            );
+        })?;
         cleaned.map_err(|error| Error::Workspace(error.to_string()))?;
         Self::checkpoint_delivery(delivery, scope, state, runtime).await
     }

@@ -86,8 +86,24 @@ impl Context {
             let normalized = ActionEnvelope::new(action, operation, member_id).into();
             if let Relevance::Relevant(kind) = self.reduce(normalized, member, authored_by_member) {
                 if !may_trigger {
+                    tracing::info!(
+                        %author,
+                        %member,
+                        ?subject,
+                        ?kind,
+                        operation = %operation.id,
+                        "ignored relevant activity because its author may not trigger agents"
+                    );
                     continue;
                 }
+                tracing::debug!(
+                    %author,
+                    %member,
+                    ?subject,
+                    ?kind,
+                    operation = %operation.id,
+                    "classified activity as relevant"
+                );
                 activities.push(Activity::new(
                     repository,
                     subject,

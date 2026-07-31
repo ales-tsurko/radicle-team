@@ -206,7 +206,10 @@ impl Publisher {
             + Send
             + 'static,
     {
-        self.authorizer.authorize(method).await?;
+        if let Err(error) = self.authorizer.authorize(method).await {
+            tracing::warn!(method, %error, "the manifest no longer allows this MCP method");
+            return Err(error);
+        }
         let _mutation_guard = if mutation.is_some() {
             Some(self.mutation_lock.lock().await)
         } else {
@@ -263,7 +266,15 @@ impl Publisher {
                 _ => None,
             };
             let (value, author) = match recovered {
-                Some(recovered) => recovered,
+                Some(recovered) => {
+                    tracing::info!(
+                        method,
+                        author = %recovered.1,
+                        operation = recovered.0,
+                        "recovered an interrupted mutation instead of repeating it"
+                    );
+                    recovered
+                }
                 None => {
                     let value = if let Some(marker) = recovery_marker.as_deref() {
                         operation(&repository, &signer, marker)?.to_string()
@@ -295,6 +306,7 @@ impl Publisher {
                 .complete(self.repository, key, method, author, &value)
                 .await?;
         }
+        tracing::info!(method, author = %author, operation = value, "published Radicle mutation");
         self.announce(author).await?;
         Ok(value)
     }

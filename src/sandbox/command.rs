@@ -79,6 +79,12 @@ impl AgentSandbox {
         // command, even though `build` reloads it for every spawn.
         policy.validate(&Config::load(home)?)?;
 
+        tracing::info!(
+            workspaces = %workspaces.display(),
+            configuration = %home.sandbox_config().display(),
+            "agent sandbox ready"
+        );
+
         Ok(Self {
             home: home.clone(),
             policy,
@@ -113,10 +119,18 @@ impl AgentSandbox {
             self.policy
                 .file_system(&config, &self.workspaces, self.helper_executable())?;
 
+        let network = self.policy.external_network(&config);
+        tracing::debug!(
+            program = command.program,
+            working_directory = %current_dir.display(),
+            external_network_restricted = network.is_restricted(),
+            "building sandbox policy for a command"
+        );
+
         Ok(Launch {
             current_dir,
             file_system,
-            network: self.policy.external_network(&config),
+            network,
             helper: self.helper_executable().map(Path::to_owned),
         })
     }

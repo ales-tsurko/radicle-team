@@ -32,9 +32,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Zerobox launches sandboxed processes through bubblewrap on Linux. Ubuntu 23.10 and later
+      # also confine unprivileged user namespaces by default, which bubblewrap needs to build its
+      # uid map, so that restriction is lifted here and verified before the tests run.
       - name: Install bubblewrap
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install --yes bubblewrap
+          sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --dev-bind / / --unshare-user true
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -61,8 +67,13 @@ jobs:
         with:
           components: clippy
 
+      # `make test-all` runs the sandbox spawn tests, which need bubblewrap and unconfined
+      # unprivileged user namespaces on Linux.
       - name: Install bubblewrap
-        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install --yes bubblewrap
+          sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --dev-bind / / --unshare-user true
 
       - name: Install Rust nightly tools
         run: rustup toolchain install nightly --component miri --component rust-src --component rustfmt

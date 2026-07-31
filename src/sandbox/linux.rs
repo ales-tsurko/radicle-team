@@ -25,7 +25,7 @@ pub(super) struct Helper {
 
 impl Helper {
     pub(super) fn prepare(home: &MemberHome) -> Result<Self, Error> {
-        Self::ensure_initialized()?;
+        Self::ensure_available()?;
         fs::create_dir_all(home.path()).map_err(|source| Error::Io {
             path: home.path().into(),
             source,
@@ -40,11 +40,38 @@ impl Helper {
         })
     }
 
+    /// Rejects an environment that cannot launch a sandboxed process at all.
+    fn ensure_available() -> Result<(), Error> {
+        Self::ensure_initialized()?;
+        Self::ensure_bubblewrap()
+    }
+
     fn ensure_initialized() -> Result<(), Error> {
         INITIALIZED
             .load(Ordering::Acquire)
             .then_some(())
             .ok_or(Error::Uninitialized)
+    }
+
+    /// Fails before any command runs when Zerobox has no bubblewrap to launch it with.
+    ///
+    /// Without this, the first sandboxed command dies in the re-executed helper process and the
+    /// caller only sees an exit status, so a missing package looks like a broken agent. A
+    /// `bwrap` beside the executable also counts, so a bundled distribution is not rejected.
+    fn ensure_bubblewrap() -> Result<(), Error> {
+        if zerobox_sandboxing::find_system_bwrap_in_path().is_some() {
+            return Ok(());
+        }
+        let executable = std::env::current_exe().map_err(|source| Error::Io {
+            path: Path::new("/proc/self/exe").into(),
+            source,
+        })?;
+        let bundled = executable.parent().map(|directory| directory.join("bwrap"));
+        if bundled.is_some_and(|bundled| bundled.is_file()) {
+            Ok(())
+        } else {
+            Err(Error::BubblewrapMissing)
+        }
     }
 
     fn directory(home: &MemberHome) -> Result<tempfile::TempDir, Error> {
@@ -82,6 +109,12 @@ pub enum Error {
          radicle_team::sandbox::dispatch_linux_helper() as the first statement in main"
     )]
     Uninitialized,
+    /// Bubblewrap is absent, so Zerobox cannot launch a sandboxed process.
+    #[error(
+        "bubblewrap is required for agent sandboxing on Linux; install it so that 'bwrap' is on \
+         PATH, for example 'sudo apt-get install bubblewrap'"
+    )]
+    BubblewrapMissing,
     /// A helper path could not be prepared.
     #[error("failed to prepare Linux sandbox helper path '{path}': {source}")]
     Io {

@@ -119,6 +119,18 @@ system's own sandbox.
 sudo apt-get install bubblewrap   # or the equivalent for your distribution
 ```
 
+Bubblewrap also needs an unprivileged user namespace. Ubuntu 23.10 and later
+confine those by default, which makes `bwrap` fail with `setting up uid map:
+Permission denied`. Confirm it works, and lift the restriction if it does not:
+
+```sh
+bwrap --dev-bind / / --unshare-user true
+sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+Add `kernel.apparmor_restrict_unprivileged_userns=0` to `/etc/sysctl.d/` to make
+that persist across reboots.
+
 Build the application from this repository:
 
 ```sh
@@ -197,6 +209,24 @@ The process owns the member's node for its lifetime. It classifies relevant
 assignments, mentions, replies, comments, reviews, revisions, reactions,
 resolutions, lifecycle changes, and merges until stopped. `SIGINT` and
 `SIGTERM` trigger graceful node shutdown before the child is reaped.
+
+Operational events are emitted as structured records through `tracing`, so the
+destination and verbosity are chosen by the process rather than fixed in the
+library. `RUST_LOG` selects both, defaulting to `info`:
+
+```sh
+RUST_LOG=radicle_team=debug radicle-team run nico --repo rad:...
+```
+
+At `info` the process reports what it decided and why: activity dispatched to
+the agent, activity ignored because its author may not trigger agents, a
+mutation published or recovered from an interrupted delivery, an MCP method the
+manifest no longer allows, and the sandbox becoming ready. `debug` adds each
+repository scan, each classified activity, and the policy built for every
+sandboxed command.
+
+The first of those matters most in practice: without it, a `triggered_by`
+decision looks exactly like an agent that is simply not responding.
 
 
 
