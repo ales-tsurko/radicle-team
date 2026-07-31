@@ -6,7 +6,7 @@ use directories::BaseDirs;
 
 use crate::{
     cli::setup::Error,
-    sandbox::{Config, ExternalNetwork},
+    sandbox::{Config, NetworkAccess},
 };
 
 #[derive(Debug)]
@@ -52,8 +52,7 @@ impl SandboxSetup {
 
     fn customize(&mut self) -> Result<(), Error> {
         self.configure_paths()?;
-        self.config
-            .set_external_network(self.prompt_external_network()?);
+        self.config.set_network(self.prompt_network()?);
         self.config.write(&self.path)?;
         cliclack::log::success("Sandbox configuration updated").map_err(Error::from)
     }
@@ -132,32 +131,28 @@ impl SandboxSetup {
             .ok_or(Error::HomeUnavailable)
     }
 
-    fn prompt_external_network(&self) -> Result<ExternalNetwork, Error> {
-        let initial = NetworkChoice::from(self.config.external_network());
-        let choice = cliclack::select("Sandbox external network access")
+    fn prompt_network(&self) -> Result<NetworkAccess, Error> {
+        let initial = NetworkChoice::from(self.config.network());
+        let choice = cliclack::select("Sandbox network access")
             .initial_value(initial)
             .item(NetworkChoice::All, "Allow all", "default")
             .item(
                 NetworkChoice::Disabled,
-                "Disable external network",
-                "loopback stays reachable",
+                "Disable network",
+                "local servers need 'all' on Linux",
             )
-            .item(
-                NetworkChoice::Domains,
-                "Allow selected external domains",
-                "",
-            )
+            .item(NetworkChoice::Domains, "Allow selected domains", "")
             .interact()?;
         match choice {
-            NetworkChoice::All => Ok(ExternalNetwork::All),
-            NetworkChoice::Disabled => Ok(ExternalNetwork::Disabled),
+            NetworkChoice::All => Ok(NetworkAccess::All),
+            NetworkChoice::Disabled => Ok(NetworkAccess::Disabled),
             NetworkChoice::Domains => self.prompt_domains(),
         }
     }
 
-    fn prompt_domains(&self) -> Result<ExternalNetwork, Error> {
+    fn prompt_domains(&self) -> Result<NetworkAccess, Error> {
         let default = self.current_domains().join("\n");
-        let mut input = cliclack::input("Allowed external domains (one per line)")
+        let mut input = cliclack::input("Allowed domains (one per line)")
             .placeholder("api.openai.com")
             .multiline();
         if !default.is_empty() {
@@ -169,13 +164,13 @@ impl SandboxSetup {
             return Err(Error::EmptySandboxDomains);
         }
 
-        Ok(ExternalNetwork::Domains(domains))
+        Ok(NetworkAccess::Domains(domains))
     }
 
     fn current_domains(&self) -> &[String] {
-        match self.config.external_network() {
-            ExternalNetwork::Domains(domains) => domains,
-            ExternalNetwork::All | ExternalNetwork::Disabled => &[],
+        match self.config.network() {
+            NetworkAccess::Domains(domains) => domains,
+            NetworkAccess::All | NetworkAccess::Disabled => &[],
         }
     }
 
@@ -198,12 +193,12 @@ enum NetworkChoice {
     Domains,
 }
 
-impl From<&ExternalNetwork> for NetworkChoice {
-    fn from(network: &ExternalNetwork) -> Self {
+impl From<&NetworkAccess> for NetworkChoice {
+    fn from(network: &NetworkAccess) -> Self {
         match network {
-            ExternalNetwork::All => Self::All,
-            ExternalNetwork::Disabled => Self::Disabled,
-            ExternalNetwork::Domains(_) => Self::Domains,
+            NetworkAccess::All => Self::All,
+            NetworkAccess::Disabled => Self::Disabled,
+            NetworkAccess::Domains(_) => Self::Domains,
         }
     }
 }

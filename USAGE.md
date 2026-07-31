@@ -267,30 +267,50 @@ allow_read = ["/custom/toolchain"]
 deny_read = ["/private/project"]
 allow_write = ["/custom/build-cache"]
 deny_write = ["/custom/build-cache/protected"]
-external_network = "all"
+network = "all"
 ```
 
-External network access can be unrestricted, disabled, or limited to domains:
+Network access can be unrestricted, disabled, or limited to domains:
 
 ```toml
-external_network = "disabled"
+network = "disabled"
 ```
 
 ```toml
-external_network = ["api.openai.com", "crates.io", "github.com"]
+network = ["api.openai.com", "crates.io", "github.com"]
 ```
 
-Omitting `external_network` defaults to `"all"`. Disabled and domain-restricted
+Omitting `network` defaults to `"all"`. Disabled and domain-restricted
 modes route external traffic through the managed proxy, which accepts only the
 capability-protected MCP endpoint.
 
-This setting governs traffic leaving the host only. **Loopback is always
-reachable, under every setting.** Sandboxed agents need to bind and reach local
-ports for development servers and language servers, so the sandbox permits
-loopback directly rather than through the proxy. A sandboxed agent can therefore
-connect to any service listening on localhost, including ones this application
-does not operate. Do not rely on the sandbox to isolate a local service; bind it
-elsewhere, or require authentication.
+Loopback behaves differently on each platform, because Zerobox uses a different
+backend on each, and neither behaviour is configurable from here.
+
+On **macOS** the sandbox keeps host loopback reachable under every setting. An
+agent can use a local development or language server directly, and a local
+service is **not** isolated from it. Do not rely on this setting to isolate
+something sensitive: bind it elsewhere, or require authentication.
+
+On **Linux** a restricted sandbox runs in its own network namespace, so host
+loopback is unreachable and only the managed proxy bridges out. Zerobox creates
+that namespace per command, so a server one command starts is not reachable from
+the next one. A workflow that runs a local development server and then connects
+to it therefore needs `network = "all"` on Linux; `"domains"` does not help,
+because it is still a restricted sandbox.
+
+A restricted sandbox on Linux also blocks the command from creating new Unix
+domain sockets, so local services reached that way, such as a container daemon
+or a database socket, are unavailable there as well.
+
+The member's own MCP endpoint stays reachable under every setting, directly on
+macOS and through the managed proxy on Linux, which bridges it into the
+namespace.
+
+If you need both an isolated internet and a working local server on Linux, run
+the whole member inside a container with `network = "all"` and filter egress at
+the container instead. Leave the container able to reach your Radicle seeds, or
+`radicle-node` cannot synchronize.
 
 Agent adapters select commands and arguments but cannot weaken this policy.
 Every subprocess inherits the same sandbox.

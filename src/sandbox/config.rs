@@ -21,7 +21,7 @@ pub struct Config {
     deny_read: Vec<PathBuf>,
     allow_write: Vec<PathBuf>,
     deny_write: Vec<PathBuf>,
-    external_network: ExternalNetwork,
+    network: NetworkAccess,
 }
 
 impl Config {
@@ -101,10 +101,10 @@ impl Config {
         &self.deny_write
     }
 
-    /// Returns the external network policy.
+    /// Returns the network policy.
     #[must_use]
-    pub const fn external_network(&self) -> &ExternalNetwork {
-        &self.external_network
+    pub const fn network(&self) -> &NetworkAccess {
+        &self.network
     }
 
     /// Replaces the additional readable paths.
@@ -127,9 +127,9 @@ impl Config {
         self.deny_write = paths;
     }
 
-    /// Replaces the external network policy.
-    pub fn set_external_network(&mut self, external_network: ExternalNetwork) {
-        self.external_network = external_network;
+    /// Replaces the network policy.
+    pub fn set_network(&mut self, network: NetworkAccess) {
+        self.network = network;
     }
 
     fn load_file(path: &Path) -> Result<Self, ConfigError> {
@@ -162,7 +162,7 @@ impl Config {
                 return Err(ConfigError::RelativePath(path.clone()));
             }
         }
-        if let ExternalNetwork::Domains(domains) = &self.external_network {
+        if let NetworkAccess::Domains(domains) = &self.network {
             if domains.is_empty() {
                 return Err(ConfigError::EmptyDomains);
             }
@@ -237,21 +237,24 @@ impl Default for Config {
             deny_read: Vec::new(),
             allow_write: Vec::new(),
             deny_write: Vec::new(),
-            external_network: ExternalNetwork::All,
+            network: NetworkAccess::All,
         }
     }
 }
 
 /// External network access available to sandboxed agents.
 ///
-/// This governs traffic leaving the host only. Loopback stays reachable under every variant, so a
-/// sandboxed agent can always connect to local services, including ones this application does not
-/// operate. Isolate anything sensitive that listens on loopback by other means.
+/// Loopback behaves differently on each platform because Zerobox uses a different backend on each,
+/// and neither behaviour is configurable here. macOS keeps host loopback reachable under every
+/// variant, so a sandboxed agent reaches local services this application does not operate; isolate
+/// anything sensitive by other means. Linux runs a restricted sandbox in its own network namespace,
+/// created per command, so host loopback is unreachable and a server one command starts is not
+/// reachable from the next. Only the member's MCP endpoint is bridged through the managed proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExternalNetwork {
+pub enum NetworkAccess {
     /// Allow every external domain.
     All,
-    /// Disable external networking, leaving only loopback reachable.
+    /// Disable outbound networking beyond the host.
     Disabled,
     /// Allow only the listed external domains.
     Domains(Vec<String>),
@@ -270,7 +273,7 @@ struct Document {
     #[serde(default)]
     deny_write: Vec<PathBuf>,
     #[serde(default)]
-    external_network: NetworkValue,
+    network: NetworkValue,
 }
 
 impl From<Document> for Config {
@@ -280,7 +283,7 @@ impl From<Document> for Config {
             deny_read: document.deny_read,
             allow_write: document.allow_write,
             deny_write: document.deny_write,
-            external_network: document.external_network.into(),
+            network: document.network.into(),
         }
     }
 }
@@ -293,7 +296,7 @@ impl<'a> From<&'a Config> for Document {
             deny_read: config.deny_read.clone(),
             allow_write: config.allow_write.clone(),
             deny_write: config.deny_write.clone(),
-            external_network: NetworkValue::from(&config.external_network),
+            network: NetworkValue::from(&config.network),
         }
     }
 }
@@ -311,7 +314,7 @@ impl Default for NetworkValue {
     }
 }
 
-impl From<NetworkValue> for ExternalNetwork {
+impl From<NetworkValue> for NetworkAccess {
     fn from(value: NetworkValue) -> Self {
         match value {
             NetworkValue::Mode(NetworkMode::All) => Self::All,
@@ -321,12 +324,12 @@ impl From<NetworkValue> for ExternalNetwork {
     }
 }
 
-impl<'a> From<&'a ExternalNetwork> for NetworkValue {
-    fn from(value: &'a ExternalNetwork) -> Self {
+impl<'a> From<&'a NetworkAccess> for NetworkValue {
+    fn from(value: &'a NetworkAccess) -> Self {
         match value {
-            ExternalNetwork::All => Self::Mode(NetworkMode::All),
-            ExternalNetwork::Disabled => Self::Mode(NetworkMode::Disabled),
-            ExternalNetwork::Domains(domains) => Self::Domains(domains.clone()),
+            NetworkAccess::All => Self::Mode(NetworkMode::All),
+            NetworkAccess::Disabled => Self::Mode(NetworkMode::Disabled),
+            NetworkAccess::Domains(domains) => Self::Domains(domains.clone()),
         }
     }
 }
@@ -368,10 +371,10 @@ pub enum ConfigError {
     #[error("sandbox path must be absolute: '{}'", .0.display())]
     RelativePath(PathBuf),
     /// A domain allowlist must contain at least one domain.
-    #[error("sandbox external network domain list cannot be empty; use 'all' or 'disabled'")]
+    #[error("sandbox network domain list cannot be empty; use 'all' or 'disabled'")]
     EmptyDomains,
     /// A configured domain is empty.
-    #[error("invalid empty sandbox external network domain: {0:?}")]
+    #[error("invalid empty sandbox network domain: {0:?}")]
     InvalidDomain(String),
 }
 
@@ -385,7 +388,7 @@ mod tests {
     use crate::{
         home::MemberHome,
         member::Member,
-        sandbox::{Config, ExternalNetwork},
+        sandbox::{Config, NetworkAccess},
     };
     #[cfg(not(miri))]
     use crate::sandbox::ConfigError;
@@ -398,7 +401,7 @@ mod tests {
         assert!(config.deny_read().is_empty());
         assert!(config.allow_write().is_empty());
         assert!(config.deny_write().is_empty());
-        assert_eq!(config.external_network(), &ExternalNetwork::All);
+        assert_eq!(config.network(), &NetworkAccess::All);
     }
 
     #[test]
@@ -412,7 +415,7 @@ mod tests {
         config.set_deny_read(vec![directory.path().join("secret")]);
         config.set_allow_write(vec![directory.path().join("cache")]);
         config.set_deny_write(vec![directory.path().join("protected")]);
-        config.set_external_network(ExternalNetwork::Domains(vec![
+        config.set_network(NetworkAccess::Domains(vec![
             "crates.io".to_owned(),
             "github.com".to_owned(),
         ]));
@@ -420,7 +423,7 @@ mod tests {
         config
             .write(&home.sandbox_config())
             .expect("configuration should be written");
-        config.set_external_network(ExternalNetwork::Disabled);
+        config.set_network(NetworkAccess::Disabled);
         config
             .write(&home.sandbox_config())
             .expect("configuration should be replaced");
@@ -458,7 +461,7 @@ mod tests {
         home.create().expect("member home should be created");
         fs::write(
             home.sandbox_config(),
-            "version = 1\nexternal_network = \"disabled\"\nallow_read = [\"relative\"]\n",
+            "version = 1\nnetwork = \"disabled\"\nallow_read = [\"relative\"]\n",
         )
         .expect("configuration should be written");
 

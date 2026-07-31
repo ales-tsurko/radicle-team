@@ -119,11 +119,11 @@ impl AgentSandbox {
             self.policy
                 .file_system(&config, &self.workspaces, self.helper_executable())?;
 
-        let network = self.policy.external_network(&config);
+        let network = self.policy.network(&config);
         tracing::debug!(
             program = command.program,
             working_directory = %current_dir.display(),
-            external_network_restricted = network.is_restricted(),
+            network_restricted = network.is_restricted(),
             "building sandbox policy for a command"
         );
 
@@ -468,7 +468,10 @@ pub enum Error {
     Zerobox(#[from] anyhow::Error),
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+// Excluded from Miri: every test here loads a real sandbox, which writes a configuration file
+// that Miri's synthetic user ID cannot own, and on Linux resolves bubblewrap through a foreign
+// `access` call that Miri cannot execute.
+#[cfg(all(test, not(miri), any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use url::Url;
 
@@ -498,10 +501,7 @@ mod tests {
         ));
     }
 
-    // Not run under Miri: this writes a real configuration file, and Miri reports a synthetic user
-    // ID, so the administrator-ownership check rejects a file the test itself just created.
     #[test]
-    #[cfg(not(miri))]
     fn builds_every_configured_policy() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let home = MemberHome::at(directory.path(), Member::Nico);
@@ -509,16 +509,16 @@ mod tests {
         let path = directory.path().to_owned();
 
         for network in [
-            crate::sandbox::ExternalNetwork::All,
-            crate::sandbox::ExternalNetwork::Disabled,
-            crate::sandbox::ExternalNetwork::Domains(vec!["example.com".to_owned()]),
+            crate::sandbox::NetworkAccess::All,
+            crate::sandbox::NetworkAccess::Disabled,
+            crate::sandbox::NetworkAccess::Domains(vec!["example.com".to_owned()]),
         ] {
             let mut config = crate::sandbox::Config::default();
             config.set_allow_read(vec![path.clone()]);
             config.set_deny_read(vec![path.clone()]);
             config.set_allow_write(vec![path.clone()]);
             config.set_deny_write(vec![path.clone()]);
-            config.set_external_network(network);
+            config.set_network(network);
             write_config(&home, &config);
             let command = sandbox.command("true");
 

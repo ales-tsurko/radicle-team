@@ -17,7 +17,7 @@ use radicle_team::{
     agent::McpEndpoint,
     home::MemberHome,
     member::Member,
-    sandbox::{AgentSandbox, Config, ExternalNetwork},
+    sandbox::{AgentSandbox, Config, NetworkAccess},
 };
 use url::Url;
 
@@ -27,8 +27,8 @@ const CHECKS: &[(&str, Check)] = &[
     ("confines_the_file_system", || {
         Box::pin(confines_the_file_system())
     }),
-    ("leaves_loopback_reachable", || {
-        Box::pin(leaves_loopback_reachable())
+    ("restricts_loopback_per_platform", || {
+        Box::pin(restricts_loopback_per_platform())
     }),
     (
         "blocks_external_hosts",
@@ -36,6 +36,9 @@ const CHECKS: &[(&str, Check)] = &[
     ),
     ("reloads_configuration_between_commands", || {
         Box::pin(reloads_configuration_between_commands())
+    }),
+    ("reaches_the_mcp_endpoint_with_networking_disabled", || {
+        Box::pin(reaches_the_mcp_endpoint_with_networking_disabled())
     }),
 ];
 
@@ -119,11 +122,13 @@ async fn confines_the_file_system() {
     );
 }
 
-/// Records that loopback stays reachable even with external networking disabled.
+/// Records how each platform treats loopback once networking is disabled.
 ///
-/// Agents bind and reach local ports for development and language servers, so the sandbox permits
-/// loopback directly rather than through the proxy. A failure here means that contract changed.
-async fn leaves_loopback_reachable() {
+/// macOS keeps host loopback reachable, so an agent can use a local development or language
+/// server directly. Linux confines the process to its own network namespace, so the same address
+/// is unreachable and only the proxy bridges out. Both are asserted because the difference decides
+/// whether a local service is isolated from the agent.
+async fn restricts_loopback_per_platform() {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("local listener should bind");
@@ -132,18 +137,15 @@ async fn leaves_loopback_reachable() {
         .expect("local address should be available")
         .port();
     let _server = tokio::spawn(async move {
-        while let Ok((mut stream, _peer)) = listener.accept().await {
-            use tokio::io::AsyncWriteExt as _;
-            let _written = stream
-                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                .await;
+        while let Ok((stream, _peer)) = listener.accept().await {
+            tokio::spawn(serve(stream));
         }
     });
     let fixture = Fixture::new("loopback");
     let target = format!("http://127.0.0.1:{port}/");
 
     let mut config = Config::default();
-    config.set_external_network(ExternalNetwork::All);
+    config.set_network(NetworkAccess::All);
     check(
         fetch(&fixture.sandbox(config), &target).await.success(),
         "an unrestricted sandbox must reach the listener; without this control the result below \
@@ -151,11 +153,21 @@ async fn leaves_loopback_reachable() {
     );
 
     let mut config = Config::default();
-    config.set_external_network(ExternalNetwork::Disabled);
-    check(
-        fetch(&fixture.sandbox(config), &target).await.success(),
-        "loopback must stay reachable when external networking is disabled",
-    );
+    config.set_network(NetworkAccess::Disabled);
+    let reachable = fetch(&fixture.sandbox(config), &target).await.success();
+    if cfg!(target_os = "macos") {
+        check(
+            reachable,
+            "macOS must keep host loopback reachable with networking disabled, so a local service \
+             is not isolated from the agent",
+        );
+    } else {
+        check(
+            !reachable,
+            "Linux runs the sandbox in its own network namespace, so host loopback must be \
+             unreachable with networking disabled",
+        );
+    }
 }
 
 /// Proves external traffic is stopped by the sandbox rather than only by the proxy.
@@ -167,7 +179,7 @@ async fn blocks_external_hosts() {
 
     let fixture = Fixture::new("external");
     let mut config = Config::default();
-    config.set_external_network(ExternalNetwork::All);
+    config.set_network(NetworkAccess::All);
     if !fetch(&fixture.sandbox(config), EXTERNAL).await.success() {
         println!(
             "sandbox_spawn: SKIPPED blocks_external_hosts, no connectivity to {EXTERNAL}, so a \
@@ -177,10 +189,10 @@ async fn blocks_external_hosts() {
     }
 
     let mut config = Config::default();
-    config.set_external_network(ExternalNetwork::Disabled);
+    config.set_network(NetworkAccess::Disabled);
     check(
         !fetch(&fixture.sandbox(config), EXTERNAL).await.success(),
-        "a sandbox with external networking disabled must not reach an external host",
+        "a sandbox with networking disabled must not reach an external host",
     );
 }
 
@@ -212,6 +224,40 @@ async fn reloads_configuration_between_commands() {
     );
 }
 
+/// Proves an agent can still reach its MCP endpoint once networking is disabled.
+///
+/// This is the one loopback address a restricted sandbox must keep usable, and the platforms get
+/// there differently: macOS permits host loopback directly, while Linux runs the process in its
+/// own network namespace and bridges the endpoint through the managed proxy. The probe therefore
+/// honours the proxy environment, as an MCP client must.
+async fn reaches_the_mcp_endpoint_with_networking_disabled() {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("MCP listener should bind");
+    let port = listener
+        .local_addr()
+        .expect("MCP address should be available")
+        .port();
+    let _server = tokio::spawn(async move {
+        while let Ok((stream, _peer)) = listener.accept().await {
+            tokio::spawn(serve(stream));
+        }
+    });
+    let fixture = Fixture::new("mcp");
+    let endpoint = Url::parse(&format!("http://127.0.0.1:{port}/mcp/capability"))
+        .expect("MCP endpoint should be valid");
+
+    let mut config = Config::default();
+    config.set_network(NetworkAccess::Disabled);
+    let sandbox = fixture.sandbox_for(config, &McpEndpoint::new(endpoint.clone()));
+
+    check(
+        proxied(&sandbox, endpoint.as_str()).await.success(),
+        "the MCP endpoint must stay reachable with networking disabled, or an agent cannot use \
+         any tool once the sandbox is restricted",
+    );
+}
+
 struct Fixture {
     directory: tempfile::TempDir,
     home: MemberHome,
@@ -240,9 +286,13 @@ impl Fixture {
 
     /// Writes `config` as the member's sandbox configuration and loads a sandbox using it.
     fn sandbox(&self, config: Config) -> AgentSandbox {
+        self.sandbox_for(config, &endpoint())
+    }
+
+    fn sandbox_for(&self, config: Config, endpoint: &McpEndpoint) -> AgentSandbox {
         self.write_config(&config);
 
-        AgentSandbox::load(&self.home, &endpoint()).expect("sandbox should load")
+        AgentSandbox::load(&self.home, endpoint).expect("sandbox should load")
     }
 
     fn write_config(&self, config: &Config) {
@@ -258,6 +308,26 @@ fn endpoint() -> McpEndpoint {
     McpEndpoint::new(
         Url::parse("http://127.0.0.1:12345/mcp/capability").expect("MCP endpoint should be valid"),
     )
+}
+
+/// Answers one request, reading it first so the peer never sees a reset instead of the response.
+async fn serve(mut stream: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut request = [0_u8; 1024];
+    let _read = stream.read(&mut request).await;
+    let _written = stream
+        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+        .await;
+    let _flushed = stream.flush().await;
+}
+
+/// Fetches `target` while honouring the proxy environment the sandbox injects.
+async fn proxied(sandbox: &AgentSandbox, target: &str) -> ExitStatus {
+    run(sandbox
+        .command("curl")
+        .args(["-s", "--fail", "-o", "/dev/null", "-m", "10", target]))
+    .await
 }
 
 async fn read(sandbox: &AgentSandbox, path: &Path) -> ExitStatus {

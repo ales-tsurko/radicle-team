@@ -615,7 +615,7 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use crate::sandbox::{
-        ExternalNetwork,
+        NetworkAccess,
         network::{ManagedNetwork, Route},
         policy::NetworkPolicy,
     };
@@ -641,7 +641,7 @@ mod tests {
                 .expect("response should write");
         });
         let policy = NetworkPolicy::new(
-            ExternalNetwork::Disabled,
+            NetworkAccess::Disabled,
             std::net::Ipv4Addr::LOCALHOST.to_string(),
             address.port(),
         );
@@ -675,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn proxy_route_rejects_other_loopback_ports() {
         let route = Route::new(&NetworkPolicy::new(
-            ExternalNetwork::Disabled,
+            NetworkAccess::Disabled,
             "127.0.0.1".to_owned(),
             1234,
         ))

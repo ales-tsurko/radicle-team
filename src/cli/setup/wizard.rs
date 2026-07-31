@@ -556,7 +556,7 @@ pub enum Error {
     #[error("could not expand '~' because the operating-system home directory is unavailable")]
     HomeUnavailable,
     /// A domain allowlist was selected without any domains.
-    #[error("at least one sandbox external network domain is required")]
+    #[error("at least one sandbox network domain is required")]
     EmptySandboxDomains,
     /// A trigger allowlist was selected without any identities.
     #[error("at least one triggering identity is required")]

@@ -1,7 +1,7 @@
 //! Immutable sandbox policy supplied by the application.
 
 use std::{
-    env,
+    env, fs,
     net::IpAddr,
     path::{Path, PathBuf},
 };
@@ -18,7 +18,7 @@ use zerobox::profile_core::Profile;
 
 use crate::{
     agent::McpEndpoint,
-    sandbox::{Config, ExternalNetwork, command::Error},
+    sandbox::{Config, NetworkAccess, command::Error},
 };
 
 const PROFILES: &[&str] = &[
@@ -164,17 +164,36 @@ impl Policy {
         )?;
         let policy = FileSystemSandboxPolicy::restricted(entries);
 
-        Ok(match helper.and_then(Path::parent) {
-            Some(root) => {
-                policy.with_additional_readable_roots(workspaces, &[Self::absolute(root)?])
+        Ok(match helper {
+            Some(helper) => {
+                policy.with_additional_readable_roots(workspaces, &Self::helper_roots(helper)?)
             }
             None => policy,
         })
     }
 
-    pub(super) fn external_network(&self, config: &Config) -> NetworkPolicy {
+    /// Returns the paths Zerobox's Linux helper must be able to read inside the sandbox.
+    ///
+    /// The helper is a symbolic link to this executable, and Zerobox re-enters that binary within
+    /// the sandbox to apply the policy. Granting only the link's directory leaves the link
+    /// resolving to a path that does not exist there, so the target is granted as well.
+    fn helper_roots(helper: &Path) -> Result<Vec<AbsolutePathBuf>, Error> {
+        let mut roots = Vec::new();
+        if let Some(directory) = helper.parent() {
+            roots.push(Self::absolute(directory)?);
+        }
+        let target = fs::canonicalize(helper).map_err(|source| Error::Io {
+            path: helper.into(),
+            source,
+        })?;
+        roots.push(Self::absolute(&target)?);
+
+        Ok(roots)
+    }
+
+    pub(super) fn network(&self, config: &Config) -> NetworkPolicy {
         NetworkPolicy::new(
-            config.external_network().clone(),
+            config.network().clone(),
             self.mcp_host.clone(),
             self.mcp_port,
         )
@@ -299,13 +318,13 @@ impl Policy {
 
 #[derive(Debug, Clone)]
 pub(super) struct NetworkPolicy {
-    access: ExternalNetwork,
+    access: NetworkAccess,
     mcp_host: String,
     mcp_port: u16,
 }
 
 impl NetworkPolicy {
-    pub(super) const fn new(access: ExternalNetwork, mcp_host: String, mcp_port: u16) -> Self {
+    pub(super) const fn new(access: NetworkAccess, mcp_host: String, mcp_port: u16) -> Self {
         Self {
             access,
             mcp_host,
@@ -314,7 +333,7 @@ impl NetworkPolicy {
     }
 
     pub(super) const fn is_restricted(&self) -> bool {
-        !matches!(self.access, ExternalNetwork::All)
+        !matches!(self.access, NetworkAccess::All)
     }
 
     pub(super) fn mcp_address(&self) -> (&str, u16) {
@@ -323,8 +342,8 @@ impl NetworkPolicy {
 
     pub(super) fn domains(&self) -> &[String] {
         match &self.access {
-            ExternalNetwork::Domains(domains) => domains,
-            ExternalNetwork::All | ExternalNetwork::Disabled => &[],
+            NetworkAccess::Domains(domains) => domains,
+            NetworkAccess::All | NetworkAccess::Disabled => &[],
         }
     }
 }
@@ -335,7 +354,7 @@ mod tests {
 
     use crate::{
         agent::McpEndpoint,
-        sandbox::{Config, ExternalNetwork, policy::Policy},
+        sandbox::{Config, NetworkAccess, policy::Policy},
     };
 
     #[test]
@@ -344,8 +363,8 @@ mod tests {
         let policy =
             Policy::load(directory.path(), &endpoint()).expect("embedded policy should load");
         let mut config = Config::default();
-        config.set_external_network(ExternalNetwork::Domains(vec!["example.com".to_owned()]));
-        let network = policy.external_network(&config);
+        config.set_network(NetworkAccess::Domains(vec!["example.com".to_owned()]));
+        let network = policy.network(&config);
 
         assert!(network.is_restricted());
         assert_eq!(network.mcp_address(), ("127.0.0.1", 12345));

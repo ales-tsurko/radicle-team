@@ -8,7 +8,7 @@
 pub use crate::sandbox::linux::Error as LinuxHelperError;
 pub use crate::sandbox::{
     command::{AgentChild, AgentCommand, AgentSandbox, Error},
-    config::{Config, ConfigError, ExternalNetwork},
+    config::{Config, ConfigError, NetworkAccess},
 };
 
 mod command;
