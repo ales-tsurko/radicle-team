@@ -110,6 +110,15 @@ Install Radicle so that `rad` and `radicle-node` are available on `PATH`. You
 also need the repository RID and permission to propose or approve its project
 manifest.
 
+On Linux, install `bubblewrap` as well. Zerobox launches every sandboxed agent
+process through it, so without `bwrap` on `PATH` the sandbox cannot start and
+each agent command fails. macOS needs nothing extra; it uses the operating
+system's own sandbox.
+
+```sh
+sudo apt-get install bubblewrap   # or the equivalent for your distribution
+```
+
 Build the application from this repository:
 
 ```sh
@@ -257,7 +266,9 @@ Agent adapters select commands and arguments but cannot weaken this policy.
 Every subprocess inherits the same sandbox.
 
 Agent execution currently fails closed outside macOS and Linux because Zerobox
-does not provide an enforcing backend there.
+does not provide an enforcing backend there. On Linux it also fails closed when
+`bubblewrap` is missing, because Zerobox launches sandboxed processes through
+it.
 
 Executables embedding the library on Linux must call
 `radicle_team::sandbox::dispatch_linux_helper()` as the first statement in

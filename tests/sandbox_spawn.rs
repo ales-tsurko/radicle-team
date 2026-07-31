@@ -64,6 +64,15 @@ fn main() {
     if cfg!(miri) {
         return;
     }
+    // Agent sandboxing fails closed where Zerobox has no enforcing backend, so there is nothing to
+    // observe on those platforms.
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        println!(
+            "sandbox_spawn: SKIPPED on {}, agent sandboxing has no enforcing backend there",
+            std::env::consts::OS
+        );
+        return;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -270,14 +279,31 @@ async fn fetch(sandbox: &AgentSandbox, target: &str) -> ExitStatus {
     .await
 }
 
+/// Runs `command` and reports the child's own diagnostics when it fails.
+///
+/// A bare exit status cannot distinguish "the policy denied this" from "the sandbox could not
+/// start", so the child's stderr is surfaced whenever it does not succeed.
 async fn run(command: radicle_team::sandbox::AgentCommand) -> ExitStatus {
-    command
+    let mut child = command
         .spawn()
         .await
-        .expect("sandboxed process should spawn")
-        .wait()
-        .await
-        .expect("sandboxed process should exit")
+        .expect("sandboxed process should spawn");
+    let errors = child.stderr();
+    let status = child.wait().await.expect("sandboxed process should exit");
+    if !status.success() {
+        let mut message = String::new();
+        if let Some(mut errors) = errors {
+            let _read = tokio::io::AsyncReadExt::read_to_string(&mut errors, &mut message).await;
+        }
+        // Written to stderr so it is unbuffered and ordered against the panic that follows; a
+        // piped stdout is block buffered and could surface after the failure, or not at all.
+        eprintln!(
+            "sandbox_spawn: child failed with {status}; stderr: {}",
+            message.trim()
+        );
+    }
+
+    status
 }
 
 fn check(passed: bool, message: &str) {

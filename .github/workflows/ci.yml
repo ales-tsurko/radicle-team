@@ -32,6 +32,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install bubblewrap
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -56,6 +60,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
 
       - name: Install Rust nightly tools
         run: rustup toolchain install nightly --component miri --component rust-src --component rustfmt
