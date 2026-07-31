@@ -11,7 +11,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 use crate::{
     Application, Setup,
     cli::setup::{Error, SecurityManifest},
-    manifest::Manifest,
+    manifest::{Manifest, TriggerAccess},
     member::Member,
 };
 
@@ -37,6 +37,7 @@ pub(crate) enum ManifestUpdate {
     Create {
         entry: ManifestEntry,
         security: SecurityManifest,
+        triggered_by: TriggerAccess,
     },
     Extend(ManifestEntry),
 }
@@ -44,14 +45,20 @@ pub(crate) enum ManifestUpdate {
 #[derive(Serialize)]
 struct SetupDocument<'a> {
     version: u32,
+    triggered_by: &'a TriggerAccess,
     security: SetupSecurity<'a>,
     members: BTreeMap<&'static str, SetupBinding>,
 }
 
 impl<'a> SetupDocument<'a> {
-    fn new(entry: &ManifestEntry, security: &'a SecurityManifest) -> Self {
+    fn new(
+        entry: &ManifestEntry,
+        security: &'a SecurityManifest,
+        triggered_by: &'a TriggerAccess,
+    ) -> Self {
         Self {
             version: 1,
+            triggered_by,
             security: SetupSecurity {
                 repository: security.repository,
                 recipients: [&security.recipient],
@@ -88,8 +95,16 @@ struct SetupBinding {
 }
 
 impl ManifestUpdate {
-    pub(super) const fn create(entry: ManifestEntry, security: SecurityManifest) -> Self {
-        Self::Create { entry, security }
+    pub(super) const fn create(
+        entry: ManifestEntry,
+        security: SecurityManifest,
+        triggered_by: TriggerAccess,
+    ) -> Self {
+        Self::Create {
+            entry,
+            security,
+            triggered_by,
+        }
     }
 
     pub(super) const fn extend(entry: ManifestEntry) -> Self {
@@ -110,8 +125,12 @@ impl ManifestUpdate {
         };
         let create = existing.is_none();
         let contents = match self {
-            Self::Create { entry, security } if existing.is_none() => {
-                SetupDocument::new(entry, security).serialize()?
+            Self::Create {
+                entry,
+                security,
+                triggered_by,
+            } if existing.is_none() => {
+                SetupDocument::new(entry, security, triggered_by).serialize()?
             }
             Self::Create { .. } => return Err(Error::ExistingManifest),
             Self::Extend(entry) => {

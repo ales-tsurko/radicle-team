@@ -75,7 +75,7 @@ impl Helper {
 
 /// Error preparing the embedded Linux helper.
 #[derive(Debug, thiserror::Error)]
-pub(super) enum Error {
+pub enum Error {
     /// The embedding executable omitted early helper dispatch.
     #[error(
         "Linux sandbox helper is uninitialized; call \

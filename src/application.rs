@@ -202,10 +202,16 @@ impl Application {
             generation = binding.generation(),
             "team member initialized"
         );
-        AgentRuntime::start(self, runtime, agent, binding.mcp_allow().clone())
-            .await?
-            .run(self, agent)
-            .await
+        AgentRuntime::start(
+            self,
+            runtime,
+            agent,
+            binding.mcp_allow().clone(),
+            binding.triggered_by().clone(),
+        )
+        .await?
+        .run(self, agent)
+        .await
     }
 
     fn warn_agent_stop(stopped: Result<(), agent::Error>) {
@@ -668,6 +674,7 @@ impl Runtime {
 struct AgentRuntime {
     runtime: Runtime,
     mcp: mcp::Server,
+    triggered_by: manifest::TriggerAccess,
 }
 
 impl AgentRuntime {
@@ -676,6 +683,7 @@ impl AgentRuntime {
         runtime: Runtime,
         agent: &mut (impl Agent + ?Sized),
         allowlist: manifest::McpAllowlist,
+        triggered_by: manifest::TriggerAccess,
     ) -> Result<Self, Error> {
         let authorizer = WriteAuthorizer {
             application: application.clone(),
@@ -688,7 +696,11 @@ impl AgentRuntime {
         let (runtime, mcp) = Self::start_mcp(application, runtime, publisher, allowlist).await?;
         let (runtime, mcp) = Self::start_agent(application, runtime, mcp, agent).await?;
 
-        Ok(Self { runtime, mcp })
+        Ok(Self {
+            runtime,
+            mcp,
+            triggered_by,
+        })
     }
 
     async fn start_mcp(
@@ -783,16 +795,20 @@ impl AgentRuntime {
             *profile.id(),
         );
         let delivery_scope = self.mcp.delivery_scope();
-        let watched = watcher::Watcher::new(application.member, application.repository)
-            .run(
-                profile,
-                self.runtime.node.node(),
-                &self.runtime.home.state_database(),
-                agent,
-                workspaces,
-                delivery_scope,
-            )
-            .await;
+        let watched = watcher::Watcher::new(
+            application.member,
+            application.repository,
+            self.triggered_by.clone(),
+        )
+        .run(
+            profile,
+            self.runtime.node.node(),
+            &self.runtime.home.state_database(),
+            agent,
+            workspaces,
+            delivery_scope,
+        )
+        .await;
         let interrupted = application.shutdown.is_requested();
         let cleanup = RunCleanup {
             agent: agent.stop().await,
@@ -1285,6 +1301,7 @@ mod tests {
             Revision::Repository(Oid::from_sha1([0; 20])),
             crate::manifest::McpAllowlist::default(),
             crate::manifest::SecurityPolicy::test(repository),
+            crate::manifest::TriggerAccess::Delegates,
         );
         application
             .record_binding(&home, binding.clone())

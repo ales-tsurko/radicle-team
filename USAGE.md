@@ -138,8 +138,8 @@ repository checkout. It shows the exact Git commands and asks before writing
 `.radicle-team.toml`, creating a commit, and opening a Radicle patch with the
 user's identity.
 
-For a new manifest, the wizard asks whether to create a private security-report
-repository with the user's Radicle identity or use an existing repository RID.
+For a new manifest, the wizard asks who may trigger the repository's agents,
+then whether to create a private security-report repository with the user's Radicle identity or use an existing repository RID.
 It grants the member DID access, generates an age encryption identity, and
 shows its recovery key once. Save that key outside every agent environment.
 Later member setup grants each new DID access through the same repository
@@ -269,6 +269,7 @@ logs, locks, and watcher state remain under `~/.radicle-team`.
 
 ```toml
 version = 1
+triggered_by = "delegates"
 
 [security]
 repository = "rad:z3Security..."
@@ -280,6 +281,30 @@ generation = 1
 state = "active"
 mcp_allow = ["read", "comments", "patches", "reactions", "reviews"]
 ```
+
+`triggered_by` decides whose activity may put a member to work. Assignments,
+mentions, replies, and other changes from an identity outside it are recorded
+but never dispatched, so they cost nothing.
+
+```toml
+triggered_by = "delegates"                    # default when omitted
+triggered_by = "anyone"
+triggered_by = ["did:key:z6Mk...", "did:key:z6Mk..."]
+```
+
+Repository delegates are always allowed, including when explicit DIDs are
+listed, because they control this manifest and could grant themselves access by
+editing it. `"anyone"` suits a private repository, where Radicle's own access
+list already decides who can write. On a public repository it lets any seeding
+peer spend the operator's agent budget.
+
+Omitting `triggered_by` restricts triggers to delegates. The setup wizard asks
+for it when it creates a manifest and leaves it alone when it later adds a
+member, so editing the value by hand is safe.
+
+Delegates are re-read on every scan, so granting or revoking one takes effect
+without restarting the member. Keep `triggered_by` above `[security]`: TOML
+assigns any key after a table header to that table.
 
 `mcp_allow` accepts exact MCP method names and the fixed `read`, `comments`,
 `issues`, `patches`, `reactions`, and `reviews` groups. The `patches` group does

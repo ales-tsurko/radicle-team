@@ -1,6 +1,9 @@
 //! Setup wizard orchestration.
 
-use std::{io, io::IsTerminal as _, path::Path, process::ExitStatus};
+use std::{
+    collections::BTreeSet, io, io::IsTerminal as _, path::Path, process::ExitStatus,
+    str::FromStr as _,
+};
 
 use radicle::identity::Did;
 
@@ -10,7 +13,7 @@ use crate::{
         ManifestEntry, ManifestUpdate, RepositoryCheckout, SandboxSetup, SecurityManifest,
         SecuritySetup,
     },
-    manifest::FILE_NAME,
+    manifest::{FILE_NAME, TriggerAccess},
     member::Member,
 };
 
@@ -61,7 +64,8 @@ impl SetupWizard {
         let action = match status {
             SetupStatus::ManifestMissing { .. } => {
                 "add .radicle-team.toml to the repository's canonical branch:\n\nversion = \
-                 1\n\n[security]\nrepository = \"rad:...\"\nrecipients = [\"age1...\"]\n\n"
+                 1\ntriggered_by = \"delegates\"\n\n[security]\nrepository = \
+                 \"rad:...\"\nrecipients = [\"age1...\"]\n\n"
             }
             SetupStatus::BindingMissing { .. } => "add this binding to .radicle-team.toml:\n\n",
             SetupStatus::Ready { .. } => {
@@ -83,8 +87,9 @@ impl SetupWizard {
         let action = match status {
             SetupStatus::ManifestMissing { .. } => {
                 format!(
-                    "create explicit manifest '{}':\n\nversion = 1\n\n[security]\nrepository = \
-                     \"rad:...\"\nrecipients = [\"age1...\"]\n\n",
+                    "create explicit manifest '{}':\n\nversion = 1\ntriggered_by = \
+                     \"delegates\"\n\n[security]\nrepository = \"rad:...\"\nrecipients = \
+                     [\"age1...\"]\n\n",
                     path.display()
                 )
             }
@@ -106,17 +111,17 @@ impl SetupWizard {
     }
 
     async fn run_interactive(&self) -> Result<(), Error> {
-        let mut security = None;
+        let mut policy = None;
         loop {
-            if self.step(&mut security).await? == Step::Complete {
+            if self.step(&mut policy).await? == Step::Complete {
                 return Ok(());
             }
         }
     }
 
-    async fn step(&self, security: &mut Option<SecurityManifest>) -> Result<Step, Error> {
+    async fn step(&self, policy: &mut Option<NewManifestPolicy>) -> Result<Step, Error> {
         match self.attempt().await {
-            Ok(setup) => self.handle_setup(setup, security).await,
+            Ok(setup) => self.handle_setup(setup, policy).await,
             Err(error) => self.handle_error(error),
         }
     }
@@ -124,14 +129,14 @@ impl SetupWizard {
     async fn handle_setup(
         &self,
         setup: Setup,
-        security: &mut Option<SecurityManifest>,
+        policy: &mut Option<NewManifestPolicy>,
     ) -> Result<Step, Error> {
         if matches!(setup.status(), SetupStatus::Ready { .. }) {
             self.configure_sandbox()?;
             cliclack::outro(setup)?;
             Ok(Step::Complete)
         } else {
-            self.prepare_manifest(setup, security).await?;
+            self.prepare_manifest(setup, policy).await?;
             Ok(Step::Retry)
         }
     }
@@ -158,9 +163,9 @@ impl SetupWizard {
     async fn prepare_manifest(
         &self,
         setup: Setup,
-        security: &mut Option<SecurityManifest>,
+        policy: &mut Option<NewManifestPolicy>,
     ) -> Result<(), Error> {
-        let update = self.manifest_update(&setup, security).await?;
+        let update = self.manifest_update(&setup, policy).await?;
         self.show_manifest(update.entry())?;
         if let Some(path) = self.application.manifest_file() {
             return self.prepare_explicit_manifest(path, update).await;
@@ -172,12 +177,10 @@ impl SetupWizard {
     async fn manifest_update(
         &self,
         setup: &Setup,
-        security: &mut Option<SecurityManifest>,
+        policy: &mut Option<NewManifestPolicy>,
     ) -> Result<ManifestUpdate, Error> {
         match setup.status() {
-            SetupStatus::ManifestMissing { .. } => {
-                self.create_manifest_update(setup, security).await
-            }
+            SetupStatus::ManifestMissing { .. } => self.create_manifest_update(setup, policy).await,
             SetupStatus::BindingMissing { .. } => self.extend_manifest_update(setup).await,
             SetupStatus::Ready { .. } => Err(Error::ReadyManifest),
         }
@@ -186,17 +189,72 @@ impl SetupWizard {
     async fn create_manifest_update(
         &self,
         setup: &Setup,
-        security: &mut Option<SecurityManifest>,
+        policy: &mut Option<NewManifestPolicy>,
     ) -> Result<ManifestUpdate, Error> {
-        let security = match security {
-            Some(security) => security.clone(),
-            None => security
-                .insert(self.provision_security(setup.did()).await?)
+        let policy = match policy {
+            Some(policy) => policy.clone(),
+            None => policy
+                .insert(self.prompt_new_policy(setup.did()).await?)
                 .clone(),
         };
         let entry = ManifestEntry::new(&self.application, setup);
 
-        Ok(ManifestUpdate::create(entry, security))
+        Ok(ManifestUpdate::create(
+            entry,
+            policy.security,
+            policy.triggered_by,
+        ))
+    }
+
+    async fn prompt_new_policy(&self, did: Did) -> Result<NewManifestPolicy, Error> {
+        let triggered_by = Self::trigger_access()?;
+        let security = self.provision_security(did).await?;
+
+        Ok(NewManifestPolicy {
+            security,
+            triggered_by,
+        })
+    }
+
+    fn trigger_access() -> Result<TriggerAccess, Error> {
+        let choice = cliclack::select("Who may trigger this repository's agents?")
+            .initial_value(TriggerChoice::Delegates)
+            .item(
+                TriggerChoice::Delegates,
+                "Repository delegates",
+                "recommended",
+            )
+            .item(TriggerChoice::Dids, "Delegates and selected identities", "")
+            .item(
+                TriggerChoice::Anyone,
+                "Anyone",
+                "only for a private repository",
+            )
+            .interact()?;
+        match choice {
+            TriggerChoice::Delegates => Ok(TriggerAccess::Delegates),
+            TriggerChoice::Anyone => Ok(TriggerAccess::Anyone),
+            TriggerChoice::Dids => Self::trigger_dids(),
+        }
+    }
+
+    fn trigger_dids() -> Result<TriggerAccess, Error> {
+        let value: String = cliclack::input("Allowed identities (one DID per line)")
+            .placeholder("did:key:z6Mk...")
+            .multiline()
+            .interact()?;
+        let dids = value
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(Did::from_str)
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(Error::TriggerDid)?;
+        if dids.is_empty() {
+            return Err(Error::EmptyTriggerDids);
+        }
+
+        Ok(TriggerAccess::Dids(dids))
     }
 
     async fn extend_manifest_update(&self, setup: &Setup) -> Result<ManifestUpdate, Error> {
@@ -450,6 +508,20 @@ enum Step {
     Complete,
 }
 
+/// Repository-wide policy chosen once when the wizard creates a manifest.
+#[derive(Debug, Clone)]
+struct NewManifestPolicy {
+    security: SecurityManifest,
+    triggered_by: TriggerAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerChoice {
+    Delegates,
+    Dids,
+    Anyone,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecurityRepositoryChoice {
     Create,
@@ -486,6 +558,12 @@ pub enum Error {
     /// A domain allowlist was selected without any domains.
     #[error("at least one sandbox external network domain is required")]
     EmptySandboxDomains,
+    /// A trigger allowlist was selected without any identities.
+    #[error("at least one triggering identity is required")]
+    EmptyTriggerDids,
+    /// A triggering identity is not a valid DID.
+    #[error("invalid triggering identity: {0}")]
+    TriggerDid(radicle::identity::did::DidError),
     /// A setup filesystem or subprocess operation failed.
     #[error("setup I/O failed: {0}")]
     Io(#[from] io::Error),

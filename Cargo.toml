@@ -49,6 +49,13 @@ rustix = { version = "1.1.4", features = ["process"] }
 [dev-dependencies]
 rmcp = { version = "2.2.0", features = ["client", "transport-streamable-http-client-reqwest"] }
 
+# Linux sandboxing re-enters this binary as `zerobox-linux-sandbox`, which requires helper
+# dispatch before argument parsing. libtest owns `main` in a harness test and never dispatches,
+# so sandboxed spawning can only be verified from a binary that controls its own `main`.
+[[test]]
+name = "sandbox_spawn"
+harness = false
+
 [lints]
 workspace = true
 

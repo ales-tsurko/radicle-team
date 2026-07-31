@@ -4,6 +4,8 @@
 //! [`Config`]. Adapters may select and parameterize a command, but cannot change its filesystem or
 //! network permissions.
 
+#[cfg(target_os = "linux")]
+pub use crate::sandbox::linux::Error as LinuxHelperError;
 pub use crate::sandbox::{
     command::{AgentChild, AgentCommand, AgentSandbox, Error},
     config::{Config, ConfigError, ExternalNetwork},

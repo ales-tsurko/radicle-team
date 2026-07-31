@@ -2,7 +2,7 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
-use std::{fs, path::PathBuf, process::Command, str::FromStr as _};
+use std::{collections::BTreeSet, fs, path::PathBuf, process::Command, str::FromStr as _};
 
 use radicle::identity::{Did, RepoId};
 
@@ -11,7 +11,7 @@ use crate::{
     cli::setup::{
         Error, ManifestEntry, ManifestUpdate, RepositoryCheckout, SecurityManifest, SetupWizard,
     },
-    manifest::{FILE_NAME, Manifest},
+    manifest::{FILE_NAME, Manifest, TriggerAccess},
     member::Member,
 };
 
@@ -89,6 +89,7 @@ impl Fixture {
                 repository: RepoId::from_str(REPOSITORY).expect("repository ID should parse"),
                 recipient: RECIPIENT.to_owned(),
             },
+            TriggerAccess::Delegates,
         )
     }
 
@@ -161,6 +162,55 @@ fn emits_each_members_preconfigured_mcp_groups() {
     assert!(maya.contains(
         "mcp_allow = [\"read\", \"comments\", \"issues\", \"patches\", \"reactions\", \"reviews\"]"
     ));
+}
+
+#[test]
+fn writes_every_trigger_access_form_above_the_security_table() {
+    for (access, expected) in [
+        (TriggerAccess::Delegates, "triggered_by = \"delegates\""),
+        (TriggerAccess::Anyone, "triggered_by = \"anyone\""),
+        (
+            TriggerAccess::Dids(BTreeSet::from([
+                NICO.parse().expect("DID should parse"),
+                MAYA.parse().expect("DID should parse"),
+            ])),
+            "triggered_by = [",
+        ),
+    ] {
+        let fixture = Fixture::new("trigger-access");
+        let manifest = fixture.manifest();
+        let _removed = fs::remove_file(&manifest);
+        let entry = Fixture::entry(Member::Nico, NICO);
+        let update = ManifestUpdate::create(
+            entry.clone(),
+            SecurityManifest {
+                repository: RepoId::from_str(REPOSITORY).expect("repository ID should parse"),
+                recipient: RECIPIENT.to_owned(),
+            },
+            access.clone(),
+        );
+
+        assert!(matches!(update.prepare(&manifest), Ok(true)));
+
+        let contents = fs::read_to_string(&manifest).expect("manifest should be readable");
+        assert!(
+            contents.contains(expected),
+            "{access:?} should serialize as '{expected}', got:\n{contents}"
+        );
+        let triggered_by = contents
+            .find("triggered_by")
+            .expect("the generated manifest should set 'triggered_by'");
+        let security = contents
+            .find("[security]")
+            .expect("the generated manifest should contain the security table");
+        assert!(
+            triggered_by < security,
+            "'triggered_by' must precede '[security]', or TOML makes it a key of that \
+             table:\n{contents}"
+        );
+        Manifest::validate_candidate(&contents, Member::Nico, entry.did)
+            .expect("the generated manifest should parse back");
+    }
 }
 
 #[test]
@@ -317,10 +367,11 @@ fn extends_inline_and_dotted_member_maps() {
 fn validates_a_checkout_manifest_before_writing_it() {
     let fixture = Fixture::new("invalid-checkout-manifest");
     let manifest = fixture.manifest();
-    let unsupported =
-        "version = 2\n[security]\nrepository = \"rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc\"\nrecipients \
-         = [\"age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa\"]\n[members]\n";
-    fs::write(&manifest, unsupported).expect("manifest should be written");
+    let unsupported = format!(
+        "version = 2\n\n[security]\nrepository = \"{REPOSITORY}\"\nrecipients = \
+         [\"{RECIPIENT}\"]\n\n[members]\n"
+    );
+    fs::write(&manifest, &unsupported).expect("manifest should be written");
 
     assert!(matches!(
         Fixture::extend(Fixture::entry(Member::Nico, NICO)).prepare(&manifest),

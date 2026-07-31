@@ -11,17 +11,35 @@ use radicle::{
         EntryId, Op,
         patch::{ReviewId, RevisionId},
     },
-    identity::RepoId,
+    identity::{Did, RepoId},
     node::NodeId,
 };
 
 use crate::{
+    manifest::TriggerAccess,
     member::Member,
     watcher::{
         Change, Comment, Subject, Target,
         activity::{Activity, Kind},
     },
 };
+
+/// Repository trigger policy resolved against the current delegate set.
+#[derive(Debug, Clone)]
+pub(super) struct Triggers {
+    access: TriggerAccess,
+    delegates: Vec<Did>,
+}
+
+impl Triggers {
+    pub(super) const fn new(access: TriggerAccess, delegates: Vec<Did>) -> Self {
+        Self { access, delegates }
+    }
+
+    pub(super) fn allows(&self, author: Did) -> bool {
+        self.access.allows(author, &self.delegates)
+    }
+}
 
 /// Stateful reducer which classifies normalized actions for one collaborative object.
 #[derive(Debug, Default)]
@@ -37,6 +55,12 @@ impl Context {
         self.assigned
     }
 
+    /// Classifies one operation, emitting activities only for authors allowed to trigger work.
+    ///
+    /// Reduction runs for every author so that involvement, ownership, and assignment stay
+    /// consistent with the repository. Only emission is gated, because suppressing the state
+    /// updates would make a later trusted operation on the same subject classify against a
+    /// history the repository does not have.
     pub(super) fn classify<A>(
         &mut self,
         operation: &Op<A>,
@@ -44,6 +68,7 @@ impl Context {
         member_id: NodeId,
         repository: RepoId,
         subject: Subject,
+        triggers: &Triggers,
     ) -> Vec<Activity>
     where
         for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
@@ -53,17 +78,22 @@ impl Context {
             self.owned = authored_by_member;
             self.seen = true;
         }
+        let author = Did::from(operation.author);
+        let may_trigger = authored_by_member || triggers.allows(author);
 
         let mut activities = Vec::new();
         for (action_index, action) in operation.actions.iter().enumerate() {
             let normalized = ActionEnvelope::new(action, operation, member_id).into();
             if let Relevance::Relevant(kind) = self.reduce(normalized, member, authored_by_member) {
+                if !may_trigger {
+                    continue;
+                }
                 activities.push(Activity::new(
                     repository,
                     subject,
                     operation.id,
                     action_index,
-                    operation.author.into(),
+                    author,
                     kind,
                 ));
             }

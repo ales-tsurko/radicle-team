@@ -16,16 +16,18 @@ use radicle::{
 };
 
 use crate::{
+    manifest::TriggerAccess,
     member::Member,
     watcher::{
         Change, Comment, Subject,
         activity::{Activity, Kind},
-        classification::{ActionEnvelope, Context, NormalizedAction},
+        classification::{ActionEnvelope, Context, NormalizedAction, Triggers},
     },
 };
 
 const MEMBER: &str = "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
 const AUTHOR: &str = "z6MkvUJtYD9dHDJfpevWRT98mzDDpdAtmUjwyDSkyqksUr7C";
+const DELEGATE: &str = "z6MkeXCES4onVW4up9Qgz1KRnZsKmGufcaZxF6Zpv2w5QwUK";
 const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 const ISSUE: &str = "1111111111111111111111111111111111111111";
 const OPERATION: &str = "2222222222222222222222222222222222222222";
@@ -64,6 +66,23 @@ impl Fixture {
             PublicKey::from_str(MEMBER).expect("member key should be valid"),
             RepoId::from_str(REPOSITORY).expect("repository should be valid"),
             subject,
+            &Triggers::new(TriggerAccess::Anyone, Vec::new()),
+        )
+    }
+
+    fn classify_with(
+        action: Action,
+        author: PublicKey,
+        context: &mut Context,
+        triggers: &Triggers,
+    ) -> Vec<Activity> {
+        context.classify(
+            &Self::operation(OPERATION, action, author, TYPENAME.clone()),
+            Member::Nico,
+            PublicKey::from_str(MEMBER).expect("member key should be valid"),
+            RepoId::from_str(REPOSITORY).expect("repository should be valid"),
+            Subject::Issue(ObjectId::from_str(ISSUE).expect("issue should be valid")),
+            triggers,
         )
     }
 
@@ -93,6 +112,87 @@ impl Fixture {
             context,
         )
     }
+}
+
+#[test]
+fn suppresses_activities_from_authors_that_may_not_trigger() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let delegate = PublicKey::from_str(DELEGATE).expect("delegate key should be valid");
+    let assignment = Action::Assign {
+        assignees: BTreeSet::from([Did::from(member)]),
+    };
+    let delegates = vec![Did::from(delegate)];
+
+    let permitted = Fixture::classify_with(
+        assignment.clone(),
+        author,
+        &mut Context::default(),
+        &Triggers::new(TriggerAccess::Anyone, delegates.clone()),
+    );
+    assert!(
+        !permitted.is_empty(),
+        "'anyone' must let a non-delegate trigger work; without this control the suppression \
+         below could come from the action rather than the policy"
+    );
+
+    let mut context = Context::default();
+    let suppressed = Fixture::classify_with(
+        assignment.clone(),
+        author,
+        &mut context,
+        &Triggers::new(TriggerAccess::Delegates, delegates.clone()),
+    );
+    assert!(
+        suppressed.is_empty(),
+        "'delegates' must suppress a non-delegate's assignment"
+    );
+    assert!(
+        context.assigned(),
+        "the suppressed assignment must still update state, so that later delegate activity on \
+         this subject classifies against the repository's real history"
+    );
+
+    assert!(
+        !Fixture::classify_with(
+            assignment,
+            delegate,
+            &mut Context::default(),
+            &Triggers::new(TriggerAccess::Delegates, delegates),
+        )
+        .is_empty(),
+        "'delegates' must let a delegate trigger work"
+    );
+}
+
+#[test]
+fn listed_trigger_dids_keep_delegate_access() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let delegate = PublicKey::from_str(DELEGATE).expect("delegate key should be valid");
+    let assignment = Action::Assign {
+        assignees: BTreeSet::from([Did::from(member)]),
+    };
+    let triggers = Triggers::new(
+        TriggerAccess::Dids(BTreeSet::from([Did::from(author)])),
+        vec![Did::from(delegate)],
+    );
+
+    assert!(
+        !Fixture::classify_with(
+            assignment.clone(),
+            author,
+            &mut Context::default(),
+            &triggers
+        )
+        .is_empty(),
+        "a listed DID must trigger work"
+    );
+    assert!(
+        !Fixture::classify_with(assignment, delegate, &mut Context::default(), &triggers)
+            .is_empty(),
+        "delegates keep access when explicit DIDs are listed, because they control the manifest"
+    );
 }
 
 #[test]

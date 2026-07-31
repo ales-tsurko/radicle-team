@@ -304,6 +304,7 @@ mod tests {
                 Revision::Repository(Oid::from_sha1([0; 20])),
                 crate::manifest::McpAllowlist::default(),
                 crate::manifest::SecurityPolicy::test(Self::repository()),
+                crate::manifest::TriggerAccess::Delegates,
             )
         }
     }

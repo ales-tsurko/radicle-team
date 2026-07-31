@@ -10,19 +10,22 @@ use radicle::{
         store::access::ReadOnly,
         stream::CobStream as _,
     },
-    identity::RepoId,
+    identity::{Did, RepoId},
     node::{Handle as _, Node, NodeId, events::Event as NodeEvent},
     profile::Profile as RadicleProfile,
-    storage::{ReadStorage as _, RefUpdate, git::Storage},
+    storage::{ReadRepository as _, ReadStorage as _, RefUpdate, git::Storage},
 };
 
 use crate::{
     agent::{self, Agent},
+    manifest::TriggerAccess,
     mcp::DeliveryScope,
     member::Member,
     watcher::{
         activity::{Activity, Kind, Subject},
-        classification::{ActionEnvelope, Context as ClassificationContext, NormalizedAction},
+        classification::{
+            ActionEnvelope, Context as ClassificationContext, NormalizedAction, Triggers,
+        },
         state::ProcessedActivities,
     },
     workspace::Workspaces,
@@ -61,6 +64,7 @@ macro_rules! history_scanner {
 pub struct Watcher {
     member: Member,
     repository: RepoId,
+    triggered_by: TriggerAccess,
 }
 
 impl Watcher {
@@ -85,8 +89,12 @@ impl Watcher {
 
     /// Creates a watcher for `member` and `repository`.
     #[must_use]
-    pub const fn new(member: Member, repository: RepoId) -> Self {
-        Self { member, repository }
+    pub const fn new(member: Member, repository: RepoId, triggered_by: TriggerAccess) -> Self {
+        Self {
+            member,
+            repository,
+            triggered_by,
+        }
     }
 
     /// Watches with an identity profile already validated by the controller.
@@ -195,28 +203,56 @@ impl Watcher {
         agent: &mut (impl Agent + ?Sized),
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error> {
+        let triggers = self.resolve_triggers(storage).await?;
         let issues = self.issue_histories(storage.clone());
-        self.scan_objects(issues, member_id, state, agent, delivery, Subject::Issue)
-            .await?;
+        self.scan_objects(
+            issues,
+            state,
+            agent,
+            delivery,
+            HistorySource::new(member_id, Subject::Issue, &triggers),
+        )
+        .await?;
         let patches = self.patch_histories(storage.clone());
-        self.scan_objects(patches, member_id, state, agent, delivery, Subject::Patch)
-            .await
+        self.scan_objects(
+            patches,
+            state,
+            agent,
+            delivery,
+            HistorySource::new(member_id, Subject::Patch, &triggers),
+        )
+        .await
+    }
+
+    /// Resolves the repository's current delegate set for `access`.
+    ///
+    /// Delegates are re-read on every scan so that adding or removing one takes effect without
+    /// restarting the member process.
+    async fn resolve_triggers(&self, storage: &Storage) -> Result<Triggers, Error> {
+        let storage = storage.clone();
+        let repository = self.repository;
+        let delegates = tokio::task::spawn_blocking(move || {
+            let repository = storage.repository(repository)?;
+            Ok::<Vec<Did>, Error>(repository.delegates()?.into_iter().collect())
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))??;
+
+        Ok(Triggers::new(self.triggered_by.clone(), delegates))
     }
 
     async fn scan_objects<A>(
         &self,
         mut histories: tokio::sync::mpsc::Receiver<HistoryEvent<A>>,
-        member_id: NodeId,
         state: &ProcessedActivities,
         agent: &mut (impl Agent + ?Sized),
         delivery: &DeliveryRuntime,
-        subject: fn(ObjectId) -> Subject,
+        source: HistorySource<'_>,
     ) -> Result<(), Error>
     where
         for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
     {
         let mut active = None;
-        let source = HistorySource { member_id, subject };
         while let Some(event) = histories.recv().await {
             self.handle_history_event(event, source, &mut active, state, agent, delivery)
                 .await?;
@@ -263,7 +299,7 @@ impl Watcher {
     async fn handle_history_event<A>(
         &self,
         event: HistoryEvent<A>,
-        source: HistorySource,
+        source: HistorySource<'_>,
         active: &mut Option<ActiveHistory>,
         state: &ProcessedActivities,
         agent: &mut (impl Agent + ?Sized),
@@ -276,7 +312,9 @@ impl Watcher {
             HistoryEvent::Begin { object, actionable } => {
                 self.begin_history(object, actionable, source.member_id, source.subject, active)
             }
-            HistoryEvent::Operation(operation) => Self::scan_active(operation, active, state).await,
+            HistoryEvent::Operation(operation) => {
+                Self::scan_active(operation, active, state, source.triggers).await
+            }
             HistoryEvent::End => Self::finish_active(active, state, agent, delivery).await,
             HistoryEvent::Failed(error) => Err(error),
         }
@@ -315,6 +353,7 @@ impl Watcher {
         operation: Op<A>,
         active: &mut Option<ActiveHistory>,
         state: &ProcessedActivities,
+        triggers: &Triggers,
     ) -> Result<(), Error>
     where
         for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
@@ -328,6 +367,7 @@ impl Watcher {
             &mut active.context,
             &mut active.pending,
             state,
+            triggers,
         )
         .await
     }
@@ -370,6 +410,7 @@ impl Watcher {
         context: &mut ClassificationContext,
         pending: &mut PendingActivities,
         state: &ProcessedActivities,
+        triggers: &Triggers,
     ) -> Result<(), Error>
     where
         for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
@@ -380,6 +421,7 @@ impl Watcher {
             scope.member_id,
             scope.repository,
             scope.subject,
+            triggers,
         );
         for activity in activities {
             let delivery = activity.delivery_id();
@@ -458,9 +500,24 @@ struct ActiveHistory {
 }
 
 #[derive(Clone, Copy)]
-struct HistorySource {
+struct HistorySource<'a> {
     member_id: NodeId,
     subject: fn(ObjectId) -> Subject,
+    triggers: &'a Triggers,
+}
+
+impl<'a> HistorySource<'a> {
+    const fn new(
+        member_id: NodeId,
+        subject: fn(ObjectId) -> Subject,
+        triggers: &'a Triggers,
+    ) -> Self {
+        Self {
+            member_id,
+            subject,
+            triggers,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

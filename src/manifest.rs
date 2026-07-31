@@ -27,7 +27,7 @@ use radicle::{
     identity::{Did, RepoId},
     storage::{ReadRepository as _, RepositoryError, git::Repository},
 };
-use serde::{Deserialize, Deserializer, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{
     identity::{Identity, permissions::Permissions},
@@ -43,6 +43,7 @@ const SCHEMA_VERSION: u32 = 1;
 pub struct Manifest {
     members: BTreeMap<Member, Binding>,
     security: SecurityPolicy,
+    triggered_by: TriggerAccess,
     revision: Revision,
 }
 
@@ -170,6 +171,7 @@ impl Manifest {
             self.revision,
             binding.mcp_allow.clone(),
             self.security.clone(),
+            self.triggered_by.clone(),
         ))
     }
 
@@ -192,6 +194,7 @@ impl Manifest {
         Ok(Self {
             members,
             security: document.security,
+            triggered_by: document.triggered_by,
             revision,
         })
     }
@@ -342,6 +345,84 @@ impl<'de> Deserialize<'de> for McpAllowlist {
     }
 }
 
+/// Identities allowed to trigger this repository's agents.
+///
+/// Repository delegates are always allowed, because they control the manifest and could grant
+/// themselves access by editing it. Restricting them would express an intent the manifest cannot
+/// enforce.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TriggerAccess {
+    /// Only repository delegates.
+    #[default]
+    Delegates,
+    /// Any identity that can author an operation in this repository.
+    Anyone,
+    /// Repository delegates and the listed identities.
+    Dids(BTreeSet<Did>),
+}
+
+impl TriggerAccess {
+    /// Returns whether `author` may trigger agent work, given the repository's `delegates`.
+    #[must_use]
+    pub fn allows(&self, author: Did, delegates: &[Did]) -> bool {
+        match self {
+            Self::Anyone => true,
+            Self::Delegates => delegates.contains(&author),
+            Self::Dids(dids) => dids.contains(&author) || delegates.contains(&author),
+        }
+    }
+}
+
+impl Serialize for TriggerAccess {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Delegates => serializer.serialize_str("delegates"),
+            Self::Anyone => serializer.serialize_str("anyone"),
+            Self::Dids(dids) => serializer.collect_seq(dids.iter().map(Did::to_string)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TriggerAccess {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match TriggerValue::deserialize(deserializer)? {
+            TriggerValue::Mode(TriggerMode::Delegates) => Ok(Self::Delegates),
+            TriggerValue::Mode(TriggerMode::Anyone) => Ok(Self::Anyone),
+            TriggerValue::Dids(dids) => {
+                if dids.is_empty() {
+                    return Err(de::Error::custom(
+                        "'triggered_by' cannot be an empty list; use \"delegates\" or \"anyone\"",
+                    ));
+                }
+                dids.into_iter()
+                    .map(|did| Did::from_str(&did).map_err(de::Error::custom))
+                    .collect::<Result<_, _>>()
+                    .map(Self::Dids)
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TriggerValue {
+    Mode(TriggerMode),
+    Dids(Vec<String>),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TriggerMode {
+    Delegates,
+    Anyone,
+}
+
 /// Revision from which the manifest was loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Revision {
@@ -360,6 +441,7 @@ pub struct ValidatedBinding {
     revision: Revision,
     mcp_allow: McpAllowlist,
     security: SecurityPolicy,
+    triggered_by: TriggerAccess,
 }
 
 impl ValidatedBinding {
@@ -370,6 +452,7 @@ impl ValidatedBinding {
         revision: Revision,
         mcp_allow: McpAllowlist,
         security: SecurityPolicy,
+        triggered_by: TriggerAccess,
     ) -> Self {
         Self {
             member,
@@ -378,7 +461,14 @@ impl ValidatedBinding {
             revision,
             mcp_allow,
             security,
+            triggered_by,
         }
+    }
+
+    /// Returns the identities allowed to trigger this repository's agents.
+    #[must_use]
+    pub const fn triggered_by(&self) -> &TriggerAccess {
+        &self.triggered_by
     }
 
     /// Returns the bound member.
@@ -423,6 +513,8 @@ impl ValidatedBinding {
 struct Document {
     version: u32,
     security: SecurityPolicy,
+    #[serde(default)]
+    triggered_by: TriggerAccess,
     members: BTreeMap<String, Binding>,
 }
 
@@ -581,12 +673,12 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{collections::BTreeSet, fs, path::PathBuf};
 
     use radicle::identity::Did;
 
     use crate::{
-        manifest::{Error, Manifest, McpAllowlist, Revision},
+        manifest::{Error, Manifest, McpAllowlist, Revision, TriggerAccess},
         member::Member,
     };
 
@@ -779,6 +871,60 @@ mod tests {
             )),
             Err(Error::UnknownMember(_))
         ));
+    }
+
+    #[test]
+    fn parses_every_trigger_access_form() {
+        let member = format!(
+            "[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
+             \"active\"\nmcp_allow = []\n"
+        );
+        let document = |triggered_by: &str| {
+            format!(
+                "version = 1\n{triggered_by}[security]\nrepository = \"{REPOSITORY}\"\nrecipients \
+                 = [\"{RECIPIENT}\"]\n{member}"
+            )
+        };
+        let parse = |value: &str| {
+            Manifest::parse(
+                &document(&format!("triggered_by = {value}\n")),
+                Revision::External,
+            )
+            .map(|manifest| manifest.triggered_by)
+        };
+
+        assert_eq!(
+            Manifest::parse(&document(""), Revision::External)
+                .expect("a manifest without 'triggered_by' should parse")
+                .triggered_by,
+            TriggerAccess::Delegates,
+            "omitting 'triggered_by' must fall back to delegates rather than opening the \
+             repository"
+        );
+        assert_eq!(
+            parse("\"delegates\"").expect("\"delegates\" should parse"),
+            TriggerAccess::Delegates
+        );
+        assert_eq!(
+            parse("\"anyone\"").expect("\"anyone\" should parse"),
+            TriggerAccess::Anyone
+        );
+        assert_eq!(
+            parse(&format!("[\"{NICO}\"]")).expect("a DID list should parse"),
+            TriggerAccess::Dids(BTreeSet::from([NICO.parse().expect("DID should parse")]))
+        );
+        assert!(
+            matches!(parse("[]"), Err(Error::Parse(_))),
+            "an empty list must be rejected rather than silently denying everyone"
+        );
+        assert!(
+            matches!(parse("\"everyone\""), Err(Error::Parse(_))),
+            "an unknown mode must be rejected"
+        );
+        assert!(
+            matches!(parse("[\"not-a-did\"]"), Err(Error::Parse(_))),
+            "an invalid DID must be rejected"
+        );
     }
 
     #[test]

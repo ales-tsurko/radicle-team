@@ -88,7 +88,9 @@ impl fmt::Display for DeliveryId {
 pub struct McpEndpoint(Url);
 
 impl McpEndpoint {
-    pub(crate) const fn new(url: Url) -> Self {
+    /// Wraps a validated Streamable HTTP MCP URL.
+    #[must_use]
+    pub const fn new(url: Url) -> Self {
         Self(url)
     }
 

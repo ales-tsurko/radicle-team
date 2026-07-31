@@ -49,7 +49,13 @@ pub struct AgentSandbox {
 }
 
 impl AgentSandbox {
-    pub(crate) fn load(home: &MemberHome, endpoint: &McpEndpoint) -> Result<Self, Error> {
+    /// Loads the fixed policy and the member's local configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform has no enforcing backend, the workspace root cannot be
+    /// prepared, or the local configuration is unsafe or invalid.
+    pub fn load(home: &MemberHome, endpoint: &McpEndpoint) -> Result<Self, Error> {
         Self::ensure_supported()?;
         let workspaces = home.workspaces();
         fs::create_dir_all(&workspaces).map_err(|source| Error::Io {
@@ -408,7 +414,7 @@ pub enum Error {
     #[cfg(target_os = "linux")]
     /// Preparing the embedded Linux helper failed.
     #[error(transparent)]
-    LinuxHelper(#[from] crate::sandbox::linux::Error),
+    LinuxHelper(#[from] crate::sandbox::LinuxHelperError),
     /// Preparing a workspace path failed.
     #[error("failed to prepare sandbox path '{path}': {source}")]
     Io {
@@ -494,159 +500,6 @@ mod tests {
                 .build(&command)
                 .expect("configured policy should build");
         }
-    }
-
-    #[tokio::test]
-    #[cfg(not(miri))]
-    async fn confines_the_file_system_of_a_spawned_process() {
-        let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let home = MemberHome::at(directory.path(), Member::Nico);
-        let mut sandbox = sandbox(&home);
-        let workspaces =
-            std::fs::canonicalize(home.workspaces()).expect("workspaces should be canonicalized");
-
-        let permitted = workspaces.join("permitted.txt");
-        std::fs::write(&permitted, b"permitted").expect("permitted file should be written");
-        let secrets = std::fs::canonicalize(directory.path())
-            .expect("temporary directory should be canonicalized")
-            .join("secrets");
-        std::fs::create_dir(&secrets).expect("secret directory should be created");
-        let secret = secrets.join("secret.txt");
-        std::fs::write(&secret, b"secret").expect("secret file should be written");
-
-        assert!(
-            read(&sandbox, &permitted).await.success(),
-            "a workspace file must stay readable; without this control a denial proves nothing"
-        );
-        assert!(
-            read(&sandbox, &secret).await.success(),
-            "the secret must be readable before it is denied; without this control the denial \
-             below could come from a bad path rather than the policy"
-        );
-
-        sandbox.config.set_deny_read(vec![secrets]);
-
-        assert!(
-            !read(&sandbox, &secret).await.success(),
-            "a denied file must be unreadable inside the sandbox"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(not(miri))]
-    async fn leaves_loopback_reachable_under_every_external_network_setting() {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("forbidden listener should bind");
-        let forbidden = listener
-            .local_addr()
-            .expect("forbidden address should be available")
-            .port();
-        let _server = tokio::spawn(async move {
-            while let Ok((mut stream, _peer)) = listener.accept().await {
-                use tokio::io::AsyncWriteExt as _;
-                let _written = stream
-                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                    .await;
-            }
-        });
-        let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let home = MemberHome::at(directory.path(), Member::Nico);
-        let mut sandbox = sandbox(&home);
-
-        sandbox
-            .config
-            .set_external_network(crate::sandbox::ExternalNetwork::All);
-        assert!(
-            connect(&sandbox, forbidden).await.success(),
-            "an unrestricted sandbox must reach the listener; without this control the failure \
-             below could be a missing curl or a dead listener rather than the policy"
-        );
-
-        sandbox
-            .config
-            .set_external_network(crate::sandbox::ExternalNetwork::Disabled);
-        assert!(
-            connect(&sandbox, forbidden).await.success(),
-            "loopback must stay reachable when external networking is disabled; agents bind and \
-             reach local ports for development and language servers, so ManagedNetwork::metadata \
-             sets 'allow_local_binding = true' and Zerobox emits '(allow network-outbound (remote \
-             ip \"localhost:*\"))'. If this fails the sandbox stopped permitting loopback and \
-             ExternalNetwork's documented contract no longer holds"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(not(miri))]
-    async fn blocks_external_hosts_when_external_networking_is_disabled() {
-        const EXTERNAL: &str = "http://example.com/";
-
-        let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let home = MemberHome::at(directory.path(), Member::Nico);
-        let mut sandbox = sandbox(&home);
-
-        sandbox
-            .config
-            .set_external_network(crate::sandbox::ExternalNetwork::All);
-        if !fetch(&sandbox, EXTERNAL).await.success() {
-            eprintln!(
-                "SKIPPED blocks_external_hosts_when_external_networking_is_disabled: no \
-                 connectivity to {EXTERNAL}, so a blocked result would prove nothing"
-            );
-            return;
-        }
-
-        sandbox
-            .config
-            .set_external_network(crate::sandbox::ExternalNetwork::Disabled);
-
-        assert!(
-            !fetch(&sandbox, EXTERNAL).await.success(),
-            "a sandbox with external networking disabled must not reach an external host; this \
-             probe ignores the proxy environment, so reaching the host would mean the sandbox \
-             itself permits direct external traffic rather than the proxy merely refusing it"
-        );
-    }
-
-    #[cfg(not(miri))]
-    async fn connect(sandbox: &AgentSandbox, port: u16) -> std::process::ExitStatus {
-        fetch(sandbox, &format!("http://127.0.0.1:{port}/")).await
-    }
-
-    #[cfg(not(miri))]
-    async fn fetch(sandbox: &AgentSandbox, target: &str) -> std::process::ExitStatus {
-        sandbox
-            .command("/usr/bin/curl")
-            .args([
-                "-s",
-                "--noproxy",
-                "*",
-                "--fail",
-                "-o",
-                "/dev/null",
-                "-m",
-                "10",
-                target,
-            ])
-            .spawn()
-            .await
-            .expect("sandboxed process should spawn")
-            .wait()
-            .await
-            .expect("sandboxed process should exit")
-    }
-
-    #[cfg(not(miri))]
-    async fn read(sandbox: &AgentSandbox, path: &std::path::Path) -> std::process::ExitStatus {
-        sandbox
-            .command("/bin/cat")
-            .arg(path.display().to_string())
-            .spawn()
-            .await
-            .expect("sandboxed process should spawn")
-            .wait()
-            .await
-            .expect("sandboxed process should exit")
     }
 
     fn sandbox(home: &MemberHome) -> AgentSandbox {
