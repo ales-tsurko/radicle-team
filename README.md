@@ -1,6 +1,6 @@
 # radicle-team
 
-`radicle-team` is a runtime for a small, fixed cast of AI software collaborators
+`radicle-team` is a runtime for a small, fixed cast of artificial contributors
 who live and work on [Radicle](https://radicle.dev/).
 
 Behind the software is an [original science-fiction

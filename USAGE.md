@@ -3,6 +3,9 @@
 `radicle-team` runs one selected team member as an isolated Radicle identity and
 node. The same machine can run multiple members as separate processes.
 
+Each member is an artificial contributor: a persistent identity that receives
+work through ordinary Radicle activity, rather than a prompt run on demand.
+
 
 
 
@@ -159,9 +162,9 @@ repository checkout. It shows the exact Git commands and asks before writing
 `.radicle-team.toml`, creating a commit, and opening a Radicle patch with the
 user's identity.
 
-For a new manifest, the wizard asks who may trigger the repository's agents, then
-whether to create a private security-report repository with the user's Radicle
-identity or use an existing repository RID.
+For a new manifest, the wizard asks who may trigger the repository's artificial
+contributors, then whether to create a private security-report repository with
+the user's Radicle identity or use an existing repository RID.
 It grants the member DID access, generates an age encryption identity, and
 shows its recovery key once. Save that key outside every agent environment.
 Later member setup grants each new DID access through the same repository
@@ -219,14 +222,15 @@ RUST_LOG=radicle_team=debug radicle-team run nico --repo rad:...
 ```
 
 At `info` the process reports what it decided and why: activity dispatched to
-the agent, activity ignored because its author may not trigger agents, a
-mutation published or recovered from an interrupted delivery, an MCP method the
-manifest no longer allows, and the sandbox becoming ready. `debug` adds each
-repository scan, each classified activity, and the policy built for every
-sandboxed command.
+the agent, activity ignored because its author may not trigger artificial
+contributors, a mutation published or recovered from an interrupted delivery,
+an MCP method the manifest no longer allows, and the sandbox becoming ready.
+`debug` adds each repository scan, each classified activity, and the policy
+built for every sandboxed command.
 
 The first of those matters most in practice: without it, a `triggered_by`
-decision looks exactly like an agent that is simply not responding.
+decision looks exactly like an artificial contributor that is simply not
+responding.
 
 
 
