@@ -76,6 +76,23 @@ maintenance systems operating continuously.
 
 
 
+## The Nine-Minute Fall
+
+Corrupted telemetry once synchronized Aster Vale's lift cells against the same
+false altitude. The city began descending toward denser, hotter atmosphere, and
+recovery models gave it nine minutes.
+
+Control was divided among local crews. Three industrial decks were cut loose to
+shed mass, and the lift cells were restored out of their normal sequence. The
+city stabilized. Forty-three people were injured, and thousands lost homes,
+workshops, or possessions when the decks fell into Sable. Nobody died.
+
+Sable remembers it as proof that an atmospheric city depends on systems nobody
+can pause to repair.
+
+
+
+
 ## Sable Ring
 
 Sable Ring is a vast border complex built around the Sable system's wormhole.
@@ -104,8 +121,10 @@ The resulting blockade disrupted civilian communications while thousands of
 residents waited for evacuation.
 
 The Ring survived, but substantial sections were damaged. Its hydroponic
-district and civilian infrastructure suffered heavily. The border remained under
-reconstruction for years.
+district and civilian infrastructure suffered heavily, and most of that year's
+food supply was lost. Not all of that damage was Cyrran fire: some of it came
+from the improvised effort to keep the evacuation coordinated. The border
+remained under reconstruction for years.
 
 The war ended with an armistice. Transit later resumed under strict inspection,
 but the relationship between Sable and Cyrra remains cold. The border is open

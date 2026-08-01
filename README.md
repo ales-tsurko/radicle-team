@@ -4,10 +4,11 @@
 who live and work on [Radicle](https://radicle.dev/).
 
 Behind the software is an [original science-fiction
-setting](members/UNIVERSE.md). The team is based at the rebuilt Sable Ring, a
-guarded wormhole between independent settlements around a storm-covered gas
-giant and Cyrra, the centralized system that once ruled them. Their histories
-there shape how they think, speak, disagree, and trust one another.
+setting](members/UNIVERSE.md). The team is based at the rebuilt Sable Ring, the
+guarded border complex around a wormhole joining independent settlements at a
+storm-covered gas giant to Cyrra, the centralized system that once ruled them.
+Their histories there shape how they think, speak, disagree, and trust one
+another.
 
 Each member is a persistent contributor rather than a disposable prompt. They
 have their own identity, role, expertise, personality, fictional history, model
