@@ -42,9 +42,9 @@ use crate::mcp::{
         CreateIssueRequest, CreatePatchRequest, DiffRequest, Document, EditIssueRequest,
         EditPatchRequest, EmbedReadRequest, EmbedWriteRequest, IssueRequest, IssueStateFilter,
         ListIssuesRequest, LocationRequest, MAX_EMBED_BYTES, MergePatchRequest, PreparedEmbed,
-        ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest, SecurityIssueRequest,
-        SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest,
-        mutation_identity, parse_location, parse_object, validate_code_location,
+        ReactionWriteRequest, ResolveCommentRequest, ReviewCommentRequest, ReviewWriteRequest,
+        SecurityIssueRequest, SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind,
+        SubjectRequest, mutation_identity, parse_location, parse_object, validate_code_location,
     },
     read::MAX_DIFF_BYTES,
     recovery::{ReactionRecovery, find_review, review_mutation_operation},
@@ -907,6 +907,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
         summary: Some("Looks good".to_owned()),
         labels: Vec::new(),
         embeds: Vec::new(),
+        comments: Vec::new(),
     };
     delivery_service
         .review_write(review_request(), false)
@@ -1933,6 +1934,7 @@ async fn manages_patch_reviews_and_inline_comments() {
                 summary: None,
                 labels: Vec::new(),
                 embeds: Vec::new(),
+                comments: Vec::new(),
             },
             false,
         )
@@ -1950,12 +1952,49 @@ async fn manages_patch_reviews_and_inline_comments() {
                     summary: Some("Needs work".to_owned()),
                     labels: Vec::new(),
                     embeds: Vec::new(),
+                    comments: vec![
+                        ReviewCommentRequest {
+                            body: "This allocation is avoidable.".to_owned(),
+                            location: Some(LocationRequest {
+                                commit: fixture.head.to_string(),
+                                path: "file".to_owned(),
+                                old_start: None,
+                                old_end: None,
+                                new_start: Some(1),
+                                new_end: Some(2),
+                            }),
+                        },
+                        ReviewCommentRequest {
+                            body: "And this name reads backwards.".to_owned(),
+                            location: None,
+                        },
+                    ],
                 },
                 false,
             )
             .await
             .expect("review should be created"),
     );
+
+    {
+        let published = Patches::open(&repository, ReadOnly)
+            .expect("patches should open")
+            .get(&patch_id)
+            .expect("patch should load")
+            .expect("patch should exist");
+        let review_id = patch::ReviewId::from(EntryId::from_str(&review).expect("id should parse"));
+        let comments = published
+            .revisions()
+            .flat_map(|(_revision, value)| value.reviews())
+            .find_map(|(_author, value)| (value.id() == review_id).then_some(value))
+            .expect("the review should exist")
+            .comments()
+            .count();
+        assert_eq!(
+            comments, 2,
+            "every line comment sent with a review must be published with it, so that a reviewer              never has to spend several turns saying one thing"
+        );
+    }
     let objects = object_count(&repository.backend);
     for (target, entity) in [
         (CommentTargetKind::Revision, revision.clone()),
@@ -2031,6 +2070,7 @@ async fn manages_patch_reviews_and_inline_comments() {
                     summary: Some("Duplicate".to_owned()),
                     labels: Vec::new(),
                     embeds: Vec::new(),
+                    comments: Vec::new(),
                 },
                 false,
             )
@@ -2052,6 +2092,7 @@ async fn manages_patch_reviews_and_inline_comments() {
                         name: "review.png".to_owned(),
                         content_base64: "cHJldmlldw==".to_owned(),
                     }],
+                    comments: Vec::new(),
                 },
                 true,
             )
@@ -2101,24 +2142,65 @@ async fn manages_patch_reviews_and_inline_comments() {
         "cHJldmlldw=="
     );
 
-    let comment = result_id(
-        service
-            .write_comment(
-                CommentWriteRequest {
-                    subject: subject.clone(),
-                    target: CommentTargetKind::Review,
-                    entity: Some(review.clone()),
-                    comment: None,
-                    body: Some("Inline finding".to_owned()),
-                    reply_to: None,
-                    location: Some(location),
-                    embeds: Vec::new(),
-                },
-                CommentOperation::Create,
-            )
-            .await
-            .expect("review comment should be created"),
-    );
+    service
+        .write_comment(
+            CommentWriteRequest {
+                subject: subject.clone(),
+                target: CommentTargetKind::Review,
+                entity: Some(review.clone()),
+                comment: None,
+                body: Some("Inline finding".to_owned()),
+                reply_to: None,
+                location: Some(location),
+                embeds: Vec::new(),
+            },
+            CommentOperation::Create,
+        )
+        .await
+        .err()
+        .expect(
+            "a review comment posted on its own must be refused, or the batch that keeps a              review to one act would be optional",
+        );
+    let comment = {
+        let published = Patches::open(&repository, ReadOnly)
+            .expect("patches should open")
+            .get(&patch_id)
+            .expect("patch should load")
+            .expect("patch should exist");
+        let review_id = patch::ReviewId::from(EntryId::from_str(&review).expect("id should parse"));
+        published
+            .revisions()
+            .flat_map(|(_revision, value)| value.reviews())
+            .find_map(|(_author, value)| (value.id() == review_id).then_some(value))
+            .expect("the review should exist")
+            .comments()
+            .map(|(id, _comment)| id.to_string())
+            .next()
+            .expect("the review should carry the comments sent with it")
+    };
+
+    let _reply =
+        result_id(
+            service
+                .write_comment(
+                    CommentWriteRequest {
+                        subject: subject.clone(),
+                        target: CommentTargetKind::Review,
+                        entity: Some(review.clone()),
+                        comment: None,
+                        body: Some("Answering that line.".to_owned()),
+                        reply_to: Some(comment.clone()),
+                        location: None,
+                        embeds: Vec::new(),
+                    },
+                    CommentOperation::Create,
+                )
+                .await
+                .expect(
+                    "answering somebody else's line comment is a conversation, not a second \
+                     review,                  so it must stay possible",
+                ),
+        );
     for resolved in [true, false] {
         service
             .resolve_review_comment(ResolveCommentRequest {

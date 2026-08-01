@@ -304,7 +304,10 @@ mod tests {
                 Revision::Repository(Oid::from_sha1([0; 20])),
                 crate::manifest::McpAllowlist::default(),
                 crate::manifest::SecurityPolicy::test(Self::repository()),
-                crate::manifest::TriggerAccess::Delegates,
+                crate::manifest::TriggerPolicy::new(
+                    crate::manifest::TriggerAccess::Delegates,
+                    vec![Did::from_str(did).expect("DID should parse")],
+                ),
             )
         }
     }

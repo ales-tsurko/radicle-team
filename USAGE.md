@@ -104,6 +104,13 @@ receive these values at startup and map them to provider-specific controls.
 These are strengths, not exclusive permissions. Full character, expertise, and
 voice documents live under [`members/`](members/).
 
+Mention a member by name to address them: `@nico`, `@maya`, and so on. `@team`
+addresses everyone, for brainstorming or for work with no obvious owner. Every
+running member treats `@team` as a mention of itself, so each one responds and
+one such mention costs one delivery per running member. Members cannot use
+`@team` themselves; see [`triggered_by`](#repository-manifest) for what they may
+trigger in each other.
+
 
 
 
@@ -375,6 +382,31 @@ listed, because they control this manifest and could grant themselves access by
 editing it. `"anyone"` suits a private repository, where Radicle's own access
 list already decides who can write. On a public repository it lets any seeding
 peer spend the operator's agent budget.
+
+Members themselves are always allowed, whatever this setting says, so that one
+can delegate to another without being listed here. What they may trigger in each
+other is narrower than what a person may, so that a discussion between them
+cannot feed itself while nobody is watching:
+
+- assigning work to a member,
+- naming one directly, as `@nico`,
+- replying to a comment that member owns.
+
+`@team` is not among them, so no member can summon the whole cast, and neither
+are ambient changes such as an edited title. A submitted review and a new
+revision are the exceptions: those carry work to whoever owns the subject, and
+without them delegated work would stall once it was reviewed.
+
+Each member also comments on any one issue or patch at most three times until a
+non-member acts on it again, which bounds a runaway at three deliveries per
+member rather than an open-ended conversation. Only comments count against that
+allowance. Publishing a revision, submitting a review, or merging is work rather
+than speech, so a member that spends the day building still hears about its own
+patch. A member's own activity never triggers itself.
+
+Reactions never trigger anyone, whoever adds them. Approving an idea and asking
+for it to be carried out look identical, so acting on a reaction risks work
+nobody asked for. Request work in a comment.
 
 Omitting `triggered_by` restricts triggers to delegates. The setup wizard asks
 for it when it creates a manifest and leaves it alone when it later adds a

@@ -146,20 +146,14 @@ impl ToolService {
         let body = request.body.clone();
         let location = request.location.map(parse_location).transpose()?;
         let embeds = PreparedEmbed::prepare(request.embeds)?;
-        if matches!(operation, CommentOperation::Create | CommentOperation::Edit) && body.is_none()
-        {
-            return Err(ServiceError::Request("body is required".to_owned()));
-        }
-        if matches!(operation, CommentOperation::Edit | CommentOperation::Redact)
-            && comment.is_none()
-        {
-            return Err(ServiceError::Request("comment is required".to_owned()));
-        }
-        if matches!(operation, CommentOperation::Redact) && !embeds.is_empty() {
-            return Err(ServiceError::Request(
-                "redacted comments cannot include embeds".to_owned(),
-            ));
-        }
+        validate_comment_request(
+            operation,
+            request.target,
+            body.as_deref(),
+            comment,
+            embeds.is_empty(),
+            reply_to.is_some(),
+        )?;
         let kind = request.subject.kind;
         let target = request.target;
         let expected_body = body.clone();
@@ -1142,6 +1136,25 @@ impl ToolService {
                 "create_review cannot include embeds; create it, then use edit_review".to_owned(),
             ));
         }
+        if edit && !request.comments.is_empty() {
+            return Err(ServiceError::Request(
+                "edit_review cannot include line comments; publish them with create_review"
+                    .to_owned(),
+            ));
+        }
+        let comments = request
+            .comments
+            .into_iter()
+            .map(|comment| {
+                if comment.body.trim().is_empty() {
+                    return Err(ServiceError::Request(
+                        "a review comment body cannot be empty".to_owned(),
+                    ));
+                }
+                let location = comment.location.map(parse_location).transpose()?;
+                Ok((comment.body, location))
+            })
+            .collect::<Result<Vec<_>, ServiceError>>()?;
         let id = self
             .mutate(
                 method,
@@ -1242,7 +1255,57 @@ impl ToolService {
                 },
             )
             .await?;
+        if !comments.is_empty() {
+            self.write_review_comments(&id, patch_id, comments).await?;
+        }
         write_result(id)
+    }
+
+    // Publishes every line comment sent with a freshly created review.
+    async fn write_review_comments(
+        &self,
+        review: &str,
+        patch_id: radicle::cob::ObjectId,
+        comments: Vec<(String, Option<radicle::cob::CodeLocation>)>,
+    ) -> Result<(), ServiceError> {
+        let review = patch::ReviewId::from(parse_entry_string(review)?);
+        for (index, (body, location)) in comments.into_iter().enumerate() {
+            let expected = body.clone();
+            let _id = self
+                .mutate(
+                    "create_review_comment",
+                    format!("create_review_comment:{review}:{index}"),
+                    move |repository, signer, marker| {
+                        let mut patches = patch::Cache::no_cache(repository, signer)?;
+                        let mut patch = patches.get_mut(&patch_id)?;
+                        patch
+                            .transaction(marker, |tx| {
+                                tx.review_comment(review, body, location, None, Vec::new())
+                            })
+                            .map_err(PublishError::from)
+                    },
+                    move |repository, _author, _operation, _validation| {
+                        let patch = Patches::open(repository, ReadOnly)?.get(&patch_id)?;
+                        Ok(patch
+                            .as_ref()
+                            .and_then(|patch| {
+                                patch
+                                    .revisions()
+                                    .flat_map(|(_revision, value)| value.reviews())
+                                    .find_map(|(_author, value)| {
+                                        (value.id() == review).then_some(value)
+                                    })
+                            })
+                            .is_some_and(|value| {
+                                value
+                                    .comments()
+                                    .any(|(_id, comment)| comment.body() == expected)
+                            }))
+                    },
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn merge_patch_write(
@@ -1291,5 +1354,34 @@ impl ToolService {
             )
             .await?;
         write_result(id)
+    }
+}
+
+// Rejects comment requests that no operation could satisfy.
+fn validate_comment_request(
+    operation: CommentOperation,
+    target: CommentTargetKind,
+    body: Option<&str>,
+    comment: Option<EntryId>,
+    embeds_empty: bool,
+    reply: bool,
+) -> Result<(), ServiceError> {
+    let problem = match operation {
+        CommentOperation::Create if matches!(target, CommentTargetKind::Review) && !reply => {
+            Some("a new review comment is published with its review; pass it to create_review")
+        }
+        CommentOperation::Create if body.is_none() => Some("body is required"),
+        CommentOperation::Edit if body.is_none() => Some("body is required"),
+        CommentOperation::Edit | CommentOperation::Redact if comment.is_none() => {
+            Some("comment is required")
+        }
+        CommentOperation::Redact if !embeds_empty => {
+            Some("redacted comments cannot include embeds")
+        }
+        CommentOperation::Create | CommentOperation::Edit | CommentOperation::Redact => None,
+    };
+    match problem {
+        Some(problem) => Err(ServiceError::Request(problem.to_owned())),
+        None => Ok(()),
     }
 }

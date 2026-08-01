@@ -66,7 +66,7 @@ impl Fixture {
             PublicKey::from_str(MEMBER).expect("member key should be valid"),
             RepoId::from_str(REPOSITORY).expect("repository should be valid"),
             subject,
-            &Triggers::new(TriggerAccess::Anyone, Vec::new()),
+            &Triggers::new(TriggerAccess::Anyone, Vec::new(), Vec::new()),
         )
     }
 
@@ -128,7 +128,7 @@ fn suppresses_activities_from_authors_that_may_not_trigger() {
         assignment.clone(),
         author,
         &mut Context::default(),
-        &Triggers::new(TriggerAccess::Anyone, delegates.clone()),
+        &Triggers::new(TriggerAccess::Anyone, delegates.clone(), Vec::new()),
     );
     assert!(
         !permitted.is_empty(),
@@ -141,7 +141,7 @@ fn suppresses_activities_from_authors_that_may_not_trigger() {
         assignment.clone(),
         author,
         &mut context,
-        &Triggers::new(TriggerAccess::Delegates, delegates.clone()),
+        &Triggers::new(TriggerAccess::Delegates, delegates.clone(), Vec::new()),
     );
     assert!(
         suppressed.is_empty(),
@@ -158,7 +158,7 @@ fn suppresses_activities_from_authors_that_may_not_trigger() {
             assignment,
             delegate,
             &mut Context::default(),
-            &Triggers::new(TriggerAccess::Delegates, delegates),
+            &Triggers::new(TriggerAccess::Delegates, delegates, Vec::new()),
         )
         .is_empty(),
         "'delegates' must let a delegate trigger work"
@@ -176,6 +176,7 @@ fn listed_trigger_dids_keep_delegate_access() {
     let triggers = Triggers::new(
         TriggerAccess::Dids(BTreeSet::from([Did::from(author)])),
         vec![Did::from(delegate)],
+        Vec::new(),
     );
 
     assert!(
@@ -466,16 +467,26 @@ fn classifies_every_remaining_issue_interaction() {
             embeds: Vec::new(),
         },
         Action::CommentRedact { id: comment },
-        Action::CommentReact {
-            id: comment,
-            reaction,
-            active: true,
-        },
     ];
 
     for action in actions {
         assert!(!Fixture::classify_issue(action, author, &mut context).is_empty());
     }
+
+    assert!(
+        Fixture::classify_issue(
+            Action::CommentReact {
+                id: comment,
+                reaction,
+                active: true,
+            },
+            author,
+            &mut context,
+        )
+        .is_empty(),
+        "a reaction must not start work, because approving an idea and asking for it to be \
+         carried out are indistinguishable"
+    );
 }
 
 #[test]
@@ -557,11 +568,6 @@ fn classifies_every_remaining_patch_interaction() {
             Vec::new(),
         )),
         PatchAction::ReviewRedact { review },
-        PatchAction::ReviewReact {
-            review,
-            reaction,
-            active: true,
-        },
         PatchAction::ReviewCommentEdit {
             review,
             comment: review_comment,
@@ -571,12 +577,6 @@ fn classifies_every_remaining_patch_interaction() {
         PatchAction::ReviewCommentRedact {
             review,
             comment: review_comment,
-        },
-        PatchAction::ReviewCommentReact {
-            review,
-            comment: review_comment,
-            reaction,
-            active: true,
         },
         PatchAction::ReviewCommentResolve {
             review,
@@ -592,12 +592,6 @@ fn classifies_every_remaining_patch_interaction() {
             embeds: Vec::new(),
         },
         PatchAction::RevisionRedact { revision },
-        PatchAction::RevisionReact {
-            revision,
-            location: None,
-            reaction,
-            active: true,
-        },
         PatchAction::RevisionCommentEdit {
             revision,
             comment: revision_comment,
@@ -608,6 +602,30 @@ fn classifies_every_remaining_patch_interaction() {
             revision,
             comment: revision_comment,
         },
+    ];
+
+    for action in actions {
+        assert!(!Fixture::classify_patch(ISSUE, action, author, &mut context).is_empty());
+    }
+
+    let reactions = [
+        PatchAction::ReviewReact {
+            review,
+            reaction,
+            active: true,
+        },
+        PatchAction::ReviewCommentReact {
+            review,
+            comment: review_comment,
+            reaction,
+            active: true,
+        },
+        PatchAction::RevisionReact {
+            revision,
+            location: None,
+            reaction,
+            active: true,
+        },
         PatchAction::RevisionCommentReact {
             revision,
             comment: revision_comment,
@@ -616,7 +634,262 @@ fn classifies_every_remaining_patch_interaction() {
         },
     ];
 
-    for action in actions {
-        assert!(!Fixture::classify_patch(ISSUE, action, author, &mut context).is_empty());
+    for action in reactions {
+        assert!(
+            Fixture::classify_patch(ISSUE, action, author, &mut context).is_empty(),
+            "a reaction must not start work, because approving an idea and asking for it to be \
+             carried out are indistinguishable"
+        );
     }
+}
+
+#[test]
+fn allows_members_to_trigger_each_other_whatever_the_manifest_says() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
+    let triggers = Triggers::new(TriggerAccess::Delegates, Vec::new(), vec![Did::from(peer)]);
+
+    assert!(
+        !Fixture::classify_with(
+            Action::Assign {
+                assignees: BTreeSet::from([Did::from(member)]),
+            },
+            peer,
+            &mut Context::default(),
+            &triggers,
+        )
+        .is_empty(),
+        "one member must be able to delegate to another without being listed in `triggered_by`"
+    );
+}
+
+#[test]
+fn refuses_team_mentions_between_members() {
+    let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
+    let outsider = PublicKey::from_str(DELEGATE).expect("outsider key should be valid");
+    let triggers = Triggers::new(TriggerAccess::Anyone, Vec::new(), vec![Did::from(peer)]);
+    let comment = |body: &str| Action::Comment {
+        body: body.to_owned(),
+        reply_to: None,
+        embeds: Vec::new(),
+    };
+
+    assert!(
+        Fixture::classify_with(
+            comment("@team what do you think?"),
+            peer,
+            &mut Context::default(),
+            &triggers,
+        )
+        .is_empty(),
+        "no member may summon the whole team, because that fans one message out to everyone"
+    );
+    assert!(
+        !Fixture::classify_with(
+            comment("@nico could you look at this?"),
+            peer,
+            &mut Context::default(),
+            &triggers,
+        )
+        .is_empty(),
+        "a member may still address another by name"
+    );
+    assert!(
+        !Fixture::classify_with(
+            comment("@team what do you think?"),
+            outsider,
+            &mut Context::default(),
+            &triggers,
+        )
+        .is_empty(),
+        "`@team` remains available to everyone outside the team"
+    );
+}
+
+#[test]
+fn refuses_ambient_changes_between_members() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
+    let outsider = PublicKey::from_str(DELEGATE).expect("outsider key should be valid");
+    let triggers = Triggers::new(TriggerAccess::Anyone, Vec::new(), vec![Did::from(peer)]);
+    let mut context = Context::default();
+
+    assert!(
+        !Fixture::classify_with(
+            Action::Assign {
+                assignees: BTreeSet::from([Did::from(member)]),
+            },
+            outsider,
+            &mut context,
+            &triggers,
+        )
+        .is_empty(),
+        "the assignment itself should reach the member"
+    );
+
+    let edit = || Action::Edit {
+        title: Title::new("Updated issue").expect("title should be valid"),
+    };
+    assert!(
+        Fixture::classify_with(edit(), peer, &mut context, &triggers).is_empty(),
+        "a member editing the subject must not wake another, or a thread could sustain itself"
+    );
+    assert!(
+        !Fixture::classify_with(edit(), outsider, &mut context, &triggers).is_empty(),
+        "the same change from outside the team still reaches the member"
+    );
+}
+
+#[test]
+fn stops_answering_once_a_member_reaches_its_response_limit() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
+    let outsider = PublicKey::from_str(DELEGATE).expect("outsider key should be valid");
+    let triggers = Triggers::new(
+        TriggerAccess::Anyone,
+        Vec::new(),
+        vec![Did::from(member), Did::from(peer)],
+    );
+    let comment = |body: &str| Action::Comment {
+        body: body.to_owned(),
+        reply_to: None,
+        embeds: Vec::new(),
+    };
+    let mut context = Context::default();
+
+    for answer in 0..3 {
+        assert!(
+            !Fixture::classify_with(comment("@nico thoughts?"), peer, &mut context, &triggers)
+                .is_empty(),
+            "answer {answer} is still within the limit"
+        );
+        let _own =
+            Fixture::classify_with(comment("here they are"), member, &mut context, &triggers);
+    }
+
+    assert!(
+        Fixture::classify_with(comment("@nico thoughts?"), peer, &mut context, &triggers)
+            .is_empty(),
+        "a member must stop answering a subject once it has spent its allowance"
+    );
+
+    let _human =
+        Fixture::classify_with(comment("let us move on"), outsider, &mut context, &triggers);
+    assert!(
+        !Fixture::classify_with(comment("@nico thoughts?"), peer, &mut context, &triggers)
+            .is_empty(),
+        "a non-member acting on the subject must restore the allowance"
+    );
+}
+
+#[test]
+fn delivers_a_peer_review_to_the_patch_owner() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
+    let triggers = Triggers::new(TriggerAccess::Anyone, Vec::new(), vec![Did::from(peer)]);
+    let revision = RevisionId::from(EntryId::from_str(COMMENT).expect("revision should be valid"));
+    let mut context = Context::default();
+
+    let opened = context.classify(
+        &Fixture::operation(
+            ISSUE,
+            PatchAction::Revision {
+                description: "Initial revision".to_owned(),
+                base: *ObjectId::from_str(ISSUE).expect("base should be valid"),
+                oid: *ObjectId::from_str(COMMENT).expect("head should be valid"),
+                resolves: BTreeSet::new(),
+            },
+            member,
+            PATCH_TYPENAME.clone(),
+        ),
+        Member::Nico,
+        member,
+        RepoId::from_str(REPOSITORY).expect("repository should be valid"),
+        Subject::Patch(ObjectId::from_str(ISSUE).expect("patch should be valid")),
+        &triggers,
+    );
+    assert!(
+        opened.is_empty(),
+        "a member's own revision must not come back to it"
+    );
+
+    let reviewed = context.classify(
+        &Fixture::operation(
+            OPERATION,
+            PatchAction::Review {
+                revision,
+                summary: None,
+                verdict: Some(Verdict::Reject),
+                labels: Vec::new(),
+            },
+            peer,
+            PATCH_TYPENAME.clone(),
+        ),
+        Member::Nico,
+        member,
+        RepoId::from_str(REPOSITORY).expect("repository should be valid"),
+        Subject::Patch(ObjectId::from_str(ISSUE).expect("patch should be valid")),
+        &triggers,
+    );
+    assert!(
+        !reviewed.is_empty(),
+        "a review by another member must reach the patch owner without a mention, or delegated \
+         work would stall once it was reviewed"
+    );
+}
+
+#[test]
+fn building_does_not_spend_a_member_s_answer_allowance() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
+    let triggers = Triggers::new(TriggerAccess::Anyone, Vec::new(), vec![Did::from(peer)]);
+    let subject = Subject::Patch(ObjectId::from_str(ISSUE).expect("patch should be valid"));
+    let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
+    let mut context = Context::default();
+
+    for _ in 0..4 {
+        let _own = context.classify(
+            &Fixture::operation(
+                ISSUE,
+                PatchAction::Revision {
+                    description: "Another revision".to_owned(),
+                    base: *ObjectId::from_str(ISSUE).expect("base should be valid"),
+                    oid: *ObjectId::from_str(COMMENT).expect("head should be valid"),
+                    resolves: BTreeSet::new(),
+                },
+                member,
+                PATCH_TYPENAME.clone(),
+            ),
+            Member::Nico,
+            member,
+            repository,
+            subject,
+            &triggers,
+        );
+    }
+
+    assert!(
+        !context
+            .classify(
+                &Fixture::operation(
+                    OPERATION,
+                    PatchAction::Revision {
+                        description: "@nico could you rebase this?".to_owned(),
+                        base: *ObjectId::from_str(ISSUE).expect("base should be valid"),
+                        oid: *ObjectId::from_str(COMMENT).expect("head should be valid"),
+                        resolves: BTreeSet::new(),
+                    },
+                    peer,
+                    PATCH_TYPENAME.clone(),
+                ),
+                Member::Nico,
+                member,
+                repository,
+                subject,
+                &triggers,
+            )
+            .is_empty(),
+        "publishing revisions is work, not speech, so it must not exhaust the allowance a member \
+         needs to keep hearing about its own patch"
+    );
 }

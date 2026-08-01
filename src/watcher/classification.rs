@@ -24,20 +24,41 @@ use crate::{
     },
 };
 
+/// Responses one member may publish on a subject before a non-member acts again.
+///
+/// Members govern themselves rather than sharing a counter, because each runs its own process and
+/// may run on its own host. The bound is therefore this limit multiplied by the fixed cast size.
+const RESPONSE_LIMIT: usize = 3;
+
 /// Repository trigger policy resolved against the current delegate set.
 #[derive(Debug, Clone)]
 pub(super) struct Triggers {
     access: TriggerAccess,
     delegates: Vec<Did>,
+    members: Vec<Did>,
 }
 
 impl Triggers {
-    pub(super) const fn new(access: TriggerAccess, delegates: Vec<Did>) -> Self {
-        Self { access, delegates }
+    pub(super) const fn new(access: TriggerAccess, delegates: Vec<Did>, members: Vec<Did>) -> Self {
+        Self {
+            access,
+            delegates,
+            members,
+        }
     }
 
+    /// Returns whether `author` may put this repository's members to work.
+    ///
+    /// Members are always allowed, whatever `triggered_by` says: that setting keeps outside
+    /// identities from spending the operator's budget, and the repository's own members are not
+    /// outside identities. What one member may trigger in another is narrowed separately, when
+    /// the operation's signals are evaluated.
     pub(super) fn allows(&self, author: Did) -> bool {
-        self.access.allows(author, &self.delegates)
+        self.is_member(author) || self.access.allows(author, &self.delegates)
+    }
+
+    pub(super) fn is_member(&self, author: Did) -> bool {
+        self.members.contains(&author)
     }
 }
 
@@ -48,6 +69,7 @@ pub(super) struct Context {
     owned: bool,
     seen: bool,
     entities: HashSet<Entity>,
+    responses: usize,
 }
 
 impl Context {
@@ -79,12 +101,33 @@ impl Context {
             self.seen = true;
         }
         let author = Did::from(operation.author);
+        let authored_by_peer = !authored_by_member && triggers.is_member(author);
         let may_trigger = authored_by_member || triggers.allows(author);
+
+        if !triggers.is_member(author) {
+            self.responses = 0;
+        }
+        let exhausted = self.responses >= RESPONSE_LIMIT;
 
         let mut activities = Vec::new();
         for (action_index, action) in operation.actions.iter().enumerate() {
             let normalized = ActionEnvelope::new(action, operation, member_id).into();
-            if let Relevance::Relevant(kind) = self.reduce(normalized, member, authored_by_member) {
+            if let Relevance::Relevant(kind) =
+                self.reduce(normalized, member, authored_by_member, authored_by_peer)
+            {
+                if exhausted {
+                    tracing::info!(
+                        %author,
+                        %member,
+                        ?subject,
+                        ?kind,
+                        operation = %operation.id,
+                        limit = RESPONSE_LIMIT,
+                        "ignored relevant activity because the member already answered this \
+                         subject its allowed number of times since a non-member acted"
+                    );
+                    continue;
+                }
                 if !may_trigger {
                     tracing::info!(
                         %author,
@@ -117,11 +160,20 @@ impl Context {
         activities
     }
 
+    /// Reduces one action, narrowing what a member may trigger in another member.
+    ///
+    /// A non-member is classified as before. A peer member reaches this one only by assigning it
+    /// work, naming it directly, replying to a comment it owns, or submitting work against
+    /// something it owns, which are the deliberate acts a human contributor would perform.
+    /// `@team` is excluded so that one member cannot summon the whole cast, and every other
+    /// ambient change is excluded so that a thread cannot sustain itself. Reactions never reach
+    /// anyone, because agreement is too ambiguous to act on.
     fn reduce(
         &mut self,
         action: NormalizedAction<'_>,
         member: Member,
         authored_by_member: bool,
+        authored_by_peer: bool,
     ) -> Relevance {
         if authored_by_member && let Some(entity) = action.track {
             self.entities.insert(entity);
@@ -140,12 +192,23 @@ impl Context {
         }
 
         if authored_by_member {
+            if action.signals.iter().any(Signal::writes_comment) {
+                self.responses = self.responses.saturating_add(1);
+            }
             return Relevance::Ignored;
         }
 
+        let addresses = |body: &str| {
+            if authored_by_peer {
+                member.is_named_in(body)
+            } else {
+                member.is_mentioned_in(body)
+            }
+        };
+
         for signal in action.signals {
             match signal {
-                Signal::Mention { body, target } if member.is_mentioned_in(body) => {
+                Signal::Mention { body, target } if addresses(body) => {
                     return Relevance::Relevant(Kind::Mentioned(target));
                 }
                 Signal::Reply {
@@ -157,7 +220,11 @@ impl Context {
                         reply_to: parent,
                     });
                 }
-                Signal::Change { audience, change } if audience.matches(self) => {
+                Signal::Change { audience, change }
+                    if !change.is_reaction()
+                        && (!authored_by_peer || change.is_work_submission())
+                        && audience.matches(self) =>
+                {
                     return Relevance::Relevant(Kind::Changed(change));
                 }
                 Signal::Mention { .. } | Signal::Reply { .. } | Signal::Change { .. } => {}
@@ -313,6 +380,19 @@ impl Audience {
     fn matches(&self, context: &Context) -> bool {
         (self.involved && context.involved())
             || self.owners.iter().any(|entity| context.owns(*entity))
+    }
+}
+
+impl Signal<'_> {
+    // Returns whether this signal is the member speaking on the subject.
+    fn writes_comment(&self) -> bool {
+        matches!(
+            self,
+            Self::Change {
+                change: Change::CommentCreated(Comment::Issue(_) | Comment::Revision { .. }),
+                ..
+            }
+        )
     }
 }
 

@@ -555,6 +555,16 @@ pub(super) struct ReviewWriteRequest {
     pub(super) labels: Vec<String>,
     #[serde(default)]
     pub(super) embeds: Vec<EmbedWriteRequest>,
+    /// Line comments published together with the review.
+    #[serde(default)]
+    pub(super) comments: Vec<ReviewCommentRequest>,
+}
+
+/// One line comment belonging to a review.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(super) struct ReviewCommentRequest {
+    pub(super) body: String,
+    pub(super) location: Option<LocationRequest>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]

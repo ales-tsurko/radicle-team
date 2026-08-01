@@ -2,6 +2,9 @@
 
 use std::{fmt, str::FromStr};
 
+// Handle which mentions every member at once, for work with no obvious owner.
+const TEAM_MENTION: &str = "team";
+
 /// A fixed member of the team.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Member {
@@ -106,14 +109,23 @@ impl Member {
         }
     }
 
+    // Returns whether `body` addresses this member by name or through [`TEAM_MENTION`].
     pub(crate) fn is_mentioned_in(self, body: &str) -> bool {
+        Self::addresses(body, |name| {
+            name.eq_ignore_ascii_case(self.id()) || name.eq_ignore_ascii_case(TEAM_MENTION)
+        })
+    }
+
+    // Returns whether `body` addresses this member by name alone.
+    pub(crate) fn is_named_in(self, body: &str) -> bool {
+        Self::addresses(body, |name| name.eq_ignore_ascii_case(self.id()))
+    }
+
+    fn addresses(body: &str, is_match: impl Fn(&str) -> bool) -> bool {
         body.split(|character: char| {
             !(character.is_ascii_alphanumeric() || matches!(character, '@' | '_' | '-'))
         })
-        .any(|word| {
-            word.strip_prefix('@')
-                .is_some_and(|name| name.eq_ignore_ascii_case(self.id()))
-        })
+        .any(|word| word.strip_prefix('@').is_some_and(&is_match))
     }
 }
 
@@ -212,6 +224,16 @@ mod tests {
         assert!(!Member::Nico.is_mentioned_in("Ask @nicole"));
         assert!(!Member::Nico.is_mentioned_in("mail@example@nico"));
         assert!(!Member::Nico.is_mentioned_in("nico"));
+    }
+
+    #[test]
+    fn detects_team_mentions_for_every_member() {
+        for member in Member::ALL {
+            assert!(member.is_mentioned_in("@team what do you think?"));
+            assert!(member.is_mentioned_in("(@Team) please weigh in"));
+            assert!(!member.is_mentioned_in("Ask @teams"));
+            assert!(!member.is_mentioned_in("team"));
+        }
     }
 
     #[test]

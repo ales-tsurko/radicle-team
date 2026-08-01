@@ -208,6 +208,7 @@ impl Application {
             agent,
             binding.mcp_allow().clone(),
             binding.triggered_by().clone(),
+            binding.member_dids().to_vec(),
         )
         .await?
         .run(self, agent)
@@ -675,6 +676,7 @@ struct AgentRuntime {
     runtime: Runtime,
     mcp: mcp::Server,
     triggered_by: manifest::TriggerAccess,
+    member_dids: Vec<Did>,
 }
 
 impl AgentRuntime {
@@ -684,6 +686,7 @@ impl AgentRuntime {
         agent: &mut (impl Agent + ?Sized),
         allowlist: manifest::McpAllowlist,
         triggered_by: manifest::TriggerAccess,
+        member_dids: Vec<Did>,
     ) -> Result<Self, Error> {
         let authorizer = WriteAuthorizer {
             application: application.clone(),
@@ -700,6 +703,7 @@ impl AgentRuntime {
             runtime,
             mcp,
             triggered_by,
+            member_dids,
         })
     }
 
@@ -799,6 +803,7 @@ impl AgentRuntime {
             application.member,
             application.repository,
             self.triggered_by.clone(),
+            self.member_dids.clone(),
         )
         .run(
             profile,
@@ -1301,7 +1306,10 @@ mod tests {
             Revision::Repository(Oid::from_sha1([0; 20])),
             crate::manifest::McpAllowlist::default(),
             crate::manifest::SecurityPolicy::test(repository),
-            crate::manifest::TriggerAccess::Delegates,
+            crate::manifest::TriggerPolicy::new(
+                crate::manifest::TriggerAccess::Delegates,
+                vec![did],
+            ),
         );
         application
             .record_binding(&home, binding.clone())

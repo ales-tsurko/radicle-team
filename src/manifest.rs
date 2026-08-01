@@ -171,8 +171,16 @@ impl Manifest {
             self.revision,
             binding.mcp_allow.clone(),
             self.security.clone(),
-            self.triggered_by.clone(),
+            TriggerPolicy::new(self.triggered_by.clone(), self.active_member_dids()),
         ))
+    }
+
+    fn active_member_dids(&self) -> Vec<Did> {
+        self.members
+            .values()
+            .filter(|binding| binding.state == BindingState::Active)
+            .map(|binding| binding.signing_did)
+            .collect()
     }
 
     fn parse(contents: &str, revision: Revision) -> Result<Self, Error> {
@@ -432,6 +440,33 @@ pub enum Revision {
     External,
 }
 
+/// Identities allowed to put this repository's members to work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerPolicy {
+    access: TriggerAccess,
+    members: Vec<Did>,
+}
+
+impl TriggerPolicy {
+    /// Pairs an access rule with every active member's signing DID.
+    #[must_use]
+    pub const fn new(access: TriggerAccess, members: Vec<Did>) -> Self {
+        Self { access, members }
+    }
+
+    /// Returns the configured access rule.
+    #[must_use]
+    pub const fn access(&self) -> &TriggerAccess {
+        &self.access
+    }
+
+    /// Returns every active member's signing DID.
+    #[must_use]
+    pub fn members(&self) -> &[Did] {
+        &self.members
+    }
+}
+
 /// An active binding verified against the local signing identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedBinding {
@@ -441,7 +476,7 @@ pub struct ValidatedBinding {
     revision: Revision,
     mcp_allow: McpAllowlist,
     security: SecurityPolicy,
-    triggered_by: TriggerAccess,
+    triggers: TriggerPolicy,
 }
 
 impl ValidatedBinding {
@@ -452,7 +487,7 @@ impl ValidatedBinding {
         revision: Revision,
         mcp_allow: McpAllowlist,
         security: SecurityPolicy,
-        triggered_by: TriggerAccess,
+        triggers: TriggerPolicy,
     ) -> Self {
         Self {
             member,
@@ -461,14 +496,20 @@ impl ValidatedBinding {
             revision,
             mcp_allow,
             security,
-            triggered_by,
+            triggers,
         }
+    }
+
+    /// Returns every active member's signing DID, including this binding's own.
+    #[must_use]
+    pub fn member_dids(&self) -> &[Did] {
+        self.triggers.members()
     }
 
     /// Returns the identities allowed to trigger this repository's agents.
     #[must_use]
     pub const fn triggered_by(&self) -> &TriggerAccess {
-        &self.triggered_by
+        self.triggers.access()
     }
 
     /// Returns the bound member.

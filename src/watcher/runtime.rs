@@ -65,6 +65,7 @@ pub struct Watcher {
     member: Member,
     repository: RepoId,
     triggered_by: TriggerAccess,
+    member_dids: Vec<Did>,
 }
 
 impl Watcher {
@@ -89,11 +90,17 @@ impl Watcher {
 
     /// Creates a watcher for `member` and `repository`.
     #[must_use]
-    pub const fn new(member: Member, repository: RepoId, triggered_by: TriggerAccess) -> Self {
+    pub const fn new(
+        member: Member,
+        repository: RepoId,
+        triggered_by: TriggerAccess,
+        member_dids: Vec<Did>,
+    ) -> Self {
         Self {
             member,
             repository,
             triggered_by,
+            member_dids,
         }
     }
 
@@ -243,7 +250,11 @@ impl Watcher {
         .await
         .map_err(|error| Error::Task(error.to_string()))??;
 
-        Ok(Triggers::new(self.triggered_by.clone(), delegates))
+        Ok(Triggers::new(
+            self.triggered_by.clone(),
+            delegates,
+            self.member_dids.clone(),
+        ))
     }
 
     async fn scan_objects<A>(

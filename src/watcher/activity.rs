@@ -215,6 +215,28 @@ pub enum Change {
     },
 }
 
+impl Change {
+    /// Returns whether this change delivers work to whoever owns the subject.
+    #[must_use]
+    pub const fn is_work_submission(&self) -> bool {
+        matches!(
+            self,
+            Self::ReviewSubmitted { .. } | Self::RevisionCreated(_)
+        )
+    }
+
+    /// Returns whether this change is a reaction being added or removed.
+    #[must_use]
+    pub const fn is_reaction(&self) -> bool {
+        matches!(
+            self,
+            Self::CommentReaction { .. }
+                | Self::ReviewReaction { .. }
+                | Self::RevisionReaction { .. }
+        )
+    }
+}
+
 #[cfg(all(test, not(miri)))]
 mod tests {
     use std::str::FromStr as _;
