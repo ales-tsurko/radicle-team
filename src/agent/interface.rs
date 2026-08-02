@@ -132,6 +132,19 @@ pub enum WorkId {
     Job(i64),
 }
 
+impl WorkId {
+    /// Returns a name for this work usable as a directory on every supported platform.
+    #[must_use]
+    pub fn directory(&self) -> String {
+        match self {
+            Self::Delivery(delivery) => {
+                format!("{}-{}", delivery.operation, delivery.action)
+            }
+            Self::Job(job) => format!("job-{job}"),
+        }
+    }
+}
+
 impl fmt::Display for WorkId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -196,9 +209,30 @@ impl Error {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr as _;
+
+    use radicle::cob::EntryId;
     use url::Url;
 
-    use crate::agent::McpEndpoint;
+    use crate::agent::{DeliveryId, McpEndpoint, WorkId};
+
+    #[test]
+    fn work_directory_names_avoid_characters_a_path_cannot_hold() {
+        let delivery = WorkId::Delivery(DeliveryId {
+            operation: EntryId::from_str("1111111111111111111111111111111111111111")
+                .expect("operation should be valid"),
+            action: 2,
+        });
+
+        for work in [delivery, WorkId::Job(7)] {
+            let directory = work.directory();
+            assert!(
+                !directory.contains(':'),
+                "Windows rejects a colon in a path, so '{directory}' would fail there"
+            );
+            assert!(directory.contains(&work.to_string().replace(':', "-")));
+        }
+    }
 
     #[test]
     fn endpoint_debug_output_hides_its_capability() {

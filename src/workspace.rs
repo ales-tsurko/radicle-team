@@ -49,7 +49,7 @@ impl Workspaces {
 
     fn prepare_blocking(&self, work: WorkId, subject: Subject) -> Result<WorkingCopy, Error> {
         fs::create_dir_all(&self.root)?;
-        let path = self.root.join(work.to_string());
+        let path = self.root.join(work.directory());
         if path.exists() {
             fs::remove_dir_all(&path)?;
         }
