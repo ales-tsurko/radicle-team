@@ -276,11 +276,17 @@ or invalid fails the next spawn rather than silently reusing the previous
 policy, so a typo surfaces immediately instead of appearing to apply.
 
 The repository manifest deliberately does **not** work this way: it is read once
-at startup, and changing `triggered_by`, `mcp_allow`, or a binding needs a
-restart. The asymmetry is intentional. A sandbox denial interrupts work already
-in progress, and the operator fixing it wants the running member to recover;
-manifest values do not block a running task, and reloading only some of them
-would leave a member acting on two different revisions of the same file at once.
+at startup. The asymmetry is intentional. A sandbox denial interrupts work
+already in progress, and the operator fixing it wants the running member to
+recover; manifest values do not block a running task, and reloading only some of
+them would leave a member acting on two different revisions of the same file at
+once.
+
+Agent adapters select commands and arguments but cannot weaken this policy.
+Every subprocess inherits the same sandbox.
+
+
+### Filesystem paths
 
 Radicle Team loads Zerobox's embedded platform and sensitive-path policies
 directly, so user-defined Zerobox profiles cannot replace them. It also enables
@@ -297,22 +303,27 @@ deny_write = ["/custom/build-cache/protected"]
 network = "all"
 ```
 
+
+### Network
+
 Network access can be unrestricted, disabled, or limited to domains:
 
 ```toml
+network = "all"                                          # default when omitted
 network = "disabled"
-```
-
-```toml
 network = ["api.openai.com", "crates.io", "github.com"]
 ```
 
-Omitting `network` defaults to `"all"`. Disabled and domain-restricted
-modes route external traffic through the managed proxy, which accepts only the
-capability-protected MCP endpoint.
+Disabled and domain-restricted modes route external traffic through the managed
+proxy, which accepts only the capability-protected MCP endpoint.
+
+
+### Loopback
 
 Loopback behaves differently on each platform, because Zerobox uses a different
-backend on each, and neither behaviour is configurable from here.
+backend on each, and neither behaviour is configurable from here. The member's
+own MCP endpoint stays reachable under every setting, directly on macOS and
+through the managed proxy on Linux, which bridges it into the namespace.
 
 On **macOS** the sandbox keeps host loopback reachable under every setting. An
 agent can use a local development or language server directly, and a local
@@ -324,23 +335,18 @@ loopback is unreachable and only the managed proxy bridges out. Zerobox creates
 that namespace per command, so a server one command starts is not reachable from
 the next one. A workflow that runs a local development server and then connects
 to it therefore needs `network = "all"` on Linux; `"domains"` does not help,
-because it is still a restricted sandbox.
-
-A restricted sandbox on Linux also blocks the command from creating new Unix
-domain sockets, so local services reached that way, such as a container daemon
-or a database socket, are unavailable there as well.
-
-The member's own MCP endpoint stays reachable under every setting, directly on
-macOS and through the managed proxy on Linux, which bridges it into the
-namespace.
+because it is still a restricted sandbox. A restricted sandbox on Linux also
+blocks the command from creating new Unix domain sockets, so local services
+reached that way, such as a container daemon or a database socket, are
+unavailable there as well.
 
 If you need both an isolated internet and a working local server on Linux, run
 the whole member inside a container with `network = "all"` and filter egress at
 the container instead. Leave the container able to reach your Radicle seeds, or
 `radicle-node` cannot synchronize.
 
-Agent adapters select commands and arguments but cannot weaken this policy.
-Every subprocess inherits the same sandbox.
+
+### Platform support
 
 Agent execution currently fails closed outside macOS and Linux because Zerobox
 does not provide an enforcing backend there. On Linux it also fails closed when
@@ -369,19 +375,30 @@ reviewed mapping between members and DIDs. Machine-private identity material,
 logs, locks, and watcher state remain under `~/.radicle-team`.
 
 ```toml
-version = 1
-triggered_by = "delegates"
+version = 1                              # required, must be 1
+triggered_by = "delegates"               # optional, defaults to "delegates"
 
-[security]
-repository = "rad:z3Security..."
-recipients = ["age1..."]
+[security]                               # required
+repository = "rad:z3Security..."         # private repository for reports
+recipients = ["age1..."]                 # age X25519, at least one
 
-[members.nico]
-signing_did = "did:key:z6Mk..."
-generation = 1
-state = "active"
-mcp_allow = ["read", "comments", "patches", "reactions", "reviews"]
+[priority]                               # optional, both keys optional
+front = "urgent"                         # defaults to "urgent"
+next = "next"                            # defaults to "next"
+
+[members.nico]                           # one table per member, fixed names
+signing_did = "did:key:z6Mk..."          # required
+generation = 1                           # required, monotonic
+state = "active"                         # required, "active" or "inactive"
+mcp_allow = ["read", "comments"]         # required, may be empty
 ```
+
+Every value here is read once at startup, so changing one needs a restart. The
+single exception is the delegate set, which is re-read on every scan: granting
+or revoking a delegate takes effect immediately.
+
+
+### Who may put a member to work
 
 `triggered_by` decides whose activity may put a member to work. Assignments,
 mentions, replies, and other changes from an identity outside it are recorded
@@ -398,6 +415,9 @@ listed, because they control this manifest and could grant themselves access by
 editing it. `"anyone"` suits a private repository, where Radicle's own access
 list already decides who can write. On a public repository it lets any seeding
 peer spend the operator's agent budget.
+
+The setup wizard asks for the value when it creates a manifest and leaves it
+alone when it later adds a member, so editing it by hand is safe.
 
 Members themselves are always allowed, whatever this setting says, so that one
 can delegate to another without being listed here. What they may trigger in each
@@ -424,15 +444,8 @@ Reactions never trigger anyone, whoever adds them. Approving an idea and asking
 for it to be carried out look identical, so acting on a reaction risks work
 nobody asked for. Request work in a comment.
 
-Omitting `triggered_by` restricts triggers to delegates. The setup wizard asks
-for it when it creates a manifest and leaves it alone when it later adds a
-member, so editing the value by hand is safe.
 
-Delegates are re-read on every scan, so granting or revoking one takes effect
-without restarting the member. `triggered_by` itself does not: like every other
-manifest value it is read at startup, unlike the local sandbox configuration,
-which reloads for each command. Keep `triggered_by` above `[security]`: TOML
-assigns any key after a table header to that table.
+### Which tools a member may use
 
 `mcp_allow` accepts exact MCP method names and the fixed `read`, `comments`,
 `issues`, `patches`, `reactions`, and `reviews` groups. The `patches` group does
@@ -444,17 +457,25 @@ Groups are derived from the tools registered by the MCP server: `get_*` and
 `patch`, `reaction`, or `review` component in their name. MCP `tools/list` is
 the authoritative method list. `comment_issue` belongs only to `issues`.
 
-`report_security_issue` is controlled by the security policy instead of
-`mcp_allow` and is available to every member. So are `add_job`, `cancel`,
-`note`, and `work_status`: they reach only the member's own queue, never the
-repository, so the manifest has no say in them and naming one in `mcp_allow` is
-rejected. They are offered to the talking half alone. `create_patch` and
-`update_patch` are offered to the building half alone, since they need commits
-the talking half cannot make. Everything else follows `mcp_allow` on both.
+Five tools are outside `mcp_allow`, and naming one there is rejected:
 
-New work joins the end of the queue. An assignment carrying an `urgent` label
-goes to the front and one carrying `next` goes after the running job. Rename
-either word for a repository that already uses different ones:
+- `report_security_issue`, controlled by `[security]` below and available to
+  every member;
+- `add_job`, `cancel`, `note`, and `work_status`, which reach only the member's
+  own queue and never the repository.
+
+A member's two halves also divide the remaining tools between them. `add_job`,
+`cancel`, `note`, and `work_status` are offered to the talking half alone;
+`create_patch` and `update_patch` to the building half alone, since they need
+commits the talking half cannot make. Everything else follows `mcp_allow` on
+both.
+
+
+### Where new work goes
+
+An assignment becomes a job in the member's queue. New work joins the end of
+that queue, an assignment labelled `urgent` goes to the front, and one labelled
+`next` goes after the running job.
 
 ```toml
 [priority]
@@ -462,7 +483,11 @@ front = "urgent"
 next = "next"
 ```
 
-The section is optional and only overrides the defaults shown above.
+The section is optional and only renames the two labels, for a repository that
+already uses different words. Omit it and the defaults above apply.
+
+
+### Security reports
 
 The security repository and at least one valid age X25519 recipient are
 required. `report_security_issue` encrypts the complete report before creating
@@ -474,7 +499,11 @@ exposed to agents. Agent adapters receive only the scoped MCP endpoint; trusted
 adapter code must also keep the host Radicle profile and recovery keys outside
 model subprocesses.
 
-Invocation-specific options remain command-line arguments:
+
+### Command-line options
+
+Invocation-specific options stay command-line arguments rather than manifest
+values:
 
 - `--home PATH` overrides `RADICLE_TEAM_HOME`;
 - `--seed NID` adds a preferred synchronization seed and may be repeated;
