@@ -7,7 +7,7 @@
 //! delivery-scoped MCP server.
 
 pub use crate::{
-    agent::interface::{Agent, Context, DeliveryId, Error, McpEndpoint},
+    agent::interface::{Coder, Context, DeliveryId, Error, McpEndpoint, Talker, WorkId},
     sandbox::{AgentChild, AgentCommand, AgentSandbox},
     watcher::{Change, Comment, Subject, Target},
 };

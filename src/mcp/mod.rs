@@ -4,7 +4,7 @@
 //! routing in `tools`, and repository operations in `read`, `write`, and `recovery`.
 
 pub(crate) use crate::mcp::{
-    server::{DeliveryScope, Error, Server},
+    server::{Error, Role, Server, WorkContext, WorkScope},
     tools::ToolService,
 };
 

@@ -53,9 +53,15 @@ use crate::mcp::{
 };
 #[cfg(not(miri))]
 use crate::mcp::server::ServiceError;
-use crate::mcp::{
-    read::{paginate_operations, revision_action},
-    tools::ToolService,
+use crate::{
+    manifest::QueuePosition,
+    mcp::{
+        read::{paginate_operations, revision_action},
+        tools::ToolService,
+    },
+    member::Member,
+    queue::WorkQueue,
+    watcher::Subject,
 };
 
 #[cfg(not(miri))]
@@ -157,7 +163,13 @@ impl RepositoryFixture {
         repository
     }
 
-    fn service(&self) -> ToolService {
+    async fn queue(&self) -> WorkQueue {
+        WorkQueue::memory(self.repository, Member::Nico)
+            .await
+            .expect("queue should open")
+    }
+
+    async fn service(&self) -> ToolService {
         let publisher = crate::agent::Publisher::new(
             self.profile.clone(),
             self.repository,
@@ -165,20 +177,20 @@ impl RepositoryFixture {
             TestAnnouncer,
             TestAuthorizer(self.repository),
         );
-        let security = SecurityReporting::new(&publisher);
         ToolService::new(
             self.profile.storage.clone(),
             self.repository,
-            super::DeliveryScope::default(),
+            super::WorkScope::default(),
             publisher,
             crate::manifest::McpAllowlist::default(),
-            security,
+            super::Role::Talker,
+            self.queue().await,
         )
     }
 
     async fn journaled_service(
         &self,
-        scope: super::DeliveryScope,
+        scope: super::WorkScope,
         announcer: impl crate::agent::Announcer,
     ) -> ToolService {
         let publisher = crate::agent::Publisher::new(
@@ -191,14 +203,33 @@ impl RepositoryFixture {
         .with_memory_journal()
         .await
         .expect("mutation journal should initialize");
-        let security = SecurityReporting::new(&publisher);
         ToolService::new(
             self.profile.storage.clone(),
             self.repository,
             scope,
             publisher,
             crate::manifest::McpAllowlist::default(),
-            security,
+            super::Role::Talker,
+            self.queue().await,
+        )
+    }
+
+    async fn service_for(&self, role: super::Role, queue: WorkQueue) -> ToolService {
+        let publisher = crate::agent::Publisher::new(
+            self.profile.clone(),
+            self.repository,
+            None,
+            TestAnnouncer,
+            TestAuthorizer(self.repository),
+        );
+        ToolService::new(
+            self.profile.storage.clone(),
+            self.repository,
+            super::WorkScope::new(publisher.clone()),
+            publisher,
+            crate::manifest::McpAllowlist::everything(),
+            role,
+            queue,
         )
     }
 
@@ -348,6 +379,10 @@ async fn starts_on_a_loopback_capability_url_and_stops() {
         repository,
         publisher,
         crate::manifest::McpAllowlist::default(),
+        super::Role::Talker,
+        WorkQueue::memory(repository, Member::Nico)
+            .await
+            .expect("queue should open"),
     )
     .await
     .expect("MCP server should start");
@@ -370,7 +405,7 @@ async fn starts_on_a_loopback_capability_url_and_stops() {
 #[tokio::test]
 #[cfg(not(miri))]
 async fn limits_tools_to_the_active_delivery_subject() {
-    let scope = super::DeliveryScope::default();
+    let scope = super::WorkScope::default();
     let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
     let subject = radicle::cob::ObjectId::from_str("1111111111111111111111111111111111111111")
         .expect("subject should be valid");
@@ -494,7 +529,7 @@ impl crate::agent::Announcer for FlakyAnnouncer {
 #[cfg(not(miri))]
 async fn recovers_a_completed_write_when_the_delivery_is_replayed() {
     let fixture = RepositoryFixture::new();
-    let scope = super::DeliveryScope::default();
+    let scope = super::WorkScope::default();
     let announcements = Arc::new(AtomicUsize::new(0));
     let service = fixture
         .journaled_service(scope.clone(), FlakyAnnouncer(Arc::clone(&announcements)))
@@ -520,7 +555,7 @@ async fn recovers_a_completed_write_when_the_delivery_is_replayed() {
     };
     let mutation = crate::agent::MutationKey {
         repository: fixture.repository,
-        delivery: context.delivery,
+        work: context.delivery.into(),
         invocation: 0,
         request: mutation_identity("create_issue", &request()).expect("request should serialize"),
     };
@@ -533,7 +568,7 @@ async fn recovers_a_completed_write_when_the_delivery_is_replayed() {
         .access_current()
         .await
         .expect("delivery should be accessible");
-    let delivery_service = service.for_delivery(&access);
+    let delivery_service = service.for_work(&access);
     assert!(
         delivery_service
             .create_issue_write(request())
@@ -548,7 +583,7 @@ async fn recovers_a_completed_write_when_the_delivery_is_replayed() {
         .expect("completion should be cleared to simulate an interrupted journal update");
     service
         .publisher
-        .reconcile(context.delivery)
+        .reconcile(context.delivery.into())
         .await
         .expect("unfinished write should reconcile without an exact retry");
     service
@@ -566,7 +601,7 @@ async fn recovers_a_completed_write_when_the_delivery_is_replayed() {
         .await
         .expect("delivery should be accessible");
     service
-        .for_delivery(&access)
+        .for_work(&access)
         .create_issue_write(request())
         .await
         .expect("replayed write should recover");
@@ -603,7 +638,7 @@ async fn reconciles_security_writes_from_the_delivery_journal() {
     .with_memory_journal()
     .await
     .expect("mutation journal should initialize");
-    let scope = super::DeliveryScope::new(publisher.clone());
+    let scope = super::WorkScope::new(publisher.clone());
     let reporting = SecurityReporting::new(&publisher);
     let service = ToolService::new(
         fixture.profile.storage.clone(),
@@ -611,7 +646,8 @@ async fn reconciles_security_writes_from_the_delivery_journal() {
         scope.clone(),
         publisher,
         crate::manifest::McpAllowlist::default(),
-        reporting.clone(),
+        super::Role::Talker,
+        fixture.queue().await,
     );
     let context = crate::agent::Context {
         repository: fixture.repository,
@@ -635,7 +671,7 @@ async fn reconciles_security_writes_from_the_delivery_journal() {
         .access_current()
         .await
         .expect("delivery should be accessible");
-    let delivery_service = service.for_delivery(&access);
+    let delivery_service = service.for_work(&access);
 
     let _announcement = reporting
         .report(
@@ -649,7 +685,7 @@ async fn reconciles_security_writes_from_the_delivery_journal() {
         .expect_err("the first announcement should fail");
     drop(access);
     scope
-        .reconcile(context.delivery)
+        .reconcile(context.delivery.into())
         .await
         .expect("security write should reconcile");
 
@@ -672,7 +708,7 @@ async fn reconciles_security_writes_from_the_delivery_journal() {
 #[cfg(not(miri))]
 async fn recovers_an_unsigned_local_write_without_duplication() {
     let fixture = RepositoryFixture::new();
-    let scope = super::DeliveryScope::default();
+    let scope = super::WorkScope::default();
     let service = fixture
         .journaled_service(scope.clone(), TestAnnouncer)
         .await;
@@ -698,7 +734,7 @@ async fn recovers_an_unsigned_local_write_without_duplication() {
     };
     let mutation = crate::agent::MutationKey {
         repository: fixture.repository,
-        delivery: context.delivery,
+        work: context.delivery.into(),
         invocation: 0,
         request: mutation_identity("create_issue", &request()).expect("request should serialize"),
     };
@@ -753,7 +789,7 @@ async fn recovers_an_unsigned_local_write_without_duplication() {
         .await
         .expect("delivery should be accessible");
     service
-        .for_delivery(&access)
+        .for_work(&access)
         .create_issue_write(request())
         .await
         .expect("unsigned write should recover");
@@ -777,7 +813,7 @@ async fn recovers_an_unsigned_local_write_without_duplication() {
 #[cfg(not(miri))]
 async fn recovers_created_comments_and_reviews_by_operation_id() {
     let fixture = RepositoryFixture::new();
-    let scope = super::DeliveryScope::default();
+    let scope = super::WorkScope::default();
     let service = fixture
         .journaled_service(scope.clone(), TestAnnouncer)
         .await;
@@ -804,7 +840,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
         .access_current()
         .await
         .expect("delivery should be accessible");
-    let delivery_service = service.for_delivery(&access);
+    let delivery_service = service.for_work(&access);
 
     let issue_request = || CreateIssueRequest {
         title: "Recovery target".to_owned(),
@@ -842,7 +878,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
         .publisher
         .forget_completion(&crate::agent::MutationKey {
             repository: fixture.repository,
-            delivery,
+            work: delivery.into(),
             invocation: 0,
             request: mutation_identity("create_comment", &comment_request())
                 .expect("request should serialize"),
@@ -859,7 +895,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
         .access_current()
         .await
         .expect("delivery should be accessible");
-    let delivery_service = service.for_delivery(&access);
+    let delivery_service = service.for_work(&access);
     delivery_service
         .create_issue_write(issue_request())
         .await
@@ -917,7 +953,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
         .publisher
         .forget_completion(&crate::agent::MutationKey {
             repository: fixture.repository,
-            delivery,
+            work: delivery.into(),
             invocation: 0,
             request: mutation_identity("create_review", &review_request())
                 .expect("request should serialize"),
@@ -934,7 +970,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
         .access_current()
         .await
         .expect("delivery should be accessible");
-    let delivery_service = service.for_delivery(&access);
+    let delivery_service = service.for_work(&access);
     delivery_service
         .create_issue_write(issue_request())
         .await
@@ -983,7 +1019,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
 #[cfg(not(miri))]
 async fn replays_stale_mutations_and_distinguishes_repeated_invocations() {
     let fixture = RepositoryFixture::new();
-    let scope = super::DeliveryScope::default();
+    let scope = super::WorkScope::default();
     let service = fixture
         .journaled_service(scope.clone(), TestAnnouncer)
         .await;
@@ -1010,7 +1046,7 @@ async fn replays_stale_mutations_and_distinguishes_repeated_invocations() {
         .access_current()
         .await
         .expect("delivery should be accessible");
-    let delivery_service = service.for_delivery(&access);
+    let delivery_service = service.for_work(&access);
     let issue_request = || CreateIssueRequest {
         title: "Original".to_owned(),
         description: "Issue".to_owned(),
@@ -1040,7 +1076,7 @@ async fn replays_stale_mutations_and_distinguishes_repeated_invocations() {
         .publisher
         .forget_completion(&crate::agent::MutationKey {
             repository: fixture.repository,
-            delivery,
+            work: delivery.into(),
             invocation: 0,
             request: mutation_identity("edit_issue", &stale()).expect("request should serialize"),
         })
@@ -1064,7 +1100,7 @@ async fn replays_stale_mutations_and_distinguishes_repeated_invocations() {
         .access_current()
         .await
         .expect("delivery should be accessible");
-    let delivery_service = service.for_delivery(&access);
+    let delivery_service = service.for_work(&access);
     delivery_service
         .create_issue_write(issue_request())
         .await
@@ -1119,7 +1155,7 @@ async fn replays_stale_mutations_and_distinguishes_repeated_invocations() {
 #[cfg(not(miri))]
 async fn distinguishes_identical_mutations_and_replays_concurrent_writes() {
     let fixture = RepositoryFixture::new();
-    let scope = super::DeliveryScope::default();
+    let scope = super::WorkScope::default();
     let service = fixture
         .journaled_service(scope.clone(), TestAnnouncer)
         .await;
@@ -1144,7 +1180,7 @@ async fn distinguishes_identical_mutations_and_replays_concurrent_writes() {
         .access_current()
         .await
         .expect("delivery should be accessible");
-    let delivery_service = service.for_delivery(&access);
+    let delivery_service = service.for_work(&access);
     let deactivating = tokio::spawn({
         let scope = scope.clone();
         async move { scope.deactivate().await }
@@ -1193,7 +1229,7 @@ async fn distinguishes_identical_mutations_and_replays_concurrent_writes() {
         .access_current()
         .await
         .expect("delivery should be accessible");
-    let replay = service.for_delivery(&access);
+    let replay = service.for_work(&access);
     assert_eq!(
         result_id(
             replay
@@ -1260,7 +1296,7 @@ async fn preserves_and_signs_workspace_only_patch_commits() {
         .expect("parent should exist");
     let head = commit(&checkout, &signature, "Workspace-only change", &[&parent]);
     drop(parent);
-    let service = fixture.service();
+    let service = fixture.service().await;
 
     service
         .create_patch_write(
@@ -1307,7 +1343,7 @@ async fn preserves_and_signs_workspace_only_patch_commits() {
 #[cfg(not(miri))]
 async fn filters_listed_issues_by_state_and_query() {
     let fixture = RepositoryFixture::new();
-    let service = fixture.service();
+    let service = fixture.service().await;
     let matching = result_id(
         service
             .create_issue_write(CreateIssueRequest {
@@ -1386,7 +1422,7 @@ async fn filters_listed_issues_by_state_and_query() {
 #[cfg(not(miri))]
 async fn manages_issues_and_their_comments() {
     let fixture = RepositoryFixture::new();
-    let service = fixture.service();
+    let service = fixture.service().await;
     let issue = result_id(
         service
             .create_issue_write(CreateIssueRequest {
@@ -1703,7 +1739,7 @@ async fn manages_issues_and_their_comments() {
 #[cfg(not(miri))]
 async fn reports_security_issues_independently_of_the_issue_allowlist() {
     let fixture = RepositoryFixture::new();
-    let service = fixture.service();
+    let service = fixture.service().await;
     let report = SecurityReporting::new(&service.publisher)
         .report(
             &service,
@@ -1753,10 +1789,11 @@ async fn reloads_the_security_policy_before_reporting() {
     let service = ToolService::new(
         fixture.profile.storage.clone(),
         fixture.repository,
-        super::DeliveryScope::default(),
+        super::WorkScope::default(),
         publisher,
         crate::manifest::McpAllowlist::default(),
-        reporting.clone(),
+        super::Role::Talker,
+        fixture.queue().await,
     );
     *policy.write().await = crate::manifest::SecurityPolicy::test_with_recipients(
         fixture.repository,
@@ -1796,7 +1833,7 @@ async fn reloads_the_security_policy_before_reporting() {
 #[cfg(not(miri))]
 async fn manages_patch_reviews_and_inline_comments() {
     let fixture = RepositoryFixture::new();
-    let service = fixture.service();
+    let service = fixture.service().await;
     let patch = result_id(
         service
             .create_patch_write(
@@ -2320,7 +2357,7 @@ async fn rejects_a_diff_with_a_single_oversized_line() {
     let head = commit(&checkout, &signature, "Large line", &[&parent]);
     drop(parent);
 
-    let service = fixture.service();
+    let service = fixture.service().await;
     let patch = result_id(
         service
             .create_patch_write(
@@ -2384,7 +2421,7 @@ async fn groups_diff_lines_by_raw_non_utf8_paths() {
     drop(parent);
     drop(tree);
 
-    let service = fixture.service();
+    let service = fixture.service().await;
     let patch = result_id(
         service
             .create_patch_write(
@@ -2502,4 +2539,80 @@ fn includes_merges_in_revision_history() {
     };
 
     assert!(revision_action(operation, &action, &revision.to_string()));
+}
+
+#[tokio::test]
+#[cfg(not(miri))]
+async fn each_half_offers_only_the_tools_its_side_can_use() {
+    let fixture = RepositoryFixture::new();
+    let queue = fixture.queue().await;
+    let talker = fixture
+        .service_for(super::Role::Talker, queue.clone())
+        .await;
+    let coder = fixture.service_for(super::Role::Coder, queue).await;
+
+    for tool in ["add_job", "cancel", "note", "work_status"] {
+        assert!(
+            talker.offers(tool),
+            "the talking half records work, so '{tool}' must reach it"
+        );
+        assert!(
+            !coder.offers(tool),
+            "'{tool}' would let the building half hand itself work"
+        );
+    }
+    for tool in ["create_patch", "update_patch"] {
+        assert!(
+            coder.offers(tool),
+            "the building half makes the commits '{tool}' needs"
+        );
+        assert!(
+            !talker.offers(tool),
+            "the talking half has no commits to turn into a patch with '{tool}'"
+        );
+    }
+    for tool in ["get_subject", "create_comment", "merge_patch"] {
+        assert!(talker.offers(tool));
+        assert!(
+            coder.offers(tool),
+            "'{tool}' belongs to whatever the manifest allows, not to one half"
+        );
+    }
+}
+
+#[tokio::test]
+#[cfg(not(miri))]
+async fn carries_a_note_on_the_next_result_the_building_half_receives() {
+    let fixture = RepositoryFixture::new();
+    let queue = fixture.queue().await;
+    let issue = Subject::Issue(
+        ObjectId::from_str("1111111111111111111111111111111111111111")
+            .expect("subject should be valid"),
+    );
+    let job = queue
+        .push("write it".to_owned(), issue, QueuePosition::End)
+        .await
+        .expect("job should be recorded");
+    let taken = queue.next().await.expect("queue should be readable");
+    assert_eq!(taken.id, job);
+
+    let talker = fixture
+        .service_for(super::Role::Talker, queue.clone())
+        .await;
+    let coder = fixture.service_for(super::Role::Coder, queue.clone()).await;
+    queue.note("use the existing parser".to_owned()).await;
+
+    assert!(
+        talker.pending_notes().await.is_empty(),
+        "a note must not travel back to the conversation that wrote it"
+    );
+    assert_eq!(
+        coder.pending_notes().await,
+        ["use the existing parser"],
+        "the building half has no inbox, so a note has to arrive on a tool result"
+    );
+    assert!(
+        coder.pending_notes().await.is_empty(),
+        "a note already carried must not repeat on every later call"
+    );
 }

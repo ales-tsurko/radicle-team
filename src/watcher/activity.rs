@@ -1,6 +1,6 @@
 //! Activities which may require the selected member's attention.
 
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf, str::FromStr};
 
 use radicle::{
     cob::{
@@ -10,7 +10,7 @@ use radicle::{
     identity::{Did, RepoId},
 };
 
-use crate::agent::{self, Agent, Context, DeliveryId};
+use crate::agent::{self, Context, DeliveryId, Talker};
 
 /// Activity addressed to or otherwise relevant to the selected member.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,15 +50,17 @@ impl Activity {
 
     pub(super) async fn dispatch(
         self,
-        agent: &mut (impl Agent + ?Sized),
+        delivery: Delivery,
+        agent: &mut (impl Talker + ?Sized),
         workspace: PathBuf,
     ) -> Result<(), agent::Error> {
         let context = self.context(workspace);
-        match self.kind {
-            Kind::Assigned => agent.assigned(context).await,
-            Kind::Mentioned(target) => agent.mentioned(context, target).await,
-            Kind::Replied { comment, reply_to } => agent.replied(context, comment, reply_to).await,
-            Kind::Changed(change) => agent.changed(context, change).await,
+        match delivery {
+            Delivery::Mentioned(target) => agent.mentioned(context, target).await,
+            Delivery::Replied { comment, reply_to } => {
+                agent.replied(context, comment, reply_to).await
+            }
+            Delivery::Changed(change) => agent.changed(context, change).await,
         }
     }
 
@@ -89,21 +91,58 @@ pub enum Subject {
     Patch(ObjectId),
 }
 
-/// Reason an interaction requires the member's attention.
+impl Subject {
+    /// Returns the identifier of the issue or patch.
+    #[must_use]
+    pub const fn id(&self) -> ObjectId {
+        match self {
+            Self::Issue(id) | Self::Patch(id) => *id,
+        }
+    }
+}
+
+impl fmt::Display for Subject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Issue(id) => write!(formatter, "issue:{id}"),
+            Self::Patch(id) => write!(formatter, "patch:{id}"),
+        }
+    }
+}
+
+impl FromStr for Subject {
+    type Err = InvalidSubject;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || InvalidSubject(value.to_owned());
+        let (kind, id) = value.split_once(':').ok_or_else(invalid)?;
+        let id = ObjectId::from_str(id).map_err(|_error| invalid())?;
+        match kind {
+            "issue" => Ok(Self::Issue(id)),
+            "patch" => Ok(Self::Patch(id)),
+            _ => Err(invalid()),
+        }
+    }
+}
+
+/// A stored subject address could not be read back.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid subject '{0}'")]
+pub struct InvalidSubject(String);
+
+// Reason an interaction requires the member's attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
-    /// The member was assigned an issue or patch review.
     Assigned,
-    /// The member was mentioned in text.
+    // Something happened that the talking half should answer.
+    Delivered(Delivery),
+}
+
+// An interaction the talking half handles itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Delivery {
     Mentioned(Target),
-    /// A comment replied to one of the member's comments.
-    Replied {
-        /// New reply.
-        comment: Comment,
-        /// Member comment receiving the reply.
-        reply_to: EntryId,
-    },
-    /// Another relevant interaction occurred.
+    Replied { comment: Comment, reply_to: EntryId },
     Changed(Change),
 }
 
@@ -247,9 +286,11 @@ mod tests {
     };
 
     use crate::{
-        agent::{Agent, Context, DeliveryId, Error, McpEndpoint},
+        agent::{Context, DeliveryId, Error, McpEndpoint, Talker},
         member::Profile,
-        watcher::activity::{Activity, Change, Comment, Kind, Subject, Target},
+        watcher::activity::{
+            Activity, Change, Comment, Delivery, InvalidSubject, Kind, Subject, Target,
+        },
     };
 
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
@@ -260,7 +301,6 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum Call {
-        Assigned(Context),
         Mentioned(Context, Target),
         Replied(Context, Comment, EntryId),
         Changed(Context, Change),
@@ -272,18 +312,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl Agent for RecordingAgent {
+    impl Talker for RecordingAgent {
         async fn start(
             &mut self,
             _profile: Profile,
             _mcp: &McpEndpoint,
             _sandbox: crate::sandbox::AgentSandbox,
         ) -> Result<(), Error> {
-            Ok(())
-        }
-
-        async fn assigned(&mut self, context: Context) -> Result<(), Error> {
-            self.calls.push(Call::Assigned(context));
             Ok(())
         }
 
@@ -334,39 +369,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatches_every_activity_to_its_typed_agent_method() {
+    async fn dispatches_every_delivery_to_its_typed_agent_method() {
         let comment =
             Comment::Issue(EntryId::from_str(COMMENT).expect("comment operation should be valid"));
         let mut agent = RecordingAgent::default();
+        let deliveries = [
+            Delivery::Mentioned(Target::Comment(comment)),
+            Delivery::Replied {
+                comment,
+                reply_to: context().delivery.operation,
+            },
+            Delivery::Changed(Change::CommentCreated(comment)),
+        ];
 
-        activity(Kind::Assigned)
-            .dispatch(&mut agent, context().workspace)
-            .await
-            .expect("assignment should dispatch");
-        activity(Kind::Mentioned(Target::Comment(comment)))
-            .dispatch(&mut agent, context().workspace)
-            .await
-            .expect("mention should dispatch");
-        activity(Kind::Replied {
-            comment,
-            reply_to: context().delivery.operation,
-        })
-        .dispatch(&mut agent, context().workspace)
-        .await
-        .expect("reply should dispatch");
-        activity(Kind::Changed(Change::CommentCreated(comment)))
-            .dispatch(&mut agent, context().workspace)
-            .await
-            .expect("change should dispatch");
+        for delivery in deliveries {
+            activity(Kind::Delivered(delivery))
+                .dispatch(delivery, &mut agent, context().workspace)
+                .await
+                .expect("delivery should dispatch");
+        }
 
         assert_eq!(
             agent.calls,
             [
-                Call::Assigned(context()),
                 Call::Mentioned(context(), Target::Comment(comment)),
                 Call::Replied(context(), comment, context().delivery.operation),
                 Call::Changed(context(), Change::CommentCreated(comment)),
             ]
         );
+    }
+
+    #[test]
+    fn reads_back_every_subject_address_it_writes() {
+        let issue = Subject::Issue(ObjectId::from_str(SUBJECT).expect("subject should be valid"));
+        let patch = Subject::Patch(ObjectId::from_str(SUBJECT).expect("subject should be valid"));
+
+        for subject in [issue, patch] {
+            assert_eq!(
+                Subject::from_str(&subject.to_string()),
+                Ok(subject),
+                "a queued job is only traceable if its stored source survives a round trip"
+            );
+        }
+        for malformed in [SUBJECT.to_owned(), format!("review:{SUBJECT}")] {
+            assert!(
+                matches!(Subject::from_str(&malformed), Err(InvalidSubject(value)) if value == malformed),
+                "an address that names no issue or patch must be refused rather than guessed at"
+            );
+        }
     }
 }

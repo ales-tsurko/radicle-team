@@ -20,7 +20,7 @@ use crate::{
     member::Member,
     watcher::{
         Change, Comment, Subject, Target,
-        activity::{Activity, Kind},
+        activity::{Activity, Delivery, Kind},
     },
 };
 
@@ -186,7 +186,7 @@ impl Context {
                 return Relevance::Relevant(if assigned {
                     Kind::Assigned
                 } else {
-                    Kind::Changed(Change::Unassigned)
+                    Kind::Delivered(Delivery::Changed(Change::Unassigned))
                 });
             }
         }
@@ -209,23 +209,23 @@ impl Context {
         for signal in action.signals {
             match signal {
                 Signal::Mention { body, target } if addresses(body) => {
-                    return Relevance::Relevant(Kind::Mentioned(target));
+                    return Relevance::Relevant(Kind::Delivered(Delivery::Mentioned(target)));
                 }
                 Signal::Reply {
                     parent: Some(parent),
                     comment,
                 } if self.owns(Entity::Comment(parent)) => {
-                    return Relevance::Relevant(Kind::Replied {
+                    return Relevance::Relevant(Kind::Delivered(Delivery::Replied {
                         comment,
                         reply_to: parent,
-                    });
+                    }));
                 }
                 Signal::Change { audience, change }
                     if !change.is_reaction()
                         && (!authored_by_peer || change.is_work_submission())
                         && audience.matches(self) =>
                 {
-                    return Relevance::Relevant(Kind::Changed(change));
+                    return Relevance::Relevant(Kind::Delivered(Delivery::Changed(change)));
                 }
                 Signal::Mention { .. } | Signal::Reply { .. } | Signal::Change { .. } => {}
             }

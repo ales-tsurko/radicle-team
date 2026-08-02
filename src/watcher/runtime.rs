@@ -17,12 +17,13 @@ use radicle::{
 };
 
 use crate::{
-    agent::{self, Agent},
-    manifest::TriggerAccess,
-    mcp::DeliveryScope,
+    agent::{self, Talker},
+    manifest::{PriorityLabels, RepositoryPolicy},
+    mcp::WorkScope,
     member::Member,
+    queue::WorkQueue,
     watcher::{
-        activity::{Activity, Kind, Subject},
+        activity::{Activity, Delivery, Kind, Subject},
         classification::{
             ActionEnvelope, Context as ClassificationContext, NormalizedAction, Triggers,
         },
@@ -64,8 +65,7 @@ macro_rules! history_scanner {
 pub struct Watcher {
     member: Member,
     repository: RepoId,
-    triggered_by: TriggerAccess,
-    member_dids: Vec<Did>,
+    policy: RepositoryPolicy,
 }
 
 impl Watcher {
@@ -90,17 +90,11 @@ impl Watcher {
 
     /// Creates a watcher for `member` and `repository`.
     #[must_use]
-    pub const fn new(
-        member: Member,
-        repository: RepoId,
-        triggered_by: TriggerAccess,
-        member_dids: Vec<Did>,
-    ) -> Self {
+    pub const fn new(member: Member, repository: RepoId, policy: RepositoryPolicy) -> Self {
         Self {
             member,
             repository,
-            triggered_by,
-            member_dids,
+            policy,
         }
     }
 
@@ -110,18 +104,13 @@ impl Watcher {
         profile: &RadicleProfile,
         node: &Node,
         state_path: &Path,
-        agent: &mut (impl Agent + ?Sized),
-        workspaces: Workspaces,
-        delivery_scope: DeliveryScope,
+        agent: &mut (impl Talker + ?Sized),
+        delivery: DeliveryRuntime,
     ) -> Result<(), Error> {
         let member_id = Self::verify_profile(*profile.id(), node.clone()).await?;
-        let storage = profile.storage.clone();
+        let storage = delivery.storage.clone();
         let state = ProcessedActivities::open(state_path).await?;
         let events = self.subscribe(node.clone()).await?;
-        let delivery = DeliveryRuntime {
-            workspaces,
-            scope: delivery_scope,
-        };
         self.watch(&storage, member_id, &state, events, agent, &delivery)
             .await
     }
@@ -141,7 +130,7 @@ impl Watcher {
         member_id: NodeId,
         state: &ProcessedActivities,
         mut events: tokio::sync::mpsc::Receiver<Result<(), Error>>,
-        agent: &mut (impl Agent + ?Sized),
+        agent: &mut (impl Talker + ?Sized),
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error> {
         self.scan_all(storage, member_id, state, agent, delivery)
@@ -207,7 +196,7 @@ impl Watcher {
         storage: &Storage,
         member_id: NodeId,
         state: &ProcessedActivities,
-        agent: &mut (impl Agent + ?Sized),
+        agent: &mut (impl Talker + ?Sized),
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error> {
         let triggers = self.resolve_triggers(storage).await?;
@@ -251,9 +240,9 @@ impl Watcher {
         .map_err(|error| Error::Task(error.to_string()))??;
 
         Ok(Triggers::new(
-            self.triggered_by.clone(),
+            self.policy.access().clone(),
             delegates,
-            self.member_dids.clone(),
+            self.policy.members().to_vec(),
         ))
     }
 
@@ -261,7 +250,7 @@ impl Watcher {
         &self,
         mut histories: tokio::sync::mpsc::Receiver<HistoryEvent<A>>,
         state: &ProcessedActivities,
-        agent: &mut (impl Agent + ?Sized),
+        agent: &mut (impl Talker + ?Sized),
         delivery: &DeliveryRuntime,
         source: HistorySource<'_>,
     ) -> Result<(), Error>
@@ -318,7 +307,7 @@ impl Watcher {
         source: HistorySource<'_>,
         active: &mut Option<ActiveHistory>,
         state: &ProcessedActivities,
-        agent: &mut (impl Agent + ?Sized),
+        agent: &mut (impl Talker + ?Sized),
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error>
     where
@@ -391,7 +380,7 @@ impl Watcher {
     async fn finish_active(
         active: &mut Option<ActiveHistory>,
         state: &ProcessedActivities,
-        agent: &mut (impl Agent + ?Sized),
+        agent: &mut (impl Talker + ?Sized),
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error> {
         let active = active
@@ -496,10 +485,97 @@ impl Watcher {
     }
 }
 
+// Everything one scan needs in order to hand work to the member's two halves.
 #[derive(Debug, Clone)]
-struct DeliveryRuntime {
+pub(crate) struct DeliveryRuntime {
     workspaces: Workspaces,
-    scope: DeliveryScope,
+    scope: WorkScope,
+    storage: Storage,
+    queue: WorkQueue,
+    priority: PriorityLabels,
+}
+
+impl DeliveryRuntime {
+    // Pairs the conversation's own resources with the queue its assignments end up in.
+    pub(crate) const fn new(
+        workspaces: Workspaces,
+        scope: WorkScope,
+        storage: Storage,
+        queue: WorkQueue,
+        priority: PriorityLabels,
+    ) -> Self {
+        Self {
+            workspaces,
+            scope,
+            storage,
+            queue,
+            priority,
+        }
+    }
+
+    async fn assignment(&self, repository: RepoId, subject: Subject) -> Result<Assignment, Error> {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let stored = storage.repository(repository)?;
+            let id = subject.id();
+            match subject {
+                Subject::Issue(_) => {
+                    let issue = Issues::open(&stored, ReadOnly)?
+                        .get(&id)?
+                        .ok_or(Error::SubjectMissing(subject))?;
+                    Ok(Assignment::new(
+                        subject,
+                        issue.title(),
+                        issue.description(),
+                        issue.labels(),
+                    ))
+                }
+                Subject::Patch(_) => {
+                    let patch = Patches::open(&stored, ReadOnly)?
+                        .get(&id)?
+                        .ok_or(Error::SubjectMissing(subject))?;
+                    Ok(Assignment::new(
+                        subject,
+                        patch.title(),
+                        patch.description(),
+                        patch.labels(),
+                    ))
+                }
+            }
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))?
+    }
+}
+
+struct Assignment {
+    brief: String,
+    labels: Vec<String>,
+}
+
+impl Assignment {
+    fn new<'a>(
+        subject: Subject,
+        title: &str,
+        description: &str,
+        labels: impl Iterator<Item = &'a radicle::cob::Label>,
+    ) -> Self {
+        let kind = match subject {
+            Subject::Issue(_) => "issue",
+            Subject::Patch(_) => "patch",
+        };
+        let mut brief = format!("You were assigned this {kind}: {title}");
+        let description = description.trim();
+        if !description.is_empty() {
+            brief.push_str("\n\n");
+            brief.push_str(description);
+        }
+
+        Self {
+            brief,
+            labels: labels.map(ToString::to_string).collect(),
+        }
+    }
 }
 
 enum HistoryEvent<A> {
@@ -570,7 +646,7 @@ impl ScanScope {
 struct PendingActivities {
     assignment: Option<Activity>,
     skipped: Vec<Activity>,
-    activities: Vec<Activity>,
+    activities: Vec<(Activity, Delivery)>,
 }
 
 impl PendingActivities {
@@ -581,7 +657,7 @@ impl PendingActivities {
                     self.skipped.push(superseded);
                 }
             }
-            _ => self.activities.push(activity),
+            Kind::Delivered(delivery) => self.activities.push((activity, delivery)),
         }
     }
 
@@ -591,7 +667,7 @@ impl PendingActivities {
         actionable: bool,
         scope: ScanScope,
         state: &ProcessedActivities,
-        agent: &mut (impl Agent + ?Sized),
+        agent: &mut (impl Talker + ?Sized),
         runtime: &DeliveryRuntime,
     ) -> Result<(), Error> {
         for activity in self.skipped {
@@ -599,39 +675,57 @@ impl PendingActivities {
         }
         if let Some(activity) = self.assignment {
             if assigned && actionable {
-                Self::deliver(activity, scope, state, agent, runtime).await?;
+                Self::enqueue(activity, scope, state, runtime).await?;
             } else {
                 Self::checkpoint(activity, scope, state, runtime).await?;
             }
         }
-        for activity in self.activities {
-            Self::deliver(activity, scope, state, agent, runtime).await?;
+        for (activity, delivery) in self.activities {
+            Self::deliver(activity, delivery, scope, state, agent, runtime).await?;
         }
         Ok(())
     }
 
-    async fn deliver(
+    // Records an assignment as queued work rather than handing it to the conversation.
+    async fn enqueue(
         activity: Activity,
         scope: ScanScope,
         state: &ProcessedActivities,
-        agent: &mut (impl Agent + ?Sized),
         runtime: &DeliveryRuntime,
     ) -> Result<(), Error> {
-        Self::deliver_fresh(activity, scope, state, agent, runtime).await
+        let subject = activity.subject;
+        let assignment = runtime.assignment(scope.repository, subject).await?;
+        let position = runtime
+            .priority
+            .position(assignment.labels.iter().map(String::as_str));
+        let job = runtime
+            .queue
+            .push(assignment.brief, subject, position)
+            .await?;
+        tracing::info!(
+            member = %scope.member,
+            repository = %scope.repository,
+            %subject,
+            job,
+            ?position,
+            "assignment recorded as queued work"
+        );
+        Self::checkpoint(activity, scope, state, runtime).await
     }
 
-    async fn deliver_fresh(
+    async fn deliver(
         activity: Activity,
+        delivery: Delivery,
         scope: ScanScope,
         state: &ProcessedActivities,
-        agent: &mut (impl Agent + ?Sized),
+        agent: &mut (impl Talker + ?Sized),
         runtime: &DeliveryRuntime,
     ) -> Result<(), Error> {
-        let delivery = activity.delivery_id();
+        let identity = activity.delivery_id();
         let subject = activity.subject;
         let workspace = runtime
             .workspaces
-            .prepare(delivery, subject)
+            .prepare(identity.into(), subject)
             .await
             .map_err(|error| Error::Workspace(error.to_string()))?;
         let path = workspace.path().to_path_buf();
@@ -639,30 +733,30 @@ impl PendingActivities {
             .scope
             .activate(activity.context(path.clone()))
             .await
-            .map_err(Error::DeliveryScope)?;
+            .map_err(Error::WorkScope)?;
         tracing::info!(
             member = %scope.member,
             repository = %scope.repository,
             ?subject,
-            operation = %delivery.operation,
-            action = delivery.action,
+            operation = %identity.operation,
+            action = identity.action,
             workspace = %path.display(),
             "dispatching activity to the agent"
         );
-        let handled = activity.dispatch(agent, path).await;
+        let handled = activity.dispatch(delivery, agent, path).await;
         runtime.scope.deactivate().await;
         let cleaned = workspace.cleanup().await;
         handled.inspect_err(|error| {
             tracing::warn!(
                 member = %scope.member,
-                operation = %delivery.operation,
-                action = delivery.action,
+                operation = %identity.operation,
+                action = identity.action,
                 %error,
                 "agent failed to handle activity"
             );
         })?;
         cleaned.map_err(|error| Error::Workspace(error.to_string()))?;
-        Self::checkpoint_delivery(delivery, scope, state, runtime).await
+        Self::checkpoint_delivery(identity, scope, state, runtime).await
     }
 
     async fn checkpoint(
@@ -683,7 +777,7 @@ impl PendingActivities {
     ) -> Result<(), Error> {
         runtime
             .scope
-            .reconcile(delivery)
+            .reconcile(delivery.into())
             .await
             .map_err(Error::PublicationRecovery)?;
         let _inserted = state
@@ -736,18 +830,24 @@ pub enum Error {
     /// Reading or writing the local watcher database failed.
     #[error("watcher database error: {0}")]
     Database(String),
+    /// Recording assigned work failed.
+    #[error("work queue error: {0}")]
+    Queue(#[from] crate::queue::Error),
+    /// An assignment names an issue or patch the repository does not contain.
+    #[error("assigned {0} was not found")]
+    SubjectMissing(Subject),
     /// An agent adapter failed while handling classified activity.
     #[error(transparent)]
-    Agent(#[from] agent::Error),
+    Talker(#[from] agent::Error),
     /// Preparing the local watcher database failed.
     #[error("watcher state I/O error: {0}")]
     Io(#[from] std::io::Error),
     /// Preparing or cleaning the agent workspace failed.
     #[error("agent workspace failed: {0}")]
     Workspace(String),
-    /// Activating the delivery-scoped MCP capability failed.
-    #[error("delivery scope failed: {0}")]
-    DeliveryScope(String),
+    /// Activating the work-scoped MCP capability failed.
+    #[error("work scope failed: {0}")]
+    WorkScope(String),
     /// Recovering durable MCP publications before checkpointing failed.
     #[error("MCP publication recovery failed: {0}")]
     PublicationRecovery(String),
@@ -776,16 +876,19 @@ mod tests {
     use std::str::FromStr as _;
 
     use radicle::{
-        cob::{EntryId, ObjectId},
+        cob::{EntryId, Label, ObjectId, Title},
         crypto::Seed,
-        identity::RepoId,
+        identity::{RepoId, doc::Visibility},
         node::Alias,
         profile::{Home, Profile},
+        storage::ReadStorage as _,
     };
 
     use crate::{
-        agent::{Agent, Context, McpEndpoint},
+        agent::{Context, McpEndpoint, Talker},
+        manifest::{PriorityLabels, QueuePosition},
         member::{Member, Profile as MemberProfile},
+        queue::WorkQueue,
         watcher::{
             Change, Comment, Subject, Target,
             activity::{Activity, Kind},
@@ -837,6 +940,9 @@ mod tests {
         let state = ProcessedActivities::memory()
             .await
             .expect("state should initialize");
+        let queue = WorkQueue::memory(repository, Member::Nico)
+            .await
+            .expect("queue should open");
         let runtime = DeliveryRuntime {
             workspaces: Workspaces::new(
                 root.path().join("workspaces"),
@@ -844,7 +950,10 @@ mod tests {
                 repository,
                 *profile.id(),
             ),
-            scope: crate::mcp::DeliveryScope::default(),
+            scope: crate::mcp::WorkScope::default(),
+            storage: profile.storage.clone(),
+            queue: queue.clone(),
+            priority: PriorityLabels::default(),
         };
 
         pending
@@ -859,22 +968,188 @@ mod tests {
                     .expect("state should be readable")
             );
         }
+        assert!(
+            queue
+                .pending()
+                .await
+                .expect("queue should be readable")
+                .is_empty(),
+            "an assignment that never became active must not leave work behind"
+        );
+    }
+
+    /// Builds a repository holding one labelled issue, and returns its identifiers.
+    fn assigned_issue(root: &std::path::Path, labels: &[Label]) -> (Profile, RepoId, ObjectId) {
+        let profile = Profile::init(
+            Home::new(root.join("home")).expect("home should be created"),
+            Alias::new("assignment-test"),
+            None,
+            Seed::generate(),
+        )
+        .expect("profile should initialize");
+        let working = root.join("working");
+        let checkout = git2::Repository::init(&working).expect("repository should initialize");
+        let signature = git2::Signature::now("Assignment Test", "assignment@example.com")
+            .expect("signature should be valid");
+        std::fs::write(working.join("README.md"), "initial\n").expect("README should be written");
+        let tree = {
+            let mut index = checkout.index().expect("index should open");
+            index
+                .add_path(std::path::Path::new("README.md"))
+                .expect("README should be added");
+            let oid = index.write_tree().expect("tree should be written");
+            checkout.find_tree(oid).expect("tree should exist")
+        };
+        checkout
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "Initial",
+                &tree,
+                &[],
+            )
+            .expect("commit should be created");
+        drop(tree);
+        let signer = profile.signer().expect("signer should load");
+        let (repository, _document, _refs) = radicle::rad::init(
+            &checkout,
+            "assignment-test"
+                .try_into()
+                .expect("project name should be valid"),
+            "Assignment test",
+            "main".try_into().expect("branch should be valid"),
+            Visibility::default(),
+            &signer,
+            &profile.storage,
+        )
+        .expect("Radicle repository should initialize");
+        let issue = {
+            let stored = profile
+                .storage
+                .repository(repository)
+                .expect("stored repository should open");
+            let mut issues = profile
+                .issues_mut(&stored, &signer)
+                .expect("issue cache should open");
+            let issue = issues
+                .create(
+                    Title::try_from("Fix the parser".to_owned()).expect("title should be valid"),
+                    "It drops the last field.",
+                    labels,
+                    &[],
+                    [],
+                )
+                .expect("issue should be created");
+            *issue.id()
+        };
+
+        (profile, repository, issue)
+    }
+
+    async fn enqueue_assignment(labels: &[Label]) -> (WorkQueue, tempfile::TempDir) {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let (profile, repository, issue) = assigned_issue(root.path(), labels);
+        let operation = EntryId::from_str("2222222222222222222222222222222222222222")
+            .expect("operation should be valid");
+        let mut pending = PendingActivities::default();
+        pending.add(Activity::new(
+            repository,
+            Subject::Issue(issue),
+            operation,
+            0,
+            profile.did(),
+            Kind::Assigned,
+        ));
+        let queue = WorkQueue::memory(repository, Member::Nico)
+            .await
+            .expect("queue should open");
+        let runtime = DeliveryRuntime::new(
+            Workspaces::new(
+                root.path().join("workspaces"),
+                profile.storage.clone(),
+                repository,
+                *profile.id(),
+            ),
+            crate::mcp::WorkScope::default(),
+            profile.storage.clone(),
+            queue.clone(),
+            PriorityLabels::default(),
+        );
+        let state = ProcessedActivities::memory()
+            .await
+            .expect("state should initialize");
+        let scope = ScanScope::new(
+            Member::Nico,
+            *profile.id(),
+            repository,
+            issue,
+            Subject::Issue(issue),
+            true,
+        );
+        pending
+            .dispatch(true, true, scope, &state, &mut NoopAgent, &runtime)
+            .await
+            .expect("an active assignment should become queued work");
+        assert!(
+            state
+                .contains(repository, issue, operation, 0)
+                .await
+                .expect("state should be readable"),
+            "a queued assignment must be checkpointed, or a rescan would queue it again"
+        );
+
+        (queue, root)
+    }
+
+    #[tokio::test]
+    async fn records_an_assignment_as_work_rather_than_conversation() {
+        let (queue, _root) = enqueue_assignment(&[]).await;
+
+        let pending = queue.pending().await.expect("queue should be readable");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].position,
+            QueuePosition::End,
+            "work nobody marked urgent joins the end of the queue"
+        );
+        assert!(
+            pending[0].brief.contains("Fix the parser")
+                && pending[0].brief.contains("It drops the last field."),
+            "the brief must carry the request, so the building half can start without rereading \
+             the issue: {}",
+            pending[0].brief
+        );
+    }
+
+    #[tokio::test]
+    async fn takes_the_queue_position_from_the_labels_on_the_subject() {
+        for (label, expected) in [
+            ("urgent", QueuePosition::Front),
+            ("next", QueuePosition::Next),
+            ("chore", QueuePosition::End),
+        ] {
+            let label = Label::new(label).expect("label should be valid");
+            let (queue, _root) = enqueue_assignment(std::slice::from_ref(&label)).await;
+
+            let pending = queue.pending().await.expect("queue should be readable");
+            assert_eq!(
+                pending[0].position, expected,
+                "'{label}' must decide where the assignment joins the queue"
+            );
+        }
     }
 
     struct NoopAgent;
 
     #[async_trait::async_trait]
-    impl Agent for NoopAgent {
+    impl Talker for NoopAgent {
         async fn start(
             &mut self,
             _profile: MemberProfile,
             _mcp: &McpEndpoint,
             _sandbox: crate::sandbox::AgentSandbox,
         ) -> Result<(), crate::agent::Error> {
-            Ok(())
-        }
-
-        async fn assigned(&mut self, _context: Context) -> Result<(), crate::agent::Error> {
             Ok(())
         }
 

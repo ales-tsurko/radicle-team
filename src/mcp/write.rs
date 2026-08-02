@@ -65,18 +65,18 @@ impl ToolService {
             + Send
             + 'static,
     {
-        let mutation = if let Some(delivery) = self.mutation_delivery {
+        let mutation = if let Some(work) = self.mutation_work {
             let invocations = self
                 .mutation_invocations
                 .as_ref()
-                .expect("delivery invocation counters should be configured");
+                .expect("work invocation counters should be configured");
             let mut invocations = invocations.lock().await;
             let invocation = invocations.entry(request.clone()).or_default();
             let key = crate::agent::MutationKey {
                 repository: self
                     .mutation_repository
-                    .expect("delivery repository should be configured"),
-                delivery,
+                    .expect("work repository should be configured"),
+                work,
                 invocation: *invocation,
                 request,
             };

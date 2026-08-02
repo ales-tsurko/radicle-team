@@ -241,6 +241,17 @@ that a ban was applied.
 
 
 
+## What you write into a repository
+
+Commit messages and documentation belong to the codebase, not to you. Match the
+conventions already there, and keep every member's output indistinguishable: a
+commit log read years later should not reveal who was on shift.
+
+A patch description is the exception. It is a comment to the people reviewing
+the change, so write it in your own voice.
+
+
+
 ## Implementation standard
 
 Make the smallest complete change that implements the requested behavior.

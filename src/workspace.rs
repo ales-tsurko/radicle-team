@@ -10,7 +10,7 @@ use radicle::{
     storage::{ReadRepository as _, ReadStorage as _, git::Storage},
 };
 
-use crate::{agent::DeliveryId, watcher::Subject};
+use crate::{agent::WorkId, watcher::Subject};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Workspaces {
@@ -35,26 +35,21 @@ impl Workspaces {
         }
     }
 
+    /// Checks out the canonical head for `work`, or the patch head when it addresses one.
     pub(crate) async fn prepare(
         &self,
-        delivery: DeliveryId,
+        work: WorkId,
         subject: Subject,
     ) -> Result<WorkingCopy, Error> {
         let manager = self.clone();
-        tokio::task::spawn_blocking(move || manager.prepare_blocking(delivery, subject))
+        tokio::task::spawn_blocking(move || manager.prepare_blocking(work, subject))
             .await
             .map_err(|error| Error::Task(error.to_string()))?
     }
 
-    fn prepare_blocking(
-        &self,
-        delivery: DeliveryId,
-        subject: Subject,
-    ) -> Result<WorkingCopy, Error> {
+    fn prepare_blocking(&self, work: WorkId, subject: Subject) -> Result<WorkingCopy, Error> {
         fs::create_dir_all(&self.root)?;
-        let path = self
-            .root
-            .join(format!("{}-{}", delivery.operation, delivery.action));
+        let path = self.root.join(work.to_string());
         if path.exists() {
             fs::remove_dir_all(&path)?;
         }
@@ -226,11 +221,11 @@ mod tests {
         };
 
         let issue = workspaces
-            .prepare_blocking(delivery, Subject::Issue(patch))
+            .prepare_blocking(delivery.into(), Subject::Issue(patch))
             .expect("issue workspace should prepare");
         fs::write(issue.path().join("marker"), "stale").expect("marker should be written");
         let refreshed = workspaces
-            .prepare_blocking(delivery, Subject::Issue(patch))
+            .prepare_blocking(delivery.into(), Subject::Issue(patch))
             .expect("workspace should refresh");
         assert!(!refreshed.path().join("marker").exists());
         refreshed
@@ -243,7 +238,8 @@ mod tests {
                 DeliveryId {
                     operation: delivery.operation,
                     action: 1,
-                },
+                }
+                .into(),
                 Subject::Patch(patch),
             )
             .await

@@ -7,8 +7,10 @@ use std::{
 
 use radicle::{identity::RepoId, storage::git::Storage};
 use rmcp::{
-    Json, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    ErrorData, Json, RoleServer, ServerHandler,
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    model::{CallToolRequestParams, CallToolResult, ContentBlock},
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use serde::Serialize;
@@ -18,30 +20,41 @@ use crate::{
     manifest::McpAllowlist,
     mcp::{
         protocol::{
-            CommentIssueRequest, CommentOperation, CommentWriteRequest, CreateIssueRequest,
-            CreatePatchRequest, DiffRequest, Document, EditIssueRequest, EditPatchRequest,
-            EmbedReadRequest, EntityRequest, EntryRequest, IssuePage, IssueRequest,
-            ListIssuesRequest, MergePatchRequest, PatchEntity, PatchEntityRequest,
-            ReactionWriteRequest, ResolveCommentRequest, ReviewWriteRequest, SecurityIssueRequest,
-            SecurityIssueResult, SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind,
-            SubjectRequest, TimelinePage, TimelineRequest, UpdatePatchRequest,
+            AddJobRequest, CommentIssueRequest, CommentOperation, CommentWriteRequest,
+            CreateIssueRequest, CreatePatchRequest, DiffRequest, Document, EditIssueRequest,
+            EditPatchRequest, EmbedReadRequest, EntityRequest, EntryRequest, IssuePage,
+            IssueRequest, JobAction, JobRecord, JobSummary, ListIssuesRequest, MergePatchRequest,
+            NoteRequest, PatchEntity, PatchEntityRequest, ReactionWriteRequest,
+            ResolveCommentRequest, ReviewWriteRequest, SecurityIssueRequest, SecurityIssueResult,
+            SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest,
+            TimelinePage, TimelineRequest, UpdatePatchRequest, WorkStatus,
         },
         read::serialize,
         security::SecurityReporting,
-        server::{DeliveryAccess, DeliveryScope, ServiceError},
+        server::{Role, ServiceError, WorkAccess, WorkScope},
     },
+    queue::WorkQueue,
 };
+
+// Tools which coordinate the member's two halves rather than write to the repository.
+const QUEUE_TOOLS: [&str; 4] = ["add_job", "cancel", "note", "work_status"];
+// Tools which need commits that only the building half can make.
+const BUILDING_TOOLS: [&str; 2] = ["create_patch", "update_patch"];
+// Tool which every member may always reach, whatever the manifest allows.
+const SECURITY_TOOL: &str = "report_security_issue";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolService {
     pub(super) storage: Storage,
     pub(super) repository: RepoId,
     tool_router: ToolRouter<Self>,
-    pub(super) delivery: DeliveryScope,
+    pub(super) scope: WorkScope,
     pub(super) publisher: Publisher,
     security: SecurityReporting,
+    role: Role,
+    queue: WorkQueue,
     pub(super) mutation_repository: Option<RepoId>,
-    pub(super) mutation_delivery: Option<crate::agent::DeliveryId>,
+    pub(super) mutation_work: Option<crate::agent::WorkId>,
     pub(super) mutation_invocations: Option<Arc<tokio::sync::Mutex<BTreeMap<String, usize>>>>,
 }
 
@@ -62,17 +75,34 @@ impl ToolService {
         })
     }
 
+    /// Returns the tools the repository manifest cannot grant or withhold.
+    pub(crate) fn unrestricted_tools() -> impl Iterator<Item = &'static str> {
+        QUEUE_TOOLS.into_iter().chain([SECURITY_TOOL])
+    }
+
+    pub(super) const fn queue_tools() -> &'static [&'static str] {
+        &QUEUE_TOOLS
+    }
+
+    pub(super) const fn building_tools() -> &'static [&'static str] {
+        &BUILDING_TOOLS
+    }
+
     pub(super) fn new(
         storage: Storage,
         repository: RepoId,
-        delivery: DeliveryScope,
+        scope: WorkScope,
         publisher: Publisher,
         allowlist: McpAllowlist,
-        security: SecurityReporting,
+        role: Role,
+        queue: WorkQueue,
     ) -> Self {
+        let security = SecurityReporting::new(&publisher);
         let mut tool_router = Self::tool_router();
         for method in Self::registered_tools() {
-            if method != "report_security_issue" && !allowlist.allows(method) {
+            let permitted =
+                Self::unrestricted_tools().any(|tool| tool == method) || allowlist.allows(method);
+            if !permitted || !role.allows(method) {
                 let _disabled = tool_router.disable_route(method.clone());
             }
         }
@@ -80,11 +110,13 @@ impl ToolService {
             storage,
             repository,
             tool_router,
-            delivery,
+            scope,
             publisher,
             security,
+            role,
+            queue,
             mutation_repository: None,
-            mutation_delivery: None,
+            mutation_work: None,
             mutation_invocations: None,
         }
     }
@@ -95,7 +127,7 @@ impl ToolService {
         Parameters(request): Parameters<ListIssuesRequest>,
     ) -> Result<Json<IssuePage>, String> {
         self.authorize("list_issues").await?;
-        let _active = self.delivery.access_current().await?;
+        let _active = self.scope.access_current().await?;
         self.blocking(move |service| service.issues(request))
             .await
             .map(Json)
@@ -108,7 +140,7 @@ impl ToolService {
         Parameters(request): Parameters<IssueRequest>,
     ) -> Result<Json<Document>, String> {
         self.authorize("get_issue").await?;
-        let _active = self.delivery.access_current().await?;
+        let _active = self.scope.access_current().await?;
         self.blocking(move |service| service.issue(request))
             .await
             .map(|data| Json(Document { data }))
@@ -123,10 +155,16 @@ impl ToolService {
             .map_err(|error| error.to_string())
     }
 
-    pub(super) fn for_delivery(&self, access: &DeliveryAccess) -> Self {
+    /// Returns whether this server exposes `method` at all.
+    #[cfg(test)]
+    pub(super) fn offers(&self, method: &str) -> bool {
+        self.tool_router.has_route(method)
+    }
+
+    pub(super) fn for_work(&self, access: &WorkAccess) -> Self {
         let mut service = self.clone();
         service.mutation_repository = Some(access.context().repository);
-        service.mutation_delivery = Some(access.context().delivery);
+        service.mutation_work = Some(access.context().work);
         service.mutation_invocations = Some(Arc::clone(access.invocations()));
         service
     }
@@ -157,7 +195,7 @@ impl ToolService {
         Parameters(request): Parameters<SubjectRequest>,
     ) -> Result<Json<Document>, String> {
         self.authorize("get_subject").await?;
-        let _active = self.delivery.access(&request).await?;
+        let _active = self.scope.access(&request).await?;
         self.blocking(move |service| service.subject(request))
             .await
             .map(|data| Json(Document { data }))
@@ -171,7 +209,7 @@ impl ToolService {
         Parameters(request): Parameters<EntryRequest>,
     ) -> Result<Json<Document>, String> {
         self.authorize("get_entry").await?;
-        let _active = self.delivery.access(&request.subject).await?;
+        let _active = self.scope.access(&request.subject).await?;
         self.blocking(move |service| service.entry(request))
             .await
             .map(|data| Json(Document { data }))
@@ -185,7 +223,7 @@ impl ToolService {
         Parameters(request): Parameters<TimelineRequest>,
     ) -> Result<Json<TimelinePage>, String> {
         self.authorize("list_timeline").await?;
-        let _active = self.delivery.access(&request.subject).await?;
+        let _active = self.scope.access(&request.subject).await?;
         self.blocking(move |service| service.timeline(request))
             .await
             .map(Json)
@@ -199,7 +237,7 @@ impl ToolService {
         Parameters(request): Parameters<EntityRequest>,
     ) -> Result<Json<TimelinePage>, String> {
         self.authorize("get_thread").await?;
-        let _active = self.delivery.access(&request.subject).await?;
+        let _active = self.scope.access(&request.subject).await?;
         self.blocking(move |service| service.thread(request))
             .await
             .map(Json)
@@ -213,7 +251,7 @@ impl ToolService {
         Parameters(request): Parameters<PatchEntityRequest>,
     ) -> Result<Json<TimelinePage>, String> {
         self.authorize("get_review").await?;
-        let _active = self.delivery.access(&request.subject).await?;
+        let _active = self.scope.access(&request.subject).await?;
         self.blocking(move |service| service.patch_entity(request, PatchEntity::Review))
             .await
             .map(Json)
@@ -227,7 +265,7 @@ impl ToolService {
         Parameters(request): Parameters<PatchEntityRequest>,
     ) -> Result<Json<TimelinePage>, String> {
         self.authorize("get_revision").await?;
-        let _active = self.delivery.access(&request.subject).await?;
+        let _active = self.scope.access(&request.subject).await?;
         self.blocking(move |service| service.patch_entity(request, PatchEntity::Revision))
             .await
             .map(Json)
@@ -240,7 +278,7 @@ impl ToolService {
         Parameters(request): Parameters<DiffRequest>,
     ) -> Result<Json<Document>, String> {
         self.authorize("get_diff").await?;
-        let _active = self.delivery.access(&request.subject).await?;
+        let _active = self.scope.access(&request.subject).await?;
         self.document(move |service| service.diff(request)).await
     }
 
@@ -251,7 +289,7 @@ impl ToolService {
         Parameters(request): Parameters<EmbedReadRequest>,
     ) -> Result<Json<Document>, String> {
         self.authorize("get_embed").await?;
-        let _active = self.delivery.access(&request.subject).await?;
+        let _active = self.scope.access(&request.subject).await?;
         self.document(move |service| service.embed(request)).await
     }
 
@@ -260,8 +298,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<CommentWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .write_comment(request, CommentOperation::Create)
             .await
             .map_err(|error| error.to_string())
@@ -272,8 +310,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<CommentWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .write_comment(request, CommentOperation::Edit)
             .await
             .map_err(|error| error.to_string())
@@ -284,8 +322,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<CommentWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .write_comment(request, CommentOperation::Redact)
             .await
             .map_err(|error| error.to_string())
@@ -296,8 +334,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<ResolveCommentRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .resolve_review_comment(request)
             .await
             .map_err(|error| error.to_string())
@@ -309,8 +347,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<ReactionWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .reaction_write(request)
             .await
             .map_err(|error| error.to_string())
@@ -321,8 +359,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<CreateIssueRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access_current().await?;
-        self.for_delivery(&active)
+        let active = self.scope.access_current().await?;
+        self.for_work(&active)
             .create_issue_write(request)
             .await
             .map_err(|error| error.to_string())
@@ -333,8 +371,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<CommentIssueRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access_current().await?;
-        self.for_delivery(&active)
+        let active = self.scope.access_current().await?;
+        self.for_work(&active)
             .comment_issue_write(request)
             .await
             .map_err(|error| error.to_string())
@@ -345,8 +383,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SecurityIssueRequest>,
     ) -> Result<Json<SecurityIssueResult>, String> {
-        let active = self.delivery.access_current().await?;
-        let service = self.for_delivery(&active);
+        let active = self.scope.access_current().await?;
+        let service = self.for_work(&active);
         self.security.report(&service, request).await.map(Json)
     }
 
@@ -355,8 +393,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<EditIssueRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .edit_issue_write(request)
             .await
             .map_err(|error| error.to_string())
@@ -367,8 +405,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStateRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .set_state_write(request, SubjectKind::Issue)
             .await
             .map_err(|error| error.to_string())
@@ -379,8 +417,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStringsRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .set_strings_write(request, SubjectKind::Issue, StringUpdate::Labels)
             .await
             .map_err(|error| error.to_string())
@@ -391,8 +429,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStringsRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .set_strings_write(request, SubjectKind::Issue, StringUpdate::Assignees)
             .await
             .map_err(|error| error.to_string())
@@ -403,8 +441,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<CreatePatchRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access_current().await?;
-        self.for_delivery(&active)
+        let active = self.scope.access_current().await?;
+        self.for_work(&active)
             .create_patch_write(request, active.context().workspace.clone())
             .await
             .map_err(|error| error.to_string())
@@ -415,8 +453,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<UpdatePatchRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .update_patch_write(request, active.context().workspace.clone())
             .await
             .map_err(|error| error.to_string())
@@ -427,8 +465,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<EditPatchRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .edit_patch_write(request)
             .await
             .map_err(|error| error.to_string())
@@ -439,8 +477,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStateRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .set_state_write(request, SubjectKind::Patch)
             .await
             .map_err(|error| error.to_string())
@@ -451,8 +489,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStringsRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .set_strings_write(request, SubjectKind::Patch, StringUpdate::Labels)
             .await
             .map_err(|error| error.to_string())
@@ -463,8 +501,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStringsRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .set_strings_write(request, SubjectKind::Patch, StringUpdate::Assignees)
             .await
             .map_err(|error| error.to_string())
@@ -475,8 +513,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<ReviewWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .review_write(request, false)
             .await
             .map_err(|error| error.to_string())
@@ -487,8 +525,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<ReviewWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .review_write(request, true)
             .await
             .map_err(|error| error.to_string())
@@ -499,13 +537,109 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<MergePatchRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.delivery.access(&request.subject).await?;
-        self.for_delivery(&active)
+        let active = self.scope.access(&request.subject).await?;
+        self.for_work(&active)
             .merge_patch_write(request)
             .await
             .map_err(|error| error.to_string())
     }
+
+    #[tool(
+        description = "Record work for the building half of this member, which carries it out \
+                       under the same identity"
+    )]
+    async fn add_job(
+        &self,
+        Parameters(request): Parameters<AddJobRequest>,
+    ) -> Result<Json<JobRecord>, String> {
+        let active = self.scope.access_current().await?;
+        let source = active.context().subject;
+        let position = request.position;
+        let job = self
+            .queue
+            .push(request.brief, source, position)
+            .await
+            .map_err(|error| error.to_string())?;
+        let waiting = self.waiting().await?;
+
+        Ok(Json(JobRecord {
+            job,
+            position,
+            waiting,
+        }))
+    }
+
+    #[tool(description = "Ask the running job to stop and commit what it has to a branch")]
+    async fn cancel(&self) -> Result<Json<JobAction>, String> {
+        let _active = self.scope.access_current().await?;
+
+        Ok(Json(JobAction {
+            job: self.queue.cancel().await.as_ref().map(JobSummary::new),
+        }))
+    }
+
+    #[tool(description = "Send a correction to the running job without stopping it")]
+    async fn note(
+        &self,
+        Parameters(request): Parameters<NoteRequest>,
+    ) -> Result<Json<JobAction>, String> {
+        let _active = self.scope.access_current().await?;
+        let running = self.queue.running().await;
+        if running.is_some() {
+            self.queue.note(request.note).await;
+        }
+
+        Ok(Json(JobAction {
+            job: running.as_ref().map(JobSummary::new),
+        }))
+    }
+
+    #[tool(description = "Report what this member is building and what is waiting")]
+    async fn work_status(&self) -> Result<Json<WorkStatus>, String> {
+        let _active = self.scope.access_current().await?;
+        let waiting = self
+            .queue
+            .pending()
+            .await
+            .map_err(|error| error.to_string())?;
+
+        Ok(Json(WorkStatus {
+            running: self.queue.running().await.as_ref().map(JobSummary::new),
+            waiting: waiting.iter().map(JobSummary::new).collect(),
+        }))
+    }
+
+    async fn waiting(&self) -> Result<usize, String> {
+        self.queue
+            .pending()
+            .await
+            .map(|pending| pending.len())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) async fn pending_notes(&self) -> Vec<String> {
+        match self.role {
+            Role::Coder => self.queue.notes().await,
+            Role::Talker => Vec::new(),
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for ToolService {}
+impl ServerHandler for ToolService {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let call = ToolCallContext::new(self, request, context);
+        let mut result = self.tool_router.call(call).await?;
+        for note in self.pending_notes().await {
+            result.content.push(ContentBlock::text(format!(
+                "Note from the conversation: {note}"
+            )));
+        }
+
+        Ok(result)
+    }
+}

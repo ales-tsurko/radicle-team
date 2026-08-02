@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::mcp::server::ServiceError;
+use crate::{manifest::QueuePosition, mcp::server::ServiceError, queue::Job};
 
 pub(super) const MAX_EMBED_BYTES: usize = 10_000_000;
 const MAX_EMBEDS: usize = 16;
@@ -155,6 +155,60 @@ pub(super) enum IssueStateFilter {
 pub(super) struct IssuePage {
     pub(super) issues: Vec<SubjectDocument>,
     pub(super) next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct AddJobRequest {
+    /// What was decided, in enough detail to begin without rereading the discussion.
+    pub(super) brief: String,
+    /// Where the work joins the queue; ask before putting anything ahead of it.
+    #[serde(default)]
+    pub(super) position: QueuePosition,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct NoteRequest {
+    /// Correction for the running job to read before its next step.
+    pub(super) note: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct JobRecord {
+    pub(super) job: i64,
+    pub(super) position: QueuePosition,
+    pub(super) waiting: usize,
+}
+
+/// Outcome of a request aimed at whatever is running.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct JobAction {
+    /// Job the request reached, absent when nothing was running.
+    pub(super) job: Option<JobSummary>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct WorkStatus {
+    pub(super) running: Option<JobSummary>,
+    pub(super) waiting: Vec<JobSummary>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct JobSummary {
+    pub(super) job: i64,
+    pub(super) brief: String,
+    pub(super) source: String,
+    pub(super) position: QueuePosition,
+}
+
+impl JobSummary {
+    pub(super) fn new(job: &Job) -> Self {
+        Self {
+            job: job.id,
+            brief: job.brief.clone(),
+            source: job.source.to_string(),
+            position: job.position,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

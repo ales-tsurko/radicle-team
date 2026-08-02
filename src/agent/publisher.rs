@@ -1,6 +1,6 @@
 //! Authorized Radicle writes issued through MCP.
 
-use std::{fmt, path::Path, str::FromStr as _, sync::Arc};
+use std::{fmt, path::Path, str::FromStr, sync::Arc};
 
 use radicle::{
     cob::{
@@ -18,23 +18,21 @@ use radicle::{
 };
 use sqlite::State;
 
-use crate::{agent::DeliveryId, database::Database, manifest::SecurityPolicy};
+use crate::{agent::WorkId, database::Database, manifest::SecurityPolicy};
 
 const JOURNAL_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS mcp_mutations (
         repository TEXT NOT NULL,
-        delivery_repository TEXT NOT NULL,
-        operation TEXT NOT NULL,
-        action TEXT NOT NULL,
+        work_repository TEXT NOT NULL,
+        work TEXT NOT NULL,
         invocation TEXT NOT NULL,
         method TEXT NOT NULL,
         author TEXT NOT NULL,
         result TEXT,
         PRIMARY KEY (
             repository,
-            delivery_repository,
-            operation,
-            action,
+            work_repository,
+            work,
             invocation
         )
     ) STRICT;
@@ -118,13 +116,13 @@ impl Publisher {
         self.authorizer.security_policy().await
     }
 
-    pub(crate) async fn reconcile(&self, delivery: DeliveryId) -> Result<(), Error> {
+    pub(crate) async fn reconcile(&self, work: WorkId) -> Result<(), Error> {
         let Some(journal) = &self.journal else {
             return Ok(());
         };
-        for repository in journal.repositories(self.repository, delivery).await? {
+        for repository in journal.repositories(self.repository, work).await? {
             self.for_repository(repository)
-                .reconcile_repository(self.repository, delivery)
+                .reconcile_repository(self.repository, work)
                 .await?;
         }
         Ok(())
@@ -132,15 +130,15 @@ impl Publisher {
 
     async fn reconcile_repository(
         &self,
-        delivery_repository: RepoId,
-        delivery: DeliveryId,
+        work_repository: RepoId,
+        work: WorkId,
     ) -> Result<(), Error> {
         let Some(journal) = &self.journal else {
             return Ok(());
         };
         let _mutation_guard = self.mutation_lock.lock().await;
         for entry in journal
-            .entries(self.repository, delivery_repository, delivery)
+            .entries(self.repository, work_repository, work)
             .await?
         {
             if entry.result.is_some() {
@@ -313,11 +311,11 @@ impl Publisher {
 
     fn marker(key: &MutationKey) -> String {
         if key.invocation == 0 {
-            format!("radicle-team mcp {}:{}", key.delivery, key.request)
+            format!("radicle-team mcp {}:{}", key.work, key.request)
         } else {
             format!(
                 "radicle-team mcp {}:{}:{}",
-                key.delivery, key.invocation, key.request
+                key.work, key.invocation, key.request
             )
         }
     }
@@ -446,7 +444,7 @@ impl Publisher {
 #[derive(Debug, Clone)]
 pub(crate) struct MutationKey {
     pub(crate) repository: RepoId,
-    pub(crate) delivery: DeliveryId,
+    pub(crate) work: WorkId,
     pub(crate) invocation: usize,
     pub(crate) request: String,
 }
@@ -509,20 +507,19 @@ impl MutationJournal {
             .call(move |connection| {
                 let mut insert = connection.prepare(
                     "INSERT OR IGNORE INTO mcp_mutations
-                         (repository, delivery_repository, operation, action, invocation,
-                          method, author)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                         (repository, work_repository, work, invocation, method, author)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )?;
                 bind_mutation(&mut insert, &values)?;
-                insert.bind((6, method))?;
-                insert.bind((7, author.as_str()))?;
+                insert.bind((5, method))?;
+                insert.bind((6, author.as_str()))?;
                 insert.next()?;
                 drop(insert);
 
                 let mut select = connection.prepare(
                     "SELECT method, author, result FROM mcp_mutations
-                     WHERE repository = ?1 AND delivery_repository = ?2
-                       AND operation = ?3 AND action = ?4 AND invocation = ?5",
+                     WHERE repository = ?1 AND work_repository = ?2
+                       AND work = ?3 AND invocation = ?4",
                 )?;
                 bind_mutation(&mut select, &values)?;
                 if select.next()? != State::Row {
@@ -573,86 +570,77 @@ impl MutationJournal {
             .map_err(Error::from)
     }
 
-    async fn entries(
+    /// Runs `sql` with `values` bound in order and reads every row through `row`.
+    async fn select<T, F>(
         &self,
-        repository: RepoId,
-        delivery_repository: RepoId,
-        delivery: DeliveryId,
-    ) -> Result<Vec<DeliveryJournalEntry>, Error> {
-        let values = [
-            repository.to_string(),
-            delivery_repository.to_string(),
-            delivery.operation.to_string(),
-            delivery.action.to_string(),
-        ];
+        sql: &'static str,
+        values: Vec<String>,
+        row: F,
+    ) -> Result<Vec<T>, Error>
+    where
+        T: Send + 'static,
+        F: Fn(&sqlite::Statement<'_>) -> sqlite::Result<T> + Send + 'static,
+    {
         self.database
             .call(move |connection| {
-                let mut select = connection.prepare(
-                    "SELECT invocation, method, author, result FROM mcp_mutations
-                     WHERE repository = ?1 AND delivery_repository = ?2
-                       AND operation = ?3 AND action = ?4",
-                )?;
+                let mut select = connection.prepare(sql)?;
                 for (index, value) in values.iter().enumerate() {
                     select.bind((index + 1, value.as_str()))?;
                 }
-                let mut entries = Vec::new();
+                let mut rows = Vec::new();
                 while select.next()? == State::Row {
-                    let encoded = select.read::<String, _>(0)?;
-                    let (invocation, request) = decode_invocation(encoded)?;
-                    let method = select.read::<String, _>(1)?;
-                    let value = select.read::<String, _>(2)?;
-                    let author = PublicKey::from_str(&value).map_err(|error| sqlite::Error {
-                        code: None,
-                        message: Some(error.to_string()),
-                    })?;
-                    entries.push(DeliveryJournalEntry {
-                        key: MutationKey {
-                            repository: delivery_repository,
-                            delivery,
-                            invocation,
-                            request,
-                        },
-                        method,
-                        author,
-                        result: select.read::<Option<String>, _>(3)?,
-                    });
+                    rows.push(row(&select)?);
                 }
-                Ok(entries)
+                Ok(rows)
             })
             .await
             .map_err(Error::from)
     }
 
+    async fn entries(
+        &self,
+        repository: RepoId,
+        work_repository: RepoId,
+        work: WorkId,
+    ) -> Result<Vec<WorkJournalEntry>, Error> {
+        self.select(
+            "SELECT invocation, method, author, result FROM mcp_mutations
+             WHERE repository = ?1 AND work_repository = ?2 AND work = ?3",
+            vec![
+                repository.to_string(),
+                work_repository.to_string(),
+                work.to_string(),
+            ],
+            move |row| {
+                let (invocation, request) = decode_invocation(row.read::<String, _>(0)?)?;
+                Ok(WorkJournalEntry {
+                    key: MutationKey {
+                        repository: work_repository,
+                        work,
+                        invocation,
+                        request,
+                    },
+                    method: row.read::<String, _>(1)?,
+                    author: stored(&row.read::<String, _>(2)?)?,
+                    result: row.read::<Option<String>, _>(3)?,
+                })
+            },
+        )
+        .await
+    }
+
     async fn repositories(
         &self,
-        delivery_repository: RepoId,
-        delivery: DeliveryId,
+        work_repository: RepoId,
+        work: WorkId,
     ) -> Result<Vec<RepoId>, Error> {
-        let delivery_repository = delivery_repository.to_string();
-        let operation = delivery.operation.to_string();
-        let action = delivery.action.to_string();
-        self.database
-            .call(move |connection| {
-                let mut select = connection.prepare(
-                    "SELECT DISTINCT repository FROM mcp_mutations
-                     WHERE delivery_repository = ?1
-                       AND operation = ?2 AND action = ?3",
-                )?;
-                select.bind((1, delivery_repository.as_str()))?;
-                select.bind((2, operation.as_str()))?;
-                select.bind((3, action.as_str()))?;
-                let mut repositories = Vec::new();
-                while select.next()? == State::Row {
-                    let value = select.read::<String, _>(0)?;
-                    repositories.push(RepoId::from_str(&value).map_err(|error| sqlite::Error {
-                        code: None,
-                        message: Some(error.to_string()),
-                    })?);
-                }
-                Ok(repositories)
-            })
-            .await
-            .map_err(Error::from)
+        self.select(
+            "SELECT DISTINCT repository FROM mcp_mutations
+             WHERE work_repository = ?1 AND work = ?2",
+            vec![work_repository.to_string(), work.to_string()],
+            |row| stored(&row.read::<String, _>(0)?),
+        )
+        .await
     }
 
     async fn discard(&self, repository: RepoId, key: &MutationKey) -> Result<(), Error> {
@@ -660,9 +648,8 @@ impl MutationJournal {
             repository,
             key,
             "DELETE FROM mcp_mutations
-             WHERE repository = ?1 AND delivery_repository = ?2
-               AND operation = ?3 AND action = ?4
-               AND invocation = ?5 AND result IS NULL",
+             WHERE repository = ?1 AND work_repository = ?2
+               AND work = ?3 AND invocation = ?4 AND result IS NULL",
         )
         .await
     }
@@ -673,8 +660,8 @@ impl MutationJournal {
             repository,
             key,
             "UPDATE mcp_mutations SET result = NULL
-             WHERE repository = ?1 AND delivery_repository = ?2
-               AND operation = ?3 AND action = ?4 AND invocation = ?5",
+             WHERE repository = ?1 AND work_repository = ?2
+               AND work = ?3 AND invocation = ?4",
         )
         .await
     }
@@ -704,7 +691,7 @@ struct JournalEntry {
     result: Option<String>,
 }
 
-struct DeliveryJournalEntry {
+struct WorkJournalEntry {
     key: MutationKey,
     method: String,
     author: PublicKey,
@@ -727,33 +714,43 @@ fn signed_tip_reaches(
 
 fn complete_mutation(
     connection: &sqlite::ConnectionThreadSafe,
-    values: &[String; 5],
+    values: &[String; 4],
     method: &str,
     author: &str,
     result: &str,
 ) -> sqlite::Result<()> {
     let mut update = connection.prepare(
-        "UPDATE mcp_mutations SET author = ?7, result = ?8
-         WHERE repository = ?1 AND delivery_repository = ?2
-           AND operation = ?3 AND action = ?4
-           AND invocation = ?5 AND method = ?6",
+        "UPDATE mcp_mutations SET author = ?6, result = ?7
+         WHERE repository = ?1 AND work_repository = ?2
+           AND work = ?3 AND invocation = ?4 AND method = ?5",
     )?;
     bind_mutation(&mut update, values)?;
-    update.bind((6, method))?;
-    update.bind((7, author))?;
-    update.bind((8, result))?;
+    update.bind((5, method))?;
+    update.bind((6, author))?;
+    update.bind((7, result))?;
     update.next()?;
     Ok(())
 }
 
-fn mutation_values(repository: RepoId, key: &MutationKey) -> [String; 5] {
+fn mutation_values(repository: RepoId, key: &MutationKey) -> [String; 4] {
     [
         repository.to_string(),
         key.repository.to_string(),
-        key.delivery.operation.to_string(),
-        key.delivery.action.to_string(),
+        key.work.to_string(),
         encode_invocation(key),
     ]
+}
+
+/// Parses a value the journal wrote earlier, reporting a corrupt row as a database error.
+fn stored<T>(value: &str) -> sqlite::Result<T>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    T::from_str(value).map_err(|error| sqlite::Error {
+        code: None,
+        message: Some(error.to_string()),
+    })
 }
 
 fn encode_invocation(key: &MutationKey) -> String {
@@ -775,7 +772,7 @@ fn decode_invocation(value: String) -> sqlite::Result<(usize, String)> {
 
 fn bind_mutation(
     statement: &mut sqlite::Statement<'_>,
-    values: &[String; 5],
+    values: &[String; 4],
 ) -> sqlite::Result<()> {
     for (index, value) in values.iter().enumerate() {
         statement.bind((index + 1, value.as_str()))?;

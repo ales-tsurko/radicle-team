@@ -11,13 +11,17 @@ use url::Url;
 
 use crate::{
     member::Profile,
+    queue::Job,
     sandbox::AgentSandbox,
     watcher::{Change, Comment, Subject, Target},
 };
 
-/// A backend capable of handling activity addressed to one team member.
+/// A backend capable of answering activity addressed to one team member.
+///
+/// Being assigned is the one thing this never sees: it is work rather than a message, so it joins
+/// the member's queue and reaches [`Coder`] instead.
 #[async_trait]
-pub trait Agent: Send {
+pub trait Talker: Send {
     /// Configures and starts the adapter for one member and run-scoped MCP server.
     async fn start(
         &mut self,
@@ -25,9 +29,6 @@ pub trait Agent: Send {
         mcp: &McpEndpoint,
         sandbox: AgentSandbox,
     ) -> Result<(), Error>;
-
-    /// Handles assignment to an issue or patch review.
-    async fn assigned(&mut self, context: Context) -> Result<(), Error>;
 
     /// Handles a mention in an issue or patch.
     async fn mentioned(&mut self, context: Context, target: Target) -> Result<(), Error>;
@@ -42,6 +43,44 @@ pub trait Agent: Send {
 
     /// Handles another relevant change to an owned or assigned issue or patch.
     async fn changed(&mut self, context: Context, change: Change) -> Result<(), Error>;
+
+    /// Stops the adapter and releases its resources.
+    async fn stop(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// A backend which carries out queued work for one team member.
+///
+/// A member answers messages and builds at the same time, which one conversation cannot do: a
+/// half-written patch has no safe point to pause at. The two run as separate adapters under one
+/// identity, so this interface receives jobs rather than activity. Deciding what should be built
+/// belongs to [`Talker`]; deciding how belongs here.
+#[async_trait]
+pub trait Coder: Send + Sync {
+    /// Configures and starts the adapter for one member and run-scoped MCP server.
+    async fn start(
+        &mut self,
+        profile: Profile,
+        mcp: &McpEndpoint,
+        sandbox: AgentSandbox,
+    ) -> Result<(), Error>;
+
+    /// Carries out one queued job in `workspace`.
+    ///
+    /// The job's brief states what was decided and its source addresses the discussion behind it.
+    /// A job may arrive from a conversation this adapter never saw.
+    ///
+    /// This takes a shared reference so that [`interrupt`](Self::interrupt) can reach the adapter
+    /// while the job is still running.
+    async fn work(&self, job: Job, workspace: PathBuf) -> Result<(), Error>;
+
+    /// Asks the adapter to stop the running job and preserve what it has.
+    ///
+    /// Work in progress is committed to a branch rather than discarded, because the request to
+    /// stop usually means priorities moved, not that the work was worthless. The interrupted
+    /// [`work`](Self::work) call returns once that has happened.
+    async fn interrupt(&self) -> Result<(), Error>;
 
     /// Stops the adapter and releases its resources.
     async fn stop(&mut self) -> Result<(), Error> {
@@ -76,6 +115,35 @@ pub struct DeliveryId {
 impl fmt::Display for DeliveryId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}:{}", self.operation, self.action)
+    }
+}
+
+/// One unit of work a member's repository writes belong to.
+///
+/// The talker handles one classified delivery at a time and the coder one queued job, so the two
+/// run under separate scopes even though they publish under a single identity. Recovering an
+/// interrupted write means asking which scope it belonged to, which is why a job needs an identity
+/// the delivery key cannot express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkId {
+    /// One classified action delivered to the talker.
+    Delivery(DeliveryId),
+    /// One queued job carried out by the coder.
+    Job(i64),
+}
+
+impl fmt::Display for WorkId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Delivery(delivery) => write!(formatter, "{delivery}"),
+            Self::Job(job) => write!(formatter, "job:{job}"),
+        }
+    }
+}
+
+impl From<DeliveryId> for WorkId {
+    fn from(delivery: DeliveryId) -> Self {
+        Self::Delivery(delivery)
     }
 }
 

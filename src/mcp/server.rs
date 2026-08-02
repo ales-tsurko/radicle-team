@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     net::{Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -16,13 +17,13 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-    agent::{Context as AgentContext, McpEndpoint, Publisher},
+    agent::{Context as AgentContext, McpEndpoint, Publisher, WorkId},
     manifest::McpAllowlist,
     mcp::{
         protocol::{SubjectKind, SubjectRequest},
-        security::SecurityReporting,
         tools::ToolService,
     },
+    queue::WorkQueue,
     watcher::Subject,
 };
 
@@ -31,12 +32,28 @@ pub(crate) struct Server {
     endpoint: McpEndpoint,
     cancellation: CancellationToken,
     task: Option<tokio::task::JoinHandle<Result<(), Error>>>,
-    delivery: DeliveryScope,
+    scope: WorkScope,
 }
 
 impl std::fmt::Debug for Server {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("McpServer").finish_non_exhaustive()
+    }
+}
+
+// Which half of a member one MCP server serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    Talker,
+    Coder,
+}
+
+impl Role {
+    pub(super) fn allows(self, method: &str) -> bool {
+        match self {
+            Self::Talker => !ToolService::building_tools().contains(&method),
+            Self::Coder => !ToolService::queue_tools().contains(&method),
+        }
     }
 }
 
@@ -46,6 +63,8 @@ impl Server {
         repository: RepoId,
         publisher: Publisher,
         allowlist: McpAllowlist,
+        role: Role,
+        queue: WorkQueue,
     ) -> Result<Self, Error> {
         let listener = Self::bind_loopback().await?;
         let address = listener.local_addr()?;
@@ -54,18 +73,18 @@ impl Server {
         let endpoint = McpEndpoint::new(Url::parse(&format!("http://{address}{route}"))?);
         let cancellation = CancellationToken::new();
         let server_cancellation = cancellation.child_token();
-        let delivery = DeliveryScope::new(publisher.clone());
-        let security = SecurityReporting::new(&publisher);
+        let scope = WorkScope::new(publisher.clone());
         let task = tokio::spawn(Self::serve(
             listener,
             route,
             ToolService::new(
                 storage,
                 repository,
-                delivery.clone(),
+                scope.clone(),
                 publisher,
                 allowlist,
-                security,
+                role,
+                queue,
             ),
             server_cancellation,
         ));
@@ -74,7 +93,7 @@ impl Server {
             endpoint,
             cancellation,
             task: Some(task),
-            delivery,
+            scope,
         })
     }
 
@@ -89,8 +108,8 @@ impl Server {
         }
     }
 
-    pub(crate) fn delivery_scope(&self) -> DeliveryScope {
-        self.delivery.clone()
+    pub(crate) fn scope(&self) -> WorkScope {
+        self.scope.clone()
     }
 
     pub(crate) async fn stop(mut self) -> Result<(), Error> {
@@ -137,14 +156,34 @@ impl Drop for Server {
     }
 }
 
-/// Activates MCP access for exactly one watcher delivery.
+// Repository the member is addressing while one unit of work runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkContext {
+    pub(crate) repository: RepoId,
+    pub(crate) subject: Subject,
+    pub(crate) work: WorkId,
+    pub(crate) workspace: PathBuf,
+}
+
+impl From<AgentContext> for WorkContext {
+    fn from(context: AgentContext) -> Self {
+        Self {
+            repository: context.repository,
+            subject: context.subject,
+            work: context.delivery.into(),
+            workspace: context.workspace,
+        }
+    }
+}
+
+// Activates MCP access for exactly one delivery or job.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct DeliveryScope {
-    active: Arc<tokio::sync::RwLock<Option<Arc<ActiveDelivery>>>>,
+pub(crate) struct WorkScope {
+    active: Arc<tokio::sync::RwLock<Option<Arc<ActiveWork>>>>,
     publisher: Option<Publisher>,
 }
 
-impl DeliveryScope {
+impl WorkScope {
     pub(super) fn new(publisher: Publisher) -> Self {
         Self {
             active: Arc::default(),
@@ -152,13 +191,13 @@ impl DeliveryScope {
         }
     }
 
-    pub(crate) async fn activate(&self, context: AgentContext) -> Result<(), String> {
+    pub(crate) async fn activate(&self, context: impl Into<WorkContext>) -> Result<(), String> {
         let mut active = self.active.write().await;
         if active.is_some() {
-            return Err("another delivery is already active".to_owned());
+            return Err("another unit of work is already active".to_owned());
         }
-        *active = Some(Arc::new(ActiveDelivery {
-            context,
+        *active = Some(Arc::new(ActiveWork {
+            context: context.into(),
             invocations: Arc::default(),
         }));
         Ok(())
@@ -168,16 +207,16 @@ impl DeliveryScope {
         *self.active.write().await = None;
     }
 
-    pub(crate) async fn reconcile(&self, delivery: crate::agent::DeliveryId) -> Result<(), String> {
+    pub(crate) async fn reconcile(&self, work: WorkId) -> Result<(), String> {
         if let Some(publisher) = &self.publisher {
-            Box::pin(publisher.reconcile(delivery))
+            Box::pin(publisher.reconcile(work))
                 .await
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
 
-    pub(super) async fn access(&self, request: &SubjectRequest) -> Result<DeliveryAccess, String> {
+    pub(super) async fn access(&self, request: &SubjectRequest) -> Result<WorkAccess, String> {
         let access = self.access_current().await?;
         let context = access.context();
         let matches = match (request.kind, context.subject) {
@@ -187,47 +226,47 @@ impl DeliveryScope {
             _ => false,
         };
         if !matches {
-            return Err("subject is outside the active delivery".to_owned());
+            return Err("subject is outside the active unit of work".to_owned());
         }
         Ok(access)
     }
 
-    pub(super) async fn access_current(&self) -> Result<DeliveryAccess, String> {
+    pub(super) async fn access_current(&self) -> Result<WorkAccess, String> {
         let guard = Arc::clone(&self.active).read_owned().await;
-        let delivery = guard
+        let work = guard
             .as_ref()
-            .ok_or_else(|| "no delivery is active".to_owned())?;
-        let context = delivery.context.clone();
-        let delivery = Arc::clone(delivery);
-        Ok(DeliveryAccess {
+            .ok_or_else(|| "no unit of work is active".to_owned())?;
+        let context = work.context.clone();
+        let work = Arc::clone(work);
+        Ok(WorkAccess {
             guard,
             context,
-            delivery,
+            work,
         })
     }
 }
 
 #[derive(Debug)]
-struct ActiveDelivery {
-    context: AgentContext,
+struct ActiveWork {
+    context: WorkContext,
     invocations: Arc<tokio::sync::Mutex<BTreeMap<String, usize>>>,
 }
 
 #[derive(Debug)]
-pub(super) struct DeliveryAccess {
-    guard: tokio::sync::OwnedRwLockReadGuard<Option<Arc<ActiveDelivery>>>,
-    context: AgentContext,
-    delivery: Arc<ActiveDelivery>,
+pub(super) struct WorkAccess {
+    guard: tokio::sync::OwnedRwLockReadGuard<Option<Arc<ActiveWork>>>,
+    context: WorkContext,
+    work: Arc<ActiveWork>,
 }
 
-impl DeliveryAccess {
-    pub(super) fn context(&self) -> &AgentContext {
+impl WorkAccess {
+    pub(super) fn context(&self) -> &WorkContext {
         let _keep_active = &self.guard;
         &self.context
     }
 
     pub(super) fn invocations(&self) -> &Arc<tokio::sync::Mutex<BTreeMap<String, usize>>> {
-        &self.delivery.invocations
+        &self.work.invocations
     }
 }
 

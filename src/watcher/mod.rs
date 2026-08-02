@@ -2,8 +2,10 @@
 //!
 //! A [`Watcher`](crate::watcher::Watcher) observes one repository as one
 //! [`Member`](crate::member::Member), classifies interactions requiring that member's attention,
-//! dispatches them through an [`Agent`](crate::agent::Agent), and publishes requested replies with
-//! the managed member identity.
+//! dispatches them through a [`Talker`](crate::agent::Talker), and publishes requested replies with
+//! the managed member identity. Assignments are the exception: they are work rather than
+//! conversation, so they join the member's [`WorkQueue`](crate::queue::WorkQueue) and reach the
+//! building half through [`Builder`](crate::builder::Builder).
 //!
 //! # Lifecycle
 //!
@@ -42,9 +44,10 @@
 //! - `state` persists processed operation IDs for idempotent rescanning.
 
 pub use crate::watcher::{
-    activity::{Change, Comment, Subject, Target},
+    activity::{Change, Comment, InvalidSubject, Subject, Target},
     runtime::{Error, Watcher},
 };
+pub(crate) use crate::watcher::runtime::DeliveryRuntime;
 
 mod activity;
 mod classification;

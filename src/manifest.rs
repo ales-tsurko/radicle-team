@@ -37,6 +37,8 @@ use crate::{
 /// Name of the repository manifest file.
 pub const FILE_NAME: &str = ".radicle-team.toml";
 const SCHEMA_VERSION: u32 = 1;
+const DEFAULT_FRONT_LABEL: &str = "urgent";
+const DEFAULT_NEXT_LABEL: &str = "next";
 
 /// Parsed repository manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +46,7 @@ pub struct Manifest {
     members: BTreeMap<Member, Binding>,
     security: SecurityPolicy,
     triggered_by: TriggerAccess,
+    priority: PriorityLabels,
     revision: Revision,
 }
 
@@ -171,7 +174,11 @@ impl Manifest {
             self.revision,
             binding.mcp_allow.clone(),
             self.security.clone(),
-            TriggerPolicy::new(self.triggered_by.clone(), self.active_member_dids()),
+            RepositoryPolicy::new(
+                self.triggered_by.clone(),
+                self.active_member_dids(),
+                self.priority.clone(),
+            ),
         ))
     }
 
@@ -203,6 +210,7 @@ impl Manifest {
             members,
             security: document.security,
             triggered_by: document.triggered_by,
+            priority: document.priority,
             revision,
         })
     }
@@ -282,7 +290,7 @@ impl McpAllowlist {
         for entry in entries {
             if Self::is_group(&entry) {
                 allowlist.extend_group(&entry);
-            } else if entry != "report_security_issue"
+            } else if !Self::is_unrestricted(&entry)
                 && crate::mcp::ToolService::registered_tools()
                     .iter()
                     .any(|method| method == &entry)
@@ -293,6 +301,23 @@ impl McpAllowlist {
             }
         }
         Ok(allowlist)
+    }
+
+    /// Returns whether the manifest has no say in `method`.
+    fn is_unrestricted(method: &str) -> bool {
+        crate::mcp::ToolService::unrestricted_tools().any(|tool| tool == method)
+    }
+
+    /// Allows every method the manifest is able to grant.
+    #[cfg(test)]
+    pub(crate) fn everything() -> Self {
+        let mut allowlist = Self::default();
+        for method in crate::mcp::ToolService::registered_tools() {
+            if !Self::is_unrestricted(method) {
+                allowlist.insert(method);
+            }
+        }
+        allowlist
     }
 
     fn extend_group(&mut self, group: &str) {
@@ -326,7 +351,7 @@ impl McpAllowlist {
     }
 
     fn belongs_to_group(method: &str, group: &str) -> bool {
-        if method == "report_security_issue" {
+        if Self::is_unrestricted(method) {
             return false;
         }
         let read = method.starts_with("get_") || method.starts_with("list_");
@@ -442,16 +467,27 @@ pub enum Revision {
 
 /// Identities allowed to put this repository's members to work.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TriggerPolicy {
+pub struct RepositoryPolicy {
     access: TriggerAccess,
     members: Vec<Did>,
+    priority: PriorityLabels,
 }
 
-impl TriggerPolicy {
+impl RepositoryPolicy {
     /// Pairs an access rule with every active member's signing DID.
     #[must_use]
-    pub const fn new(access: TriggerAccess, members: Vec<Did>) -> Self {
-        Self { access, members }
+    pub const fn new(access: TriggerAccess, members: Vec<Did>, priority: PriorityLabels) -> Self {
+        Self {
+            access,
+            members,
+            priority,
+        }
+    }
+
+    /// Returns the labels which move assigned work ahead of the queue.
+    #[must_use]
+    pub const fn priority(&self) -> &PriorityLabels {
+        &self.priority
     }
 
     /// Returns the configured access rule.
@@ -476,7 +512,7 @@ pub struct ValidatedBinding {
     revision: Revision,
     mcp_allow: McpAllowlist,
     security: SecurityPolicy,
-    triggers: TriggerPolicy,
+    triggers: RepositoryPolicy,
 }
 
 impl ValidatedBinding {
@@ -487,7 +523,7 @@ impl ValidatedBinding {
         revision: Revision,
         mcp_allow: McpAllowlist,
         security: SecurityPolicy,
-        triggers: TriggerPolicy,
+        triggers: RepositoryPolicy,
     ) -> Self {
         Self {
             member,
@@ -500,16 +536,10 @@ impl ValidatedBinding {
         }
     }
 
-    /// Returns every active member's signing DID, including this binding's own.
+    /// Returns the repository-wide policy this binding was validated against.
     #[must_use]
-    pub fn member_dids(&self) -> &[Did] {
-        self.triggers.members()
-    }
-
-    /// Returns the identities allowed to trigger this repository's agents.
-    #[must_use]
-    pub const fn triggered_by(&self) -> &TriggerAccess {
-        self.triggers.access()
+    pub const fn policy(&self) -> &RepositoryPolicy {
+        &self.triggers
     }
 
     /// Returns the bound member.
@@ -556,7 +586,82 @@ struct Document {
     security: SecurityPolicy,
     #[serde(default)]
     triggered_by: TriggerAccess,
+    #[serde(default)]
+    priority: PriorityLabels,
     members: BTreeMap<String, Binding>,
+}
+
+/// Issue labels which move assigned work ahead of the queue.
+///
+/// Omitting the section leaves the defaults in place, so an ordinary manifest carries nothing
+/// about scheduling. Only a repository that already uses different words for urgency needs to say
+/// so. Work carrying neither label joins the end of the queue.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriorityLabels {
+    #[serde(default = "default_front_label")]
+    front: String,
+    #[serde(default = "default_next_label")]
+    next: String,
+}
+
+fn default_front_label() -> String {
+    DEFAULT_FRONT_LABEL.to_owned()
+}
+
+fn default_next_label() -> String {
+    DEFAULT_NEXT_LABEL.to_owned()
+}
+
+impl Default for PriorityLabels {
+    fn default() -> Self {
+        Self {
+            front: default_front_label(),
+            next: default_next_label(),
+        }
+    }
+}
+
+impl PriorityLabels {
+    /// Returns the queue position `labels` ask for.
+    #[must_use]
+    pub fn position<'a>(&self, labels: impl IntoIterator<Item = &'a str>) -> QueuePosition {
+        let mut position = QueuePosition::End;
+        for label in labels {
+            if label == self.front {
+                return QueuePosition::Front;
+            }
+            if label == self.next {
+                position = QueuePosition::Next;
+            }
+        }
+        position
+    }
+}
+
+/// Where new work joins the member's queue.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum QueuePosition {
+    /// Ahead of everything already waiting.
+    Front,
+    /// After the running job, ahead of everything else waiting.
+    Next,
+    /// Behind everything already waiting.
+    #[default]
+    End,
 }
 
 /// Private repository and encryption recipients for security reports.
@@ -719,7 +824,7 @@ mod tests {
     use radicle::identity::Did;
 
     use crate::{
-        manifest::{Error, Manifest, McpAllowlist, Revision, TriggerAccess},
+        manifest::{Error, Manifest, McpAllowlist, QueuePosition, Revision, TriggerAccess},
         member::Member,
     };
 
@@ -867,9 +972,10 @@ mod tests {
     #[test]
     fn accepts_every_registered_tool_without_a_manifest_method_registry() {
         for method in crate::mcp::ToolService::registered_tools() {
-            if method == "report_security_issue" {
-                McpAllowlist::from_entries(vec![method.clone()])
-                    .expect_err("security reporting must not be an MCP permission");
+            if McpAllowlist::is_unrestricted(method) {
+                McpAllowlist::from_entries(vec![method.clone()]).expect_err(
+                    "a tool the manifest has no say in must not be usable as a permission",
+                );
                 continue;
             }
             let allowlist = McpAllowlist::from_entries(vec![method.clone()])
@@ -965,6 +1071,42 @@ mod tests {
         assert!(
             matches!(parse("[\"not-a-did\"]"), Err(Error::Parse(_))),
             "an invalid DID must be rejected"
+        );
+    }
+
+    #[test]
+    fn renames_the_priority_labels_without_touching_the_defaults() {
+        let member = format!(
+            "[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
+             \"active\"\nmcp_allow = []\n"
+        );
+
+        let default = Fixture::parse(&format!("version = 1\n{member}"))
+            .expect("a manifest without '[priority]' should parse")
+            .priority;
+        assert_eq!(
+            default.position(["chore", "urgent"]),
+            QueuePosition::Front,
+            "the defaults must work without the section, so an ordinary manifest says nothing \
+             about scheduling"
+        );
+        assert_eq!(default.position(["chore", "next"]), QueuePosition::Next);
+        assert_eq!(default.position(["chore"]), QueuePosition::End);
+
+        let renamed = Fixture::parse(&format!(
+            "version = 1\n[priority]\nfront = \"now\"\n{member}"
+        ))
+        .expect("a renamed label should parse");
+        assert_eq!(renamed.priority.position(["now"]), QueuePosition::Front);
+        assert_eq!(
+            renamed.priority.position(["urgent"]),
+            QueuePosition::End,
+            "renaming one label must not leave the word it replaced still working"
+        );
+        assert_eq!(
+            renamed.priority.position(["next"]),
+            QueuePosition::Next,
+            "the label that was not renamed keeps its default"
         );
     }
 

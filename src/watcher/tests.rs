@@ -20,7 +20,7 @@ use crate::{
     member::Member,
     watcher::{
         Change, Comment, Subject,
-        activity::{Activity, Kind},
+        activity::{Activity, Delivery, Kind},
         classification::{ActionEnvelope, Context, NormalizedAction, Triggers},
     },
 };
@@ -224,7 +224,7 @@ fn classifies_assignment_changes() {
         )
         .as_slice(),
         [Activity {
-            kind: Kind::Changed(Change::Unassigned),
+            kind: Kind::Delivered(Delivery::Changed(Change::Unassigned)),
             ..
         }]
     ));
@@ -245,7 +245,7 @@ fn classifies_external_mentions_only() {
     assert!(matches!(
         Fixture::classify_issue(comment.clone(), author, &mut context).as_slice(),
         [Activity {
-            kind: Kind::Mentioned(_),
+            kind: Kind::Delivered(Delivery::Mentioned(_)),
             ..
         }]
     ));
@@ -262,7 +262,7 @@ fn classifies_external_mentions_only() {
         )
         .as_slice(),
         [Activity {
-            kind: Kind::Mentioned(_),
+            kind: Kind::Delivered(Delivery::Mentioned(_)),
             ..
         }]
     ));
@@ -295,7 +295,7 @@ fn classifies_issue_replies_and_owned_discussion() {
         )
         .as_slice(),
         [Activity {
-            kind: Kind::Replied { .. },
+            kind: Kind::Delivered(Delivery::Replied { .. }),
             ..
         }]
     ));
@@ -354,7 +354,7 @@ fn classifies_patch_assignment_and_review() {
         )
         .as_slice(),
         [Activity {
-            kind: Kind::Changed(Change::ReviewSubmitted { .. }),
+            kind: Kind::Delivered(Delivery::Changed(Change::ReviewSubmitted { .. })),
             ..
         }]
     ));
@@ -398,10 +398,10 @@ fn classifies_patch_mentions_and_replies() {
         )
         .as_slice(),
         [Activity {
-            kind: Kind::Replied {
+            kind: Kind::Delivered(Delivery::Replied {
                 comment: Comment::Revision { .. },
                 ..
-            },
+            }),
             ..
         }]
     ));
@@ -420,7 +420,7 @@ fn classifies_patch_mentions_and_replies() {
         )
         .as_slice(),
         [Activity {
-            kind: Kind::Mentioned(_),
+            kind: Kind::Delivered(Delivery::Mentioned(_)),
             ..
         }]
     ));

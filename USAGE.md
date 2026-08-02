@@ -16,29 +16,45 @@ node, repository storage, delivery workspace, and durable state. The
 repository's reviewed `.radicle-team.toml` manifest binds that member to its DID
 and allowed tools.
 
+A member answers messages while it builds, which one conversation cannot do: a
+half-written patch has no safe point to pause at, so a question would wait
+behind a twenty-minute job. Each member therefore runs two adapters under one
+identity, with one MCP server each. To everybody reading the repository it is
+one person.
+
 The runtime watches Radicle histories and converts relevant activity into typed
 agent events:
 
 ```text
 Radicle activity
-    -> assignment, mention, reply, or relevant change
-    -> selected member's agent adapter
-    -> delivery-scoped workspace and MCP tools
+    -> mention, reply, or relevant change
+        -> the member's talking adapter
+    -> assignment
+        -> the member's work queue
+        -> the member's building adapter
+    -> work-scoped workspace and MCP tools
     -> signed Radicle comments, issues, patches, reviews, or reactions
 ```
 
 Agent integrations implement the provider-neutral
-[`Agent`](src/agent/interface.rs) interface. The runtime calls `start` with the
-selected member's `Profile` and run-scoped MCP endpoint, then delivers typed
-activity.
+[`Talker`](src/agent/interface.rs) and [`Coder`](src/agent/interface.rs)
+interfaces. The runtime calls `start` on each with the selected member's
+`Profile` and its own run-scoped MCP endpoint, then delivers typed activity to
+one and queued jobs to the other.
 
-The adapter is responsible for:
+The talking adapter records work with `add_job`, checks `work_status`, sends a
+correction to the running job with `note`, and asks it to stop with `cancel`. A
+note arrives on the next MCP tool result the building adapter receives, so it
+needs no polling. Cancelling asks the building adapter to commit what it has to
+a branch rather than discarding it.
+
+Each adapter is responsible for:
 
 - Mapping provider-neutral tuning to model controls
 - Supplying the member and shared Markdown documents as model context
 - Managing the provider's conversation or execution runtime
 - Using only the supplied workspace and allowed MCP tools
-- Returning success only after the event has been handled durably
+- Returning success only after the event or job has been handled durably
 
 The core does not depend on a particular model vendor or agent framework.
 
@@ -427,8 +443,26 @@ Groups are derived from the tools registered by the MCP server: `get_*` and
 `list_*` tools are reads; non-read tools are grouped by the `comment`, `issue`,
 `patch`, `reaction`, or `review` component in their name. MCP `tools/list` is
 the authoritative method list. `comment_issue` belongs only to `issues`.
+
 `report_security_issue` is controlled by the security policy instead of
-`mcp_allow` and is available to every member.
+`mcp_allow` and is available to every member. So are `add_job`, `cancel`,
+`note`, and `work_status`: they reach only the member's own queue, never the
+repository, so the manifest has no say in them and naming one in `mcp_allow` is
+rejected. They are offered to the talking half alone. `create_patch` and
+`update_patch` are offered to the building half alone, since they need commits
+the talking half cannot make. Everything else follows `mcp_allow` on both.
+
+New work joins the end of the queue. An assignment carrying an `urgent` label
+goes to the front and one carrying `next` goes after the running job. Rename
+either word for a repository that already uses different ones:
+
+```toml
+[priority]
+front = "urgent"
+next = "next"
+```
+
+The section is optional and only overrides the defaults shown above.
 
 The security repository and at least one valid age X25519 recipient are
 required. `report_security_issue` encrypts the complete report before creating

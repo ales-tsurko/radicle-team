@@ -15,13 +15,15 @@ use radicle::{
 };
 
 use crate::{
-    agent::{self, Agent, Change, Comment, Context as AgentContext, Target},
+    agent::{self, Change, Coder, Comment, Context as AgentContext, Talker, Target},
+    builder,
     home::{self, MemberHome},
     identity::{self, GenerationStore, Manager, MemberLock, Provider},
     manifest::{self, Manifest},
     mcp,
     member::Member,
     node::{self, NodeManager},
+    queue::{Job, WorkQueue},
     sandbox::AgentSandbox,
     shutdown::Shutdown,
     watcher,
@@ -181,10 +183,14 @@ impl Application {
     /// Returns an error if manifest, identity, repository, node, event stream, or local state
     /// validation fails.
     pub async fn run(&self) -> Result<(), Error> {
-        self.run_with_agent(&mut LoggingAgent).await
+        Box::pin(self.run_with_agents(&mut LoggingAgent, &mut LoggingAgent)).await
     }
 
-    /// Runs the team member and dispatches relevant activity to `agent`.
+    /// Runs the team member with `talker` answering messages and `coder` carrying out queued work.
+    ///
+    /// The two adapters share one identity, one manifest binding, and one node, but not one train
+    /// of thought: a half-written patch has no safe point to pause at, so a question cannot wait
+    /// behind it.
     ///
     /// Linux executables must call
     /// [`sandbox::dispatch_linux_helper`](crate::sandbox::dispatch_linux_helper) as the first
@@ -192,8 +198,12 @@ impl Application {
     ///
     /// # Errors
     ///
-    /// Returns an error if preparation, watching, or agent dispatch fails.
-    pub async fn run_with_agent(&self, agent: &mut (impl Agent + ?Sized)) -> Result<(), Error> {
+    /// Returns an error if preparation, watching, building, or agent dispatch fails.
+    pub async fn run_with_agents(
+        &self,
+        talker: &mut (impl Talker + ?Sized),
+        coder: &mut (impl Coder + ?Sized),
+    ) -> Result<(), Error> {
         let (runtime, binding) = self.start_run().await?;
         let profile = self.member.profile();
         tracing::info!(
@@ -205,13 +215,13 @@ impl Application {
         AgentRuntime::start(
             self,
             runtime,
-            agent,
+            talker,
+            coder,
             binding.mcp_allow().clone(),
-            binding.triggered_by().clone(),
-            binding.member_dids().to_vec(),
+            binding.policy().clone(),
         )
         .await?
-        .run(self, agent)
+        .run(self, talker, coder)
         .await
     }
 
@@ -535,7 +545,7 @@ impl Application {
 struct LoggingAgent;
 
 #[async_trait::async_trait]
-impl Agent for LoggingAgent {
+impl Talker for LoggingAgent {
     async fn start(
         &mut self,
         profile: crate::member::Profile,
@@ -551,11 +561,6 @@ impl Agent for LoggingAgent {
             caution = profile.tuning.caution,
             "agent adapter started"
         );
-        Ok(())
-    }
-
-    async fn assigned(&mut self, context: AgentContext) -> Result<(), agent::Error> {
-        tracing::info!(?context, "assignment received");
         Ok(())
     }
 
@@ -580,6 +585,29 @@ impl Agent for LoggingAgent {
 
     async fn changed(&mut self, context: AgentContext, change: Change) -> Result<(), agent::Error> {
         tracing::info!(?context, ?change, "relevant change received");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Coder for LoggingAgent {
+    async fn start(
+        &mut self,
+        profile: crate::member::Profile,
+        _mcp: &agent::McpEndpoint,
+        _sandbox: AgentSandbox,
+    ) -> Result<(), agent::Error> {
+        tracing::info!(member = profile.member.id(), "coder adapter started");
+        Ok(())
+    }
+
+    async fn work(&self, job: Job, workspace: PathBuf) -> Result<(), agent::Error> {
+        tracing::info!(?job, workspace = %workspace.display(), "queued work received");
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> Result<(), agent::Error> {
+        tracing::info!("queued work asked to stop");
         Ok(())
     }
 }
@@ -674,98 +702,147 @@ impl Runtime {
 #[derive(Debug)]
 struct AgentRuntime {
     runtime: Runtime,
-    mcp: mcp::Server,
-    triggered_by: manifest::TriggerAccess,
-    member_dids: Vec<Did>,
+    servers: Servers,
+    queue: WorkQueue,
+    policy: manifest::RepositoryPolicy,
+}
+
+#[derive(Debug)]
+struct Servers {
+    talker: mcp::Server,
+    coder: mcp::Server,
+}
+
+impl Servers {
+    async fn stop(self) -> Result<(), mcp::Error> {
+        let talker = self.talker.stop().await;
+        let coder = self.coder.stop().await;
+
+        talker.and(coder)
+    }
+
+    async fn stop_after_error(self) {
+        Application::warn_mcp_stop(self.stop().await);
+    }
 }
 
 impl AgentRuntime {
     async fn start(
         application: &Application,
         runtime: Runtime,
-        agent: &mut (impl Agent + ?Sized),
+        talker: &mut (impl Talker + ?Sized),
+        coder: &mut (impl Coder + ?Sized),
         allowlist: manifest::McpAllowlist,
-        triggered_by: manifest::TriggerAccess,
-        member_dids: Vec<Did>,
+        policy: manifest::RepositoryPolicy,
     ) -> Result<Self, Error> {
+        match Self::initialize(application, &runtime, talker, coder, allowlist).await {
+            Ok((servers, queue)) => Ok(Self {
+                runtime,
+                servers,
+                queue,
+                policy,
+            }),
+            Err(error) => Application::finish_after_stop(
+                Err(error),
+                runtime.stop(&application.shutdown).await,
+            ),
+        }
+    }
+
+    async fn initialize(
+        application: &Application,
+        runtime: &Runtime,
+        talker: &mut (impl Talker + ?Sized),
+        coder: &mut (impl Coder + ?Sized),
+        allowlist: manifest::McpAllowlist,
+    ) -> Result<(Servers, WorkQueue), Error> {
+        let publisher = Self::initialize_publisher(application, runtime).await?;
+        let queue = WorkQueue::open(
+            &runtime.home.state_database(),
+            application.repository,
+            application.member,
+        )
+        .await?;
+        let servers = Self::start_mcp(application, runtime, publisher, allowlist, &queue).await?;
+        if let Err(error) = Self::start_agents(application, runtime, &servers, talker, coder).await
+        {
+            Application::warn_agent_stop(talker.stop().await);
+            Application::warn_agent_stop(coder.stop().await);
+            servers.stop_after_error().await;
+            return Err(error);
+        }
+
+        Ok((servers, queue))
+    }
+
+    async fn start_mcp(
+        application: &Application,
+        runtime: &Runtime,
+        publisher: agent::Publisher,
+        allowlist: manifest::McpAllowlist,
+        queue: &WorkQueue,
+    ) -> Result<Servers, Error> {
+        let storage = runtime.identity.profile().storage.clone();
+        let start = async |role| {
+            mcp::Server::start(
+                storage.clone(),
+                application.repository,
+                publisher.clone(),
+                allowlist.clone(),
+                role,
+                queue.clone(),
+            )
+            .await
+            .map_err(|error| Error::Mcp(error.to_string()))
+        };
+        let talker = start(mcp::Role::Talker).await?;
+        match start(mcp::Role::Coder).await {
+            Ok(coder) => Ok(Servers { talker, coder }),
+            Err(error) => {
+                Application::warn_mcp_stop(talker.stop().await);
+                Err(error)
+            }
+        }
+    }
+
+    async fn start_agents(
+        application: &Application,
+        runtime: &Runtime,
+        servers: &Servers,
+        talker: &mut (impl Talker + ?Sized),
+        coder: &mut (impl Coder + ?Sized),
+    ) -> Result<(), Error> {
+        let talker_sandbox = AgentSandbox::load(&runtime.home, servers.talker.endpoint())?;
+        let coder_sandbox = AgentSandbox::load(&runtime.home, servers.coder.endpoint())?;
+        talker
+            .start(
+                application.member.profile(),
+                servers.talker.endpoint(),
+                talker_sandbox,
+            )
+            .await?;
+        coder
+            .start(
+                application.member.profile(),
+                servers.coder.endpoint(),
+                coder_sandbox,
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn initialize_publisher(
+        application: &Application,
+        runtime: &Runtime,
+    ) -> Result<agent::Publisher, Error> {
         let authorizer = WriteAuthorizer {
             application: application.clone(),
             home: runtime.home.clone(),
             profile: runtime.identity.profile().clone(),
             did: runtime.identity.did(),
         };
-        let (runtime, publisher) =
-            Self::initialize_publisher(application, runtime, authorizer).await?;
-        let (runtime, mcp) = Self::start_mcp(application, runtime, publisher, allowlist).await?;
-        let (runtime, mcp) = Self::start_agent(application, runtime, mcp, agent).await?;
-
-        Ok(Self {
-            runtime,
-            mcp,
-            triggered_by,
-            member_dids,
-        })
-    }
-
-    async fn start_mcp(
-        application: &Application,
-        runtime: Runtime,
-        publisher: agent::Publisher,
-        allowlist: manifest::McpAllowlist,
-    ) -> Result<(Runtime, mcp::Server), Error> {
-        match mcp::Server::start(
-            runtime.identity.profile().storage.clone(),
-            application.repository,
-            publisher,
-            allowlist,
-        )
-        .await
-        {
-            Ok(mcp) => Ok((runtime, mcp)),
-            Err(error) => Application::finish_after_stop(
-                Err(Error::Mcp(error.to_string())),
-                runtime.stop(&application.shutdown).await,
-            ),
-        }
-    }
-
-    async fn start_agent(
-        application: &Application,
-        runtime: Runtime,
-        mcp: mcp::Server,
-        agent: &mut (impl Agent + ?Sized),
-    ) -> Result<(Runtime, mcp::Server), Error> {
-        let sandbox = match AgentSandbox::load(&runtime.home, mcp.endpoint()) {
-            Ok(sandbox) => sandbox,
-            Err(error) => {
-                Application::warn_mcp_stop(mcp.stop().await);
-                return Application::finish_after_stop(
-                    Err(error.into()),
-                    runtime.stop(&application.shutdown).await,
-                );
-            }
-        };
-        if let Err(error) = agent
-            .start(application.member.profile(), mcp.endpoint(), sandbox)
-            .await
-        {
-            Application::warn_agent_stop(agent.stop().await);
-            Application::warn_mcp_stop(mcp.stop().await);
-            return Application::finish_after_stop(
-                Err(error.into()),
-                runtime.stop(&application.shutdown).await,
-            );
-        }
-
-        Ok((runtime, mcp))
-    }
-
-    async fn initialize_publisher(
-        application: &Application,
-        runtime: Runtime,
-        authorizer: WriteAuthorizer,
-    ) -> Result<(Runtime, agent::Publisher), Error> {
-        let publisher = agent::Publisher::new(
+        agent::Publisher::new(
             runtime.identity.profile().clone(),
             application.repository,
             runtime.identity.memory_signer(),
@@ -773,54 +850,59 @@ impl AgentRuntime {
             authorizer,
         )
         .with_journal(&runtime.home.state_database())
-        .await;
-        let publisher = match publisher {
-            Ok(publisher) => publisher,
-            Err(error) => {
-                return Application::finish_after_stop(
-                    Err(Error::Mcp(error.to_string())),
-                    runtime.stop(&application.shutdown).await,
-                );
-            }
-        };
-        Ok((runtime, publisher))
+        .await
+        .map_err(|error| Error::Mcp(error.to_string()))
     }
 
     async fn run(
         self,
         application: &Application,
-        agent: &mut (impl Agent + ?Sized),
+        talker: &mut (impl Talker + ?Sized),
+        coder: &mut (impl Coder + ?Sized),
     ) -> Result<(), Error> {
-        let profile = self.runtime.identity.profile();
+        let profile = self.runtime.identity.profile().clone();
         let workspaces = crate::workspace::Workspaces::new(
             self.runtime.home.workspaces(),
             profile.storage.clone(),
             application.repository,
             *profile.id(),
         );
-        let delivery_scope = self.mcp.delivery_scope();
-        let watched = watcher::Watcher::new(
+        let state_database = self.runtime.home.state_database();
+        let watcher = watcher::Watcher::new(
             application.member,
             application.repository,
-            self.triggered_by.clone(),
-            self.member_dids.clone(),
-        )
-        .run(
-            profile,
-            self.runtime.node.node(),
-            &self.runtime.home.state_database(),
-            agent,
-            workspaces,
-            delivery_scope,
-        )
-        .await;
+            self.policy.clone(),
+        );
+        let builder = builder::Builder::new(application.member, application.repository);
+        let coder_scope = self.servers.coder.scope();
+        let ran = {
+            let watching = watcher.run(
+                &profile,
+                self.runtime.node.node(),
+                &state_database,
+                talker,
+                watcher::DeliveryRuntime::new(
+                    workspaces.clone(),
+                    self.servers.talker.scope(),
+                    profile.storage.clone(),
+                    self.queue.clone(),
+                    self.policy.priority().clone(),
+                ),
+            );
+            let building = builder.run(&*coder, &self.queue, &workspaces, &coder_scope);
+            tokio::select! {
+                watched = watching => watched.map_err(Error::from),
+                built = building => built.map_err(Error::from),
+            }
+        };
         let interrupted = application.shutdown.is_requested();
         let cleanup = RunCleanup {
-            agent: agent.stop().await,
-            mcp: self.mcp.stop().await,
+            talker: talker.stop().await,
+            coder: coder.stop().await,
+            mcp: self.servers.stop().await,
             node: self.runtime.stop(&application.shutdown).await,
         };
-        cleanup.finish(watched, interrupted)
+        cleanup.finish(ran, interrupted)
     }
 }
 
@@ -869,38 +951,49 @@ impl agent::Authorizer for WriteAuthorizer {
 }
 
 struct RunCleanup {
-    agent: Result<(), agent::Error>,
+    talker: Result<(), agent::Error>,
+    coder: Result<(), agent::Error>,
     mcp: Result<(), mcp::Error>,
     node: Result<(), node::Error>,
 }
 
 impl RunCleanup {
-    fn finish(self, watched: Result<(), watcher::Error>, interrupted: bool) -> Result<(), Error> {
+    fn finish(self, ran: Result<(), Error>, interrupted: bool) -> Result<(), Error> {
         if interrupted {
             return self.interrupted();
         }
-        match watched {
+        match ran {
             Ok(()) => self.successful(),
-            Err(error) => self.watcher_failed(error),
+            Err(error) => self.run_failed(error),
         }
     }
 
     fn interrupted(self) -> Result<(), Error> {
-        Application::warn_agent_stop(self.agent);
+        self.warn_agents_stopped();
         Application::warn_mcp_stop(self.mcp);
         self.node.map_err(Error::from)
     }
 
-    fn watcher_failed(self, error: watcher::Error) -> Result<(), Error> {
-        Application::warn_agent_stop(self.agent);
+    fn run_failed(self, error: Error) -> Result<(), Error> {
+        self.warn_agents_stopped();
         Application::warn_mcp_stop(self.mcp);
         Application::warn_node_stop(&self.node, "application error");
-        Err(error.into())
+        Err(error)
     }
 
-    fn successful(self) -> Result<(), Error> {
-        match self.agent {
-            Ok(()) => self.after_agent(),
+    fn warn_agents_stopped(&self) {
+        for stopped in [&self.talker, &self.coder] {
+            if let Err(error) = stopped {
+                tracing::warn!(%error, "failed to stop agent after application error");
+            }
+        }
+    }
+
+    fn successful(mut self) -> Result<(), Error> {
+        let stopped = std::mem::replace(&mut self.talker, Ok(()))
+            .and(std::mem::replace(&mut self.coder, Ok(())));
+        match stopped {
+            Ok(()) => self.after_agents(),
             Err(error) => {
                 Application::warn_mcp_stop(self.mcp);
                 Application::warn_node_stop(&self.node, "agent shutdown error");
@@ -909,7 +1002,7 @@ impl RunCleanup {
         }
     }
 
-    fn after_agent(self) -> Result<(), Error> {
+    fn after_agents(self) -> Result<(), Error> {
         match self.mcp {
             Ok(()) => self.node.map_err(Error::from),
             Err(error) => {
@@ -1122,6 +1215,12 @@ pub enum Error {
     /// Watching Radicle activity failed.
     #[error("Radicle watcher error: {0}")]
     Watcher(#[from] watcher::Error),
+    /// Carrying out queued work failed.
+    #[error("member builder error: {0}")]
+    Builder(#[from] builder::Error),
+    /// Opening the member work queue failed.
+    #[error("work queue error: {0}")]
+    Queue(#[from] crate::queue::Error),
     /// Starting or stopping the run-scoped MCP server failed.
     #[error("MCP server error: {0}")]
     Mcp(String),
@@ -1130,7 +1229,7 @@ pub enum Error {
     Sandbox(#[from] crate::sandbox::Error),
     /// Starting or stopping the agent adapter failed.
     #[error(transparent)]
-    Agent(#[from] agent::Error),
+    Talker(#[from] agent::Error),
     /// A blocking filesystem or Radicle task failed.
     #[error("application task failed: {0}")]
     Task(String),
@@ -1306,9 +1405,10 @@ mod tests {
             Revision::Repository(Oid::from_sha1([0; 20])),
             crate::manifest::McpAllowlist::default(),
             crate::manifest::SecurityPolicy::test(repository),
-            crate::manifest::TriggerPolicy::new(
+            crate::manifest::RepositoryPolicy::new(
                 crate::manifest::TriggerAccess::Delegates,
                 vec![did],
+                crate::manifest::PriorityLabels::default(),
             ),
         );
         application

@@ -7,6 +7,18 @@
 //! watcher state. `setup` provisions and validates those resources; `run` keeps them alive while
 //! repository activity is observed.
 //!
+//! # Two halves of one member
+//!
+//! A member answers messages while it builds, and one conversation cannot do both: a half-written
+//! patch has no safe point to pause at, so a question would wait behind a twenty-minute job. Each
+//! member therefore runs two adapters under one identity, one MCP server each. To everybody
+//! reading the repository it is one person.
+//!
+//! [`agent::Talker`] answers. [`agent::Coder`] builds. Being assigned is the one thing that is not
+//! a message, so it becomes a job in the member's [`queue`] instead of reaching the conversation;
+//! the talking half can add jobs of its own, send a correction to the running one, or ask it to
+//! stop. [`builder::Builder`] takes jobs and drives the building half alongside the watcher.
+//!
 //! The runtime pipeline is:
 //!
 //! ```text
@@ -15,8 +27,10 @@
 //!     -> Radicle action normalization
 //!     -> member-specific classification
 //!     -> internal activity
-//!     -> typed Agent method
-//!     -> delivery-scoped MCP reads and writes
+//!     -> typed Talker method            (a message)
+//!        or the member's work queue     (an assignment)
+//!            -> Coder::work
+//!     -> work-scoped MCP reads and writes
 //! ```
 //!
 //! [`watcher::Watcher`] rebuilds issue and patch state from their operation histories whenever a
@@ -25,18 +39,19 @@
 //! assignment, mention, reply, or relevant change for the selected member and produces an internal
 //! activity. This keeps Radicle's low-level action variants out of consumers.
 //!
-//! Delivery uses the [`agent::Agent`] interface. A dispatcher maps each internal activity to the
-//! typed `assigned`, `mentioned`, `replied`, or `changed` method. Runtime-specific adapters
-//! implement that interface; the core does not depend on an agent vendor API. Each callback gets a
-//! fresh working copy and returns only success or failure. Repository actions are separate MCP
-//! calls, so an agent can perform any number of allowed actions during one delivery.
+//! A dispatcher maps each deliverable activity to the typed `mentioned`, `replied`, or `changed`
+//! method. Runtime-specific adapters implement these interfaces; the core does not depend on an
+//! agent vendor API. Each callback gets a fresh working copy and returns only success or failure.
+//! Repository actions are separate MCP calls, so an agent can perform any number of allowed
+//! actions while one unit of work is active.
 //!
-//! During `run`, the application also starts a loopback-only MCP server scoped to the selected
-//! repository and member profile. [`agent::Agent::start`] receives the provider-neutral member
-//! profile, its unguessable capability URL, and a preconfigured [`sandbox::AgentSandbox`] before
-//! activity is delivered. Manifest allowlists control the exposed read, comment, issue, patch, and
-//! review methods. Tools are usable only while one delivery is active and cannot address a
-//! different subject. The adapter is stopped before the server and node shut down.
+//! During `run`, the application starts two loopback-only MCP servers scoped to the selected
+//! repository and member profile. `start` receives the provider-neutral member profile, its
+//! unguessable capability URL, and a preconfigured [`sandbox::AgentSandbox`] before any work is
+//! delivered. Manifest allowlists control the exposed read, comment, issue, patch, and review
+//! methods; the split between the halves only withholds what each could not use anyway. Tools are
+//! usable only while one delivery or job is active and cannot address a different subject. Both
+//! adapters are stopped before the servers and node shut down.
 //!
 //! # State and delivery
 //!
@@ -44,7 +59,9 @@
 //! ownership state. Successful action deliveries are stored in SQLite so rescans do not report
 //! them twice; each delivery is recorded after its adapter call succeeds. Adapters receive a stable
 //! [`agent::DeliveryId`] in [`agent::Context`]. Its action position distinguishes multiple
-//! deliveries from one Radicle operation.
+//! deliveries from one Radicle operation. Repository writes are journalled under an
+//! [`agent::WorkId`], which names either a delivery or a job, so an interrupted write is recovered
+//! by whichever half issued it.
 //!
 //! # Trust boundaries
 //!
@@ -60,6 +77,8 @@ pub use crate::application::{Application, Error, Setup, SetupStatus};
 /// Agent adapter interface and its typed activity context.
 pub mod agent;
 mod application;
+/// Queued work carried out by a member's building half.
+pub mod builder;
 /// Command-line interface for selecting and running a team member.
 pub mod cli;
 mod database;
@@ -74,6 +93,8 @@ mod mcp;
 pub mod member;
 /// Supervised Radicle node lifecycle.
 pub mod node;
+/// Durable per-member work queue.
+pub mod queue;
 /// Local process sandboxing for agent adapters.
 pub mod sandbox;
 mod shutdown;
