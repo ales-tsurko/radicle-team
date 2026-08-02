@@ -39,11 +39,11 @@ used by the primary implementation.
 ## Functions and types
 
 - Prefer methods on the type that owns the operation's state or context. Avoid
-  standalone functions unless the operation has no natural owner; `main`,
+  standalone functions unless the operation has no natural owner. `main`,
   tests, and trait-required functions are normal exceptions.
 - Use traits and conversion types such as `From` when they make an extension
   point explicit and keep variant-specific logic localized.
-- Derive errors with `thiserror`; do not write manual `std::error::Error`
+- Derive errors with `thiserror`. Do not write manual `std::error::Error`
   implementations.
 
 

@@ -4,9 +4,9 @@
 //! repository's canonical commit or from one explicitly selected administrator-owned file. The file
 //! is shared repository policy, not machine-local application state: contributors must agree on its
 //! reviewed character-to-DID bindings, while private identity material remains in the application
-//! home. `config-rs` parses the versioned document; domain validation rejects unknown members and
-//! duplicated active DIDs, then verifies that the selected member is active and bound to the
-//! locally loaded [`Identity`](crate::identity::Identity).
+//! home. `config-rs` parses the versioned document. Domain validation then rejects unknown
+//! members and duplicated active DIDs, and verifies that the selected member is active and bound
+//! to the locally loaded [`Identity`](crate::identity::Identity).
 //!
 //! Member identity bindings are one security-sensitive section of the manifest. Validating one
 //! produces [`ValidatedBinding`](crate::manifest::ValidatedBinding), which carries the member, DID,
@@ -39,6 +39,7 @@ pub const FILE_NAME: &str = ".radicle-team.toml";
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_FRONT_LABEL: &str = "urgent";
 const DEFAULT_NEXT_LABEL: &str = "next";
+const DEFAULT_EXCHANGES: usize = 3;
 
 /// Parsed repository manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +48,7 @@ pub struct Manifest {
     security: SecurityPolicy,
     triggered_by: TriggerAccess,
     priority: PriorityLabels,
+    limits: Limits,
     revision: Revision,
 }
 
@@ -178,6 +180,7 @@ impl Manifest {
                 self.triggered_by.clone(),
                 self.active_member_dids(),
                 self.priority.clone(),
+                self.limits.clone(),
             ),
         ))
     }
@@ -211,6 +214,7 @@ impl Manifest {
             security: document.security,
             triggered_by: document.triggered_by,
             priority: document.priority,
+            limits: document.limits,
             revision,
         })
     }
@@ -305,7 +309,7 @@ impl McpAllowlist {
 
     /// Returns whether the manifest has no say in `method`.
     fn is_unrestricted(method: &str) -> bool {
-        crate::mcp::ToolService::unrestricted_tools().any(|tool| tool == method)
+        crate::mcp::ToolService::is_unrestricted(method)
     }
 
     /// Allows every method the manifest is able to grant.
@@ -335,7 +339,7 @@ impl McpAllowlist {
     /// Returns whether the named MCP method is allowed.
     #[must_use]
     pub fn allows(&self, method: &str) -> bool {
-        self.0.contains(method)
+        self.0.contains(method) || Self::is_unrestricted(method)
     }
 
     /// Returns the allowed MCP method names.
@@ -471,17 +475,30 @@ pub struct RepositoryPolicy {
     access: TriggerAccess,
     members: Vec<Did>,
     priority: PriorityLabels,
+    limits: Limits,
 }
 
 impl RepositoryPolicy {
     /// Pairs an access rule with every active member's signing DID.
     #[must_use]
-    pub const fn new(access: TriggerAccess, members: Vec<Did>, priority: PriorityLabels) -> Self {
+    pub const fn new(
+        access: TriggerAccess,
+        members: Vec<Did>,
+        priority: PriorityLabels,
+        limits: Limits,
+    ) -> Self {
         Self {
             access,
             members,
             priority,
+            limits,
         }
+    }
+
+    /// Returns the bounds on conversation between this repository's members.
+    #[must_use]
+    pub const fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     /// Returns the labels which move assigned work ahead of the queue.
@@ -588,36 +605,48 @@ struct Document {
     triggered_by: TriggerAccess,
     #[serde(default)]
     priority: PriorityLabels,
+    #[serde(default)]
+    limits: Limits,
     members: BTreeMap<String, Binding>,
 }
 
-/// Issue labels which move assigned work ahead of the queue.
-///
-/// Omitting the section leaves the defaults in place, so an ordinary manifest carries nothing
-/// about scheduling. Only a repository that already uses different words for urgency needs to say
-/// so. Work carrying neither label joins the end of the queue.
+/// Bounds on how far this repository's members may carry a conversation by themselves.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
+pub struct Limits {
+    exchanges: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            exchanges: DEFAULT_EXCHANGES,
+        }
+    }
+}
+
+impl Limits {
+    /// Returns how many turns one member may take with another on the same issue or patch before
+    /// a person has to join the conversation.
+    #[must_use]
+    pub const fn exchanges(&self) -> usize {
+        self.exchanges
+    }
+}
+
+/// Issue labels which move assigned work ahead of the queue.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PriorityLabels {
-    #[serde(default = "default_front_label")]
     front: String,
-    #[serde(default = "default_next_label")]
     next: String,
-}
-
-fn default_front_label() -> String {
-    DEFAULT_FRONT_LABEL.to_owned()
-}
-
-fn default_next_label() -> String {
-    DEFAULT_NEXT_LABEL.to_owned()
 }
 
 impl Default for PriorityLabels {
     fn default() -> Self {
         Self {
-            front: default_front_label(),
-            next: default_next_label(),
+            front: DEFAULT_FRONT_LABEL.to_owned(),
+            next: DEFAULT_NEXT_LABEL.to_owned(),
         }
     }
 }
@@ -1107,6 +1136,38 @@ mod tests {
             renamed.priority.position(["next"]),
             QueuePosition::Next,
             "the label that was not renamed keeps its default"
+        );
+    }
+
+    #[test]
+    fn overrides_the_exchange_limit_only_when_the_manifest_says_so() {
+        let member = format!(
+            "[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = 1\nstate = \
+             \"active\"\nmcp_allow = []\n"
+        );
+
+        assert_eq!(
+            Fixture::parse(&format!("version = 1\n{member}"))
+                .expect("a manifest without '[limits]' should parse")
+                .limits
+                .exchanges(),
+            3,
+            "the default must work without the section, so an ordinary manifest says nothing \
+             about how long its members may talk"
+        );
+        assert_eq!(
+            Fixture::parse(&format!("version = 1\n[limits]\nexchanges = 8\n{member}"))
+                .expect("an overridden limit should parse")
+                .limits
+                .exchanges(),
+            8
+        );
+        assert!(
+            matches!(
+                Fixture::parse(&format!("version = 1\n[limits]\nrounds = 8\n{member}")),
+                Err(Error::Parse(_))
+            ),
+            "an unknown key must be refused rather than silently leaving the default in place"
         );
     }
 

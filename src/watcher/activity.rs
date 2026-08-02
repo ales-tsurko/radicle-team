@@ -48,22 +48,6 @@ impl Activity {
         }
     }
 
-    pub(super) async fn dispatch(
-        self,
-        delivery: Delivery,
-        agent: &mut (impl Talker + ?Sized),
-        workspace: PathBuf,
-    ) -> Result<(), agent::Error> {
-        let context = self.context(workspace);
-        match delivery {
-            Delivery::Mentioned(target) => agent.mentioned(context, target).await,
-            Delivery::Replied { comment, reply_to } => {
-                agent.replied(context, comment, reply_to).await
-            }
-            Delivery::Changed(change) => agent.changed(context, change).await,
-        }
-    }
-
     pub(super) fn context(&self, workspace: PathBuf) -> Context {
         Context {
             repository: self.repository,
@@ -99,14 +83,20 @@ impl Subject {
             Self::Issue(id) | Self::Patch(id) => *id,
         }
     }
+
+    /// Returns the word for this kind of subject.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Issue(_) => "issue",
+            Self::Patch(_) => "patch",
+        }
+    }
 }
 
 impl fmt::Display for Subject {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Issue(id) => write!(formatter, "issue:{id}"),
-            Self::Patch(id) => write!(formatter, "patch:{id}"),
-        }
+        write!(formatter, "{}:{}", self.kind(), self.id())
     }
 }
 
@@ -144,6 +134,20 @@ pub(super) enum Delivery {
     Mentioned(Target),
     Replied { comment: Comment, reply_to: EntryId },
     Changed(Change),
+}
+
+impl Delivery {
+    pub(super) async fn dispatch(
+        self,
+        context: Context,
+        agent: &mut (impl Talker + ?Sized),
+    ) -> Result<(), agent::Error> {
+        match self {
+            Self::Mentioned(target) => agent.mentioned(context, target).await,
+            Self::Replied { comment, reply_to } => agent.replied(context, comment, reply_to).await,
+            Self::Changed(change) => agent.changed(context, change).await,
+        }
+    }
 }
 
 /// Location containing a mention.
@@ -288,9 +292,7 @@ mod tests {
     use crate::{
         agent::{Context, DeliveryId, Error, McpEndpoint, Talker},
         member::Profile,
-        watcher::activity::{
-            Activity, Change, Comment, Delivery, InvalidSubject, Kind, Subject, Target,
-        },
+        watcher::activity::{Change, Comment, Delivery, InvalidSubject, Subject, Target},
     };
 
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
@@ -356,18 +358,6 @@ mod tests {
         }
     }
 
-    fn activity(kind: Kind) -> Activity {
-        let context = context();
-        Activity::new(
-            context.repository,
-            context.subject,
-            context.delivery.operation,
-            context.delivery.action,
-            context.author,
-            kind,
-        )
-    }
-
     #[tokio::test]
     async fn dispatches_every_delivery_to_its_typed_agent_method() {
         let comment =
@@ -383,8 +373,8 @@ mod tests {
         ];
 
         for delivery in deliveries {
-            activity(Kind::Delivered(delivery))
-                .dispatch(delivery, &mut agent, context().workspace)
+            delivery
+                .dispatch(context(), &mut agent)
                 .await
                 .expect("delivery should dispatch");
         }
@@ -413,7 +403,10 @@ mod tests {
         }
         for malformed in [SUBJECT.to_owned(), format!("review:{SUBJECT}")] {
             assert!(
-                matches!(Subject::from_str(&malformed), Err(InvalidSubject(value)) if value == malformed),
+                matches!(
+                    Subject::from_str(&malformed),
+                    Err(InvalidSubject(value)) if value == malformed
+                ),
                 "an address that names no issue or patch must be refused rather than guessed at"
             );
         }

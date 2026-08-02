@@ -6,7 +6,7 @@
 //! home.
 //!
 //! This module never stores or reads the Radicle private key itself. It only supplies the
-//! passphrase needed by the provider to create or unlock that key; service-provided
+//! passphrase needed by the provider to create or unlock that key. Service-provided
 //! `RAD_PASSPHRASE` values are handled directly by the provider and are not copied into the system
 //! credential store.
 

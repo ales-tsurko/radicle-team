@@ -66,8 +66,10 @@ impl Helper {
             path: Path::new("/proc/self/exe").into(),
             source,
         })?;
-        let bundled = executable.parent().map(|directory| directory.join("bwrap"));
-        if bundled.is_some_and(|bundled| bundled.is_file()) {
+        if executable
+            .parent()
+            .is_some_and(|directory| directory.join("bwrap").is_file())
+        {
             Ok(())
         } else {
             Err(Error::BubblewrapMissing)

@@ -246,7 +246,7 @@ impl Default for Config {
 ///
 /// Loopback behaves differently on each platform because Zerobox uses a different backend on each,
 /// and neither behaviour is configurable here. macOS keeps host loopback reachable under every
-/// variant, so a sandboxed agent reaches local services this application does not operate; isolate
+/// variant, so a sandboxed agent reaches local services this application does not operate. Isolate
 /// anything sensitive by other means. Linux runs a restricted sandbox in its own network namespace,
 /// created per command, so host loopback is unreachable and a server one command starts is not
 /// reachable from the next. Only the member's MCP endpoint is bridged through the managed proxy.

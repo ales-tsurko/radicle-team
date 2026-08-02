@@ -2020,16 +2020,14 @@ async fn manages_patch_reviews_and_inline_comments() {
             .expect("patch should load")
             .expect("patch should exist");
         let review_id = patch::ReviewId::from(EntryId::from_str(&review).expect("id should parse"));
-        let comments = published
-            .revisions()
-            .flat_map(|(_revision, value)| value.reviews())
-            .find_map(|(_author, value)| (value.id() == review_id).then_some(value))
+        let comments = find_review(&published, review_id)
             .expect("the review should exist")
             .comments()
             .count();
         assert_eq!(
             comments, 2,
-            "every line comment sent with a review must be published with it, so that a reviewer              never has to spend several turns saying one thing"
+            "every line comment sent with a review must be published with it, so that a reviewer \
+             never has to spend several turns saying one thing"
         );
     }
     let objects = object_count(&repository.backend);
@@ -2196,7 +2194,8 @@ async fn manages_patch_reviews_and_inline_comments() {
         .await
         .err()
         .expect(
-            "a review comment posted on its own must be refused, or the batch that keeps a              review to one act would be optional",
+            "a review comment posted on its own must be refused, or the batch that keeps a review \
+             to one act would be optional",
         );
     let comment = {
         let published = Patches::open(&repository, ReadOnly)
@@ -2205,10 +2204,7 @@ async fn manages_patch_reviews_and_inline_comments() {
             .expect("patch should load")
             .expect("patch should exist");
         let review_id = patch::ReviewId::from(EntryId::from_str(&review).expect("id should parse"));
-        published
-            .revisions()
-            .flat_map(|(_revision, value)| value.reviews())
-            .find_map(|(_author, value)| (value.id() == review_id).then_some(value))
+        find_review(&published, review_id)
             .expect("the review should exist")
             .comments()
             .map(|(id, _comment)| id.to_string())

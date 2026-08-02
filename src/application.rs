@@ -715,14 +715,9 @@ struct Servers {
 
 impl Servers {
     async fn stop(self) -> Result<(), mcp::Error> {
-        let talker = self.talker.stop().await;
-        let coder = self.coder.stop().await;
+        let (talker, coder) = tokio::join!(self.talker.stop(), self.coder.stop());
 
         talker.and(coder)
-    }
-
-    async fn stop_after_error(self) {
-        Application::warn_mcp_stop(self.stop().await);
     }
 }
 
@@ -768,7 +763,7 @@ impl AgentRuntime {
         {
             Application::warn_agent_stop(talker.stop().await);
             Application::warn_agent_stop(coder.stop().await);
-            servers.stop_after_error().await;
+            Application::warn_mcp_stop(servers.stop().await);
             return Err(error);
         }
 
@@ -884,7 +879,6 @@ impl AgentRuntime {
                 watcher::DeliveryRuntime::new(
                     workspaces.clone(),
                     self.servers.talker.scope(),
-                    profile.storage.clone(),
                     self.queue.clone(),
                     self.policy.priority().clone(),
                 ),
@@ -921,9 +915,6 @@ impl agent::Authorizer for WriteAuthorizer {
             .validate_profile_binding(&self.home, &self.profile, self.did)
             .await
             .and_then(|binding| {
-                if method == "report_security_issue" {
-                    return Ok(());
-                }
                 binding
                     .mcp_allow()
                     .allows(method)
@@ -989,24 +980,31 @@ impl RunCleanup {
         }
     }
 
-    fn successful(mut self) -> Result<(), Error> {
-        let stopped = std::mem::replace(&mut self.talker, Ok(()))
-            .and(std::mem::replace(&mut self.coder, Ok(())));
-        match stopped {
-            Ok(()) => self.after_agents(),
+    fn successful(self) -> Result<(), Error> {
+        let Self {
+            talker,
+            coder,
+            mcp,
+            node,
+        } = self;
+        match talker.and(coder) {
+            Ok(()) => Self::after_agents(mcp, node),
             Err(error) => {
-                Application::warn_mcp_stop(self.mcp);
-                Application::warn_node_stop(&self.node, "agent shutdown error");
+                Application::warn_mcp_stop(mcp);
+                Application::warn_node_stop(&node, "agent shutdown error");
                 Err(error.into())
             }
         }
     }
 
-    fn after_agents(self) -> Result<(), Error> {
-        match self.mcp {
-            Ok(()) => self.node.map_err(Error::from),
+    fn after_agents(
+        mcp: Result<(), mcp::Error>,
+        node: Result<(), node::Error>,
+    ) -> Result<(), Error> {
+        match mcp {
+            Ok(()) => node.map_err(Error::from),
             Err(error) => {
-                Application::warn_node_stop(&self.node, "MCP server error");
+                Application::warn_node_stop(&node, "MCP server error");
                 Err(Error::Mcp(error.to_string()))
             }
         }
@@ -1409,6 +1407,7 @@ mod tests {
                 crate::manifest::TriggerAccess::Delegates,
                 vec![did],
                 crate::manifest::PriorityLabels::default(),
+                crate::manifest::Limits::default(),
             ),
         );
         application

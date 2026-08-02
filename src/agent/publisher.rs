@@ -1,6 +1,6 @@
 //! Authorized Radicle writes issued through MCP.
 
-use std::{fmt, path::Path, str::FromStr, sync::Arc};
+use std::{collections::BTreeSet, fmt, path::Path, str::FromStr, sync::Arc};
 
 use radicle::{
     cob::{
@@ -137,12 +137,15 @@ impl Publisher {
             return Ok(());
         };
         let _mutation_guard = self.mutation_lock.lock().await;
+        // Signing refs and announcing is per author, not per write, and a job's scope holds one
+        // row for every write it made.
+        let mut recovered = BTreeSet::new();
         for entry in journal
             .entries(self.repository, work_repository, work)
             .await?
         {
             if entry.result.is_some() {
-                self.finish_recovery(entry.author).await?;
+                self.finish_recovered(entry.author, &mut recovered).await?;
                 continue;
             }
             let publisher = self.clone();
@@ -174,6 +177,17 @@ impl Publisher {
                     &operation.to_string(),
                 )
                 .await?;
+            self.finish_recovered(author, &mut recovered).await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_recovered(
+        &self,
+        author: PublicKey,
+        recovered: &mut BTreeSet<PublicKey>,
+    ) -> Result<(), Error> {
+        if recovered.insert(author) {
             self.finish_recovery(author).await?;
         }
         Ok(())

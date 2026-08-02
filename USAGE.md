@@ -42,11 +42,11 @@ interfaces. The runtime calls `start` on each with the selected member's
 `Profile` and its own run-scoped MCP endpoint, then delivers typed activity to
 one and queued jobs to the other.
 
-The talking adapter records work with `add_job`, checks `work_status`, sends a
-correction to the running job with `note`, and asks it to stop with `cancel`. A
-note arrives on the next MCP tool result the building adapter receives, so it
-needs no polling. Cancelling asks the building adapter to commit what it has to
-a branch rather than discarding it.
+Four MCP tools connect the two. The talking adapter records work with `add_job`,
+checks `work_status`, corrects a running job with `note`, and stops it with
+`cancel`. A note arrives on the building adapter's next tool result, so nothing
+polls, and cancelling asks it to commit what it has to a branch rather than
+discarding it.
 
 Each adapter is responsible for:
 
@@ -63,10 +63,10 @@ The core does not depend on a particular model vendor or agent framework.
 
 ## Members
 
-All provider-neutral tuning values are rated from 1 to 5. `INT` represents
-preferred model capability, `SPD` response speed, `EXP` engineering autonomy,
-`CRE` solution exploration, and `CAU` risk-aware deliberation. Agent adapters
-receive these values at startup and map them to provider-specific controls.
+Each member carries five tuning values, rated 1 to 5, which adapters receive at
+startup and map to provider-specific controls: `INT` preferred model capability,
+`SPD` response speed, `EXP` engineering autonomy, `CRE` solution exploration,
+and `CAU` risk-aware deliberation.
 
 - **Nico — Junior Developer.** Curious, informal, and emotionally transparent.
   He reproduces problems quickly and excels at focused experiments, prototypes,
@@ -121,10 +121,10 @@ These are strengths, not exclusive permissions. Full character, expertise, and
 voice documents live under [`members/`](members/).
 
 Mention a member by name to address them: `@nico`, `@maya`, and so on. `@team`
-addresses everyone, for brainstorming or for work with no obvious owner. Every
-running member treats `@team` as a mention of itself, so each one responds and
-one such mention costs one delivery per running member. Members cannot use
-`@team` themselves; see [`triggered_by`](#repository-manifest) for what they may
+addresses everyone, for brainstorming or work with no obvious owner. Every
+running member treats it as a mention of itself, so one `@team` costs one
+delivery per running member. Members cannot use `@team` themselves. See
+[the manifest](#what-members-may-trigger-in-each-other) for what they may
 trigger in each other.
 
 
@@ -138,8 +138,8 @@ manifest.
 
 On Linux, install `bubblewrap` as well. Zerobox launches every sandboxed agent
 process through it, so without `bwrap` on `PATH` the sandbox cannot start and
-each agent command fails. macOS needs nothing extra; it uses the operating
-system's own sandbox.
+each agent command fails. macOS needs nothing extra, because it uses the
+operating system's own sandbox.
 
 ```sh
 sudo apt-get install bubblewrap   # or the equivalent for your distribution
@@ -175,50 +175,43 @@ radicle-team setup nico --repo rad:...
 ```
 
 Setup creates or loads Nico's identity, starts Nico's node, synchronizes the
-repository, and prints the DID. For private repositories, the wizard waits
-while an authority grants that DID access and then retries synchronization.
-Setup also records a persistent seeding policy for the repository in the
-member's Radicle home.
-
-If the repository manifest or member binding is missing, run setup from the
-repository checkout. It shows the exact Git commands and asks before writing
-`.radicle-team.toml`, creating a commit, and opening a Radicle patch with the
-user's identity.
-
-For a new manifest, the wizard asks who may trigger the repository's artificial
-contributors, then whether to create a private security-report repository with
-the user's Radicle identity or use an existing repository RID.
-It grants the member DID access, generates an age encryption identity, and
-shows its recovery key once. Save that key outside every agent environment.
-Later member setup grants each new DID access through the same repository
-authority.
-
-The user's regular Radicle node must be running so the wizard can initialize
-and announce the security repository. A selected repository must be private
-and the user's Radicle identity must be able to update its access list. After
-the manifest patch reaches the canonical branch, the wizard validates it and
-finishes with:
+repository, records a seeding policy, and prints the DID. That DID is Nico's
+own, not the operator's, so a private repository has to grant it access before
+synchronization can succeed — the wizard waits and retries while that happens.
+It finishes with:
 
 ```text
 nico is ready for rad:... with binding generation 1
 ```
 
-Setup publishes only when `HEAD` exactly matches the live canonical `rad` tip.
-Switch to an up-to-date canonical branch first so unrelated commits and patches
-are never included.
+When standard input or output is not a terminal, setup never prompts or modifies
+the checkout. It prints the required action and exits.
 
-For a private repository, its authority must grant the printed DID access
-before synchronization can succeed. A known seed can be supplied explicitly:
 
-```sh
-radicle-team setup nico --repo rad:... --seed z6Mk...
-```
+### Adding the member to the manifest
 
-`run` synchronizes before validating the manifest and starting the watcher.
-Passing `--seed` uses those peers for that synchronization.
+If the repository manifest or member binding is missing, run setup from the
+repository checkout. It shows the exact Git commands and asks before writing
+`.radicle-team.toml`, committing, and opening a Radicle patch under the user's
+identity.
 
-When standard input or output is not a terminal, setup does not prompt or
-modify the checkout. It prints the required action and exits instead.
+It publishes only when `HEAD` exactly matches the live canonical `rad` tip, so
+switch to an up-to-date canonical branch first and unrelated commits can never
+be swept in. Once the patch reaches the canonical branch, the wizard validates
+it.
+
+
+### Creating a manifest from scratch
+
+The wizard asks who may trigger the repository's artificial contributors, then
+whether to create the security-report repository or use an existing RID. It
+grants the member DID access, generates an age encryption identity, and shows
+its recovery key once — save that key outside every agent environment. Later
+members are granted access through the same repository authority.
+
+That repository must be private, the user's own Radicle node must be running,
+and the user's Radicle identity must be able to update its access list. A
+public repository is refused.
 
 
 
@@ -244,16 +237,19 @@ library. `RUST_LOG` selects both, defaulting to `info`:
 RUST_LOG=radicle_team=debug radicle-team run nico --repo rad:...
 ```
 
-At `info` the process reports what it decided and why: activity dispatched to
-the agent, activity ignored because its author may not trigger artificial
-contributors, a mutation published or recovered from an interrupted delivery,
-an MCP method the manifest no longer allows, and the sandbox becoming ready.
+At `info` the process reports what it decided and why:
+
+- activity dispatched to an adapter, or ignored and for which reason;
+- a mutation published, or recovered from an interrupted delivery;
+- an MCP method the manifest no longer allows;
+- the sandbox becoming ready.
+
 `debug` adds each repository scan, each classified activity, and the policy
 built for every sandboxed command.
 
-The first of those matters most in practice: without it, a `triggered_by`
-decision looks exactly like an artificial contributor that is simply not
-responding.
+The ignored-activity records matter most in practice. Without them a
+`triggered_by` decision, or a conversation that has run its turns, looks exactly
+like a member that is simply not responding.
 
 
 
@@ -278,9 +274,8 @@ policy, so a typo surfaces immediately instead of appearing to apply.
 The repository manifest deliberately does **not** work this way: it is read once
 at startup. The asymmetry is intentional. A sandbox denial interrupts work
 already in progress, and the operator fixing it wants the running member to
-recover; manifest values do not block a running task, and reloading only some of
-them would leave a member acting on two different revisions of the same file at
-once.
+recover. Manifest values block nothing, and reloading only some of them would
+leave a member acting on two different revisions of the same file at once.
 
 Agent adapters select commands and arguments but cannot weaken this policy.
 Every subprocess inherits the same sandbox.
@@ -292,7 +287,8 @@ Radicle Team loads Zerobox's embedded platform and sensitive-path policies
 directly, so user-defined Zerobox profiles cannot replace them. It also enables
 common Rust, Node.js, Python, Go, and Nix toolchain paths and grants the
 member's ephemeral workspaces. Local path entries extend or restrict those
-defaults; denied paths take precedence. Paths in the file must be absolute.
+defaults, and denied paths take precedence. Paths in the file must be
+absolute.
 
 ```toml
 version = 1
@@ -334,8 +330,8 @@ On **Linux** a restricted sandbox runs in its own network namespace, so host
 loopback is unreachable and only the managed proxy bridges out. Zerobox creates
 that namespace per command, so a server one command starts is not reachable from
 the next one. A workflow that runs a local development server and then connects
-to it therefore needs `network = "all"` on Linux; `"domains"` does not help,
-because it is still a restricted sandbox. A restricted sandbox on Linux also
+to it therefore needs `network = "all"` on Linux. Domains do not help, because
+that is still a restricted sandbox. A restricted sandbox on Linux also
 blocks the command from creating new Unix domain sockets, so local services
 reached that way, such as a container daemon or a database socket, are
 unavailable there as well.
@@ -364,7 +360,7 @@ Executables embedding the library on Linux must call
 
 Exactly one `.radicle-team.toml` file is active. The default is the file on the
 repository's canonical branch. Use `--manifest PATH` to select an explicit file
-with the same schema instead; the two sources are never merged.
+with the same schema instead. The two sources are never merged.
 
 During interactive setup, the wizard asks before updating an explicit manifest
 at `PATH`, creating it when absent. It updates that file directly and does not
@@ -379,12 +375,15 @@ version = 1                              # required, must be 1
 triggered_by = "delegates"               # optional, defaults to "delegates"
 
 [security]                               # required
-repository = "rad:z3Security..."         # private repository for reports
+repository = "rad:z3Security..."         # private repo for reports
 recipients = ["age1..."]                 # age X25519, at least one
 
 [priority]                               # optional, both keys optional
 front = "urgent"                         # defaults to "urgent"
 next = "next"                            # defaults to "next"
+
+[limits]                                 # optional
+exchanges = 3                            # defaults to 3
 
 [members.nico]                           # one table per member, fixed names
 signing_did = "did:key:z6Mk..."          # required
@@ -419,10 +418,19 @@ peer spend the operator's agent budget.
 The setup wizard asks for the value when it creates a manifest and leaves it
 alone when it later adds a member, so editing it by hand is safe.
 
-Members themselves are always allowed, whatever this setting says, so that one
-can delegate to another without being listed here. What they may trigger in each
-other is narrower than what a person may, so that a discussion between them
-cannot feed itself while nobody is watching:
+Reactions never trigger anyone, whoever adds them. Approving an idea and asking
+for it to be carried out look identical, so acting on a reaction risks work
+nobody asked for. Request work in a comment.
+
+A member's own activity never triggers itself.
+
+
+### What members may trigger in each other
+
+Members are always allowed, whatever `triggered_by` says, so that one can
+delegate to another without being listed. What they may trigger in each other is
+narrower than what a person may, so that a discussion between them cannot feed
+itself while nobody is watching:
 
 - assigning work to a member,
 - naming one directly, as `@nico`,
@@ -433,42 +441,48 @@ are ambient changes such as an edited title. A submitted review and a new
 revision are the exceptions: those carry work to whoever owns the subject, and
 without them delegated work would stall once it was reviewed.
 
-Each member also comments on any one issue or patch at most three times until a
-non-member acts on it again, which bounds a runaway at three deliveries per
-member rather than an open-ended conversation. Only comments count against that
-allowance. Publishing a revision, submitting a review, or merging is work rather
-than speech, so a member that spends the day building still hears about its own
-patch. A member's own activity never triggers itself.
+Two members also stop talking to each other after a while. A conversation
+between them runs for a fixed number of turns on one issue or patch, then waits
+for a person. Without it, two members can review and revise the same patch
+forever, because neither act costs either of them anything to repeat.
 
-Reactions never trigger anyone, whoever adds them. Approving an idea and asking
-for it to be carried out look identical, so acting on a reaction risks work
-nobody asked for. Request work in a comment.
+```toml
+[limits]
+exchanges = 3
+```
+
+A turn is a run of operations by one author, so a review and the fifteen line
+comments it is made of cost what one remark costs. Turns are counted per pair,
+so a patch with three reviewers gives each of them a whole conversation rather
+than a third of one, and what a member writes never spends its own allowance.
+
+The count returns to zero when a person addresses the member: assigning it,
+naming it, or replying to something it wrote. Adding a label or commenting to
+somebody else does not, so nobody restarts a stalled thread by touching the
+patch for an unrelated reason.
 
 
 ### Which tools a member may use
 
 `mcp_allow` accepts exact MCP method names and the fixed `read`, `comments`,
 `issues`, `patches`, `reactions`, and `reviews` groups. The `patches` group does
-not include `merge_patch`; allow that method explicitly. `mcp_allow` is
+not include `merge_patch`, which has to be allowed by name. `mcp_allow` is
 required, while an empty list disables every tool.
 
-Groups are derived from the tools registered by the MCP server: `get_*` and
-`list_*` tools are reads; non-read tools are grouped by the `comment`, `issue`,
+Groups are derived from the tools registered by the MCP server. `get_*` and
+`list_*` tools are reads, and the rest are grouped by the `comment`, `issue`,
 `patch`, `reaction`, or `review` component in their name. MCP `tools/list` is
 the authoritative method list. `comment_issue` belongs only to `issues`.
 
-Five tools are outside `mcp_allow`, and naming one there is rejected:
+Five tools sit outside `mcp_allow` entirely, and naming one there is rejected:
+`report_security_issue`, which `[security]` below controls and every member has,
+and the four queue tools, which reach only the member's own queue and never the
+repository.
 
-- `report_security_issue`, controlled by `[security]` below and available to
-  every member;
-- `add_job`, `cancel`, `note`, and `work_status`, which reach only the member's
-  own queue and never the repository.
-
-A member's two halves also divide the remaining tools between them. `add_job`,
-`cancel`, `note`, and `work_status` are offered to the talking half alone;
-`create_patch` and `update_patch` to the building half alone, since they need
-commits the talking half cannot make. Everything else follows `mcp_allow` on
-both.
+The two halves then divide what is left. The queue tools go to the talking half
+alone, and `create_patch` and `update_patch` to the building half alone, since
+they need commits the talking half cannot make. Everything else follows
+`mcp_allow` on both.
 
 
 ### Where new work goes
@@ -489,15 +503,22 @@ already uses different words. Omit it and the defaults above apply.
 
 ### Security reports
 
-The security repository and at least one valid age X25519 recipient are
-required. `report_security_issue` encrypts the complete report before creating
-a generically titled issue in that private repository. It is available even
-when the member lacks ordinary issue permission.
+`[security]` names a second repository, separate from the one the member
+watches. It must be private, and both it and at least one valid age X25519
+recipient are required.
 
-The security repository is not watched and none of its read operations are
-exposed to agents. Agent adapters receive only the scoped MCP endpoint; trusted
-adapter code must also keep the host Radicle profile and recovery keys outside
-model subprocesses.
+Members cannot read it. It is never watched and none of its read operations are
+exposed, so a member can write to it and nothing more. Writing is
+`report_security_issue`, which encrypts the whole report and files it as a
+generically titled issue.
+
+Every member has that tool whatever `mcp_allow` says, including a member with no
+issue permission at all. A member that finds something dangerous must always be
+able to report it, so this is not left to configuration.
+
+Agent adapters receive only the scoped MCP endpoint. Trusted adapter code must
+also keep the host Radicle profile and recovery keys outside model
+subprocesses.
 
 
 ### Command-line options
@@ -505,12 +526,13 @@ model subprocesses.
 Invocation-specific options stay command-line arguments rather than manifest
 values:
 
-- `--home PATH` overrides `RADICLE_TEAM_HOME`;
-- `--seed NID` adds a preferred synchronization seed and may be repeated;
-- `--identity-home PATH` uses an existing dedicated Radicle identity;
-- `--expected-did DID` verifies that existing identity; and
+- `--home PATH` overrides `RADICLE_TEAM_HOME`
+- `--seed NID` adds a preferred synchronization seed and may be repeated, on
+  `setup` and on `run`, which synchronizes before it starts watching
+- `--identity-home PATH` uses an existing dedicated Radicle identity
+- `--expected-did DID` verifies that existing identity
 - `--unencrypted-identity` creates a managed key protected only by filesystem
-  permissions.
+  permissions
 
 An encrypted `--identity-home` must provide its passphrase through
 `RAD_PASSPHRASE` or the matching operating-system credential. SSH-agent access
@@ -549,9 +571,9 @@ manifest. Node output is written to:
 ~/.radicle-team/members/<member>/node.log
 ```
 
-Managed Radicle commands ignore an inherited `RAD_SOCKET`; each member always
+Managed Radicle commands ignore an inherited `RAD_SOCKET`. Each member always
 uses the control socket inside its isolated Radicle home.
 
-If setup fails for a private repository, use the DID shown in the error or
-identity log message to grant access, then rerun setup. Node startup failures
+If setup fails because a repository is private, use the DID shown in the error
+or identity log message to grant access, then rerun setup. Node startup failures
 include the log path in their diagnostic.

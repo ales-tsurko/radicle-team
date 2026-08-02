@@ -4,7 +4,7 @@ use std::{path::Path, time::Duration};
 
 use radicle::{
     cob::{
-        ObjectId, Op, TypedId,
+        Label, ObjectId, Op, TypedId,
         issue::{Action as IssueAction, IssueStream, Issues, State as IssueState},
         patch::{Action as PatchAction, PatchStream, Patches, State as PatchState},
         store::access::ReadOnly,
@@ -18,7 +18,7 @@ use radicle::{
 
 use crate::{
     agent::{self, Talker},
-    manifest::{PriorityLabels, RepositoryPolicy},
+    manifest::{PriorityLabels, QueuePosition, RepositoryPolicy},
     mcp::WorkScope,
     member::Member,
     queue::WorkQueue,
@@ -108,7 +108,7 @@ impl Watcher {
         delivery: DeliveryRuntime,
     ) -> Result<(), Error> {
         let member_id = Self::verify_profile(*profile.id(), node.clone()).await?;
-        let storage = delivery.storage.clone();
+        let storage = profile.storage.clone();
         let state = ProcessedActivities::open(state_path).await?;
         let events = self.subscribe(node.clone()).await?;
         self.watch(&storage, member_id, &state, events, agent, &delivery)
@@ -342,7 +342,7 @@ impl Watcher {
                 subject(object),
                 actionable,
             ),
-            context: ClassificationContext::default(),
+            context: ClassificationContext::new(self.policy.limits().clone()),
             pending: PendingActivities::default(),
         };
         if active.replace(history).is_some() {
@@ -490,7 +490,6 @@ impl Watcher {
 pub(crate) struct DeliveryRuntime {
     workspaces: Workspaces,
     scope: WorkScope,
-    storage: Storage,
     queue: WorkQueue,
     priority: PriorityLabels,
 }
@@ -500,45 +499,48 @@ impl DeliveryRuntime {
     pub(crate) const fn new(
         workspaces: Workspaces,
         scope: WorkScope,
-        storage: Storage,
         queue: WorkQueue,
         priority: PriorityLabels,
     ) -> Self {
         Self {
             workspaces,
             scope,
-            storage,
             queue,
             priority,
         }
     }
 
+    // Reads the assigned subject as a job the building half can start from.
     async fn assignment(&self, repository: RepoId, subject: Subject) -> Result<Assignment, Error> {
-        let storage = self.storage.clone();
+        let storage = self.workspaces.storage().clone();
+        let priority = self.priority.clone();
         tokio::task::spawn_blocking(move || {
             let stored = storage.repository(repository)?;
             let id = subject.id();
+            let missing = || Error::SubjectMissing(subject);
             match subject {
                 Subject::Issue(_) => {
                     let issue = Issues::open(&stored, ReadOnly)?
                         .get(&id)?
-                        .ok_or(Error::SubjectMissing(subject))?;
+                        .ok_or_else(missing)?;
                     Ok(Assignment::new(
                         subject,
                         issue.title(),
                         issue.description(),
                         issue.labels(),
+                        &priority,
                     ))
                 }
                 Subject::Patch(_) => {
                     let patch = Patches::open(&stored, ReadOnly)?
                         .get(&id)?
-                        .ok_or(Error::SubjectMissing(subject))?;
+                        .ok_or_else(missing)?;
                     Ok(Assignment::new(
                         subject,
                         patch.title(),
                         patch.description(),
                         patch.labels(),
+                        &priority,
                     ))
                 }
             }
@@ -550,7 +552,7 @@ impl DeliveryRuntime {
 
 struct Assignment {
     brief: String,
-    labels: Vec<String>,
+    position: QueuePosition,
 }
 
 impl Assignment {
@@ -558,13 +560,10 @@ impl Assignment {
         subject: Subject,
         title: &str,
         description: &str,
-        labels: impl Iterator<Item = &'a radicle::cob::Label>,
+        labels: impl Iterator<Item = &'a Label>,
+        priority: &PriorityLabels,
     ) -> Self {
-        let kind = match subject {
-            Subject::Issue(_) => "issue",
-            Subject::Patch(_) => "patch",
-        };
-        let mut brief = format!("You were assigned this {kind}: {title}");
+        let mut brief = format!("You were assigned this {}: {title}", subject.kind());
         let description = description.trim();
         if !description.is_empty() {
             brief.push_str("\n\n");
@@ -573,7 +572,7 @@ impl Assignment {
 
         Self {
             brief,
-            labels: labels.map(ToString::to_string).collect(),
+            position: priority.position(labels.map(Label::name)),
         }
     }
 }
@@ -695,9 +694,7 @@ impl PendingActivities {
     ) -> Result<(), Error> {
         let subject = activity.subject;
         let assignment = runtime.assignment(scope.repository, subject).await?;
-        let position = runtime
-            .priority
-            .position(assignment.labels.iter().map(String::as_str));
+        let position = assignment.position;
         let job = runtime
             .queue
             .push(assignment.brief, subject, position)
@@ -743,7 +740,7 @@ impl PendingActivities {
             workspace = %path.display(),
             "dispatching activity to the agent"
         );
-        let handled = activity.dispatch(delivery, agent, path).await;
+        let handled = delivery.dispatch(activity.context(path), agent).await;
         runtime.scope.deactivate().await;
         let cleaned = workspace.cleanup().await;
         handled.inspect_err(|error| {
@@ -755,8 +752,8 @@ impl PendingActivities {
                 "agent failed to handle activity"
             );
         })?;
-        cleaned.map_err(|error| Error::Workspace(error.to_string()))?;
-        Self::checkpoint_delivery(identity, scope, state, runtime).await
+        Self::checkpoint_delivery(identity, scope, state, runtime).await?;
+        cleaned.map_err(|error| Error::Workspace(error.to_string()))
     }
 
     async fn checkpoint(
@@ -951,7 +948,6 @@ mod tests {
                 *profile.id(),
             ),
             scope: crate::mcp::WorkScope::default(),
-            storage: profile.storage.clone(),
             queue: queue.clone(),
             priority: PriorityLabels::default(),
         };
@@ -1072,7 +1068,6 @@ mod tests {
                 *profile.id(),
             ),
             crate::mcp::WorkScope::default(),
-            profile.storage.clone(),
             queue.clone(),
             PriorityLabels::default(),
         );

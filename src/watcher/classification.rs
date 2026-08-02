@@ -4,7 +4,7 @@
 //! replays them in operation order, tracks member involvement, and emits the
 //! first relevant signal for each action.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use radicle::{
     cob::{
@@ -16,19 +16,13 @@ use radicle::{
 };
 
 use crate::{
-    manifest::TriggerAccess,
+    manifest::{Limits, TriggerAccess},
     member::Member,
     watcher::{
         Change, Comment, Subject, Target,
         activity::{Activity, Delivery, Kind},
     },
 };
-
-/// Responses one member may publish on a subject before a non-member acts again.
-///
-/// Members govern themselves rather than sharing a counter, because each runs its own process and
-/// may run on its own host. The bound is therefore this limit multiplied by the fixed cast size.
-const RESPONSE_LIMIT: usize = 3;
 
 /// Repository trigger policy resolved against the current delegate set.
 #[derive(Debug, Clone)]
@@ -47,19 +41,39 @@ impl Triggers {
         }
     }
 
-    /// Returns whether `author` may put this repository's members to work.
+    /// Returns who `author` is to the member running this watcher.
     ///
-    /// Members are always allowed, whatever `triggered_by` says: that setting keeps outside
-    /// identities from spending the operator's budget, and the repository's own members are not
-    /// outside identities. What one member may trigger in another is narrowed separately, when
-    /// the operation's signals are evaluated.
-    pub(super) fn allows(&self, author: Did) -> bool {
-        self.is_member(author) || self.access.allows(author, &self.delegates)
+    /// Members are always allowed to trigger, whatever `triggered_by` says: that setting keeps
+    /// outside identities from spending the operator's budget, and the repository's own members
+    /// are not outside identities. What one member may trigger in another is narrowed separately,
+    /// when the operation's signals are evaluated.
+    pub(super) fn author(&self, author: Did, member_id: NodeId) -> Author {
+        if author == Did::from(member_id) {
+            Author::Member
+        } else if self.members.contains(&author) {
+            Author::Peer
+        } else if self.access.allows(author, &self.delegates) {
+            Author::Person
+        } else {
+            Author::Stranger
+        }
     }
+}
 
-    pub(super) fn is_member(&self, author: Did) -> bool {
-        self.members.contains(&author)
-    }
+/// Who an operation's author is to the member classifying it.
+///
+/// The four are exclusive, which the booleans they replace were not: an author cannot be both
+/// this member and another, and a member is never a stranger to itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Author {
+    /// The member itself.
+    Member,
+    /// Another member of the same team.
+    Peer,
+    /// Somebody outside the team who may put its members to work.
+    Person,
+    /// Somebody the repository does not let put members to work.
+    Stranger,
 }
 
 /// Stateful reducer which classifies normalized actions for one collaborative object.
@@ -69,7 +83,64 @@ pub(super) struct Context {
     owned: bool,
     seen: bool,
     entities: HashSet<Entity>,
-    responses: usize,
+    turn: Turn,
+}
+
+impl Context {
+    // Starts a subject's history under the bounds its repository sets.
+    pub(super) fn new(limits: Limits) -> Self {
+        Self {
+            turn: Turn {
+                limits,
+                ..Turn::default()
+            },
+            ..Self::default()
+        }
+    }
+}
+
+// How far each of this member's conversations has run since a person last joined it.
+#[derive(Debug, Default)]
+struct Turn {
+    charged: Option<Did>,
+    exchanges: BTreeMap<Did, usize>,
+    limits: Limits,
+}
+
+impl Turn {
+    // Ends the turn in progress when this operation belongs to somebody else.
+    fn begin(&mut self, author: Did) {
+        if self.charged != Some(author) {
+            self.charged = None;
+        }
+    }
+
+    // Charges `author`'s turn for waking the member, and returns whether it still may.
+    fn admit(&mut self, author: Did, origin: Author) -> Result<(), &'static str> {
+        match origin {
+            Author::Stranger => {
+                return Err("its author may not trigger artificial contributors");
+            }
+            Author::Member | Author::Person => {
+                self.exchanges.clear();
+                return Ok(());
+            }
+            Author::Peer => {}
+        }
+        let spent = self.exchanges.entry(author).or_default();
+        if self.charged != Some(author) {
+            self.charged = Some(author);
+            *spent += 1;
+        }
+        if *spent <= self.limits.exchanges() {
+            Ok(())
+        } else {
+            Err(
+                "this conversation has run its allowed number of turns since a person last joined \
+                 it",
+            )
+        }
+    }
 }
 
 impl Context {
@@ -95,47 +166,27 @@ impl Context {
     where
         for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
     {
-        let authored_by_member = operation.author == member_id;
+        let author = Did::from(operation.author);
+        let origin = triggers.author(author, member_id);
         if !self.seen {
-            self.owned = authored_by_member;
+            self.owned = origin == Author::Member;
             self.seen = true;
         }
-        let author = Did::from(operation.author);
-        let authored_by_peer = !authored_by_member && triggers.is_member(author);
-        let may_trigger = authored_by_member || triggers.allows(author);
-
-        if !triggers.is_member(author) {
-            self.responses = 0;
-        }
-        let exhausted = self.responses >= RESPONSE_LIMIT;
+        self.turn.begin(author);
 
         let mut activities = Vec::new();
         for (action_index, action) in operation.actions.iter().enumerate() {
             let normalized = ActionEnvelope::new(action, operation, member_id).into();
-            if let Relevance::Relevant(kind) =
-                self.reduce(normalized, member, authored_by_member, authored_by_peer)
-            {
-                if exhausted {
+            if let Relevance::Relevant(kind) = self.reduce(normalized, member, origin) {
+                if let Err(reason) = self.turn.admit(author, origin) {
                     tracing::info!(
                         %author,
                         %member,
                         ?subject,
                         ?kind,
                         operation = %operation.id,
-                        limit = RESPONSE_LIMIT,
-                        "ignored relevant activity because the member already answered this \
-                         subject its allowed number of times since a non-member acted"
-                    );
-                    continue;
-                }
-                if !may_trigger {
-                    tracing::info!(
-                        %author,
-                        %member,
-                        ?subject,
-                        ?kind,
-                        operation = %operation.id,
-                        "ignored relevant activity because its author may not trigger agents"
+                        reason,
+                        "ignored relevant activity"
                     );
                     continue;
                 }
@@ -172,9 +223,9 @@ impl Context {
         &mut self,
         action: NormalizedAction<'_>,
         member: Member,
-        authored_by_member: bool,
-        authored_by_peer: bool,
+        origin: Author,
     ) -> Relevance {
+        let authored_by_member = origin == Author::Member;
         if authored_by_member && let Some(entity) = action.track {
             self.entities.insert(entity);
         }
@@ -192,14 +243,11 @@ impl Context {
         }
 
         if authored_by_member {
-            if action.signals.iter().any(Signal::writes_comment) {
-                self.responses = self.responses.saturating_add(1);
-            }
             return Relevance::Ignored;
         }
 
         let addresses = |body: &str| {
-            if authored_by_peer {
+            if origin == Author::Peer {
                 member.is_named_in(body)
             } else {
                 member.is_mentioned_in(body)
@@ -222,7 +270,7 @@ impl Context {
                 }
                 Signal::Change { audience, change }
                     if !change.is_reaction()
-                        && (!authored_by_peer || change.is_work_submission())
+                        && (origin != Author::Peer || change.is_work_submission())
                         && audience.matches(self) =>
                 {
                     return Relevance::Relevant(Kind::Delivered(Delivery::Changed(change)));
@@ -380,19 +428,6 @@ impl Audience {
     fn matches(&self, context: &Context) -> bool {
         (self.involved && context.involved())
             || self.owners.iter().any(|entity| context.owns(*entity))
-    }
-}
-
-impl Signal<'_> {
-    // Returns whether this signal is the member speaking on the subject.
-    fn writes_comment(&self) -> bool {
-        matches!(
-            self,
-            Self::Change {
-                change: Change::CommentCreated(Comment::Issue(_) | Comment::Revision { .. }),
-                ..
-            }
-        )
     }
 }
 

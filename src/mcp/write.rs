@@ -262,12 +262,7 @@ impl ToolService {
                         .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         let mut patches = patch::Cache::no_cache(repository, signer)?;
                         let mut patch = patches.get_mut(&subject)?;
-                        let review_value = patch
-                            .revisions()
-                            .flat_map(|(_revision, value)| value.reviews())
-                            .find_map(|(_author, candidate)| {
-                                (candidate.id() == review).then_some(candidate)
-                            })
+                        let review_value = find_review(&patch, review)
                             .ok_or_else(|| ServiceError::Request("review was not found".to_owned()))
                             .map_err(|error| PublishError::Rejected(error.to_string()))?;
                         if let Some(comment) = comment
@@ -395,12 +390,7 @@ impl ToolService {
                     }
                     let patch = Patches::open(repository, ReadOnly)?.get(&patch_id)?;
                     Ok(patch.is_some_and(|patch| {
-                        patch
-                            .revisions()
-                            .flat_map(|(_revision, value)| value.reviews())
-                            .find_map(|(_author, candidate)| {
-                                (candidate.id() == review).then_some(candidate)
-                            })
+                        find_review(&patch, review)
                             .and_then(|review| {
                                 review.comments().find_map(|(candidate, value)| {
                                     (*candidate == comment).then_some(value)
@@ -1236,12 +1226,7 @@ impl ToolService {
                     };
                     Ok(patch
                         .as_ref()
-                        .and_then(|patch| {
-                            patch
-                                .revisions()
-                                .flat_map(|(_revision, value)| value.reviews())
-                                .find_map(|(_author, review)| (review.id() == id).then_some(review))
-                        })
+                        .and_then(|patch| find_review(patch, id))
                         .is_some_and(|review| {
                             review.verdict() == expected_verdict
                                 && review.summary()
@@ -1288,14 +1273,7 @@ impl ToolService {
                         let patch = Patches::open(repository, ReadOnly)?.get(&patch_id)?;
                         Ok(patch
                             .as_ref()
-                            .and_then(|patch| {
-                                patch
-                                    .revisions()
-                                    .flat_map(|(_revision, value)| value.reviews())
-                                    .find_map(|(_author, value)| {
-                                        (value.id() == review).then_some(value)
-                                    })
-                            })
+                            .and_then(|patch| find_review(patch, review))
                             .is_some_and(|value| {
                                 value
                                     .comments()
@@ -1370,8 +1348,9 @@ fn validate_comment_request(
         CommentOperation::Create if matches!(target, CommentTargetKind::Review) && !reply => {
             Some("a new review comment is published with its review; pass it to create_review")
         }
-        CommentOperation::Create if body.is_none() => Some("body is required"),
-        CommentOperation::Edit if body.is_none() => Some("body is required"),
+        CommentOperation::Create | CommentOperation::Edit if body.is_none() => {
+            Some("body is required")
+        }
         CommentOperation::Edit | CommentOperation::Redact if comment.is_none() => {
             Some("comment is required")
         }

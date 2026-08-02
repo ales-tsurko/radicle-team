@@ -192,7 +192,7 @@ struct Options {
     /// Use an explicit repository manifest.
     #[arg(long, value_name = "PATH")]
     manifest: Option<PathBuf>,
-    /// Prefer this seed while synchronizing; may be repeated.
+    /// Prefer this seed while synchronizing. May be repeated.
     #[arg(long = "seed", value_name = "NID")]
     seeds: Vec<NodeId>,
 }

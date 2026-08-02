@@ -55,7 +55,7 @@ pub trait Talker: Send {
 /// A member answers messages and builds at the same time, which one conversation cannot do: a
 /// half-written patch has no safe point to pause at. The two run as separate adapters under one
 /// identity, so this interface receives jobs rather than activity. Deciding what should be built
-/// belongs to [`Talker`]; deciding how belongs here.
+/// belongs to [`Talker`]. Deciding how belongs here.
 #[async_trait]
 pub trait Coder: Send + Sync {
     /// Configures and starts the adapter for one member and run-scoped MCP server.
@@ -136,12 +136,7 @@ impl WorkId {
     /// Returns a name for this work usable as a directory on every supported platform.
     #[must_use]
     pub fn directory(&self) -> String {
-        match self {
-            Self::Delivery(delivery) => {
-                format!("{}-{}", delivery.operation, delivery.action)
-            }
-            Self::Job(job) => format!("job-{job}"),
-        }
+        self.to_string().replace(':', "-")
     }
 }
 

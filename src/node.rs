@@ -9,7 +9,7 @@
 //! Each managed identity has its own Radicle home and therefore its own control socket, storage,
 //! and databases. Radicle's default client profile does not open a listening TCP port, so multiple
 //! members can run concurrently without port allocation.
-//! [`NodeManager::stop`](crate::node::NodeManager::stop) requests graceful shutdown; dropping the
+//! [`NodeManager::stop`](crate::node::NodeManager::stop) requests graceful shutdown. Dropping the
 //! manager forcibly terminates a child that is still running. The CLI handles interruption and
 //! termination signals, forwards graceful shutdown to the node, and then lets the manager reap it.
 

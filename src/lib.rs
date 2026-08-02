@@ -4,8 +4,8 @@
 //!
 //! One [`Application`] represents one fixed [`member::Member`] working in one Radicle repository.
 //! The application owns the member's isolated home, signing identity, node, repository policy, and
-//! watcher state. `setup` provisions and validates those resources; `run` keeps them alive while
-//! repository activity is observed.
+//! watcher state. `setup` provisions and validates those resources, and `run` keeps them alive
+//! while repository activity is observed.
 //!
 //! # Two halves of one member
 //!
@@ -40,24 +40,24 @@
 //! activity. This keeps Radicle's low-level action variants out of consumers.
 //!
 //! A dispatcher maps each deliverable activity to the typed `mentioned`, `replied`, or `changed`
-//! method. Runtime-specific adapters implement these interfaces; the core does not depend on an
-//! agent vendor API. Each callback gets a fresh working copy and returns only success or failure.
-//! Repository actions are separate MCP calls, so an agent can perform any number of allowed
-//! actions while one unit of work is active.
+//! method. Runtime-specific adapters implement these interfaces, and the core does not depend on
+//! an agent vendor API. Each callback gets a fresh working copy and returns only success or
+//! failure. Repository actions are separate MCP calls, so an agent can perform any number of
+//! allowed actions while one unit of work is active.
 //!
 //! During `run`, the application starts two loopback-only MCP servers scoped to the selected
 //! repository and member profile. `start` receives the provider-neutral member profile, its
 //! unguessable capability URL, and a preconfigured [`sandbox::AgentSandbox`] before any work is
 //! delivered. Manifest allowlists control the exposed read, comment, issue, patch, and review
-//! methods; the split between the halves only withholds what each could not use anyway. Tools are
-//! usable only while one delivery or job is active and cannot address a different subject. Both
-//! adapters are stopped before the servers and node shut down.
+//! methods, and the split between the halves only withholds what each could not use anyway.
+//! Tools are usable only while one delivery or job is active and cannot address a different
+//! subject. Both adapters are stopped before the servers and node shut down.
 //!
 //! # State and delivery
 //!
 //! Full history replay is required because later operations depend on earlier assignment and
 //! ownership state. Successful action deliveries are stored in SQLite so rescans do not report
-//! them twice; each delivery is recorded after its adapter call succeeds. Adapters receive a stable
+//! them twice. Each delivery is recorded after its adapter call succeeds. Adapters receive a stable
 //! [`agent::DeliveryId`] in [`agent::Context`]. Its action position distinguishes multiple
 //! deliveries from one Radicle operation. Repository writes are journalled under an
 //! [`agent::WorkId`], which names either a delivery or a job, so an interrupted write is recovered

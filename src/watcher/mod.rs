@@ -31,7 +31,7 @@
 //! corresponding typed agent methods.
 //!
 //! This boundary keeps Radicle-specific variant matching out of the reducer. Adding an upstream
-//! action normally changes only its adapter and reuses the existing normalized behavior; only
+//! action normally changes only its adapter and reuses the existing normalized behavior. Only
 //! genuinely new semantics require extending the shared classification model.
 //!
 //! # Structure

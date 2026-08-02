@@ -43,6 +43,16 @@ const BUILDING_TOOLS: [&str; 2] = ["create_patch", "update_patch"];
 // Tool which every member may always reach, whatever the manifest allows.
 const SECURITY_TOOL: &str = "report_security_issue";
 
+impl Role {
+    // Returns whether this half of a member can make any use of `method`.
+    pub(super) fn allows(self, method: &str) -> bool {
+        match self {
+            Self::Talker => !BUILDING_TOOLS.contains(&method),
+            Self::Coder => !QUEUE_TOOLS.contains(&method),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ToolService {
     pub(super) storage: Storage,
@@ -75,17 +85,12 @@ impl ToolService {
         })
     }
 
-    /// Returns the tools the repository manifest cannot grant or withhold.
-    pub(crate) fn unrestricted_tools() -> impl Iterator<Item = &'static str> {
-        QUEUE_TOOLS.into_iter().chain([SECURITY_TOOL])
-    }
-
-    pub(super) const fn queue_tools() -> &'static [&'static str] {
-        &QUEUE_TOOLS
-    }
-
-    pub(super) const fn building_tools() -> &'static [&'static str] {
-        &BUILDING_TOOLS
+    /// Returns whether the repository manifest has any say in `method`.
+    ///
+    /// These reach the member's own queue, or the security policy, and never ordinary repository
+    /// state, so naming one in an allowlist is a mistake rather than a grant.
+    pub(crate) fn is_unrestricted(method: &str) -> bool {
+        QUEUE_TOOLS.contains(&method) || method == SECURITY_TOOL
     }
 
     pub(super) fn new(
@@ -100,9 +105,7 @@ impl ToolService {
         let security = SecurityReporting::new(&publisher);
         let mut tool_router = Self::tool_router();
         for method in Self::registered_tools() {
-            let permitted =
-                Self::unrestricted_tools().any(|tool| tool == method) || allowlist.allows(method);
-            if !permitted || !role.allows(method) {
+            if !allowlist.allows(method) || !role.allows(method) {
                 let _disabled = tool_router.disable_route(method.clone());
             }
         }
@@ -560,7 +563,11 @@ impl ToolService {
             .push(request.brief, source, position)
             .await
             .map_err(|error| error.to_string())?;
-        let waiting = self.waiting().await?;
+        let waiting = self
+            .queue
+            .waiting()
+            .await
+            .map_err(|error| error.to_string())?;
 
         Ok(Json(JobRecord {
             job,
@@ -574,7 +581,7 @@ impl ToolService {
         let _active = self.scope.access_current().await?;
 
         Ok(Json(JobAction {
-            job: self.queue.cancel().await.as_ref().map(JobSummary::new),
+            job: self.queue.cancel().await.map(JobSummary::from),
         }))
     }
 
@@ -584,13 +591,9 @@ impl ToolService {
         Parameters(request): Parameters<NoteRequest>,
     ) -> Result<Json<JobAction>, String> {
         let _active = self.scope.access_current().await?;
-        let running = self.queue.running().await;
-        if running.is_some() {
-            self.queue.note(request.note).await;
-        }
 
         Ok(Json(JobAction {
-            job: running.as_ref().map(JobSummary::new),
+            job: self.queue.note(request.note).await.map(JobSummary::from),
         }))
     }
 
@@ -604,17 +607,9 @@ impl ToolService {
             .map_err(|error| error.to_string())?;
 
         Ok(Json(WorkStatus {
-            running: self.queue.running().await.as_ref().map(JobSummary::new),
-            waiting: waiting.iter().map(JobSummary::new).collect(),
+            running: self.queue.running().await.map(JobSummary::from),
+            waiting: waiting.into_iter().map(JobSummary::from).collect(),
         }))
-    }
-
-    async fn waiting(&self) -> Result<usize, String> {
-        self.queue
-            .pending()
-            .await
-            .map(|pending| pending.len())
-            .map_err(|error| error.to_string())
     }
 
     pub(super) async fn pending_notes(&self) -> Vec<String> {

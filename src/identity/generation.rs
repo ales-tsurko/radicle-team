@@ -4,7 +4,7 @@
 //! member in the application's SQLite state database. When a validated manifest is observed
 //! again, it rejects an older generation and rejects a changed DID unless the generation increased.
 //!
-//! Repository governance decides which manifest is canonical; this module only prevents stale
+//! Repository governance decides which manifest is canonical. This module only prevents stale
 //! local or external data from silently reactivating an identity the process has already replaced.
 //! The application records the generation after binding validation and before starting the watcher.
 
@@ -308,6 +308,7 @@ mod tests {
                     crate::manifest::TriggerAccess::Delegates,
                     vec![Did::from_str(did).expect("DID should parse")],
                     crate::manifest::PriorityLabels::default(),
+                    crate::manifest::Limits::default(),
                 ),
             )
         }

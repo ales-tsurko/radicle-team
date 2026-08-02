@@ -7,7 +7,7 @@
 //!
 //! One job runs at a time. Cancelling asks the adapter to stop and commit what it has, rather than
 //! discarding it, because a request to stop usually means priorities moved. Work is taken in the
-//! order the queue hands it out; nothing here decides what matters.
+//! order the queue hands it out, and nothing here decides what matters.
 
 use radicle::identity::RepoId;
 

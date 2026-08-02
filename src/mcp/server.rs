@@ -48,15 +48,6 @@ pub(crate) enum Role {
     Coder,
 }
 
-impl Role {
-    pub(super) fn allows(self, method: &str) -> bool {
-        match self {
-            Self::Talker => !ToolService::building_tools().contains(&method),
-            Self::Coder => !ToolService::queue_tools().contains(&method),
-        }
-    }
-}
-
 impl Server {
     pub(crate) async fn start(
         storage: Storage,

@@ -35,6 +35,10 @@ impl Workspaces {
         }
     }
 
+    pub(crate) const fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
     /// Checks out the canonical head for `work`, or the patch head when it addresses one.
     pub(crate) async fn prepare(
         &self,

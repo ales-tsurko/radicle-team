@@ -161,7 +161,7 @@ pub(super) struct IssuePage {
 pub(super) struct AddJobRequest {
     /// What was decided, in enough detail to begin without rereading the discussion.
     pub(super) brief: String,
-    /// Where the work joins the queue; ask before putting anything ahead of it.
+    /// Where the work joins the queue. Ask before putting anything ahead of it.
     #[serde(default)]
     pub(super) position: QueuePosition,
 }
@@ -200,12 +200,12 @@ pub(super) struct JobSummary {
     pub(super) position: QueuePosition,
 }
 
-impl JobSummary {
-    pub(super) fn new(job: &Job) -> Self {
+impl From<Job> for JobSummary {
+    fn from(job: Job) -> Self {
         Self {
             job: job.id,
-            brief: job.brief.clone(),
             source: job.source.to_string(),
+            brief: job.brief,
             position: job.position,
         }
     }

@@ -1,8 +1,8 @@
 //! Asynchronous access to the SQLite driver shared with Radicle.
 //!
-//! Radicle already links `sqlite3` through `sqlite`; SQLx and rusqlite cannot coexist in the same
-//! dependency graph because their `-sys` crates claim that native library separately. This wrapper
-//! keeps one driver and moves every database call onto Tokio's blocking pool.
+//! Radicle already links `sqlite3` through `sqlite`, and SQLx and rusqlite cannot coexist in the
+//! same dependency graph because their `-sys` crates claim that native library separately. This
+//! wrapper keeps one driver and moves every database call onto Tokio's blocking pool.
 
 use std::{
     path::Path,

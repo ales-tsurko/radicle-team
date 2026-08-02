@@ -32,6 +32,9 @@ const SCHEMA: &str = "
         created INTEGER NOT NULL,
         taken INTEGER NOT NULL DEFAULT 0
     ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS work_queue_waiting
+        ON work_queue (repository, member, position, id) WHERE taken = 0;
 ";
 
 /// One unit of work waiting for a member.
@@ -171,9 +174,14 @@ impl WorkQueue {
         self.running.read().await.clone()
     }
 
-    /// Records a correction for the running job to read on its next tool call.
-    pub async fn note(&self, note: String) {
-        self.notes.lock().await.push(note);
+    /// Records a correction for the running job, returning the job it will reach.
+    pub async fn note(&self, note: String) -> Option<Job> {
+        let running = self.running().await;
+        if running.is_some() {
+            self.notes.lock().await.push(note);
+        }
+
+        running
     }
 
     /// Takes every note recorded since the last time they were read.
@@ -182,12 +190,8 @@ impl WorkQueue {
     }
 
     /// Asks the running job to stop and preserve what it has, returning the job reached.
-    ///
-    /// The request names the job it was meant for. Asking to stop and the job ending on its own
-    /// can happen at the same moment, and a request that outlived its job would otherwise stop the
-    /// next one the instant it started.
     pub async fn cancel(&self) -> Option<Job> {
-        let running = self.running.read().await.clone();
+        let running = self.running().await;
         if let Some(job) = &running {
             let _previous = self.cancellation.send_replace(Some(job.id));
         }
@@ -199,21 +203,15 @@ impl WorkQueue {
     pub async fn cancelled(&self, job: i64) {
         let mut cancellations = self.cancellation.subscribe();
         while *cancellations.borrow_and_update() != Some(job) {
-            if cancellations.changed().await.is_err() {
-                return std::future::pending().await;
-            }
+            cancellations
+                .changed()
+                .await
+                .expect("the queue holds the sender, so it outlives every subscriber");
         }
     }
 
-    /// Takes the job that should run next, marking it as taken.
-    ///
-    /// Jobs are ordered by position first and arrival second, so work promised ahead of the queue
-    /// runs before older work that nobody marked urgent.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the queue cannot be read or updated.
-    pub async fn take(&self) -> Result<Option<Job>, Error> {
+    // Takes the job that should run next, marking it as taken.
+    async fn take(&self) -> Result<Option<Job>, Error> {
         let repository = self.repository.to_string();
         let member = self.member.id().to_owned();
         self.database
@@ -230,6 +228,30 @@ impl WorkQueue {
                     })
             })
             .await
+            .map_err(Error::from)
+    }
+
+    /// Returns how many jobs are still waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the queue cannot be read.
+    pub async fn waiting(&self) -> Result<usize, Error> {
+        let repository = self.repository.to_string();
+        let member = self.member.id().to_owned();
+        self.database
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT COUNT(*) FROM work_queue
+                     WHERE repository = ?1 AND member = ?2 AND taken = 0",
+                )?;
+                statement.bind((1, repository.as_str()))?;
+                statement.bind((2, member.as_str()))?;
+                statement.next()?;
+                statement.read::<i64, _>(0)
+            })
+            .await
+            .map(|waiting| waiting.unsigned_abs() as usize)
             .map_err(Error::from)
     }
 
@@ -488,9 +510,18 @@ mod tests {
     #[tokio::test]
     async fn hands_every_note_to_the_running_job_once() {
         let queue = queue().await;
-        queue.note("use the existing parser".to_owned()).await;
-        queue.note("skip the migration".to_owned()).await;
+        let _id = queue
+            .push("write it".to_owned(), subject(), QueuePosition::End)
+            .await
+            .expect("job should be recorded");
+        let job = queue.next().await.expect("queue should be readable");
 
+        for note in ["use the existing parser", "skip the migration"] {
+            assert_eq!(
+                queue.note(note.to_owned()).await.map(|running| running.id),
+                Some(job.id)
+            );
+        }
         assert_eq!(
             queue.notes().await,
             ["use the existing parser", "skip the migration"]
@@ -499,5 +530,16 @@ mod tests {
             queue.notes().await.is_empty(),
             "a note already read must not repeat on the next tool call"
         );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_note_with_nothing_running() {
+        let queue = queue().await;
+
+        assert!(
+            queue.note("too late".to_owned()).await.is_none(),
+            "a note nobody is there to read must be refused, not left for the next job"
+        );
+        assert!(queue.notes().await.is_empty());
     }
 }

@@ -16,7 +16,7 @@ use radicle::{
 };
 
 use crate::{
-    manifest::TriggerAccess,
+    manifest::{Limits, TriggerAccess},
     member::Member,
     watcher::{
         Change, Comment, Subject,
@@ -38,6 +38,38 @@ const REPLY: &str = "5555555555555555555555555555555555555555";
 struct Fixture;
 
 impl Fixture {
+    // Returns how many turns a conversation gets when the manifest says nothing about it.
+    fn exchanges() -> usize {
+        Limits::default().exchanges()
+    }
+
+    // Pairs a trigger rule with the members whose turns count against each other.
+    fn triggers_for(access: TriggerAccess, delegates: Vec<Did>, members: Vec<Did>) -> Triggers {
+        Triggers::new(access, delegates, members)
+    }
+
+    // Pairs an open repository with the members whose turns count against each other.
+    fn triggers(members: Vec<Did>) -> Triggers {
+        Self::triggers_for(TriggerAccess::Anyone, Vec::new(), members)
+    }
+
+    fn revision(description: &str) -> PatchAction {
+        PatchAction::Revision {
+            description: description.to_owned(),
+            base: *ObjectId::from_str(ISSUE).expect("base should be valid"),
+            oid: *ObjectId::from_str(COMMENT).expect("head should be valid"),
+            resolves: BTreeSet::new(),
+        }
+    }
+
+    fn comment(body: &str) -> Action {
+        Action::Comment {
+            body: body.to_owned(),
+            reply_to: None,
+            embeds: Vec::new(),
+        }
+    }
+
     fn operation<A>(id: &str, action: A, author: PublicKey, type_name: TypeName) -> Op<A> {
         Op::new(
             EntryId::from_str(id).expect("operation should be valid"),
@@ -49,6 +81,14 @@ impl Fixture {
         )
     }
 
+    fn issue() -> Subject {
+        Subject::Issue(ObjectId::from_str(ISSUE).expect("issue should be valid"))
+    }
+
+    fn patch() -> Subject {
+        Subject::Patch(ObjectId::from_str(ISSUE).expect("patch should be valid"))
+    }
+
     fn classify<A>(
         id: &str,
         action: A,
@@ -56,6 +96,7 @@ impl Fixture {
         type_name: TypeName,
         subject: Subject,
         context: &mut Context,
+        triggers: &Triggers,
     ) -> Vec<Activity>
     where
         for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
@@ -66,7 +107,7 @@ impl Fixture {
             PublicKey::from_str(MEMBER).expect("member key should be valid"),
             RepoId::from_str(REPOSITORY).expect("repository should be valid"),
             subject,
-            &Triggers::new(TriggerAccess::Anyone, Vec::new(), Vec::new()),
+            triggers,
         )
     }
 
@@ -76,25 +117,37 @@ impl Fixture {
         context: &mut Context,
         triggers: &Triggers,
     ) -> Vec<Activity> {
-        context.classify(
-            &Self::operation(OPERATION, action, author, TYPENAME.clone()),
-            Member::Nico,
-            PublicKey::from_str(MEMBER).expect("member key should be valid"),
-            RepoId::from_str(REPOSITORY).expect("repository should be valid"),
-            Subject::Issue(ObjectId::from_str(ISSUE).expect("issue should be valid")),
-            triggers,
-        )
-    }
-
-    fn classify_issue(action: Action, author: PublicKey, context: &mut Context) -> Vec<Activity> {
         Self::classify(
             OPERATION,
             action,
             author,
             TYPENAME.clone(),
-            Subject::Issue(ObjectId::from_str(ISSUE).expect("issue should be valid")),
+            Self::issue(),
             context,
+            triggers,
         )
+    }
+
+    fn classify_patch_with(
+        id: &str,
+        action: PatchAction,
+        author: PublicKey,
+        context: &mut Context,
+        triggers: &Triggers,
+    ) -> Vec<Activity> {
+        Self::classify(
+            id,
+            action,
+            author,
+            PATCH_TYPENAME.clone(),
+            Self::patch(),
+            context,
+            triggers,
+        )
+    }
+
+    fn classify_issue(action: Action, author: PublicKey, context: &mut Context) -> Vec<Activity> {
+        Self::classify_with(action, author, context, &Self::triggers(Vec::new()))
     }
 
     fn classify_patch(
@@ -103,14 +156,7 @@ impl Fixture {
         author: PublicKey,
         context: &mut Context,
     ) -> Vec<Activity> {
-        Self::classify(
-            id,
-            action,
-            author,
-            PATCH_TYPENAME.clone(),
-            Subject::Patch(ObjectId::from_str(ISSUE).expect("patch should be valid")),
-            context,
-        )
+        Self::classify_patch_with(id, action, author, context, &Self::triggers(Vec::new()))
     }
 }
 
@@ -128,7 +174,7 @@ fn suppresses_activities_from_authors_that_may_not_trigger() {
         assignment.clone(),
         author,
         &mut Context::default(),
-        &Triggers::new(TriggerAccess::Anyone, delegates.clone(), Vec::new()),
+        &Fixture::triggers_for(TriggerAccess::Anyone, delegates.clone(), Vec::new()),
     );
     assert!(
         !permitted.is_empty(),
@@ -141,7 +187,7 @@ fn suppresses_activities_from_authors_that_may_not_trigger() {
         assignment.clone(),
         author,
         &mut context,
-        &Triggers::new(TriggerAccess::Delegates, delegates.clone(), Vec::new()),
+        &Fixture::triggers_for(TriggerAccess::Delegates, delegates.clone(), Vec::new()),
     );
     assert!(
         suppressed.is_empty(),
@@ -158,7 +204,7 @@ fn suppresses_activities_from_authors_that_may_not_trigger() {
             assignment,
             delegate,
             &mut Context::default(),
-            &Triggers::new(TriggerAccess::Delegates, delegates, Vec::new()),
+            &Fixture::triggers_for(TriggerAccess::Delegates, delegates, Vec::new()),
         )
         .is_empty(),
         "'delegates' must let a delegate trigger work"
@@ -173,7 +219,7 @@ fn listed_trigger_dids_keep_delegate_access() {
     let assignment = Action::Assign {
         assignees: BTreeSet::from([Did::from(member)]),
     };
-    let triggers = Triggers::new(
+    let triggers = Fixture::triggers_for(
         TriggerAccess::Dids(BTreeSet::from([Did::from(author)])),
         vec![Did::from(delegate)],
         Vec::new(),
@@ -290,8 +336,9 @@ fn classifies_issue_replies_and_owned_discussion() {
             },
             author,
             TYPENAME.clone(),
-            Subject::Issue(ObjectId::from_str(ISSUE).expect("issue should be valid")),
+            Fixture::issue(),
             &mut context,
+            &Fixture::triggers(Vec::new()),
         )
         .as_slice(),
         [Activity {
@@ -327,12 +374,7 @@ fn classifies_patch_assignment_and_review() {
     assert!(
         Fixture::classify_patch(
             OPERATION,
-            PatchAction::Revision {
-                description: "Initial revision".to_owned(),
-                base: *ObjectId::from_str(ISSUE).expect("base should be valid"),
-                oid: *ObjectId::from_str(COMMENT).expect("head should be valid"),
-                resolves: BTreeSet::new(),
-            },
+            Fixture::revision("Initial revision"),
             member,
             &mut owned_context,
         )
@@ -502,15 +544,7 @@ fn classifies_every_remaining_patch_interaction() {
     let mut context = Context::default();
 
     let member_actions = [
-        (
-            OPERATION,
-            PatchAction::Revision {
-                description: "Initial revision".to_owned(),
-                base: *ObjectId::from_str(ISSUE).expect("base should be valid"),
-                oid: *ObjectId::from_str(COMMENT).expect("head should be valid"),
-                resolves: BTreeSet::new(),
-            },
-        ),
+        (OPERATION, Fixture::revision("Initial revision")),
         (
             COMMENT,
             PatchAction::Review {
@@ -647,7 +681,8 @@ fn classifies_every_remaining_patch_interaction() {
 fn allows_members_to_trigger_each_other_whatever_the_manifest_says() {
     let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
     let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
-    let triggers = Triggers::new(TriggerAccess::Delegates, Vec::new(), vec![Did::from(peer)]);
+    let triggers =
+        Fixture::triggers_for(TriggerAccess::Delegates, Vec::new(), vec![Did::from(peer)]);
 
     assert!(
         !Fixture::classify_with(
@@ -667,16 +702,11 @@ fn allows_members_to_trigger_each_other_whatever_the_manifest_says() {
 fn refuses_team_mentions_between_members() {
     let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
     let outsider = PublicKey::from_str(DELEGATE).expect("outsider key should be valid");
-    let triggers = Triggers::new(TriggerAccess::Anyone, Vec::new(), vec![Did::from(peer)]);
-    let comment = |body: &str| Action::Comment {
-        body: body.to_owned(),
-        reply_to: None,
-        embeds: Vec::new(),
-    };
+    let triggers = Fixture::triggers(vec![Did::from(peer)]);
 
     assert!(
         Fixture::classify_with(
-            comment("@team what do you think?"),
+            Fixture::comment("@team what do you think?"),
             peer,
             &mut Context::default(),
             &triggers,
@@ -686,7 +716,7 @@ fn refuses_team_mentions_between_members() {
     );
     assert!(
         !Fixture::classify_with(
-            comment("@nico could you look at this?"),
+            Fixture::comment("@nico could you look at this?"),
             peer,
             &mut Context::default(),
             &triggers,
@@ -696,7 +726,7 @@ fn refuses_team_mentions_between_members() {
     );
     assert!(
         !Fixture::classify_with(
-            comment("@team what do you think?"),
+            Fixture::comment("@team what do you think?"),
             outsider,
             &mut Context::default(),
             &triggers,
@@ -711,7 +741,7 @@ fn refuses_ambient_changes_between_members() {
     let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
     let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
     let outsider = PublicKey::from_str(DELEGATE).expect("outsider key should be valid");
-    let triggers = Triggers::new(TriggerAccess::Anyone, Vec::new(), vec![Did::from(peer)]);
+    let triggers = Fixture::triggers(vec![Did::from(peer)]);
     let mut context = Context::default();
 
     assert!(
@@ -741,44 +771,129 @@ fn refuses_ambient_changes_between_members() {
 }
 
 #[test]
-fn stops_answering_once_a_member_reaches_its_response_limit() {
+fn stops_a_conversation_that_has_run_its_turns_until_a_person_joins_it() {
     let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
     let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
     let outsider = PublicKey::from_str(DELEGATE).expect("outsider key should be valid");
-    let triggers = Triggers::new(
-        TriggerAccess::Anyone,
-        Vec::new(),
-        vec![Did::from(member), Did::from(peer)],
-    );
-    let comment = |body: &str| Action::Comment {
-        body: body.to_owned(),
-        reply_to: None,
-        embeds: Vec::new(),
+    let triggers = Fixture::triggers(vec![Did::from(member), Did::from(peer)]);
+    let mut context = Context::default();
+    let asks = |author, context: &mut Context| {
+        Fixture::classify_with(
+            Fixture::comment("@nico thoughts?"),
+            author,
+            context,
+            &triggers,
+        )
     };
+
+    for turn in 0..Fixture::exchanges() {
+        assert!(
+            !asks(peer, &mut context).is_empty(),
+            "turn {turn} is still within the allowance"
+        );
+        let _own = Fixture::classify_with(
+            Fixture::comment("here they are"),
+            member,
+            &mut context,
+            &triggers,
+        );
+    }
+    assert!(
+        asks(peer, &mut context).is_empty(),
+        "a conversation between two members must stop once it has run its turns"
+    );
+
+    let _aside = Fixture::classify_with(
+        Fixture::comment("unrelated note"),
+        outsider,
+        &mut context,
+        &triggers,
+    );
+    assert!(
+        asks(peer, &mut context).is_empty(),
+        "a person passing through without addressing the member must not re-arm the conversation, \
+         or an unrelated label or remark would restart it by accident"
+    );
+
+    let _asked = Fixture::classify_with(
+        Fixture::comment("@nico what do you think?"),
+        outsider,
+        &mut context,
+        &triggers,
+    );
+    assert!(
+        !asks(peer, &mut context).is_empty(),
+        "a person addressing the member restores it"
+    );
+}
+
+#[test]
+fn counts_a_run_of_operations_by_one_author_as_a_single_turn() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
+    let triggers = Fixture::triggers(vec![Did::from(member), Did::from(peer)]);
     let mut context = Context::default();
 
-    for answer in 0..3 {
+    for remark in 0..Fixture::exchanges() * 3 {
         assert!(
-            !Fixture::classify_with(comment("@nico thoughts?"), peer, &mut context, &triggers)
-                .is_empty(),
-            "answer {answer} is still within the limit"
+            !Fixture::classify_with(
+                Action::Comment {
+                    body: format!("@nico point {remark}"),
+                    reply_to: None,
+                    embeds: Vec::new(),
+                },
+                peer,
+                &mut context,
+                &triggers,
+            )
+            .is_empty(),
+            "remark {remark} is part of one uninterrupted turn, so it costs what one remark costs"
         );
-        let _own =
-            Fixture::classify_with(comment("here they are"), member, &mut context, &triggers);
     }
+}
 
+#[test]
+fn counts_turns_against_the_member_that_took_them_rather_than_the_subject() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let first = PublicKey::from_str(AUTHOR).expect("first peer key should be valid");
+    let second = PublicKey::from_str(DELEGATE).expect("second peer key should be valid");
+    let triggers = Fixture::triggers(vec![Did::from(member), Did::from(first), Did::from(second)]);
+    let mut context = Context::default();
+
+    for _turn in 0..Fixture::exchanges() {
+        let _asked = Fixture::classify_with(
+            Fixture::comment("@nico thoughts?"),
+            first,
+            &mut context,
+            &triggers,
+        );
+        let _own = Fixture::classify_with(
+            Fixture::comment("here they are"),
+            member,
+            &mut context,
+            &triggers,
+        );
+    }
     assert!(
-        Fixture::classify_with(comment("@nico thoughts?"), peer, &mut context, &triggers)
-            .is_empty(),
-        "a member must stop answering a subject once it has spent its allowance"
+        Fixture::classify_with(
+            Fixture::comment("@nico thoughts?"),
+            first,
+            &mut context,
+            &triggers
+        )
+        .is_empty(),
+        "the first conversation has run its turns"
     );
-
-    let _human =
-        Fixture::classify_with(comment("let us move on"), outsider, &mut context, &triggers);
     assert!(
-        !Fixture::classify_with(comment("@nico thoughts?"), peer, &mut context, &triggers)
-            .is_empty(),
-        "a non-member acting on the subject must restore the allowance"
+        !Fixture::classify_with(
+            Fixture::comment("@nico thoughts?"),
+            second,
+            &mut context,
+            &triggers
+        )
+        .is_empty(),
+        "a second colleague has said nothing yet, so a patch with several reviewers gives each of \
+         them a whole conversation instead of a share of one"
     );
 }
 
@@ -786,26 +901,15 @@ fn stops_answering_once_a_member_reaches_its_response_limit() {
 fn delivers_a_peer_review_to_the_patch_owner() {
     let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
     let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
-    let triggers = Triggers::new(TriggerAccess::Anyone, Vec::new(), vec![Did::from(peer)]);
+    let triggers = Fixture::triggers(vec![Did::from(peer)]);
     let revision = RevisionId::from(EntryId::from_str(COMMENT).expect("revision should be valid"));
     let mut context = Context::default();
 
-    let opened = context.classify(
-        &Fixture::operation(
-            ISSUE,
-            PatchAction::Revision {
-                description: "Initial revision".to_owned(),
-                base: *ObjectId::from_str(ISSUE).expect("base should be valid"),
-                oid: *ObjectId::from_str(COMMENT).expect("head should be valid"),
-                resolves: BTreeSet::new(),
-            },
-            member,
-            PATCH_TYPENAME.clone(),
-        ),
-        Member::Nico,
+    let opened = Fixture::classify_patch_with(
+        ISSUE,
+        Fixture::revision("Initial revision"),
         member,
-        RepoId::from_str(REPOSITORY).expect("repository should be valid"),
-        Subject::Patch(ObjectId::from_str(ISSUE).expect("patch should be valid")),
+        &mut context,
         &triggers,
     );
     assert!(
@@ -813,22 +917,16 @@ fn delivers_a_peer_review_to_the_patch_owner() {
         "a member's own revision must not come back to it"
     );
 
-    let reviewed = context.classify(
-        &Fixture::operation(
-            OPERATION,
-            PatchAction::Review {
-                revision,
-                summary: None,
-                verdict: Some(Verdict::Reject),
-                labels: Vec::new(),
-            },
-            peer,
-            PATCH_TYPENAME.clone(),
-        ),
-        Member::Nico,
-        member,
-        RepoId::from_str(REPOSITORY).expect("repository should be valid"),
-        Subject::Patch(ObjectId::from_str(ISSUE).expect("patch should be valid")),
+    let reviewed = Fixture::classify_patch_with(
+        OPERATION,
+        PatchAction::Review {
+            revision,
+            summary: None,
+            verdict: Some(Verdict::Reject),
+            labels: Vec::new(),
+        },
+        peer,
+        &mut context,
         &triggers,
     );
     assert!(
@@ -839,57 +937,66 @@ fn delivers_a_peer_review_to_the_patch_owner() {
 }
 
 #[test]
-fn building_does_not_spend_a_member_s_answer_allowance() {
+fn a_member_s_own_activity_never_spends_its_own_allowance() {
     let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
     let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
-    let triggers = Triggers::new(TriggerAccess::Anyone, Vec::new(), vec![Did::from(peer)]);
-    let subject = Subject::Patch(ObjectId::from_str(ISSUE).expect("patch should be valid"));
-    let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
+    let triggers = Fixture::triggers(vec![Did::from(member), Did::from(peer)]);
     let mut context = Context::default();
 
     for _ in 0..4 {
-        let _own = context.classify(
-            &Fixture::operation(
-                ISSUE,
-                PatchAction::Revision {
-                    description: "Another revision".to_owned(),
-                    base: *ObjectId::from_str(ISSUE).expect("base should be valid"),
-                    oid: *ObjectId::from_str(COMMENT).expect("head should be valid"),
-                    resolves: BTreeSet::new(),
-                },
-                member,
-                PATCH_TYPENAME.clone(),
-            ),
-            Member::Nico,
+        let _own = Fixture::classify_patch_with(
+            ISSUE,
+            Fixture::revision("Another revision"),
             member,
-            repository,
-            subject,
+            &mut context,
             &triggers,
         );
     }
 
     assert!(
-        !context
-            .classify(
-                &Fixture::operation(
-                    OPERATION,
-                    PatchAction::Revision {
-                        description: "@nico could you rebase this?".to_owned(),
-                        base: *ObjectId::from_str(ISSUE).expect("base should be valid"),
-                        oid: *ObjectId::from_str(COMMENT).expect("head should be valid"),
-                        resolves: BTreeSet::new(),
-                    },
-                    peer,
-                    PATCH_TYPENAME.clone(),
-                ),
-                Member::Nico,
-                member,
-                repository,
-                subject,
-                &triggers,
-            )
-            .is_empty(),
-        "publishing revisions is work, not speech, so it must not exhaust the allowance a member \
-         needs to keep hearing about its own patch"
+        !Fixture::classify_patch_with(
+            OPERATION,
+            Fixture::revision("@nico could you rebase this?"),
+            peer,
+            &mut context,
+            &triggers,
+        )
+        .is_empty(),
+        "an allowance counts what a colleague has said to the member, not what the member has \
+         been doing, so a day spent building must not make it deaf to its own patch"
+    );
+}
+#[test]
+fn caps_the_review_and_revision_cycle_between_two_members() {
+    let nico = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let vera = PublicKey::from_str(AUTHOR).expect("reviewer key should be valid");
+    let triggers = Fixture::triggers(vec![Did::from(nico), Did::from(vera)]);
+    let revision = RevisionId::from(EntryId::from_str(ISSUE).expect("revision should be valid"));
+    let mut context = Context::default();
+    let revise = || Fixture::revision("addressed the comments");
+    let review = || PatchAction::Review {
+        revision,
+        summary: Some("still not right".to_owned()),
+        verdict: Some(Verdict::Reject),
+        labels: Vec::new(),
+    };
+
+    // Nico opens the patch, so the context records him as its owner.
+    let _opened = Fixture::classify_patch_with(REPLY, revise(), nico, &mut context, &triggers);
+
+    for round in 0..Fixture::exchanges() {
+        assert!(
+            !Fixture::classify_patch_with(CHANGE, review(), vera, &mut context, &triggers)
+                .is_empty(),
+            "round {round} of the review still reaches the author"
+        );
+        let _addressed =
+            Fixture::classify_patch_with(OPERATION, revise(), nico, &mut context, &triggers);
+    }
+
+    assert!(
+        Fixture::classify_patch_with(CHANGE, review(), vera, &mut context, &triggers).is_empty(),
+        "reviewing and revising cost nobody anything to repeat, so without this the two would \
+         carry on without end and no person would be asked"
     );
 }
