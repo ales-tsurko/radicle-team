@@ -17,9 +17,8 @@ use radicle::{
 };
 
 use crate::{
-    agent::{self, Talker},
+    agent, conversation,
     manifest::{PriorityLabels, QueuePosition, RepositoryPolicy},
-    mcp::WorkScope,
     member::Member,
     queue::WorkQueue,
     watcher::{
@@ -29,7 +28,6 @@ use crate::{
         },
         state::ProcessedActivities,
     },
-    workspace::Workspaces,
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -104,14 +102,13 @@ impl Watcher {
         profile: &RadicleProfile,
         node: &Node,
         state_path: &Path,
-        agent: &mut (impl Talker + ?Sized),
         delivery: DeliveryRuntime,
     ) -> Result<(), Error> {
         let member_id = Self::verify_profile(*profile.id(), node.clone()).await?;
         let storage = profile.storage.clone();
         let state = ProcessedActivities::open(state_path).await?;
         let events = self.subscribe(node.clone()).await?;
-        self.watch(&storage, member_id, &state, events, agent, &delivery)
+        self.watch(&storage, member_id, &state, events, &delivery)
             .await
     }
 
@@ -130,15 +127,12 @@ impl Watcher {
         member_id: NodeId,
         state: &ProcessedActivities,
         mut events: tokio::sync::mpsc::Receiver<Result<(), Error>>,
-        agent: &mut (impl Talker + ?Sized),
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error> {
-        self.scan_all(storage, member_id, state, agent, delivery)
-            .await?;
+        self.scan_all(storage, member_id, state, delivery).await?;
         loop {
             Self::await_update(&mut events).await?;
-            self.scan_all(storage, member_id, state, agent, delivery)
-                .await?;
+            self.scan_all(storage, member_id, state, delivery).await?;
         }
     }
 
@@ -196,7 +190,6 @@ impl Watcher {
         storage: &Storage,
         member_id: NodeId,
         state: &ProcessedActivities,
-        agent: &mut (impl Talker + ?Sized),
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error> {
         let triggers = self.resolve_triggers(storage).await?;
@@ -209,7 +202,6 @@ impl Watcher {
         self.scan_objects(
             issues,
             state,
-            agent,
             delivery,
             HistorySource::new(member_id, Subject::Issue, &triggers),
         )
@@ -218,7 +210,6 @@ impl Watcher {
         self.scan_objects(
             patches,
             state,
-            agent,
             delivery,
             HistorySource::new(member_id, Subject::Patch, &triggers),
         )
@@ -250,7 +241,6 @@ impl Watcher {
         &self,
         mut histories: tokio::sync::mpsc::Receiver<HistoryEvent<A>>,
         state: &ProcessedActivities,
-        agent: &mut (impl Talker + ?Sized),
         delivery: &DeliveryRuntime,
         source: HistorySource<'_>,
     ) -> Result<(), Error>
@@ -259,7 +249,7 @@ impl Watcher {
     {
         let mut active = None;
         while let Some(event) = histories.recv().await {
-            self.handle_history_event(event, source, &mut active, state, agent, delivery)
+            self.handle_history_event(event, source, &mut active, state, delivery)
                 .await?;
         }
         Self::complete_history_stream(active)
@@ -307,7 +297,6 @@ impl Watcher {
         source: HistorySource<'_>,
         active: &mut Option<ActiveHistory>,
         state: &ProcessedActivities,
-        agent: &mut (impl Talker + ?Sized),
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error>
     where
@@ -320,7 +309,7 @@ impl Watcher {
             HistoryEvent::Operation(operation) => {
                 Self::scan_active(operation, active, state, source.triggers).await
             }
-            HistoryEvent::End => Self::finish_active(active, state, agent, delivery).await,
+            HistoryEvent::End => Self::finish_active(active, state, delivery).await,
             HistoryEvent::Failed(error) => Err(error),
         }
     }
@@ -380,7 +369,6 @@ impl Watcher {
     async fn finish_active(
         active: &mut Option<ActiveHistory>,
         state: &ProcessedActivities,
-        agent: &mut (impl Talker + ?Sized),
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error> {
         let active = active
@@ -393,7 +381,6 @@ impl Watcher {
                 active.scope.actionable,
                 active.scope,
                 state,
-                agent,
                 delivery,
             )
             .await
@@ -488,31 +475,31 @@ impl Watcher {
 // Everything one scan needs in order to hand work to the member's two halves.
 #[derive(Debug, Clone)]
 pub(crate) struct DeliveryRuntime {
-    workspaces: Workspaces,
-    scope: WorkScope,
+    storage: Storage,
     queue: WorkQueue,
     priority: PriorityLabels,
+    conversations: conversation::Handle,
 }
 
 impl DeliveryRuntime {
-    // Pairs the conversation's own resources with the queue its assignments end up in.
+    // Pairs classified deliveries with the conversation dispatcher and assignment queue.
     pub(crate) const fn new(
-        workspaces: Workspaces,
-        scope: WorkScope,
+        storage: Storage,
         queue: WorkQueue,
         priority: PriorityLabels,
+        conversations: conversation::Handle,
     ) -> Self {
         Self {
-            workspaces,
-            scope,
+            storage,
             queue,
             priority,
+            conversations,
         }
     }
 
     // Reads the assigned subject as a job the building half can start from.
     async fn assignment(&self, repository: RepoId, subject: Subject) -> Result<Assignment, Error> {
-        let storage = self.workspaces.storage().clone();
+        let storage = self.storage.clone();
         let priority = self.priority.clone();
         tokio::task::spawn_blocking(move || {
             let stored = storage.repository(repository)?;
@@ -666,7 +653,6 @@ impl PendingActivities {
         actionable: bool,
         scope: ScanScope,
         state: &ProcessedActivities,
-        agent: &mut (impl Talker + ?Sized),
         runtime: &DeliveryRuntime,
     ) -> Result<(), Error> {
         for activity in self.skipped {
@@ -680,7 +666,7 @@ impl PendingActivities {
             }
         }
         for (activity, delivery) in self.activities {
-            Self::deliver(activity, delivery, scope, state, agent, runtime).await?;
+            Self::deliver(activity, delivery, scope, state, runtime).await?;
         }
         Ok(())
     }
@@ -715,45 +701,16 @@ impl PendingActivities {
         delivery: Delivery,
         scope: ScanScope,
         state: &ProcessedActivities,
-        agent: &mut (impl Talker + ?Sized),
         runtime: &DeliveryRuntime,
     ) -> Result<(), Error> {
         let identity = activity.delivery_id();
-        let subject = activity.subject;
-        let workspace = runtime
-            .workspaces
-            .prepare(identity.into(), subject)
+        let acknowledgement = runtime
+            .conversations
+            .deliver(activity, delivery)
             .await
-            .map_err(|error| Error::Workspace(error.to_string()))?;
-        let path = workspace.path().to_path_buf();
-        runtime
-            .scope
-            .activate(activity.context(path.clone()))
-            .await
-            .map_err(Error::WorkScope)?;
-        tracing::info!(
-            member = %scope.member,
-            repository = %scope.repository,
-            ?subject,
-            operation = %identity.operation,
-            action = identity.action,
-            workspace = %path.display(),
-            "dispatching activity to the agent"
-        );
-        let handled = delivery.dispatch(activity.context(path), agent).await;
-        runtime.scope.deactivate().await;
-        let cleaned = workspace.cleanup().await;
-        handled.inspect_err(|error| {
-            tracing::warn!(
-                member = %scope.member,
-                operation = %identity.operation,
-                action = identity.action,
-                %error,
-                "agent failed to handle activity"
-            );
-        })?;
-        Self::checkpoint_delivery(identity, scope, state, runtime).await?;
-        cleaned.map_err(|error| Error::Workspace(error.to_string()))
+            .map_err(Error::from)?;
+        Self::record_delivery(identity, scope, state).await?;
+        acknowledgement.finish().map_err(Error::from)
     }
 
     async fn checkpoint(
@@ -773,10 +730,18 @@ impl PendingActivities {
         runtime: &DeliveryRuntime,
     ) -> Result<(), Error> {
         runtime
-            .scope
+            .conversations
             .reconcile(delivery.into())
             .await
-            .map_err(Error::PublicationRecovery)?;
+            .map_err(Error::from)?;
+        Self::record_delivery(delivery, scope, state).await
+    }
+
+    async fn record_delivery(
+        delivery: crate::agent::DeliveryId,
+        scope: ScanScope,
+        state: &ProcessedActivities,
+    ) -> Result<(), Error> {
         let _inserted = state
             .insert(
                 scope.repository,
@@ -848,6 +813,9 @@ pub enum Error {
     /// Recovering durable MCP publications before checkpointing failed.
     #[error("MCP publication recovery failed: {0}")]
     PublicationRecovery(String),
+    /// The conversation dispatcher stopped accepting deliveries.
+    #[error("conversation dispatcher is not running")]
+    ConversationUnavailable,
     /// The node closed its event stream.
     #[error("Radicle node closed its event stream")]
     EventStreamClosed,
@@ -868,6 +836,18 @@ impl From<crate::database::Error> for Error {
     }
 }
 
+impl From<conversation::Error> for Error {
+    fn from(error: conversation::Error) -> Self {
+        match error {
+            conversation::Error::Talker(error) => Self::Talker(error),
+            conversation::Error::Workspace(error) => Self::Workspace(error),
+            conversation::Error::WorkScope(error) => Self::WorkScope(error),
+            conversation::Error::PublicationRecovery(error) => Self::PublicationRecovery(error),
+            conversation::Error::Unavailable => Self::ConversationUnavailable,
+        }
+    }
+}
+
 #[cfg(all(test, not(miri)))]
 mod tests {
     use std::str::FromStr as _;
@@ -883,12 +863,13 @@ mod tests {
 
     use crate::{
         agent::{Context, McpEndpoint, Talker},
+        conversation::Dispatcher,
         manifest::{PriorityLabels, QueuePosition},
         member::{Member, Profile as MemberProfile},
         queue::WorkQueue,
         watcher::{
             Change, Comment, Subject, Target,
-            activity::{Activity, Kind},
+            activity::{Activity, Delivery, Kind},
             runtime::{DeliveryRuntime, PendingActivities, ScanScope},
             state::ProcessedActivities,
         },
@@ -940,22 +921,34 @@ mod tests {
         let queue = WorkQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open");
-        let runtime = DeliveryRuntime {
-            workspaces: Workspaces::new(
+        let (conversations, dispatcher) = Dispatcher::new(
+            Member::Nico,
+            Workspaces::new(
                 root.path().join("workspaces"),
                 profile.storage.clone(),
                 repository,
                 *profile.id(),
             ),
-            scope: crate::mcp::WorkScope::default(),
-            queue: queue.clone(),
-            priority: PriorityLabels::default(),
-        };
+            crate::mcp::WorkScope::default(),
+        );
+        let runtime = DeliveryRuntime::new(
+            profile.storage.clone(),
+            queue.clone(),
+            PriorityLabels::default(),
+            conversations,
+        );
 
-        pending
-            .dispatch(false, false, scope, &state, &mut NoopAgent, &runtime)
-            .await
-            .expect("assignments should be checkpointed");
+        dispatch_pending(
+            pending,
+            (false, false),
+            scope,
+            &state,
+            &runtime,
+            dispatcher,
+            false,
+        )
+        .await
+        .expect("assignments should be checkpointed");
         for operation in [first, second] {
             assert!(
                 state
@@ -1043,6 +1036,100 @@ mod tests {
         (profile, repository, issue)
     }
 
+    #[tokio::test]
+    async fn checkpoints_a_delivery_only_after_the_dispatcher_handles_it() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let (profile, repository, issue) = assigned_issue(root.path(), &[]);
+        let operation = EntryId::from_str("2222222222222222222222222222222222222222")
+            .expect("operation should be valid");
+        let pending = || {
+            let mut pending = PendingActivities::default();
+            pending.add(Activity::new(
+                repository,
+                Subject::Issue(issue),
+                operation,
+                0,
+                profile.did(),
+                Kind::Delivered(Delivery::Mentioned(Target::Subject)),
+            ));
+            pending
+        };
+        let queue = WorkQueue::memory(repository, Member::Nico)
+            .await
+            .expect("queue should open");
+        let delivery = || {
+            let (conversations, dispatcher) = Dispatcher::new(
+                Member::Nico,
+                Workspaces::new(
+                    root.path().join("workspaces"),
+                    profile.storage.clone(),
+                    repository,
+                    *profile.id(),
+                ),
+                crate::mcp::WorkScope::default(),
+            );
+            let runtime = DeliveryRuntime::new(
+                profile.storage.clone(),
+                queue.clone(),
+                PriorityLabels::default(),
+                conversations,
+            );
+            (runtime, dispatcher)
+        };
+        let state = ProcessedActivities::memory()
+            .await
+            .expect("state should initialize");
+        let scope = ScanScope::new(
+            Member::Nico,
+            *profile.id(),
+            repository,
+            issue,
+            Subject::Issue(issue),
+            true,
+        );
+
+        let (runtime, dispatcher) = delivery();
+        let failed = dispatch_pending(
+            pending(),
+            (false, true),
+            scope,
+            &state,
+            &runtime,
+            dispatcher,
+            true,
+        )
+        .await;
+        assert!(matches!(failed, Err(super::Error::Talker(_))));
+        assert!(
+            !state
+                .contains(repository, issue, operation, 0)
+                .await
+                .expect("state should be readable"),
+            "a failed delivery must remain available for retry"
+        );
+
+        let (runtime, dispatcher) = delivery();
+        dispatch_pending(
+            pending(),
+            (false, true),
+            scope,
+            &state,
+            &runtime,
+            dispatcher,
+            false,
+        )
+        .await
+        .expect("delivery should be handled");
+
+        assert!(
+            state
+                .contains(repository, issue, operation, 0)
+                .await
+                .expect("state should be readable"),
+            "the watcher must checkpoint the delivery after the dispatcher acknowledges it"
+        );
+    }
+
     async fn enqueue_assignment(labels: &[Label]) -> (WorkQueue, tempfile::TempDir) {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let (profile, repository, issue) = assigned_issue(root.path(), labels);
@@ -1060,7 +1147,8 @@ mod tests {
         let queue = WorkQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open");
-        let runtime = DeliveryRuntime::new(
+        let (conversations, dispatcher) = Dispatcher::new(
+            Member::Nico,
             Workspaces::new(
                 root.path().join("workspaces"),
                 profile.storage.clone(),
@@ -1068,8 +1156,12 @@ mod tests {
                 *profile.id(),
             ),
             crate::mcp::WorkScope::default(),
+        );
+        let runtime = DeliveryRuntime::new(
+            profile.storage.clone(),
             queue.clone(),
             PriorityLabels::default(),
+            conversations,
         );
         let state = ProcessedActivities::memory()
             .await
@@ -1082,10 +1174,17 @@ mod tests {
             Subject::Issue(issue),
             true,
         );
-        pending
-            .dispatch(true, true, scope, &state, &mut NoopAgent, &runtime)
-            .await
-            .expect("an active assignment should become queued work");
+        dispatch_pending(
+            pending,
+            (true, true),
+            scope,
+            &state,
+            &runtime,
+            dispatcher,
+            false,
+        )
+        .await
+        .expect("an active assignment should become queued work");
         assert!(
             state
                 .contains(repository, issue, operation, 0)
@@ -1135,7 +1234,33 @@ mod tests {
         }
     }
 
-    struct NoopAgent;
+    struct NoopAgent {
+        fail_mentions: bool,
+    }
+
+    async fn dispatch_pending(
+        pending: PendingActivities,
+        state_flags: (bool, bool),
+        scope: ScanScope,
+        state: &ProcessedActivities,
+        runtime: &DeliveryRuntime,
+        dispatcher: Dispatcher,
+        fail_mentions: bool,
+    ) -> Result<(), super::Error> {
+        let mut agent = NoopAgent { fail_mentions };
+        let (assigned, actionable) = state_flags;
+        let pending = pending.dispatch(assigned, actionable, scope, state, runtime);
+        let dispatching = dispatcher.run(&mut agent);
+        tokio::pin!(pending);
+        tokio::pin!(dispatching);
+        tokio::select! {
+            result = pending => result,
+            result = dispatching => match result {
+                Ok(()) => Err(super::Error::ConversationUnavailable),
+                Err(error) => Err(error.into()),
+            },
+        }
+    }
 
     #[async_trait::async_trait]
     impl Talker for NoopAgent {
@@ -1153,7 +1278,13 @@ mod tests {
             _context: Context,
             _target: Target,
         ) -> Result<(), crate::agent::Error> {
-            Ok(())
+            if self.fail_mentions {
+                Err(crate::agent::Error::new(std::io::Error::other(
+                    "expected test failure",
+                )))
+            } else {
+                Ok(())
+            }
         }
 
         async fn replied(

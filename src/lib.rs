@@ -27,6 +27,7 @@
 //!     -> Radicle action normalization
 //!     -> member-specific classification
 //!     -> internal activity
+//!     -> serialized conversation dispatcher
 //!     -> typed Talker method            (a message)
 //!        or the member's work queue     (an assignment)
 //!            -> Coder::work
@@ -39,10 +40,11 @@
 //! assignment, mention, reply, or relevant change for the selected member and produces an internal
 //! activity. This keeps Radicle's low-level action variants out of consumers.
 //!
-//! A dispatcher maps each deliverable activity to the typed `mentioned`, `replied`, or `changed`
-//! method. Runtime-specific adapters implement these interfaces, and the core does not depend on
-//! an agent vendor API. Each callback gets a fresh working copy and returns only success or
-//! failure. Repository actions are separate MCP calls, so an agent can perform any number of
+//! The serialized conversation dispatcher maps each deliverable activity to the typed `mentioned`,
+//! `replied`, or `changed` method and acknowledges successful handling before the watcher
+//! checkpoints it. Runtime-specific adapters implement these interfaces, and the core does not
+//! depend on an agent vendor API. Each callback gets a fresh working copy and returns only success
+//! or failure. Repository actions are separate MCP calls, so an agent can perform any number of
 //! allowed actions while one unit of work is active.
 //!
 //! During `run`, the application starts two loopback-only MCP servers scoped to the selected
@@ -81,6 +83,7 @@ mod application;
 pub mod builder;
 /// Command-line interface for selecting and running a team member.
 pub mod cli;
+mod conversation;
 mod database;
 /// Filesystem locations used by each team member.
 pub mod home;

@@ -14,7 +14,7 @@ use crate::agent::{self, Context, DeliveryId, Talker};
 
 /// Activity addressed to or otherwise relevant to the selected member.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Activity {
+pub(crate) struct Activity {
     /// Repository containing the activity.
     pub repository: RepoId,
     /// Issue or patch receiving the activity.
@@ -48,7 +48,7 @@ impl Activity {
         }
     }
 
-    pub(super) fn context(&self, workspace: PathBuf) -> Context {
+    pub(crate) fn context(&self, workspace: PathBuf) -> Context {
         Context {
             repository: self.repository,
             subject: self.subject,
@@ -58,7 +58,7 @@ impl Activity {
         }
     }
 
-    pub(super) const fn delivery_id(&self) -> DeliveryId {
+    pub(crate) const fn delivery_id(&self) -> DeliveryId {
         DeliveryId {
             operation: self.operation,
             action: self.action,
@@ -122,7 +122,7 @@ pub struct InvalidSubject(String);
 
 // Reason an interaction requires the member's attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Kind {
+pub(crate) enum Kind {
     Assigned,
     // Something happened that the talking half should answer.
     Delivered(Delivery),
@@ -130,14 +130,14 @@ pub(super) enum Kind {
 
 // An interaction the talking half handles itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Delivery {
+pub(crate) enum Delivery {
     Mentioned(Target),
     Replied { comment: Comment, reply_to: EntryId },
     Changed(Change),
 }
 
 impl Delivery {
-    pub(super) async fn dispatch(
+    pub(crate) async fn dispatch(
         self,
         context: Context,
         agent: &mut (impl Talker + ?Sized),

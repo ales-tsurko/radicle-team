@@ -2,10 +2,11 @@
 //!
 //! A [`Watcher`](crate::watcher::Watcher) observes one repository as one
 //! [`Member`](crate::member::Member), classifies interactions requiring that member's attention,
-//! dispatches them through a [`Talker`](crate::agent::Talker), and publishes requested replies with
-//! the managed member identity. Assignments are the exception: they are work rather than
-//! conversation, so they join the member's [`WorkQueue`](crate::queue::WorkQueue) and reach the
-//! building half through [`Builder`](crate::builder::Builder).
+//! and emits deliveries to the member's serialized conversation dispatcher. The dispatcher invokes
+//! the [`Talker`](crate::agent::Talker) and acknowledges successful handling before the watcher
+//! checkpoints the activity. Assignments are the exception: they are work rather than conversation,
+//! so they join the member's [`WorkQueue`](crate::queue::WorkQueue) and reach the building half
+//! through [`Builder`](crate::builder::Builder).
 //!
 //! # Lifecycle
 //!
@@ -27,8 +28,8 @@
 //! Radicle issue and patch action enums are isolated behind adapter modules. Each adapter
 //! implements `From<ActionEnvelope<_>> for NormalizedAction`, translating its concrete actions into
 //! shared assignment updates, ownership updates, and ordered relevance signals. A single generic
-//! classification context reduces that normalized form into internal activities, which invoke the
-//! corresponding typed agent methods.
+//! classification context reduces that normalized form into internal activities, which the runtime
+//! emits to the conversation dispatcher.
 //!
 //! This boundary keeps Radicle-specific variant matching out of the reducer. Adding an upstream
 //! action normally changes only its adapter and reuses the existing normalized behavior. Only
@@ -47,7 +48,10 @@ pub use crate::watcher::{
     activity::{Change, Comment, InvalidSubject, Subject, Target},
     runtime::{Error, Watcher},
 };
-pub(crate) use crate::watcher::runtime::DeliveryRuntime;
+pub(crate) use crate::watcher::{
+    activity::{Activity, Delivery},
+    runtime::DeliveryRuntime,
+};
 
 mod activity;
 mod classification;

@@ -16,7 +16,7 @@ use radicle::{
 
 use crate::{
     agent::{self, Change, Coder, Comment, Context as AgentContext, Talker, Target},
-    builder,
+    builder, conversation,
     home::{self, MemberHome},
     identity::{self, GenerationStore, Manager, MemberLock, Provider},
     manifest::{self, Manifest},
@@ -870,22 +870,29 @@ impl AgentRuntime {
         );
         let builder = builder::Builder::new(application.member, application.repository);
         let coder_scope = self.servers.coder.scope();
+        let (conversations, dispatcher) = conversation::Dispatcher::new(
+            application.member,
+            workspaces.clone(),
+            self.servers.talker.scope(),
+        );
         let ran = {
             let watching = watcher.run(
                 &profile,
                 self.runtime.node.node(),
                 &state_database,
-                talker,
                 watcher::DeliveryRuntime::new(
-                    workspaces.clone(),
-                    self.servers.talker.scope(),
+                    profile.storage.clone(),
                     self.queue.clone(),
                     self.policy.priority().clone(),
+                    conversations.clone(),
                 ),
             );
+            let dispatching = dispatcher.run(talker);
             let building = builder.run(&*coder, &self.queue, &workspaces, &coder_scope);
             tokio::select! {
                 watched = watching => watched.map_err(Error::from),
+                dispatched = dispatching => dispatched
+                    .map_err(|error| Error::Conversation(error.to_string())),
                 built = building => built.map_err(Error::from),
             }
         };
@@ -1216,6 +1223,9 @@ pub enum Error {
     /// Carrying out queued work failed.
     #[error("member builder error: {0}")]
     Builder(#[from] builder::Error),
+    /// The conversation dispatcher stopped.
+    #[error("conversation dispatcher error: {0}")]
+    Conversation(String),
     /// Opening the member work queue failed.
     #[error("work queue error: {0}")]
     Queue(#[from] crate::queue::Error),
