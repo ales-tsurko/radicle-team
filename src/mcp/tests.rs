@@ -53,20 +53,26 @@ use crate::mcp::{
 };
 #[cfg(not(miri))]
 use crate::mcp::server::ServiceError;
+use crate::mcp::{
+    read::{paginate_operations, revision_action},
+    tools::ToolService,
+};
+#[cfg(not(miri))]
 use crate::{
-    manifest::QueuePosition,
-    mcp::{
-        read::{paginate_operations, revision_action},
-        tools::ToolService,
-    },
-    member::Member,
-    queue::WorkQueue,
+    manifest::QueuePosition, mcp::tools::ToolState, member::Member, queue::WorkQueue,
     watcher::Subject,
 };
 
 #[cfg(not(miri))]
 const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 const AUTHOR: &str = "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
+
+#[cfg(not(miri))]
+async fn chat_state() -> crate::chat::State {
+    crate::chat::State::memory()
+        .await
+        .expect("chat state should open")
+}
 
 #[cfg(not(miri))]
 struct RepositoryFixture {
@@ -184,7 +190,7 @@ impl RepositoryFixture {
             publisher,
             crate::manifest::McpAllowlist::default(),
             super::Role::Talker,
-            self.queue().await,
+            ToolState::new(self.queue().await, chat_state().await),
         )
     }
 
@@ -210,7 +216,7 @@ impl RepositoryFixture {
             publisher,
             crate::manifest::McpAllowlist::default(),
             super::Role::Talker,
-            self.queue().await,
+            ToolState::new(self.queue().await, chat_state().await),
         )
     }
 
@@ -229,7 +235,7 @@ impl RepositoryFixture {
             publisher,
             crate::manifest::McpAllowlist::everything(),
             role,
-            queue,
+            ToolState::new(queue, chat_state().await),
         )
     }
 
@@ -383,6 +389,7 @@ async fn starts_on_a_loopback_capability_url_and_stops() {
         WorkQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open"),
+        chat_state().await,
     )
     .await
     .expect("MCP server should start");
@@ -481,6 +488,94 @@ async fn authenticated_chat_can_address_the_active_repository() {
             .expect("authenticated chat may address any repository subject");
         assert_eq!(access.context().repository, repository);
     }
+}
+
+#[tokio::test]
+#[cfg(not(miri))]
+async fn chat_reply_targets_only_the_active_channel_and_message() {
+    let fixture = RepositoryFixture::new();
+    let chat = chat_state().await;
+    let channel = "general"
+        .parse::<crate::chat::ChannelId>()
+        .expect("channel should be valid");
+    let message = chat
+        .record(
+            fixture.repository,
+            "team",
+            &channel,
+            crate::chat::Receipt::Live {
+                message: Some("irc-1"),
+            },
+            "alice",
+            fixture.profile.did(),
+        )
+        .await
+        .expect("inbound message should be recorded")
+        .id();
+    let publisher = crate::agent::Publisher::new(
+        fixture.profile.clone(),
+        fixture.repository,
+        None,
+        TestAnnouncer,
+        TestAuthorizer(fixture.repository),
+    );
+    let scope = super::WorkScope::new(publisher.clone());
+    let service = ToolService::new(
+        fixture.profile.storage.clone(),
+        fixture.repository,
+        scope.clone(),
+        publisher,
+        crate::manifest::McpAllowlist::everything(),
+        super::Role::Talker,
+        ToolState::new(fixture.queue().await, chat.clone()),
+    );
+    scope
+        .activate(crate::agent::ChatContext::authenticated(
+            fixture.repository,
+            channel.clone(),
+            message,
+            crate::chat::AuthenticatedSender::for_test(fixture.profile.did()),
+            fixture.working.clone(),
+        ))
+        .await
+        .expect("chat message should activate");
+
+    let reply = service
+        .enqueue_chat_reply("On it".to_owned())
+        .await
+        .expect("reply should enter the outbox");
+    let pending = chat
+        .pending_replies(fixture.repository)
+        .await
+        .expect("outbox should be readable");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id.get(), reply.reply);
+    assert_eq!(pending[0].channel, channel);
+    assert_eq!(pending[0].in_reply_to, message);
+    assert_eq!(pending[0].body, "On it");
+
+    scope.deactivate().await;
+    scope
+        .activate(crate::agent::Context {
+            repository: fixture.repository,
+            subject: crate::watcher::Subject::Issue(
+                ObjectId::from_str("1111111111111111111111111111111111111111")
+                    .expect("subject should be valid"),
+            ),
+            delivery: crate::agent::DeliveryId {
+                operation: EntryId::from_str("2222222222222222222222222222222222222222")
+                    .expect("operation should be valid"),
+                action: 0,
+            },
+            author: fixture.profile.did(),
+            workspace: fixture.working.clone(),
+        })
+        .await
+        .expect("repository delivery should activate");
+    service
+        .enqueue_chat_reply("Wrong ingress".to_owned())
+        .await
+        .expect_err("repository activity must not gain a chat target");
 }
 
 #[cfg(not(miri))]
@@ -677,7 +772,7 @@ async fn reconciles_security_writes_from_the_delivery_journal() {
         publisher,
         crate::manifest::McpAllowlist::default(),
         super::Role::Talker,
-        fixture.queue().await,
+        ToolState::new(fixture.queue().await, chat_state().await),
     );
     let context = crate::agent::Context {
         repository: fixture.repository,
@@ -1823,7 +1918,7 @@ async fn reloads_the_security_policy_before_reporting() {
         publisher,
         crate::manifest::McpAllowlist::default(),
         super::Role::Talker,
-        fixture.queue().await,
+        ToolState::new(fixture.queue().await, chat_state().await),
     );
     *policy.write().await = crate::manifest::SecurityPolicy::test_with_recipients(
         fixture.repository,
@@ -2597,6 +2692,8 @@ async fn each_half_offers_only_the_tools_its_side_can_use() {
             "the talking half has no commits to turn into a patch with '{tool}'"
         );
     }
+    assert!(talker.offers("reply_chat"));
+    assert!(!coder.offers("reply_chat"));
     for tool in ["get_subject", "create_comment", "merge_patch"] {
         assert!(talker.offers(tool));
         assert!(

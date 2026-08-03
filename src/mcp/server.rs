@@ -18,10 +18,11 @@ use url::Url;
 
 use crate::{
     agent::{ChatContext, Context as AgentContext, McpEndpoint, Publisher, Source, WorkId},
+    chat::State as ChatState,
     manifest::McpAllowlist,
     mcp::{
         protocol::{SubjectKind, SubjectRequest},
-        tools::ToolService,
+        tools::{ToolService, ToolState},
     },
     queue::WorkQueue,
     watcher::Subject,
@@ -56,6 +57,7 @@ impl Server {
         allowlist: McpAllowlist,
         role: Role,
         queue: WorkQueue,
+        chat: ChatState,
     ) -> Result<Self, Error> {
         let listener = Self::bind_loopback().await?;
         let address = listener.local_addr()?;
@@ -75,7 +77,7 @@ impl Server {
                 publisher,
                 allowlist,
                 role,
-                queue,
+                ToolState::new(queue, chat),
             ),
             server_cancellation,
         ));

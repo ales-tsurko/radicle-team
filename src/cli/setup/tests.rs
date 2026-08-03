@@ -117,11 +117,9 @@ fn reports_the_explicit_manifest_path_noninteractively() {
     assert!(missing.contains("config/team-policy.toml"));
     assert!(missing.contains("create explicit manifest"));
     assert!(missing.contains("version = 1"));
-    assert!(
-        missing.contains(
-            "mcp_allow = [\"read\", \"comments\", \"patches\", \"reactions\", \"reviews\"]"
-        )
-    );
+    assert!(missing.contains(
+        "mcp_allow = [\"read\", \"chat\", \"comments\", \"patches\", \"reactions\", \"reviews\"]"
+    ));
     assert!(!missing.contains("canonical branch"));
 
     let binding = SetupWizard::explicit_manifest_output(
@@ -142,11 +140,9 @@ fn includes_member_permissions_in_repository_output() {
 
     assert!(output.contains("canonical branch"));
     assert!(output.contains("version = 1"));
-    assert!(
-        output.contains(
-            "mcp_allow = [\"read\", \"comments\", \"patches\", \"reactions\", \"reviews\"]"
-        )
-    );
+    assert!(output.contains(
+        "mcp_allow = [\"read\", \"chat\", \"comments\", \"patches\", \"reactions\", \"reviews\"]"
+    ));
 }
 
 #[test]
@@ -154,13 +150,12 @@ fn emits_each_members_preconfigured_mcp_groups() {
     let nico = Fixture::entry(Member::Nico, NICO).to_string();
     let maya = Fixture::entry(Member::Maya, MAYA).to_string();
 
-    assert!(
-        nico.contains(
-            "mcp_allow = [\"read\", \"comments\", \"patches\", \"reactions\", \"reviews\"]"
-        )
-    );
+    assert!(nico.contains(
+        "mcp_allow = [\"read\", \"chat\", \"comments\", \"patches\", \"reactions\", \"reviews\"]"
+    ));
     assert!(maya.contains(
-        "mcp_allow = [\"read\", \"comments\", \"issues\", \"patches\", \"reactions\", \"reviews\"]"
+        "mcp_allow = [\"read\", \"chat\", \"comments\", \"issues\", \"patches\", \"reactions\", \
+         \"reviews\"]"
     ));
 }
 

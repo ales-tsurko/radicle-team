@@ -464,10 +464,11 @@ patch for an unrelated reason.
 
 ### Which tools a member may use
 
-`mcp_allow` accepts exact MCP method names and the fixed `read`, `comments`,
-`issues`, `patches`, `reactions`, and `reviews` groups. The `patches` group does
-not include `merge_patch`, which has to be allowed by name. `mcp_allow` is
-required, while an empty list disables every tool.
+`mcp_allow` accepts exact MCP method names and the fixed `read`, `chat`,
+`comments`, `issues`, `patches`, `reactions`, and `reviews` groups. `chat`
+contains `reply_chat`. The `patches` group does not include `merge_patch`, which
+has to be allowed by name. `mcp_allow` is required, while an empty list disables
+every tool.
 
 Groups are derived from the tools registered by the MCP server. `get_*` and
 `list_*` tools are reads, and the rest are grouped by the `comment`, `issue`,
@@ -479,10 +480,11 @@ Five tools sit outside `mcp_allow` entirely, and naming one there is rejected:
 and the four queue tools, which reach only the member's own queue and never the
 repository.
 
-The two halves then divide what is left. The queue tools go to the talking half
-alone, and `create_patch` and `update_patch` to the building half alone, since
-they need commits the talking half cannot make. Everything else follows
-`mcp_allow` on both.
+The two halves then divide what is left. The queue tools and `reply_chat` go to
+the talking half alone, while `create_patch` and `update_patch` go to the
+building half alone since they need commits the talking half cannot make.
+Everything else follows `mcp_allow` on both. `reply_chat` is usable only while
+handling an authenticated chat message and targets that message's channel.
 
 
 ### Where new work goes

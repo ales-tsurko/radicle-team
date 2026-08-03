@@ -3,6 +3,8 @@
 use std::{fmt, str::FromStr};
 
 pub(crate) use crate::chat::{auth::AuthenticatedSender, state::State};
+#[cfg(all(test, not(miri)))]
+pub(crate) use crate::chat::state::Receipt;
 
 mod auth;
 mod state;

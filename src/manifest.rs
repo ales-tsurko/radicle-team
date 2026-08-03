@@ -313,7 +313,7 @@ impl McpAllowlist {
     }
 
     /// Allows every method the manifest is able to grant.
-    #[cfg(test)]
+    #[cfg(all(test, not(miri)))]
     pub(crate) fn everything() -> Self {
         let mut allowlist = Self::default();
         for method in crate::mcp::ToolService::registered_tools() {
@@ -350,7 +350,7 @@ impl McpAllowlist {
     fn is_group(value: &str) -> bool {
         matches!(
             value,
-            "read" | "comments" | "issues" | "patches" | "reactions" | "reviews"
+            "read" | "chat" | "comments" | "issues" | "patches" | "reactions" | "reviews"
         )
     }
 
@@ -363,6 +363,7 @@ impl McpAllowlist {
 
         match group {
             "read" => read,
+            "chat" => method == "reply_chat",
             "comments" => !read && method != "comment_issue" && names("comment"),
             "issues" => !read && names("issue"),
             "patches" => !read && method != "merge_patch" && names("patch"),
@@ -947,6 +948,7 @@ mod tests {
     fn expands_explicit_mcp_groups_without_implicitly_allowing_merge() {
         for group in [
             "read",
+            "chat",
             "comments",
             "issues",
             "patches",
@@ -1014,6 +1016,7 @@ mod tests {
                 method == "merge_patch"
                     || [
                         "read",
+                        "chat",
                         "comments",
                         "issues",
                         "patches",

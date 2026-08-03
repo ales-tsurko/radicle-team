@@ -16,18 +16,19 @@ use rmcp::{
 use serde::Serialize;
 
 use crate::{
-    agent::Publisher,
+    agent::{Publisher, Source, WorkId},
+    chat::State as ChatState,
     manifest::McpAllowlist,
     mcp::{
         protocol::{
-            AddJobRequest, CommentIssueRequest, CommentOperation, CommentWriteRequest,
-            CreateIssueRequest, CreatePatchRequest, DiffRequest, Document, EditIssueRequest,
-            EditPatchRequest, EmbedReadRequest, EntityRequest, EntryRequest, IssuePage,
-            IssueRequest, JobAction, JobRecord, JobSummary, ListIssuesRequest, MergePatchRequest,
-            NoteRequest, PatchEntity, PatchEntityRequest, ReactionWriteRequest,
-            ResolveCommentRequest, ReviewWriteRequest, SecurityIssueRequest, SecurityIssueResult,
-            SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind, SubjectRequest,
-            TimelinePage, TimelineRequest, UpdatePatchRequest, WorkStatus,
+            AddJobRequest, ChatReplyRecord, CommentIssueRequest, CommentOperation,
+            CommentWriteRequest, CreateIssueRequest, CreatePatchRequest, DiffRequest, Document,
+            EditIssueRequest, EditPatchRequest, EmbedReadRequest, EntityRequest, EntryRequest,
+            IssuePage, IssueRequest, JobAction, JobRecord, JobSummary, ListIssuesRequest,
+            MergePatchRequest, NoteRequest, PatchEntity, PatchEntityRequest, ReactionWriteRequest,
+            ReplyChatRequest, ResolveCommentRequest, ReviewWriteRequest, SecurityIssueRequest,
+            SecurityIssueResult, SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind,
+            SubjectRequest, TimelinePage, TimelineRequest, UpdatePatchRequest, WorkStatus,
         },
         read::serialize,
         security::SecurityReporting,
@@ -40,6 +41,8 @@ use crate::{
 const QUEUE_TOOLS: [&str; 4] = ["add_job", "cancel", "note", "work_status"];
 // Tools which need commits that only the building half can make.
 const BUILDING_TOOLS: [&str; 2] = ["create_patch", "update_patch"];
+// Tool which only the talking half can use while handling authenticated chat.
+const TALKING_TOOLS: [&str; 1] = ["reply_chat"];
 // Tool which every member may always reach, whatever the manifest allows.
 const SECURITY_TOOL: &str = "report_security_issue";
 
@@ -48,7 +51,7 @@ impl Role {
     pub(super) fn allows(self, method: &str) -> bool {
         match self {
             Self::Talker => !BUILDING_TOOLS.contains(&method),
-            Self::Coder => !QUEUE_TOOLS.contains(&method),
+            Self::Coder => !QUEUE_TOOLS.contains(&method) && !TALKING_TOOLS.contains(&method),
         }
     }
 }
@@ -63,9 +66,22 @@ pub(crate) struct ToolService {
     security: SecurityReporting,
     role: Role,
     queue: WorkQueue,
+    chat: ChatState,
     pub(super) mutation_repository: Option<RepoId>,
     pub(super) mutation_work: Option<crate::agent::WorkId>,
     pub(super) mutation_invocations: Option<Arc<tokio::sync::Mutex<BTreeMap<String, usize>>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolState {
+    queue: WorkQueue,
+    chat: ChatState,
+}
+
+impl ToolState {
+    pub(crate) const fn new(queue: WorkQueue, chat: ChatState) -> Self {
+        Self { queue, chat }
+    }
 }
 
 #[tool_router(router = tool_router)]
@@ -100,8 +116,9 @@ impl ToolService {
         publisher: Publisher,
         allowlist: McpAllowlist,
         role: Role,
-        queue: WorkQueue,
+        state: ToolState,
     ) -> Self {
+        let ToolState { queue, chat } = state;
         let security = SecurityReporting::new(&publisher);
         let mut tool_router = Self::tool_router();
         for method in Self::registered_tools() {
@@ -118,6 +135,7 @@ impl ToolService {
             security,
             role,
             queue,
+            chat,
             mutation_repository: None,
             mutation_work: None,
             mutation_invocations: None,
@@ -159,7 +177,7 @@ impl ToolService {
     }
 
     /// Returns whether this server exposes `method` at all.
-    #[cfg(test)]
+    #[cfg(all(test, not(miri)))]
     pub(super) fn offers(&self, method: &str) -> bool {
         self.tool_router.has_route(method)
     }
@@ -545,6 +563,30 @@ impl ToolService {
             .merge_patch_write(request)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    #[tool(description = "Reply in the authenticated chat channel of the active message")]
+    async fn reply_chat(
+        &self,
+        Parameters(request): Parameters<ReplyChatRequest>,
+    ) -> Result<Json<ChatReplyRecord>, String> {
+        self.authorize("reply_chat").await?;
+        self.enqueue_chat_reply(request.text).await.map(Json)
+    }
+
+    pub(super) async fn enqueue_chat_reply(&self, text: String) -> Result<ChatReplyRecord, String> {
+        let active = self.scope.access_current().await?;
+        let context = active.context();
+        let (channel, message) = match (&context.source, context.work) {
+            (Source::Chat(channel), WorkId::Chat(message)) => (channel, message),
+            _ => return Err("reply_chat is available only for the active chat message".to_owned()),
+        };
+        let reply = self
+            .chat
+            .enqueue_reply(context.repository, channel, message, text)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(ChatReplyRecord { reply: reply.get() })
     }
 
     #[tool(

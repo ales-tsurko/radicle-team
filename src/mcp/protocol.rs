@@ -18,6 +18,16 @@ pub(super) const MAX_EMBED_BYTES: usize = 10_000_000;
 const MAX_EMBEDS: usize = 16;
 const MAX_ENCODED_EMBED_BYTES: usize = (MAX_EMBED_BYTES + 2 * MAX_EMBEDS).div_ceil(3) * 4;
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct ReplyChatRequest {
+    pub(super) text: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct ChatReplyRecord {
+    pub(super) reply: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(super) struct SubjectRequest {
     pub(super) kind: SubjectKind,

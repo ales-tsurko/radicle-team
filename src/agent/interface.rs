@@ -130,7 +130,7 @@ pub struct ChatContext {
 impl ChatContext {
     /// Constructs context from sender evidence which only chat authorization can produce.
     #[cfg_attr(
-        not(test),
+        any(not(test), miri),
         expect(
             dead_code,
             reason = "the authenticated IRC ingress will construct this context in PR 6"

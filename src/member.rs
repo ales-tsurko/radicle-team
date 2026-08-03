@@ -55,7 +55,14 @@ impl Member {
                 name: "Nico",
                 role: "Junior Developer",
                 tuning: ModelTuning::new(3, 5, 1, 4, 2),
-                mcp_allow: &["read", "comments", "patches", "reactions", "reviews"],
+                mcp_allow: &[
+                    "read",
+                    "chat",
+                    "comments",
+                    "patches",
+                    "reactions",
+                    "reviews",
+                ],
             },
             Self::Maya => Profile {
                 member: self,
@@ -64,6 +71,7 @@ impl Member {
                 tuning: ModelTuning::new(5, 3, 5, 4, 4),
                 mcp_allow: &[
                     "read",
+                    "chat",
                     "comments",
                     "issues",
                     "patches",
@@ -76,14 +84,14 @@ impl Member {
                 name: "Leon",
                 role: "Software Architect",
                 tuning: ModelTuning::new(5, 2, 5, 4, 5),
-                mcp_allow: &["read", "comments", "issues", "reactions", "reviews"],
+                mcp_allow: &["read", "chat", "comments", "issues", "reactions", "reviews"],
             },
             Self::Vera => Profile {
                 member: self,
                 name: "Vera",
                 role: "Security Engineer",
                 tuning: ModelTuning::new(5, 2, 5, 3, 5),
-                mcp_allow: &["read", "comments", "issues", "reactions", "reviews"],
+                mcp_allow: &["read", "chat", "comments", "issues", "reactions", "reviews"],
             },
             Self::Nora => Profile {
                 member: self,
@@ -92,6 +100,7 @@ impl Member {
                 tuning: ModelTuning::new(4, 4, 4, 5, 3),
                 mcp_allow: &[
                     "read",
+                    "chat",
                     "comments",
                     "issues",
                     "patches",
@@ -104,7 +113,7 @@ impl Member {
                 name: "Theo",
                 role: "Researcher",
                 tuning: ModelTuning::new(5, 1, 5, 4, 5),
-                mcp_allow: &["read", "comments", "issues", "reactions", "reviews"],
+                mcp_allow: &["read", "chat", "comments", "issues", "reactions", "reviews"],
             },
         }
     }
@@ -268,12 +277,20 @@ mod tests {
     fn provides_setup_mcp_defaults_as_profile_data() {
         assert_eq!(
             Member::Nico.profile().mcp_allow,
-            ["read", "comments", "patches", "reactions", "reviews"]
+            [
+                "read",
+                "chat",
+                "comments",
+                "patches",
+                "reactions",
+                "reviews"
+            ]
         );
         assert_eq!(
             Member::Maya.profile().mcp_allow,
             [
                 "read",
+                "chat",
                 "comments",
                 "issues",
                 "patches",

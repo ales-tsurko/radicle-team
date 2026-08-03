@@ -1,7 +1,7 @@
 //! Evidence that an IRC account passed the repository's attestation chain.
 
 #![cfg_attr(
-    not(test),
+    any(not(test), miri),
     expect(
         dead_code,
         reason = "manifest attestation validation will produce this evidence in PR 4"
@@ -24,7 +24,7 @@ impl AuthenticatedSender {
         self.did
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(miri)))]
     pub(crate) const fn for_test(did: Did) -> Self {
         Self { did }
     }

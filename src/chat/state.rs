@@ -1,11 +1,11 @@
 //! Persistent identities for received IRC messages.
 
 #![cfg_attr(
-    not(test),
+    any(not(test), miri),
     expect(dead_code, reason = "the IRC ingress will consume this API in PR 6")
 )]
 
-use std::path::Path;
+use std::{path::Path, str::FromStr as _};
 
 use radicle::identity::{Did, RepoId};
 use sqlite::State as SqliteState;
@@ -28,6 +28,20 @@ const SCHEMA: &str = "
         received INTEGER NOT NULL DEFAULT (unixepoch()),
         UNIQUE (repository, server, channel, irc_message)
     ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS chat_outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repository TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        in_reply_to INTEGER NOT NULL,
+        body TEXT NOT NULL CHECK (length(body) > 0),
+        sent INTEGER NOT NULL DEFAULT 0 CHECK (sent IN (0, 1)),
+        created INTEGER NOT NULL DEFAULT (unixepoch()),
+        sent_at INTEGER
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS chat_outbox_pending
+        ON chat_outbox (repository, id) WHERE sent = 0;
 ";
 
 /// Whether a message is live or replayed from server history.
@@ -47,6 +61,25 @@ pub(crate) enum MessageStatus {
     Pending(MessageId),
     /// Delivery already completed and must not run again.
     Handled(MessageId),
+}
+
+/// Durable local identifier for one queued chat reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct OutboxId(i64);
+
+impl OutboxId {
+    pub(crate) const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// One reply waiting to be sent by the IRC connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutboxMessage {
+    pub(crate) id: OutboxId,
+    pub(crate) channel: ChannelId,
+    pub(crate) in_reply_to: MessageId,
+    pub(crate) body: String,
 }
 
 impl MessageStatus {
@@ -70,6 +103,13 @@ impl State {
             tokio::fs::create_dir_all(parent).await?;
         }
         let database = Database::open(path).await?;
+        database.execute(SCHEMA).await?;
+        Ok(Self { database })
+    }
+
+    #[cfg(all(test, not(miri)))]
+    pub(crate) async fn memory() -> Result<Self, Error> {
+        let database = Database::memory().await?;
         database.execute(SCHEMA).await?;
         Ok(Self { database })
     }
@@ -156,6 +196,103 @@ impl State {
             Err(Error::MessageNotFound(message))
         }
     }
+
+    /// Queues a reply for the channel and durable inbound message in the active chat context.
+    pub(crate) async fn enqueue_reply(
+        &self,
+        repository: RepoId,
+        channel: &ChannelId,
+        in_reply_to: MessageId,
+        body: String,
+    ) -> Result<OutboxId, Error> {
+        if body.trim().is_empty() {
+            return Err(Error::EmptyReply);
+        }
+        let repository = repository.to_string();
+        let channel = channel.to_string();
+        let reply = self
+            .database
+            .call(move |connection| {
+                let mut insert = connection.prepare(
+                    "INSERT INTO chat_outbox (repository, channel, in_reply_to, body)
+                     SELECT ?1, ?2, ?3, ?4
+                     WHERE EXISTS (
+                         SELECT 1 FROM chat_messages
+                         WHERE id = ?3 AND repository = ?1 AND channel = ?2
+                     )
+                     RETURNING id",
+                )?;
+                insert.bind((1, repository.as_str()))?;
+                insert.bind((2, channel.as_str()))?;
+                insert.bind((3, in_reply_to.get()))?;
+                insert.bind((4, body.as_str()))?;
+                if insert.next()? == SqliteState::Row {
+                    outbox_id(insert.read::<i64, _>("id")?).map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
+            .await?;
+        reply.ok_or(Error::MessageContextMismatch(in_reply_to))
+    }
+
+    /// Returns unsent replies in creation order for one repository.
+    pub(crate) async fn pending_replies(
+        &self,
+        repository: RepoId,
+    ) -> Result<Vec<OutboxMessage>, Error> {
+        let repository = repository.to_string();
+        self.database
+            .call(move |connection| {
+                let mut select = connection.prepare(
+                    "SELECT id, channel, in_reply_to, body FROM chat_outbox
+                     WHERE repository = ?1 AND sent = 0 ORDER BY id ASC",
+                )?;
+                select.bind((1, repository.as_str()))?;
+                let mut replies = Vec::new();
+                while select.next()? == SqliteState::Row {
+                    let channel = select.read::<String, _>("channel")?;
+                    replies.push(OutboxMessage {
+                        id: outbox_id(select.read::<i64, _>("id")?)?,
+                        channel: ChannelId::from_str(&channel).map_err(|error| sqlite::Error {
+                            code: None,
+                            message: Some(error.to_string()),
+                        })?,
+                        in_reply_to: message_id(select.read::<i64, _>("in_reply_to")?)?,
+                        body: select.read::<String, _>("body")?,
+                    });
+                }
+                Ok(replies)
+            })
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Marks a queued reply sent after the IRC transport accepts it.
+    pub(crate) async fn mark_reply_sent(&self, reply: OutboxId) -> Result<(), Error> {
+        let updated = self
+            .database
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "UPDATE chat_outbox SET sent = 1, sent_at = unixepoch()
+                     WHERE id = ?1 RETURNING id",
+                )?;
+                statement.bind((1, reply.get()))?;
+                Ok(statement.next()? == SqliteState::Row)
+            })
+            .await?;
+        if updated {
+            Ok(())
+        } else {
+            Err(Error::OutboxMessageNotFound(reply))
+        }
+    }
+}
+
+impl std::fmt::Debug for State {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ChatState").finish_non_exhaustive()
+    }
 }
 
 fn message_id(value: i64) -> sqlite::Result<MessageId> {
@@ -163,6 +300,17 @@ fn message_id(value: i64) -> sqlite::Result<MessageId> {
         code: None,
         message: Some(error.to_string()),
     })
+}
+
+fn outbox_id(value: i64) -> sqlite::Result<OutboxId> {
+    if value > 0 {
+        Ok(OutboxId(value))
+    } else {
+        Err(sqlite::Error {
+            code: None,
+            message: Some(format!("invalid chat outbox database identifier {value}")),
+        })
+    }
 }
 
 /// Failure preparing or updating durable chat state.
@@ -180,11 +328,20 @@ pub(crate) enum Error {
     /// A message absent from durable state cannot be acknowledged.
     #[error("chat message {0} does not exist")]
     MessageNotFound(MessageId),
+    /// Empty messages cannot be sent to IRC.
+    #[error("chat reply must not be empty")]
+    EmptyReply,
+    /// The reply did not match a durable inbound message and its channel.
+    #[error("chat message {0} does not belong to the active repository and channel")]
+    MessageContextMismatch(MessageId),
+    /// An outbox message absent from durable state cannot be acknowledged.
+    #[error("chat outbox message {} does not exist", .0.get())]
+    OutboxMessageNotFound(OutboxId),
 }
 
 #[cfg(all(test, not(miri)))]
 mod tests {
-    use std::str::FromStr as _;
+    use std::{fs, path::Path, str::FromStr as _};
 
     use radicle::{crypto::PublicKey, identity::RepoId};
 
@@ -196,9 +353,15 @@ mod tests {
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
     const AUTHOR: &str = "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
 
+    fn directory() -> tempfile::TempDir {
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tests/chat");
+        fs::create_dir_all(&target).expect("chat test directory should be created");
+        tempfile::tempdir_in(target).expect("temporary chat directory should be created")
+    }
+
     #[tokio::test]
     async fn deduplicates_history_and_retries_only_unhandled_messages() {
-        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let root = directory();
         let state = State::open(&root.path().join("state.db"))
             .await
             .expect("chat state should open");
@@ -234,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn permits_unidentified_live_messages_but_not_unidentified_history() {
-        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let root = directory();
         let state = State::open(&root.path().join("state.db"))
             .await
             .expect("chat state should open");
@@ -279,5 +442,87 @@ mod tests {
             )
             .await
             .expect_err("history without a stable ID must not enter delivery");
+    }
+
+    #[tokio::test]
+    async fn persists_ordered_replies_for_the_active_message_until_sent() {
+        let root = directory();
+        let path = root.path().join("state.db");
+        let state = State::open(&path).await.expect("chat state should open");
+        let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
+        let channel = ChannelId::from_str("general").expect("channel should be valid");
+        let author = radicle::identity::Did::from(
+            PublicKey::from_str(AUTHOR).expect("author should be valid"),
+        );
+        let inbound = state
+            .record(
+                repository,
+                "team",
+                &channel,
+                Receipt::Live {
+                    message: Some("irc-1"),
+                },
+                "alice",
+                author,
+            )
+            .await
+            .expect("inbound message should be recorded")
+            .id();
+        state
+            .enqueue_reply(
+                repository,
+                &ChannelId::from_str("other").expect("channel should be valid"),
+                inbound,
+                "Wrong channel".to_owned(),
+            )
+            .await
+            .expect_err("a reply must match its durable inbound channel");
+        let first = state
+            .enqueue_reply(repository, &channel, inbound, "First".to_owned())
+            .await
+            .expect("first reply should be queued");
+        let second = state
+            .enqueue_reply(repository, &channel, inbound, "Second".to_owned())
+            .await
+            .expect("second reply should be queued");
+        drop(state);
+
+        let state = State::open(&path).await.expect("chat state should reopen");
+        let pending = state
+            .pending_replies(repository)
+            .await
+            .expect("outbox should be readable");
+        assert_eq!(
+            pending
+                .iter()
+                .map(|reply| {
+                    (
+                        reply.id,
+                        reply.channel.as_str(),
+                        reply.in_reply_to,
+                        reply.body.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                (first, "general", inbound, "First"),
+                (second, "general", inbound, "Second"),
+            ]
+        );
+
+        state
+            .mark_reply_sent(first)
+            .await
+            .expect("sent reply should be acknowledged");
+        assert_eq!(
+            state
+                .pending_replies(repository)
+                .await
+                .expect("outbox should remain readable")
+                .into_iter()
+                .map(|reply| reply.id)
+                .collect::<Vec<_>>(),
+            [second]
+        );
     }
 }

@@ -764,16 +764,16 @@ impl AgentRuntime {
         allowlist: manifest::McpAllowlist,
     ) -> Result<(Servers, WorkQueue), Error> {
         let publisher = Self::initialize_publisher(application, runtime).await?;
-        let queue = WorkQueue::open(
-            &runtime.home.state_database(),
-            application.repository,
-            application.member,
+        let (queue, chat_state) = Self::initialize_state(application, runtime).await?;
+        let servers = Self::start_mcp(
+            application,
+            runtime,
+            publisher,
+            allowlist,
+            &queue,
+            &chat_state,
         )
         .await?;
-        let _chat_state = chat::State::open(&runtime.home.state_database())
-            .await
-            .map_err(|error| Error::Chat(error.to_string()))?;
-        let servers = Self::start_mcp(application, runtime, publisher, allowlist, &queue).await?;
         if let Err(error) = Self::start_agents(application, runtime, &servers, talker, coder).await
         {
             Application::warn_agent_stop(talker.stop().await);
@@ -785,12 +785,29 @@ impl AgentRuntime {
         Ok((servers, queue))
     }
 
+    async fn initialize_state(
+        application: &Application,
+        runtime: &Runtime,
+    ) -> Result<(WorkQueue, chat::State), Error> {
+        let queue = WorkQueue::open(
+            &runtime.home.state_database(),
+            application.repository,
+            application.member,
+        )
+        .await?;
+        let chat_state = chat::State::open(&runtime.home.state_database())
+            .await
+            .map_err(|error| Error::Chat(error.to_string()))?;
+        Ok((queue, chat_state))
+    }
+
     async fn start_mcp(
         application: &Application,
         runtime: &Runtime,
         publisher: agent::Publisher,
         allowlist: manifest::McpAllowlist,
         queue: &WorkQueue,
+        chat: &chat::State,
     ) -> Result<Servers, Error> {
         let storage = runtime.identity.profile().storage.clone();
         let start = async |role| {
@@ -801,6 +818,7 @@ impl AgentRuntime {
                 allowlist.clone(),
                 role,
                 queue.clone(),
+                chat.clone(),
             )
             .await
             .map_err(|error| Error::Mcp(error.to_string()))
