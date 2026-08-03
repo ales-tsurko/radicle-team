@@ -427,7 +427,7 @@ async fn limits_tools_to_the_active_delivery_subject() {
             author: radicle::identity::Did::from(
                 PublicKey::from_str(AUTHOR).expect("author should be valid"),
             ),
-            workspace: "/tmp/delivery".into(),
+            workspace: Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-delivery"),
         })
         .await
         .expect("delivery should activate");
@@ -451,6 +451,36 @@ async fn limits_tools_to_the_active_delivery_subject() {
         .access_current()
         .await
         .expect_err("deactivated scope should reject access");
+}
+
+#[tokio::test]
+#[cfg(not(miri))]
+async fn authenticated_chat_can_address_the_active_repository() {
+    let scope = super::WorkScope::default();
+    let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
+    scope
+        .activate(crate::agent::ChatContext::authenticated(
+            repository,
+            "general".parse().expect("channel should be valid"),
+            crate::chat::MessageId::new(1).expect("message should be valid"),
+            crate::chat::AuthenticatedSender::for_test(radicle::identity::Did::from(
+                PublicKey::from_str(AUTHOR).expect("author should be valid"),
+            )),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-chat"),
+        ))
+        .await
+        .expect("chat message should activate");
+
+    for kind in [SubjectKind::Issue, SubjectKind::Patch] {
+        let access = scope
+            .access(&SubjectRequest {
+                kind,
+                subject: "1111111111111111111111111111111111111111".to_owned(),
+            })
+            .await
+            .expect("authenticated chat may address any repository subject");
+        assert_eq!(access.context().repository, repository);
+    }
 }
 
 #[cfg(not(miri))]
@@ -2586,7 +2616,7 @@ async fn carries_a_note_on_the_next_result_the_building_half_receives() {
             .expect("subject should be valid"),
     );
     let job = queue
-        .push("write it".to_owned(), issue, QueuePosition::End)
+        .push("write it".to_owned(), issue.into(), QueuePosition::End)
         .await
         .expect("job should be recorded");
     let taken = queue.next().await.expect("queue should be readable");

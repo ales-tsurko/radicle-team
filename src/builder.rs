@@ -58,16 +58,16 @@ impl Builder {
         job: Job,
     ) -> Result<(), Error> {
         let work = WorkId::Job(job.id);
-        let subject = job.source;
+        let source = job.source.clone();
         let workspace = workspaces
-            .prepare(work, subject)
+            .prepare(work, source.clone())
             .await
             .map_err(|error| Error::Workspace(error.to_string()))?;
         let path = workspace.path().to_path_buf();
         scope
             .activate(WorkContext {
                 repository: self.repository,
-                subject,
+                source: source.clone(),
                 work,
                 workspace: path.clone(),
             })
@@ -77,7 +77,7 @@ impl Builder {
             member = %self.member,
             repository = %self.repository,
             job = job.id,
-            %subject,
+            %source,
             workspace = %path.display(),
             "starting queued work"
         );
@@ -191,7 +191,8 @@ mod tests {
         let queue = WorkQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open");
-        let source = Subject::Issue(ObjectId::from_str(SUBJECT).expect("subject should parse"));
+        let source =
+            Subject::Issue(ObjectId::from_str(SUBJECT).expect("subject should parse")).into();
         let _id = queue
             .push("write it".to_owned(), source, QueuePosition::End)
             .await
@@ -200,7 +201,12 @@ mod tests {
         let coder = InterruptibleCoder::default();
 
         let (built, cancelled) = tokio::join!(
-            Builder::build(&coder, &queue, job.clone(), PathBuf::from("/tmp/workspace")),
+            Builder::build(
+                &coder,
+                &queue,
+                job.clone(),
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-workspace"),
+            ),
             queue.cancel(),
         );
 

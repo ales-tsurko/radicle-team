@@ -19,7 +19,7 @@ use std::{path::Path, str::FromStr as _, sync::Arc};
 use radicle::identity::RepoId;
 use sqlite::State;
 
-use crate::{database::Database, manifest::QueuePosition, member::Member, watcher::Subject};
+use crate::{agent::Source, database::Database, manifest::QueuePosition, member::Member};
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS work_queue (
@@ -45,7 +45,7 @@ pub struct Job {
     /// What to do, in enough detail to begin without rereading the discussion.
     pub brief: String,
     /// Place the request came from.
-    pub source: Subject,
+    pub source: Source,
     /// Where the job joined the queue.
     pub position: QueuePosition,
 }
@@ -116,7 +116,7 @@ impl WorkQueue {
     pub async fn push(
         &self,
         brief: String,
-        source: Subject,
+        source: Source,
         position: QueuePosition,
     ) -> Result<i64, Error> {
         let repository = self.repository.to_string();
@@ -313,7 +313,7 @@ fn read_job(statement: &sqlite::Statement<'_>) -> sqlite::Result<Job> {
     Ok(Job {
         id: statement.read::<i64, _>("id")?,
         brief: statement.read::<String, _>("brief")?,
-        source: Subject::from_str(&source).map_err(|error| sqlite::Error {
+        source: Source::from_str(&source).map_err(|error| sqlite::Error {
             code: None,
             message: Some(error.to_string()),
         })?,
@@ -361,8 +361,8 @@ mod tests {
     use radicle::{cob::ObjectId, identity::RepoId};
 
     use crate::{
-        database::Database, manifest::QueuePosition, member::Member, queue::WorkQueue,
-        watcher::Subject,
+        agent::Source, database::Database, manifest::QueuePosition, member::Member,
+        queue::WorkQueue, watcher::Subject,
     };
 
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
@@ -381,8 +381,8 @@ mod tests {
         )
     }
 
-    fn subject() -> Subject {
-        Subject::Issue(ObjectId::from_str(SUBJECT).expect("subject should parse"))
+    fn subject() -> Source {
+        Subject::Issue(ObjectId::from_str(SUBJECT).expect("subject should parse")).into()
     }
 
     #[tokio::test]

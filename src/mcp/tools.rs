@@ -556,7 +556,7 @@ impl ToolService {
         Parameters(request): Parameters<AddJobRequest>,
     ) -> Result<Json<JobRecord>, String> {
         let active = self.scope.access_current().await?;
-        let source = active.context().subject;
+        let source = active.context().source.clone();
         let position = request.position;
         let job = self
             .queue

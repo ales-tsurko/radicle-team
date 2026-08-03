@@ -81,6 +81,8 @@ pub mod agent;
 mod application;
 /// Queued work carried out by a member's building half.
 pub mod builder;
+/// IRC chat identities and durable delivery state.
+pub mod chat;
 /// Command-line interface for selecting and running a team member.
 pub mod cli;
 mod conversation;

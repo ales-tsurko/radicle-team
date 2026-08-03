@@ -683,7 +683,7 @@ impl PendingActivities {
         let position = assignment.position;
         let job = runtime
             .queue
-            .push(assignment.brief, subject, position)
+            .push(assignment.brief, subject.into(), position)
             .await?;
         tracing::info!(
             member = %scope.member,
@@ -1285,6 +1285,14 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        async fn messaged(
+            &mut self,
+            _context: crate::agent::ChatContext,
+            _message: crate::agent::ChatMessage,
+        ) -> Result<(), crate::agent::Error> {
+            Ok(())
         }
 
         async fn replied(

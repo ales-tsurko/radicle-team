@@ -117,7 +117,7 @@ impl Dispatcher {
         let subject = activity.subject;
         let workspace = self
             .workspaces
-            .prepare(identity.into(), subject)
+            .prepare(identity.into(), subject.into())
             .await
             .map_err(|error| Error::Workspace(error.to_string()))?;
         let path = workspace.path().to_path_buf();

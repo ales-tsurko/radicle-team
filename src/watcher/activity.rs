@@ -282,7 +282,7 @@ impl Change {
 
 #[cfg(all(test, not(miri)))]
 mod tests {
-    use std::str::FromStr as _;
+    use std::{path::Path, str::FromStr as _};
 
     use radicle::{
         cob::{EntryId, ObjectId},
@@ -329,6 +329,14 @@ mod tests {
             Ok(())
         }
 
+        async fn messaged(
+            &mut self,
+            _context: crate::agent::ChatContext,
+            _message: crate::agent::ChatMessage,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
         async fn replied(
             &mut self,
             context: Context,
@@ -354,7 +362,7 @@ mod tests {
                 action: 0,
             },
             author: Did::from_str(AUTHOR).expect("author should be valid"),
-            workspace: "/tmp/workspace".into(),
+            workspace: Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-workspace"),
         }
     }
 

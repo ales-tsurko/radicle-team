@@ -10,7 +10,10 @@ use radicle::{
     storage::{ReadRepository as _, ReadStorage as _, git::Storage},
 };
 
-use crate::{agent::WorkId, watcher::Subject};
+use crate::{
+    agent::{Source, WorkId},
+    watcher::Subject,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Workspaces {
@@ -36,18 +39,14 @@ impl Workspaces {
     }
 
     /// Checks out the canonical head for `work`, or the patch head when it addresses one.
-    pub(crate) async fn prepare(
-        &self,
-        work: WorkId,
-        subject: Subject,
-    ) -> Result<WorkingCopy, Error> {
+    pub(crate) async fn prepare(&self, work: WorkId, source: Source) -> Result<WorkingCopy, Error> {
         let manager = self.clone();
-        tokio::task::spawn_blocking(move || manager.prepare_blocking(work, subject))
+        tokio::task::spawn_blocking(move || manager.prepare_blocking(work, source))
             .await
             .map_err(|error| Error::Task(error.to_string()))?
     }
 
-    fn prepare_blocking(&self, work: WorkId, subject: Subject) -> Result<WorkingCopy, Error> {
+    fn prepare_blocking(&self, work: WorkId, source: Source) -> Result<WorkingCopy, Error> {
         fs::create_dir_all(&self.root)?;
         let path = self.root.join(work.directory());
         if path.exists() {
@@ -83,7 +82,7 @@ impl Workspaces {
         repository.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
         let push = Url::from(self.repository).with_namespace(self.remote);
         repository.remote_set_pushurl(&radicle::rad::REMOTE_NAME, Some(&push.to_string()))?;
-        if let Subject::Patch(id) = subject {
+        if let Source::Subject(Subject::Patch(id)) = source {
             let patch = Patches::open(&storage_repository, ReadOnly)?
                 .get(&id)?
                 .ok_or(Error::PatchNotFound(id))?;
@@ -221,11 +220,11 @@ mod tests {
         };
 
         let issue = workspaces
-            .prepare_blocking(delivery.into(), Subject::Issue(patch))
+            .prepare_blocking(delivery.into(), Subject::Issue(patch).into())
             .expect("issue workspace should prepare");
         fs::write(issue.path().join("marker"), "stale").expect("marker should be written");
         let refreshed = workspaces
-            .prepare_blocking(delivery.into(), Subject::Issue(patch))
+            .prepare_blocking(delivery.into(), Subject::Issue(patch).into())
             .expect("workspace should refresh");
         assert!(!refreshed.path().join("marker").exists());
         refreshed
@@ -240,7 +239,7 @@ mod tests {
                     action: 1,
                 }
                 .into(),
-                Subject::Patch(patch),
+                Subject::Patch(patch).into(),
             )
             .await
             .expect("patch workspace should prepare");

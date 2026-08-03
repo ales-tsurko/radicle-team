@@ -15,8 +15,11 @@ use radicle::{
 };
 
 use crate::{
-    agent::{self, Change, Coder, Comment, Context as AgentContext, Talker, Target},
-    builder, conversation,
+    agent::{
+        self, Change, ChatContext, ChatMessage, Coder, Comment, Context as AgentContext, Talker,
+        Target,
+    },
+    builder, chat, conversation,
     home::{self, MemberHome},
     identity::{self, GenerationStore, Manager, MemberLock, Provider},
     manifest::{self, Manifest},
@@ -573,6 +576,15 @@ impl Talker for LoggingAgent {
         Ok(())
     }
 
+    async fn messaged(
+        &mut self,
+        context: ChatContext,
+        message: ChatMessage,
+    ) -> Result<(), agent::Error> {
+        tracing::info!(?context, ?message, "chat message received");
+        Ok(())
+    }
+
     async fn replied(
         &mut self,
         context: AgentContext,
@@ -758,6 +770,9 @@ impl AgentRuntime {
             application.member,
         )
         .await?;
+        let _chat_state = chat::State::open(&runtime.home.state_database())
+            .await
+            .map_err(|error| Error::Chat(error.to_string()))?;
         let servers = Self::start_mcp(application, runtime, publisher, allowlist, &queue).await?;
         if let Err(error) = Self::start_agents(application, runtime, &servers, talker, coder).await
         {
@@ -1226,6 +1241,9 @@ pub enum Error {
     /// The conversation dispatcher stopped.
     #[error("conversation dispatcher error: {0}")]
     Conversation(String),
+    /// Preparing durable chat state failed.
+    #[error("chat state error: {0}")]
+    Chat(String),
     /// Opening the member work queue failed.
     #[error("work queue error: {0}")]
     Queue(#[from] crate::queue::Error),

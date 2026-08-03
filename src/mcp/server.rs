@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-    agent::{Context as AgentContext, McpEndpoint, Publisher, WorkId},
+    agent::{ChatContext, Context as AgentContext, McpEndpoint, Publisher, Source, WorkId},
     manifest::McpAllowlist,
     mcp::{
         protocol::{SubjectKind, SubjectRequest},
@@ -151,7 +151,7 @@ impl Drop for Server {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkContext {
     pub(crate) repository: RepoId,
-    pub(crate) subject: Subject,
+    pub(crate) source: Source,
     pub(crate) work: WorkId,
     pub(crate) workspace: PathBuf,
 }
@@ -160,14 +160,25 @@ impl From<AgentContext> for WorkContext {
     fn from(context: AgentContext) -> Self {
         Self {
             repository: context.repository,
-            subject: context.subject,
+            source: context.subject.into(),
             work: context.delivery.into(),
             workspace: context.workspace,
         }
     }
 }
 
-// Activates MCP access for exactly one delivery or job.
+impl From<ChatContext> for WorkContext {
+    fn from(context: ChatContext) -> Self {
+        Self {
+            repository: context.repository(),
+            source: Source::Chat(context.channel().clone()),
+            work: context.message().into(),
+            workspace: context.workspace().to_owned(),
+        }
+    }
+}
+
+// Activates MCP access for exactly one delivery, authenticated chat message, or job.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkScope {
     active: Arc<tokio::sync::RwLock<Option<Arc<ActiveWork>>>>,
@@ -210,11 +221,17 @@ impl WorkScope {
     pub(super) async fn access(&self, request: &SubjectRequest) -> Result<WorkAccess, String> {
         let access = self.access_current().await?;
         let context = access.context();
-        let matches = match (request.kind, context.subject) {
-            (SubjectKind::Issue, Subject::Issue(id)) | (SubjectKind::Patch, Subject::Patch(id)) => {
+        let matches = match &context.source {
+            // Chat senders are authenticated and mapped to a DID before ChatContext exists, so
+            // they may address any subject in this member's already-fixed repository.
+            Source::Chat(_) => true,
+            Source::Subject(Subject::Issue(id)) if request.kind == SubjectKind::Issue => {
                 request.subject == id.to_string()
             }
-            _ => false,
+            Source::Subject(Subject::Patch(id)) if request.kind == SubjectKind::Patch => {
+                request.subject == id.to_string()
+            }
+            Source::Subject(_) => false,
         };
         if !matches {
             return Err("subject is outside the active unit of work".to_owned());

@@ -1,6 +1,11 @@
 //! Agent callback interface and delivery value types.
 
-use std::{error::Error as StdError, fmt, path::PathBuf};
+use std::{
+    error::Error as StdError,
+    fmt,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use async_trait::async_trait;
 use radicle::{
@@ -10,6 +15,7 @@ use radicle::{
 use url::Url;
 
 use crate::{
+    chat::{AuthenticatedSender, ChannelId, MessageId as ChatMessageId},
     member::Profile,
     queue::Job,
     sandbox::AgentSandbox,
@@ -32,6 +38,9 @@ pub trait Talker: Send {
 
     /// Handles a mention in an issue or patch.
     async fn mentioned(&mut self, context: Context, target: Target) -> Result<(), Error>;
+
+    /// Handles an authenticated message which addresses this member in chat.
+    async fn messaged(&mut self, context: ChatContext, message: ChatMessage) -> Result<(), Error>;
 
     /// Handles a reply to one of the member's comments.
     async fn replied(
@@ -88,7 +97,7 @@ pub trait Coder: Send + Sync {
     }
 }
 
-/// Common context supplied to every agent method.
+/// Context supplied for one classified repository activity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Context {
     /// Repository containing the interaction.
@@ -102,6 +111,130 @@ pub struct Context {
     /// Fresh checkout prepared for this delivery.
     pub workspace: PathBuf,
 }
+
+/// Repository context supplied for one authenticated chat message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatContext {
+    /// Repository whose bound channel received the message.
+    repository: RepoId,
+    /// Logical manifest binding for the IRC channel.
+    channel: ChannelId,
+    /// Durable local message key.
+    message: ChatMessageId,
+    /// Radicle identity attested for the sender's authenticated IRC account.
+    author: Did,
+    /// Fresh checkout prepared for this message.
+    workspace: PathBuf,
+}
+
+impl ChatContext {
+    /// Constructs context from sender evidence which only chat authorization can produce.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the authenticated IRC ingress will construct this context in PR 6"
+        )
+    )]
+    pub(crate) fn authenticated(
+        repository: RepoId,
+        channel: ChannelId,
+        message: ChatMessageId,
+        sender: AuthenticatedSender,
+        workspace: PathBuf,
+    ) -> Self {
+        Self {
+            repository,
+            channel,
+            message,
+            author: sender.did(),
+            workspace,
+        }
+    }
+
+    /// Returns the repository bound to the authenticated channel.
+    #[must_use]
+    pub const fn repository(&self) -> RepoId {
+        self.repository
+    }
+
+    /// Returns the logical manifest channel binding.
+    #[must_use]
+    pub const fn channel(&self) -> &ChannelId {
+        &self.channel
+    }
+
+    /// Returns the durable message key.
+    #[must_use]
+    pub const fn message(&self) -> ChatMessageId {
+        self.message
+    }
+
+    /// Returns the DID attested for the authenticated IRC account.
+    #[must_use]
+    pub const fn author(&self) -> Did {
+        self.author
+    }
+
+    /// Returns the fresh checkout prepared for this message.
+    #[must_use]
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+}
+
+/// Authenticated chat message delivered to the talking adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    /// Sender's transient IRC nickname, for presentation only.
+    pub nick: String,
+    /// Message text.
+    pub body: String,
+}
+
+/// Place from which a unit of work originated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// Radicle issue or patch activity.
+    Subject(Subject),
+    /// Authenticated chat in a repository-bound channel.
+    Chat(ChannelId),
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Subject(subject) => subject.fmt(formatter),
+            Self::Chat(channel) => write!(formatter, "chat:{channel}"),
+        }
+    }
+}
+
+impl FromStr for Source {
+    type Err = InvalidSource;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Some(channel) = value.strip_prefix("chat:") {
+            return ChannelId::from_str(channel)
+                .map(Self::Chat)
+                .map_err(|_error| InvalidSource(value.to_owned()));
+        }
+        Subject::from_str(value)
+            .map(Self::Subject)
+            .map_err(|_error| InvalidSource(value.to_owned()))
+    }
+}
+
+impl From<Subject> for Source {
+    fn from(subject: Subject) -> Self {
+        Self::Subject(subject)
+    }
+}
+
+/// A stored work source could not be read back.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid work source '{0}'")]
+pub struct InvalidSource(String);
 
 /// Idempotency key for one classified action delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -120,14 +253,16 @@ impl fmt::Display for DeliveryId {
 
 /// One unit of work a member's repository writes belong to.
 ///
-/// The talker handles one classified delivery at a time and the coder one queued job, so the two
-/// run under separate scopes even though they publish under a single identity. Recovering an
-/// interrupted write means asking which scope it belonged to, which is why a job needs an identity
-/// the delivery key cannot express.
+/// The talker handles one classified delivery or chat message at a time and the coder one queued
+/// job, so the two run under separate scopes even though they publish under a single identity.
+/// Recovering an interrupted write means asking which scope it belonged to, which is why chat and
+/// jobs need identities the delivery key cannot express.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkId {
     /// One classified action delivered to the talker.
     Delivery(DeliveryId),
+    /// One authenticated chat message.
+    Chat(ChatMessageId),
     /// One queued job carried out by the coder.
     Job(i64),
 }
@@ -144,6 +279,7 @@ impl fmt::Display for WorkId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Delivery(delivery) => write!(formatter, "{delivery}"),
+            Self::Chat(message) => write!(formatter, "chat:{message}"),
             Self::Job(job) => write!(formatter, "job:{job}"),
         }
     }
@@ -152,6 +288,12 @@ impl fmt::Display for WorkId {
 impl From<DeliveryId> for WorkId {
     fn from(delivery: DeliveryId) -> Self {
         Self::Delivery(delivery)
+    }
+}
+
+impl From<ChatMessageId> for WorkId {
+    fn from(message: ChatMessageId) -> Self {
+        Self::Chat(message)
     }
 }
 
@@ -209,7 +351,11 @@ mod tests {
     use radicle::cob::EntryId;
     use url::Url;
 
-    use crate::agent::{DeliveryId, McpEndpoint, WorkId};
+    use crate::{
+        agent::{DeliveryId, McpEndpoint, Source, WorkId},
+        chat::MessageId,
+        watcher::Subject,
+    };
 
     #[test]
     fn work_directory_names_avoid_characters_a_path_cannot_hold() {
@@ -219,13 +365,31 @@ mod tests {
             action: 2,
         });
 
-        for work in [delivery, WorkId::Job(7)] {
+        for work in [
+            delivery,
+            WorkId::Chat(MessageId::new(3).expect("message should be valid")),
+            WorkId::Job(7),
+        ] {
             let directory = work.directory();
             assert!(
                 !directory.contains(':'),
                 "Windows rejects a colon in a path, so '{directory}' would fail there"
             );
             assert!(directory.contains(&work.to_string().replace(':', "-")));
+        }
+    }
+
+    #[test]
+    fn work_sources_round_trip_through_storage() {
+        let subject = Subject::Issue(
+            radicle::cob::ObjectId::from_str("1111111111111111111111111111111111111111")
+                .expect("subject should be valid"),
+        );
+        for source in [
+            Source::Subject(subject),
+            Source::Chat("general".parse().expect("channel should be valid")),
+        ] {
+            assert_eq!(source.to_string().parse::<Source>(), Ok(source));
         }
     }
 
