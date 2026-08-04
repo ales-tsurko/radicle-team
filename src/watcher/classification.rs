@@ -4,7 +4,7 @@
 //! replays them in operation order, tracks member involvement, and emits the
 //! first relevant signal for each action.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use radicle::{
     cob::{
@@ -16,65 +16,14 @@ use radicle::{
 };
 
 use crate::{
-    manifest::{Limits, TriggerAccess},
+    conversation::{Author, Triggers, Turn},
+    manifest::Limits,
     member::Member,
     watcher::{
         Change, Comment, Subject, Target,
         activity::{Activity, Delivery, Kind},
     },
 };
-
-/// Repository trigger policy resolved against the current delegate set.
-#[derive(Debug, Clone)]
-pub(super) struct Triggers {
-    access: TriggerAccess,
-    delegates: Vec<Did>,
-    members: Vec<Did>,
-}
-
-impl Triggers {
-    pub(super) const fn new(access: TriggerAccess, delegates: Vec<Did>, members: Vec<Did>) -> Self {
-        Self {
-            access,
-            delegates,
-            members,
-        }
-    }
-
-    /// Returns who `author` is to the member running this watcher.
-    ///
-    /// Members are always allowed to trigger, whatever `triggered_by` says: that setting keeps
-    /// outside identities from spending the operator's budget, and the repository's own members
-    /// are not outside identities. What one member may trigger in another is narrowed separately,
-    /// when the operation's signals are evaluated.
-    pub(super) fn author(&self, author: Did, member_id: NodeId) -> Author {
-        if author == Did::from(member_id) {
-            Author::Member
-        } else if self.members.contains(&author) {
-            Author::Peer
-        } else if self.access.allows(author, &self.delegates) {
-            Author::Person
-        } else {
-            Author::Stranger
-        }
-    }
-}
-
-/// Who an operation's author is to the member classifying it.
-///
-/// The four are exclusive, which the booleans they replace were not: an author cannot be both
-/// this member and another, and a member is never a stranger to itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Author {
-    /// The member itself.
-    Member,
-    /// Another member of the same team.
-    Peer,
-    /// Somebody outside the team who may put its members to work.
-    Person,
-    /// Somebody the repository does not let put members to work.
-    Stranger,
-}
 
 /// Stateful reducer which classifies normalized actions for one collaborative object.
 #[derive(Debug, Default)]
@@ -90,55 +39,8 @@ impl Context {
     // Starts a subject's history under the bounds its repository sets.
     pub(super) fn new(limits: Limits) -> Self {
         Self {
-            turn: Turn {
-                limits,
-                ..Turn::default()
-            },
+            turn: Turn::new(limits),
             ..Self::default()
-        }
-    }
-}
-
-// How far each of this member's conversations has run since a person last joined it.
-#[derive(Debug, Default)]
-struct Turn {
-    charged: Option<Did>,
-    exchanges: BTreeMap<Did, usize>,
-    limits: Limits,
-}
-
-impl Turn {
-    // Ends the turn in progress when this operation belongs to somebody else.
-    fn begin(&mut self, author: Did) {
-        if self.charged != Some(author) {
-            self.charged = None;
-        }
-    }
-
-    // Charges `author`'s turn for waking the member, and returns whether it still may.
-    fn admit(&mut self, author: Did, origin: Author) -> Result<(), &'static str> {
-        match origin {
-            Author::Stranger => {
-                return Err("its author may not trigger artificial contributors");
-            }
-            Author::Member | Author::Person => {
-                self.exchanges.clear();
-                return Ok(());
-            }
-            Author::Peer => {}
-        }
-        let spent = self.exchanges.entry(author).or_default();
-        if self.charged != Some(author) {
-            self.charged = Some(author);
-            *spent += 1;
-        }
-        if *spent <= self.limits.exchanges() {
-            Ok(())
-        } else {
-            Err(
-                "this conversation has run its allowed number of turns since a person last joined \
-                 it",
-            )
         }
     }
 }
@@ -167,7 +69,7 @@ impl Context {
         for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
     {
         let author = Did::from(operation.author);
-        let origin = triggers.author(author, member_id);
+        let origin = triggers.author(author, Did::from(member_id));
         if !self.seen {
             self.owned = origin == Author::Member;
             self.seen = true;
@@ -185,7 +87,7 @@ impl Context {
                         ?subject,
                         ?kind,
                         operation = %operation.id,
-                        reason,
+                        %reason,
                         "ignored relevant activity"
                     );
                     continue;
@@ -246,17 +148,9 @@ impl Context {
             return Relevance::Ignored;
         }
 
-        let addresses = |body: &str| {
-            if origin == Author::Peer {
-                member.is_named_in(body)
-            } else {
-                member.is_mentioned_in(body)
-            }
-        };
-
         for signal in action.signals {
             match signal {
-                Signal::Mention { body, target } if addresses(body) => {
+                Signal::Mention { body, target } if origin.addresses(member, body) => {
                     return Relevance::Relevant(Kind::Delivered(Delivery::Mentioned(target)));
                 }
                 Signal::Reply {

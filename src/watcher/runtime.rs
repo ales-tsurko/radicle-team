@@ -17,15 +17,14 @@ use radicle::{
 };
 
 use crate::{
-    agent, conversation,
+    agent,
+    conversation::{self, Triggers},
     manifest::{PriorityLabels, QueuePosition, RepositoryPolicy},
     member::Member,
     queue::WorkQueue,
     watcher::{
         activity::{Activity, Delivery, Kind, Subject},
-        classification::{
-            ActionEnvelope, Context as ClassificationContext, NormalizedAction, Triggers,
-        },
+        classification::{ActionEnvelope, Context as ClassificationContext, NormalizedAction},
         state::ProcessedActivities,
     },
 };

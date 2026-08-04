@@ -2462,6 +2462,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
+name = "irc-proto"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "259640031f2f3e6d9fa632c7b314ba1eb5d1f88b3583bd2dd2e8f17155a19b5b"
+dependencies = [
+ "bytes",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "iri-string"
 version = "0.7.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3538,22 +3550,28 @@ dependencies = [
  "config",
  "ctrlc",
  "directories",
+ "futures-util",
  "git2",
  "globset",
  "hyper",
  "hyper-util",
+ "irc-proto",
  "keyring",
  "radicle",
  "rand 0.9.5",
+ "rcgen",
  "rmcp",
  "rustix",
+ "rustls",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlite",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml_edit",
  "tracing",
@@ -3979,6 +3997,7 @@ checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
 dependencies = [
  "aws-lc-rs",
  "pem",
+ "ring",
  "rustls-pki-types",
  "time",
  "x509-parser",

@@ -995,9 +995,11 @@ mod tests {
         );
         let manifest = Fixture::parse(&body).expect("signed chat manifest should parse");
         let chat = manifest.chat().expect("chat should be configured");
+        let nico = "nico".parse::<IrcAccount>().expect("account should parse");
+        let maya = "maya".parse::<IrcAccount>().expect("account should parse");
 
         let sender = chat
-            .authenticate(repository, chat.server().pin(), "nico")
+            .authenticate(repository, chat.server().pin(), &nico)
             .expect("attested account should authenticate");
         assert_eq!(sender.did(), did);
         assert!(
@@ -1006,19 +1008,19 @@ mod tests {
                 OTHER_SERVER_PIN
                     .parse::<ServerPin>()
                     .expect("other server pin should parse"),
-                "nico",
+                &nico,
             )
             .is_err(),
             "another server must not authenticate the same account"
         );
         assert!(
-            chat.authenticate(repository, chat.server().pin(), "maya")
+            chat.authenticate(repository, chat.server().pin(), &maya)
                 .is_err(),
             "an unattested account must fail closed"
         );
         let another_repository = RepoId::from(Oid::from_sha1([1; 20]));
         assert!(
-            chat.authenticate(another_repository, chat.server().pin(), "nico")
+            chat.authenticate(another_repository, chat.server().pin(), &nico)
                 .is_err(),
             "an attestation must not cross repositories"
         );

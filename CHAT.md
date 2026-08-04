@@ -260,7 +260,13 @@ conversation runs at a time. The building adapter continues to run in parallel.
    `irc-proto::IrcCodec` preserves `account` and `msgid` tags over a
    caller-owned stream, leaving DNS, TCP, client certificates, and strict SPKI
    verification under this application's control.
-6. **Implement connection, classification, replay, and delivery.**
+6. **Implement live connection and classification.** Establish pinned TLS with
+   the attested client certificate, negotiate the required capabilities and
+   SASL `EXTERNAL`, join only bound channels, then authenticate and classify
+   channel messages without falling back to nicks.
+7. **Implement replay and delivery.** Rebuild conversation limits from stable
+   history, admit messages through durable state, dispatch them, and drain the
+   reply outbox.
 
 Repository-wide MCP scope is created only after the whole chain succeeds:
 message tag to attestation to DID to policy. If any link weakens, chat fails

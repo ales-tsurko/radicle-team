@@ -13,8 +13,10 @@ pub use crate::chat::config::{
 };
 
 mod auth;
+pub(crate) mod classification;
 mod config;
 mod state;
+pub(crate) mod transport;
 
 /// Logical repository-local channel identifier from the team manifest.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

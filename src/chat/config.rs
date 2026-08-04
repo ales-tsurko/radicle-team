@@ -109,7 +109,7 @@ impl Config {
         &self,
         repository: RepoId,
         server: ServerPin,
-        account: &str,
+        account: &IrcAccount,
     ) -> Result<AuthenticatedSender, AuthenticationError> {
         if repository != self.repository {
             return Err(AuthenticationError::Repository);
@@ -117,12 +117,9 @@ impl Config {
         if server != self.server.pin {
             return Err(AuthenticationError::Server);
         }
-        let account = account
-            .parse::<IrcAccount>()
-            .map_err(|_error| AuthenticationError::Account)?;
         self.participants
             .iter()
-            .find(|participant| participant.account == account)
+            .find(|participant| &participant.account == account)
             .map(|participant| AuthenticatedSender::new(participant.did))
             .ok_or(AuthenticationError::Account)
     }
@@ -158,19 +155,35 @@ impl Server {
 
 /// Canonical `ircs://host:port` endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ServerEndpoint(String);
+pub struct ServerEndpoint {
+    canonical: String,
+    host: String,
+    port: u16,
+}
 
 impl ServerEndpoint {
     /// Returns the canonical endpoint string.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.canonical
+    }
+
+    /// Returns the host without IPv6 URL brackets.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Returns the explicit TLS port.
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
     }
 }
 
 impl fmt::Display for ServerEndpoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        self.canonical.fmt(formatter)
     }
 }
 
@@ -191,20 +204,30 @@ impl FromStr for ServerEndpoint {
         let port = url
             .port()
             .ok_or_else(|| InvalidServerEndpoint(value.to_owned()))?;
-        let host = match url
+        let (host, url_host) = match url
             .host()
             .ok_or_else(|| InvalidServerEndpoint(value.to_owned()))?
         {
-            Host::Domain(host) => host.to_ascii_lowercase(),
-            Host::Ipv4(host) => host.to_string(),
-            Host::Ipv6(host) => format!("[{host}]"),
+            Host::Domain(host) => {
+                let host = host.to_ascii_lowercase();
+                (host.clone(), host)
+            }
+            Host::Ipv4(host) => {
+                let host = host.to_string();
+                (host.clone(), host)
+            }
+            Host::Ipv6(host) => (host.to_string(), format!("[{host}]")),
         };
-        let canonical = format!("ircs://{host}:{port}");
+        let canonical = format!("ircs://{url_host}:{port}");
         if value != canonical {
             return Err(InvalidServerEndpoint(value.to_owned()));
         }
 
-        Ok(Self(canonical))
+        Ok(Self {
+            canonical,
+            host,
+            port,
+        })
     }
 }
 
@@ -700,5 +723,12 @@ mod tests {
             .replace("cert-sha256:", "sha256:")
             .parse::<ClientCertificateFingerprint>()
             .expect_err("wrong fingerprint kind should be rejected");
+
+        let endpoint = "ircs://[::1]:6697"
+            .parse::<ServerEndpoint>()
+            .expect("IPv6 endpoint should parse");
+        assert_eq!(endpoint.as_str(), "ircs://[::1]:6697");
+        assert_eq!(endpoint.host(), "::1");
+        assert_eq!(endpoint.port(), 6697);
     }
 }

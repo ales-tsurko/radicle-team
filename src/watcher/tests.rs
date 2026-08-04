@@ -16,12 +16,13 @@ use radicle::{
 };
 
 use crate::{
+    conversation::Triggers,
     manifest::{Limits, TriggerAccess},
     member::Member,
     watcher::{
         Change, Comment, Subject,
         activity::{Activity, Delivery, Kind},
-        classification::{ActionEnvelope, Context, NormalizedAction, Triggers},
+        classification::{ActionEnvelope, Context, NormalizedAction},
     },
 };
 
