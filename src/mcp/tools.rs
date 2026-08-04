@@ -41,8 +41,8 @@ use crate::{
 const QUEUE_TOOLS: [&str; 4] = ["add_job", "cancel", "note", "work_status"];
 // Tools which need commits that only the building half can make.
 const BUILDING_TOOLS: [&str; 2] = ["create_patch", "update_patch"];
-// Tool which only the talking half can use while handling authenticated chat.
-const TALKING_TOOLS: [&str; 1] = ["reply_chat"];
+// Tool which only the chatting adapter can use, while handling an authenticated message.
+const CHAT_TOOLS: [&str; 1] = ["reply_chat"];
 // Tool which every member may always reach, whatever the manifest allows.
 const SECURITY_TOOL: &str = "report_security_issue";
 
@@ -50,8 +50,9 @@ impl Role {
     // Returns whether this half of a member can make any use of `method`.
     pub(super) fn allows(self, method: &str) -> bool {
         match self {
-            Self::Talker => !BUILDING_TOOLS.contains(&method),
-            Self::Coder => !QUEUE_TOOLS.contains(&method) && !TALKING_TOOLS.contains(&method),
+            Self::Talker => !BUILDING_TOOLS.contains(&method) && !CHAT_TOOLS.contains(&method),
+            Self::Chatter => !BUILDING_TOOLS.contains(&method),
+            Self::Coder => !QUEUE_TOOLS.contains(&method) && !CHAT_TOOLS.contains(&method),
         }
     }
 }
@@ -657,7 +658,7 @@ impl ToolService {
     pub(super) async fn pending_notes(&self) -> Vec<String> {
         match self.role {
             Role::Coder => self.queue.notes().await,
-            Role::Talker => Vec::new(),
+            Role::Talker | Role::Chatter => Vec::new(),
         }
     }
 }

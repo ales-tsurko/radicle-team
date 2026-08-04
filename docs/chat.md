@@ -16,6 +16,23 @@ IRC is in [the architecture notes](architecture.md#rejected-irc-alternatives).
 
 
 
+## What chat costs
+
+A member answering chat runs a third agent adapter beside the talking and
+building ones, with its own MCP server and its own checked-out workspace. When a
+message arrives while the member is reviewing a patch and building another, all
+three are live at once.
+
+That is the price of an answer arriving now. An agent turn cannot be
+interrupted, so a shared adapter would make every question wait for whatever
+review happened to start first.
+
+Omitting `[chat]` from the manifest costs nothing. The adapter is never started
+and the member runs two.
+
+
+
+
 ## Server requirements
 
 Three capabilities are required and one is optional.

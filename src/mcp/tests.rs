@@ -2664,42 +2664,56 @@ fn includes_merges_in_revision_history() {
 
 #[tokio::test]
 #[cfg(not(miri))]
-async fn each_half_offers_only_the_tools_its_side_can_use() {
+async fn each_adapter_offers_only_the_tools_its_side_can_use() {
     let fixture = RepositoryFixture::new();
     let queue = fixture.queue().await;
     let talker = fixture
         .service_for(super::Role::Talker, queue.clone())
+        .await;
+    let chatter = fixture
+        .service_for(super::Role::Chatter, queue.clone())
         .await;
     let coder = fixture.service_for(super::Role::Coder, queue).await;
 
     for tool in ["add_job", "cancel", "note", "work_status"] {
         assert!(
             talker.offers(tool),
-            "the talking half records work, so '{tool}' must reach it"
+            "the talking adapter records work, so '{tool}' must reach it"
+        );
+        assert!(
+            chatter.offers(tool),
+            "a request made in chat becomes queued work, so '{tool}' must reach it"
         );
         assert!(
             !coder.offers(tool),
-            "'{tool}' would let the building half hand itself work"
+            "'{tool}' would let the building adapter hand itself work"
         );
     }
     for tool in ["create_patch", "update_patch"] {
         assert!(
             coder.offers(tool),
-            "the building half makes the commits '{tool}' needs"
+            "the building adapter makes the commits '{tool}' needs"
         );
-        assert!(
-            !talker.offers(tool),
-            "the talking half has no commits to turn into a patch with '{tool}'"
-        );
+        for other in [&talker, &chatter] {
+            assert!(
+                !other.offers(tool),
+                "only the building adapter has commits to turn into a patch with '{tool}'"
+            );
+        }
     }
-    assert!(talker.offers("reply_chat"));
+    assert!(
+        chatter.offers("reply_chat"),
+        "the chatting adapter is the one holding an authenticated message to answer"
+    );
+    assert!(!talker.offers("reply_chat"));
     assert!(!coder.offers("reply_chat"));
     for tool in ["get_subject", "create_comment", "merge_patch"] {
-        assert!(talker.offers(tool));
-        assert!(
-            coder.offers(tool),
-            "'{tool}' belongs to whatever the manifest allows, not to one half"
-        );
+        for adapter in [&talker, &chatter, &coder] {
+            assert!(
+                adapter.offers(tool),
+                "'{tool}' belongs to whatever the manifest allows, not to one adapter"
+            );
+        }
     }
 }
 

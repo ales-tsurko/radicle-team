@@ -20,11 +20,16 @@ node, repository storage, delivery workspace, and durable state. The
 repository's reviewed `.radicle-team.toml` manifest binds that member to its DID
 and allowed tools.
 
-A member answers messages while it builds, which one conversation cannot do: a
-half-written patch has no safe point to pause at, so a question would wait
-behind a twenty-minute job. Each member therefore runs two adapters under one
+A member answers, chats, and builds at the same time, which one conversation
+cannot do. A half-written patch has no safe point to pause at, and an agent turn
+cannot be interrupted once it begins, so sharing one would put a question behind
+a twenty-minute job. Each member therefore runs three adapters under one
 identity, with one MCP server each. To everybody reading the repository it is
 one person.
+
+`Talker` answers repository activity, `Chatter` answers chat, and `Coder`
+carries out queued work. Only the adapters chat needs are started when the
+manifest has a `[chat]` section, so a repository without chat runs two.
 
 The runtime watches Radicle histories and converts relevant activity into typed
 agent events:
@@ -36,15 +41,19 @@ Radicle activity
     -> assignment
         -> the member's work queue
         -> the member's building adapter
+authenticated chat message
+    -> the member's chatting adapter
+        -> the member's work queue, when it decides work is needed
     -> work-scoped workspace and MCP tools
     -> signed Radicle comments, issues, patches, reviews, or reactions
 ```
 
 Agent integrations implement the provider-neutral
-[`Talker`](../src/agent/interface.rs) and [`Coder`](../src/agent/interface.rs)
-interfaces. The runtime calls `start` on each with the selected member's
-`Profile` and its own run-scoped MCP endpoint, then delivers typed activity to
-one and queued jobs to the other.
+[`Talker`](../src/agent/interface.rs), [`Chatter`](../src/agent/interface.rs),
+and [`Coder`](../src/agent/interface.rs) interfaces. The runtime calls `start`
+on each with the selected member's `Profile` and its own run-scoped MCP
+endpoint, then delivers typed activity to the first, authenticated messages to
+the second, and queued jobs to the third.
 
 Four MCP tools connect the two. The talking adapter records work with `add_job`,
 checks `work_status`, corrects a running job with `note`, and stops it with
@@ -67,9 +76,19 @@ The core does not depend on a particular model vendor or agent framework.
 
 ## How chat reaches a member
 
-Chat is a second ingress alongside the watcher. Both feed one dispatcher that
-owns the talking adapter, its workspace, and its MCP scope, so only one
-conversation runs at a time. The building adapter continues in parallel.
+Chat is a second ingress alongside the watcher, with its own dispatcher, its own
+adapter, and its own MCP scope. It does not share the talking adapter's queue.
+
+That separation is the whole point. An agent turn cannot be interrupted, so a
+member that had started a review would leave a person in a channel waiting for
+it to end. Prioritising chat within one queue only helps between turns, not
+during one.
+
+The cost is a third concurrent agent for this member whenever a message arrives.
+A repository whose manifest has no `[chat]` section never pays it.
+
+Each adapter serialises its own work, so a member is at most one repository
+delivery, one chat message, and one job at a time.
 
 Each member opens one outbound TLS connection to the team's IRC server and
 joins the channels bound to its repository. Members run on separate machines,

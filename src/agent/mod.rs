@@ -8,8 +8,8 @@
 
 pub use crate::{
     agent::interface::{
-        ChatContext, ChatMessage, Coder, Context, DeliveryId, Error, InvalidSource, McpEndpoint,
-        Source, Talker, WorkId,
+        ChatContext, ChatMessage, Chatter, Coder, Context, DeliveryId, Error, InvalidSource,
+        McpEndpoint, Source, Talker, WorkId,
     },
     sandbox::{AgentChild, AgentCommand, AgentSandbox},
     watcher::{Change, Comment, Subject, Target},

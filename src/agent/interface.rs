@@ -22,10 +22,11 @@ use crate::{
     watcher::{Change, Comment, Subject, Target},
 };
 
-/// A backend capable of answering activity addressed to one team member.
+/// A backend capable of answering repository activity addressed to one team member.
 ///
-/// Being assigned is the one thing this never sees: it is work rather than a message, so it joins
-/// the member's queue and reaches [`Coder`] instead.
+/// Two things this never sees. Being assigned is work rather than a message, so it joins the
+/// member's queue and reaches [`Coder`]. A chat message reaches [`Chatter`], because somebody is
+/// waiting on the other end of it and cannot wait behind a twenty-minute review.
 #[async_trait]
 pub trait Talker: Send {
     /// Configures and starts the adapter for one member and run-scoped MCP server.
@@ -39,9 +40,6 @@ pub trait Talker: Send {
     /// Handles a mention in an issue or patch.
     async fn mentioned(&mut self, context: Context, target: Target) -> Result<(), Error>;
 
-    /// Handles an authenticated message which addresses this member in chat.
-    async fn messaged(&mut self, context: ChatContext, message: ChatMessage) -> Result<(), Error>;
-
     /// Handles a reply to one of the member's comments.
     async fn replied(
         &mut self,
@@ -52,6 +50,34 @@ pub trait Talker: Send {
 
     /// Handles another relevant change to an owned or assigned issue or patch.
     async fn changed(&mut self, context: Context, change: Change) -> Result<(), Error>;
+
+    /// Stops the adapter and releases its resources.
+    async fn stop(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// A backend which answers authenticated chat addressed to one team member.
+///
+/// Chat runs as its own adapter rather than as another kind of message for [`Talker`] because the
+/// two have different latency to meet. A person typing in a channel expects an answer now, and an
+/// agent turn cannot be interrupted, so sharing one conversation would put every question behind
+/// whatever review happened to start first.
+///
+/// Deciding that chat should produce work belongs here. Carrying it out belongs to [`Coder`],
+/// reached through the member's queue.
+#[async_trait]
+pub trait Chatter: Send {
+    /// Configures and starts the adapter for one member and run-scoped MCP server.
+    async fn start(
+        &mut self,
+        profile: Profile,
+        mcp: &McpEndpoint,
+        sandbox: AgentSandbox,
+    ) -> Result<(), Error>;
+
+    /// Handles an authenticated message which addresses this member in a bound channel.
+    async fn messaged(&mut self, context: ChatContext, message: ChatMessage) -> Result<(), Error>;
 
     /// Stops the adapter and releases its resources.
     async fn stop(&mut self) -> Result<(), Error> {

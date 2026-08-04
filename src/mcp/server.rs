@@ -42,10 +42,11 @@ impl std::fmt::Debug for Server {
     }
 }
 
-// Which half of a member one MCP server serves.
+// Which adapter of a member one MCP server serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
     Talker,
+    Chatter,
     Coder,
 }
 

@@ -6,8 +6,7 @@ use radicle::identity::Did;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    agent::{self, ChatContext, ChatMessage, Source, Talker, WorkId},
-    chat::{MessageId as ChatMessageId, classification::IncomingMessage},
+    agent::{self, Source, Talker, WorkId},
     manifest::{Limits, TriggerAccess},
     mcp::WorkScope,
     member::Member,
@@ -136,7 +135,7 @@ pub(crate) enum AdmissionError {
     Limit,
 }
 
-/// Sends conversation work to the single dispatcher which owns the talking adapter.
+/// Sends repository activity to the single dispatcher which owns the talking adapter.
 #[derive(Debug, Clone)]
 pub(crate) struct Handle {
     sender: mpsc::Sender<Request>,
@@ -155,26 +154,6 @@ impl Handle {
             .send(Request::Deliver {
                 activity,
                 delivery,
-                completion,
-            })
-            .await
-            .map_err(|_error| Error::Unavailable)?;
-        completed.await.map_err(|_error| Error::Unavailable)?
-    }
-
-    /// Delivers one authenticated IRC message through the same serialized talking adapter.
-    pub(crate) async fn message(
-        &self,
-        repository: radicle::identity::RepoId,
-        identity: ChatMessageId,
-        message: IncomingMessage,
-    ) -> Result<Acknowledgement, Error> {
-        let (completion, completed) = oneshot::channel();
-        self.sender
-            .send(Request::Message {
-                repository,
-                identity,
-                message,
                 completion,
             })
             .await
@@ -218,12 +197,72 @@ impl Acknowledgement {
     }
 }
 
+/// The workspace and MCP scope one adapter works inside.
+///
+/// Each adapter runs its own agent under its own MCP server, so each needs its own checkout and
+/// its own active-work gate. Only the request types differ between them.
+#[derive(Debug)]
+pub(crate) struct Scoped {
+    pub(crate) member: Member,
+    workspaces: Workspaces,
+    pub(crate) scope: WorkScope,
+}
+
+impl Scoped {
+    pub(crate) const fn new(member: Member, workspaces: Workspaces, scope: WorkScope) -> Self {
+        Self {
+            member,
+            workspaces,
+            scope,
+        }
+    }
+
+    /// Checks out a working copy for `work` and reports its path.
+    pub(crate) async fn prepare(
+        &self,
+        work: WorkId,
+        source: Source,
+    ) -> Result<(WorkingCopy, std::path::PathBuf), Error> {
+        let workspace = self
+            .workspaces
+            .prepare(work, source)
+            .await
+            .map_err(|error| Error::Workspace(error.to_string()))?;
+        let path = workspace.path().to_path_buf();
+
+        Ok((workspace, path))
+    }
+
+    /// Closes the scope, removes the working copy, and recovers interrupted publications.
+    pub(crate) async fn finish(
+        &self,
+        work: WorkId,
+        workspace: WorkingCopy,
+        handled: Result<(), agent::Error>,
+    ) -> Result<Acknowledgement, Error> {
+        self.scope.deactivate().await;
+        let cleanup = workspace.cleanup().await.map_err(|error| error.to_string());
+        handled.inspect_err(|error| {
+            tracing::warn!(member = %self.member, %work, %error, "agent failed to handle conversation");
+        })?;
+        self.reconcile(work).await?;
+
+        Ok(Acknowledgement { cleanup })
+    }
+
+    /// Recovers publications belonging to `work`.
+    pub(crate) async fn reconcile(&self, work: WorkId) -> Result<(), Error> {
+        self.scope
+            .reconcile(work)
+            .await
+            .map_err(Error::PublicationRecovery)
+    }
+}
+
 /// Owns the talking adapter's workspace and MCP scope while serializing deliveries.
 #[derive(Debug)]
 pub(crate) struct Dispatcher {
-    member: Member,
-    workspaces: Workspaces,
-    scope: WorkScope,
+    scoped: Scoped,
     receiver: mpsc::Receiver<Request>,
 }
 
@@ -234,9 +273,7 @@ impl Dispatcher {
         (
             Handle { sender },
             Self {
-                member,
-                workspaces,
-                scope,
+                scoped: Scoped::new(member, workspaces, scope),
                 receiver,
             },
         )
@@ -254,19 +291,8 @@ impl Dispatcher {
                     let result = self.dispatch(activity, delivery, agent).await;
                     let _delivered = completion.send(result);
                 }
-                Request::Message {
-                    repository,
-                    identity,
-                    message,
-                    completion,
-                } => {
-                    let result = self
-                        .dispatch_message(repository, identity, message, agent)
-                        .await;
-                    let _delivered = completion.send(result);
-                }
                 Request::Reconcile { work, completion } => {
-                    let result = self.reconcile(work).await;
+                    let result = self.scoped.reconcile(work).await;
                     let _reconciled = completion.send(result);
                 }
             }
@@ -282,13 +308,14 @@ impl Dispatcher {
     ) -> Result<Acknowledgement, Error> {
         let identity = activity.delivery_id();
         let subject = activity.subject;
-        let (workspace, path) = self.prepare(identity.into(), subject.into()).await?;
-        self.scope
+        let (workspace, path) = self.scoped.prepare(identity.into(), subject.into()).await?;
+        self.scoped
+            .scope
             .activate(activity.context(path.clone()))
             .await
             .map_err(Error::WorkScope)?;
         tracing::info!(
-            member = %self.member,
+            member = %self.scoped.member,
             repository = %activity.repository,
             ?subject,
             operation = %identity.operation,
@@ -297,79 +324,9 @@ impl Dispatcher {
             "dispatching activity to the agent"
         );
         let handled = delivery.dispatch(activity.context(path), agent).await;
-        self.finish(identity.into(), workspace, handled).await
-    }
-
-    async fn dispatch_message(
-        &self,
-        repository: radicle::identity::RepoId,
-        identity: ChatMessageId,
-        message: IncomingMessage,
-        agent: &mut (impl Talker + ?Sized),
-    ) -> Result<Acknowledgement, Error> {
-        let source = Source::Chat(message.channel.clone());
-        let (workspace, path) = self.prepare(identity.into(), source).await?;
-        let context =
-            ChatContext::authenticated(repository, message.channel, identity, message.sender, path);
-        self.scope
-            .activate(context.clone())
+        self.scoped
+            .finish(identity.into(), workspace, handled)
             .await
-            .map_err(Error::WorkScope)?;
-        tracing::info!(
-            member = %self.member,
-            %repository,
-            channel = %context.channel(),
-            message = %identity,
-            "dispatching chat message to the agent"
-        );
-        let handled = agent
-            .messaged(
-                context,
-                ChatMessage {
-                    nick: message.nick,
-                    body: message.body,
-                },
-            )
-            .await;
-        self.finish(identity.into(), workspace, handled).await
-    }
-
-    async fn prepare(
-        &self,
-        work: WorkId,
-        source: Source,
-    ) -> Result<(WorkingCopy, std::path::PathBuf), Error> {
-        let workspace = self
-            .workspaces
-            .prepare(work, source)
-            .await
-            .map_err(|error| Error::Workspace(error.to_string()))?;
-        let path = workspace.path().to_path_buf();
-
-        Ok((workspace, path))
-    }
-
-    async fn finish(
-        &self,
-        work: WorkId,
-        workspace: WorkingCopy,
-        handled: Result<(), agent::Error>,
-    ) -> Result<Acknowledgement, Error> {
-        self.scope.deactivate().await;
-        let cleanup = workspace.cleanup().await.map_err(|error| error.to_string());
-        handled.inspect_err(|error| {
-            tracing::warn!(member = %self.member, %work, %error, "agent failed to handle conversation");
-        })?;
-        self.reconcile(work).await?;
-
-        Ok(Acknowledgement { cleanup })
-    }
-
-    async fn reconcile(&self, work: WorkId) -> Result<(), Error> {
-        self.scope
-            .reconcile(work)
-            .await
-            .map_err(Error::PublicationRecovery)
     }
 }
 
@@ -377,12 +334,6 @@ enum Request {
     Deliver {
         activity: Activity,
         delivery: Delivery,
-        completion: oneshot::Sender<Result<Acknowledgement, Error>>,
-    },
-    Message {
-        repository: radicle::identity::RepoId,
-        identity: ChatMessageId,
-        message: IncomingMessage,
         completion: oneshot::Sender<Result<Acknowledgement, Error>>,
     },
     Reconcile {

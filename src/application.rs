@@ -16,8 +16,8 @@ use radicle::{
 
 use crate::{
     agent::{
-        self, Change, ChatContext, ChatMessage, Coder, Comment, Context as AgentContext, Talker,
-        Target,
+        self, Change, ChatContext, ChatMessage, Chatter, Coder, Comment, Context as AgentContext,
+        Talker, Target,
     },
     builder, chat, conversation,
     home::{self, MemberHome},
@@ -203,14 +203,20 @@ impl Application {
     /// Returns an error if manifest, identity, repository, node, event stream, or local state
     /// validation fails.
     pub async fn run(&self) -> Result<(), Error> {
-        Box::pin(self.run_with_agents(&mut LoggingAgent, &mut LoggingAgent)).await
+        Box::pin(self.run_with_agents(&mut LoggingAgent, &mut LoggingAgent, &mut LoggingAgent))
+            .await
     }
 
-    /// Runs the team member with `talker` answering messages and `coder` carrying out queued work.
+    /// Runs the team member with `talker` answering repository activity, `chatter` answering
+    /// chat, and `coder` carrying out queued work.
     ///
-    /// The two adapters share one identity, one manifest binding, and one node, but not one train
-    /// of thought: a half-written patch has no safe point to pause at, so a question cannot wait
-    /// behind it.
+    /// The three adapters share one identity, one manifest binding, and one node, but not one
+    /// train of thought. A half-written patch has no safe point to pause at, and an agent turn
+    /// cannot be interrupted, so neither a queued job nor a review may hold up somebody waiting in
+    /// a channel.
+    ///
+    /// Enabling chat therefore costs a third concurrent agent for this member whenever a message
+    /// arrives, on top of the talking and building adapters.
     ///
     /// Linux executables must call
     /// [`sandbox::dispatch_linux_helper`](crate::sandbox::dispatch_linux_helper) as the first
@@ -222,6 +228,7 @@ impl Application {
     pub async fn run_with_agents(
         &self,
         talker: &mut (impl Talker + ?Sized),
+        chatter: &mut (impl Chatter + ?Sized),
         coder: &mut (impl Coder + ?Sized),
     ) -> Result<(), Error> {
         let (runtime, binding) = self.start_run().await?;
@@ -236,12 +243,13 @@ impl Application {
             self,
             runtime,
             talker,
+            chatter,
             coder,
             binding.mcp_allow().clone(),
             binding.policy().clone(),
         )
         .await?
-        .run(self, talker, coder)
+        .run(self, talker, chatter, coder)
         .await
     }
 
@@ -565,6 +573,28 @@ impl Application {
 struct LoggingAgent;
 
 #[async_trait::async_trait]
+impl Chatter for LoggingAgent {
+    async fn start(
+        &mut self,
+        profile: crate::member::Profile,
+        _mcp: &agent::McpEndpoint,
+        _sandbox: AgentSandbox,
+    ) -> Result<(), agent::Error> {
+        tracing::info!(member = profile.member.id(), "chatter adapter started");
+        Ok(())
+    }
+
+    async fn messaged(
+        &mut self,
+        context: ChatContext,
+        message: ChatMessage,
+    ) -> Result<(), agent::Error> {
+        tracing::info!(?context, ?message, "chat message received");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
 impl Talker for LoggingAgent {
     async fn start(
         &mut self,
@@ -590,15 +620,6 @@ impl Talker for LoggingAgent {
         target: Target,
     ) -> Result<(), agent::Error> {
         tracing::info!(?context, ?target, "mention received");
-        Ok(())
-    }
-
-    async fn messaged(
-        &mut self,
-        context: ChatContext,
-        message: ChatMessage,
-    ) -> Result<(), agent::Error> {
-        tracing::info!(?context, ?message, "chat message received");
         Ok(())
     }
 
@@ -741,14 +762,16 @@ struct AgentRuntime {
 #[derive(Debug)]
 struct Servers {
     talker: mcp::Server,
+    chatter: mcp::Server,
     coder: mcp::Server,
 }
 
 impl Servers {
     async fn stop(self) -> Result<(), mcp::Error> {
-        let (talker, coder) = tokio::join!(self.talker.stop(), self.coder.stop());
+        let (talker, chatter, coder) =
+            tokio::join!(self.talker.stop(), self.chatter.stop(), self.coder.stop());
 
-        talker.and(coder)
+        talker.and(chatter).and(coder)
     }
 }
 
@@ -757,11 +780,22 @@ impl AgentRuntime {
         application: &Application,
         runtime: Runtime,
         talker: &mut (impl Talker + ?Sized),
+        chatter: &mut (impl Chatter + ?Sized),
         coder: &mut (impl Coder + ?Sized),
         allowlist: manifest::McpAllowlist,
         policy: manifest::RepositoryPolicy,
     ) -> Result<Self, Error> {
-        match Self::initialize(application, &runtime, talker, coder, allowlist, &policy).await {
+        match Self::initialize(
+            application,
+            &runtime,
+            talker,
+            chatter,
+            coder,
+            allowlist,
+            &policy,
+        )
+        .await
+        {
             Ok((servers, queue, chat_state, chat_identity)) => Ok(Self {
                 runtime,
                 servers,
@@ -781,6 +815,7 @@ impl AgentRuntime {
         application: &Application,
         runtime: &Runtime,
         talker: &mut (impl Talker + ?Sized),
+        chatter: &mut (impl Chatter + ?Sized),
         coder: &mut (impl Coder + ?Sized),
         allowlist: manifest::McpAllowlist,
         policy: &manifest::RepositoryPolicy,
@@ -804,9 +839,11 @@ impl AgentRuntime {
             &chat_state,
         )
         .await?;
-        if let Err(error) = Self::start_agents(application, runtime, &servers, talker, coder).await
+        if let Err(error) =
+            Self::start_agents(application, runtime, &servers, talker, chatter, coder).await
         {
             Application::warn_agent_stop(talker.stop().await);
+            Application::warn_agent_stop(chatter.stop().await);
             Application::warn_agent_stop(coder.stop().await);
             Application::warn_mcp_stop(servers.stop().await);
             return Err(error);
@@ -888,10 +925,22 @@ impl AgentRuntime {
             .map_err(|error| Error::Mcp(error.to_string()))
         };
         let talker = start(mcp::Role::Talker).await?;
-        match start(mcp::Role::Coder).await {
-            Ok(coder) => Ok(Servers { talker, coder }),
+        let chatter = match start(mcp::Role::Chatter).await {
+            Ok(chatter) => chatter,
             Err(error) => {
                 Application::warn_mcp_stop(talker.stop().await);
+                return Err(error);
+            }
+        };
+        match start(mcp::Role::Coder).await {
+            Ok(coder) => Ok(Servers {
+                talker,
+                chatter,
+                coder,
+            }),
+            Err(error) => {
+                Application::warn_mcp_stop(talker.stop().await);
+                Application::warn_mcp_stop(chatter.stop().await);
                 Err(error)
             }
         }
@@ -902,15 +951,24 @@ impl AgentRuntime {
         runtime: &Runtime,
         servers: &Servers,
         talker: &mut (impl Talker + ?Sized),
+        chatter: &mut (impl Chatter + ?Sized),
         coder: &mut (impl Coder + ?Sized),
     ) -> Result<(), Error> {
         let talker_sandbox = AgentSandbox::load(&runtime.home, servers.talker.endpoint())?;
+        let chatter_sandbox = AgentSandbox::load(&runtime.home, servers.chatter.endpoint())?;
         let coder_sandbox = AgentSandbox::load(&runtime.home, servers.coder.endpoint())?;
         talker
             .start(
                 application.member.profile(),
                 servers.talker.endpoint(),
                 talker_sandbox,
+            )
+            .await?;
+        chatter
+            .start(
+                application.member.profile(),
+                servers.chatter.endpoint(),
+                chatter_sandbox,
             )
             .await?;
         coder
@@ -950,6 +1008,7 @@ impl AgentRuntime {
         self,
         application: &Application,
         talker: &mut (impl Talker + ?Sized),
+        chatter: &mut (impl Chatter + ?Sized),
         coder: &mut (impl Coder + ?Sized),
     ) -> Result<(), Error> {
         let profile = self.runtime.identity.profile().clone();
@@ -972,7 +1031,12 @@ impl AgentRuntime {
             workspaces.clone(),
             self.servers.talker.scope(),
         );
-        let chat = self.chat_ingress(application, conversations.clone());
+        let (messages, chat_dispatcher) = chat::dispatcher::Dispatcher::new(
+            application.member,
+            workspaces.clone(),
+            self.servers.chatter.scope(),
+        );
+        let chat = self.chat_ingress(application, messages);
         let watching = watcher.run(
             &profile,
             self.runtime.node.node(),
@@ -985,6 +1049,7 @@ impl AgentRuntime {
             ),
         );
         let dispatching = dispatcher.run(talker);
+        let messaging = chat_dispatcher.run(chatter);
         let building = builder.run(&*coder, &self.queue, &workspaces, &coder_scope);
         let chatting = async move {
             if let Some(ingress) = chat
@@ -998,12 +1063,15 @@ impl AgentRuntime {
             watched = watching => watched.map_err(Error::from),
             dispatched = dispatching => dispatched
                 .map_err(|error| Error::Conversation(error.to_string())),
+            messaged = messaging => messaged
+                .map_err(|error| Error::Conversation(error.to_string())),
             built = building => built.map_err(Error::from),
             never = chatting => match never {},
         };
         let interrupted = application.shutdown.is_requested();
         let cleanup = RunCleanup {
             talker: talker.stop().await,
+            chatter: chatter.stop().await,
             coder: coder.stop().await,
             mcp: self.servers.stop().await,
             node: self.runtime.stop(&application.shutdown).await,
@@ -1014,7 +1082,7 @@ impl AgentRuntime {
     fn chat_ingress(
         &self,
         application: &Application,
-        conversations: conversation::Handle,
+        messages: chat::dispatcher::Handle,
     ) -> Option<chat::runtime::Ingress> {
         let credentials = self.chat_identity.as_ref()?;
         let storage = self.runtime.identity.profile().storage.clone();
@@ -1027,7 +1095,7 @@ impl AgentRuntime {
             storage,
             credentials.identity(),
             self.chat_state.clone(),
-            conversations,
+            messages,
         ))
     }
 }
@@ -1075,6 +1143,7 @@ impl agent::Authorizer for WriteAuthorizer {
 
 struct RunCleanup {
     talker: Result<(), agent::Error>,
+    chatter: Result<(), agent::Error>,
     coder: Result<(), agent::Error>,
     mcp: Result<(), mcp::Error>,
     node: Result<(), node::Error>,
@@ -1105,7 +1174,7 @@ impl RunCleanup {
     }
 
     fn warn_agents_stopped(&self) {
-        for stopped in [&self.talker, &self.coder] {
+        for stopped in [&self.talker, &self.chatter, &self.coder] {
             if let Err(error) = stopped {
                 tracing::warn!(%error, "failed to stop agent after application error");
             }
@@ -1115,11 +1184,12 @@ impl RunCleanup {
     fn successful(self) -> Result<(), Error> {
         let Self {
             talker,
+            chatter,
             coder,
             mcp,
             node,
         } = self;
-        match talker.and(coder) {
+        match talker.and(chatter).and(coder) {
             Ok(()) => Self::after_agents(mcp, node),
             Err(error) => {
                 Application::warn_mcp_stop(mcp);

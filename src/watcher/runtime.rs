@@ -1286,14 +1286,6 @@ mod tests {
             }
         }
 
-        async fn messaged(
-            &mut self,
-            _context: crate::agent::ChatContext,
-            _message: crate::agent::ChatMessage,
-        ) -> Result<(), crate::agent::Error> {
-            Ok(())
-        }
-
         async fn replied(
             &mut self,
             _context: Context,

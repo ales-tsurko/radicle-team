@@ -16,6 +16,7 @@ use crate::{
     chat::{
         Config, MessageId, State,
         classification::{Classification, Classifier, IncomingMessage},
+        dispatcher,
         state::{MessageStatus, Receipt},
         transport::{ClientIdentity, Connection},
     },
@@ -30,7 +31,7 @@ const RECONNECT_STABLE: Duration = Duration::from_secs(30);
 
 /// Owns one member's IRC session and reconnects after transient network failures.
 #[derive(Debug)]
-pub(crate) struct Ingress<D = conversation::Handle> {
+pub(crate) struct Ingress<D = dispatcher::Handle> {
     repository: RepoId,
     member: Member,
     did: Did,
@@ -380,7 +381,7 @@ pub(crate) trait Delivery: std::fmt::Debug + Send + Sync {
 }
 
 #[async_trait]
-impl Delivery for conversation::Handle {
+impl Delivery for dispatcher::Handle {
     async fn deliver(
         &self,
         repository: RepoId,

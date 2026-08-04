@@ -7,17 +7,23 @@
 //! watcher state. `setup` provisions and validates those resources, and `run` keeps them alive
 //! while repository activity is observed.
 //!
-//! # Two halves of one member
+//! # Three adapters, one member
 //!
-//! A member answers messages while it builds, and one conversation cannot do both: a half-written
-//! patch has no safe point to pause at, so a question would wait behind a twenty-minute job. Each
-//! member therefore runs two adapters under one identity, one MCP server each. To everybody
-//! reading the repository it is one person.
+//! A member answers, chats, and builds at once, and one conversation cannot do all three. A
+//! half-written patch has no safe point to pause at, and an agent turn cannot be interrupted, so
+//! sharing one would put a question behind a twenty-minute job. Each member therefore runs three
+//! adapters under one identity, one MCP server each. To everybody reading the repository it is one
+//! person.
 //!
-//! [`agent::Talker`] answers. [`agent::Coder`] builds. Being assigned is the one thing that is not
-//! a message, so it becomes a job in the member's [`queue`] instead of reaching the conversation;
-//! the talking half can add jobs of its own, send a correction to the running one, or ask it to
-//! stop. [`builder::Builder`] takes jobs and drives the building half alongside the watcher.
+//! [`agent::Talker`] answers repository activity. [`agent::Chatter`] answers chat.
+//! [`agent::Coder`] builds. Being assigned is the one thing that is not a message, so it becomes a
+//! job in the member's [`queue`] instead of reaching a conversation. Talking and chatting can both
+//! add jobs of their own, send a correction to the running one, or ask it to stop.
+//! [`builder::Builder`] takes jobs and drives the building adapter alongside the other two.
+//!
+//! Chat is what makes the third adapter necessary rather than convenient, and it is the reason
+//! enabling chat costs a third concurrent agent whenever a message arrives. A member with no
+//! `[chat]` section in the manifest never starts one.
 //!
 //! The runtime pipeline is:
 //!
