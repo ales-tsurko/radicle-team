@@ -15,7 +15,12 @@
     )
 )]
 
-use std::{collections::BTreeSet, fmt, io, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    fmt, io,
+    sync::Arc,
+    time::Duration,
+};
 
 use base64::Engine as _;
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -45,11 +50,22 @@ use crate::{
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAXIMUM_LINE_BYTES: usize = 16 * 1024;
+const MAXIMUM_REPLY_BODY_BYTES: usize = 400;
+const HISTORY_LIMIT: usize = 1_000;
 
 /// Client certificate chain and private key used by SASL `EXTERNAL`.
 pub(crate) struct ClientIdentity {
     certificates: Vec<CertificateDer<'static>>,
     private_key: PrivateKeyDer<'static>,
+}
+
+impl Clone for ClientIdentity {
+    fn clone(&self) -> Self {
+        Self {
+            certificates: self.certificates.clone(),
+            private_key: self.private_key.clone_key(),
+        }
+    }
 }
 
 impl ClientIdentity {
@@ -112,6 +128,7 @@ pub(crate) struct Connection {
     server: VerifiedServer,
     channels: BTreeSet<IrcChannel>,
     history: bool,
+    pending: VecDeque<Message>,
 }
 
 impl Connection {
@@ -172,6 +189,7 @@ impl Connection {
             server: VerifiedServer(server.pin()),
             channels,
             history,
+            pending: VecDeque::new(),
         })
     }
 
@@ -185,8 +203,42 @@ impl Connection {
         self.history
     }
 
+    /// Requests the latest retained messages for one manifest-bound channel.
+    pub(crate) async fn history(&mut self, channel: &IrcChannel) -> Result<Vec<Message>, Error> {
+        if !self.history {
+            return Ok(Vec::new());
+        }
+        if !self.channels.contains(channel) {
+            return Err(Error::UnboundChannel(channel.clone()));
+        }
+        self.wire
+            .send(
+                Command::Raw(
+                    "CHATHISTORY".to_owned(),
+                    vec![
+                        "LATEST".to_owned(),
+                        channel.to_string(),
+                        "*".to_owned(),
+                        HISTORY_LIMIT.to_string(),
+                    ],
+                )
+                .into(),
+            )
+            .await?;
+        tokio::time::timeout(CONNECT_TIMEOUT, self.receive_history(channel))
+            .await
+            .map_err(|_elapsed| Error::Timeout)?
+    }
+
     /// Receives the next non-keepalive IRC message.
     pub(crate) async fn next(&mut self) -> Result<Message, Error> {
+        if let Some(message) = self.pending.pop_front() {
+            return Ok(message);
+        }
+        self.next_wire().await
+    }
+
+    async fn next_wire(&mut self) -> Result<Message, Error> {
         loop {
             let message = self.wire.next().await.ok_or(Error::Disconnected)??;
             match message.command {
@@ -204,18 +256,59 @@ impl Connection {
         }
     }
 
+    async fn receive_history(&mut self, channel: &IrcChannel) -> Result<Vec<Message>, Error> {
+        let mut batch = None;
+        let mut messages = Vec::new();
+        loop {
+            let message = self.next_wire().await?;
+            match &message.command {
+                Command::BATCH(reference, Some(kind), parameters)
+                    if reference.starts_with('+')
+                        && kind.to_str().eq_ignore_ascii_case("chathistory")
+                        && parameters
+                            .as_ref()
+                            .and_then(|parameters| parameters.first())
+                            .is_some_and(|target| target == channel.as_str()) =>
+                {
+                    batch = Some(reference.trim_start_matches('+').to_owned());
+                }
+                Command::BATCH(reference, _, _)
+                    if batch
+                        .as_deref()
+                        .is_some_and(|batch| reference.strip_prefix('-') == Some(batch)) =>
+                {
+                    return Ok(messages);
+                }
+                Command::Raw(command, parameters)
+                    if command.eq_ignore_ascii_case("FAIL")
+                        && parameters
+                            .first()
+                            .is_some_and(|command| command.eq_ignore_ascii_case("CHATHISTORY")) =>
+                {
+                    return Err(Error::History(parameters.join(" ")));
+                }
+                _ if batch
+                    .as_deref()
+                    .is_some_and(|batch| message_tag(&message, "batch") == Some(batch)) =>
+                {
+                    messages.push(message);
+                }
+                _ => self.pending.push_back(message),
+            }
+        }
+    }
+
     /// Sends a reply only to a channel joined from the manifest.
     pub(crate) async fn send(&mut self, channel: &IrcChannel, body: &str) -> Result<(), Error> {
         if !self.channels.contains(channel) {
             return Err(Error::UnboundChannel(channel.clone()));
         }
-        if body.is_empty() || body.contains('\r') || body.contains('\n') {
-            return Err(Error::InvalidMessageBody);
+        for part in reply_parts(body)? {
+            self.wire
+                .send(Command::PRIVMSG(channel.to_string(), part).into())
+                .await?;
         }
-        self.wire
-            .send(Command::PRIVMSG(channel.to_string(), body.to_owned()).into())
-            .await
-            .map_err(Error::from)
+        Ok(())
     }
 }
 
@@ -226,6 +319,7 @@ impl fmt::Debug for Connection {
             .field("server", &self.server)
             .field("channels", &self.channels)
             .field("history", &self.history)
+            .field("pending", &self.pending.len())
             .finish_non_exhaustive()
     }
 }
@@ -314,6 +408,22 @@ async fn register<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    begin_registration(wire, account, nickname).await?;
+    let history = negotiate_capabilities(wire).await?;
+    authenticate_external(wire, account).await?;
+    complete_registration(wire, channels).await?;
+
+    Ok(history)
+}
+
+async fn begin_registration<S>(
+    wire: &mut Framed<S, WireCodec>,
+    account: &IrcAccount,
+    nickname: &str,
+) -> Result<(), Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     wire.send(Command::CAP(None, CapSubCommand::LS, Some("302".to_owned()), None).into())
         .await?;
     wire.send(Command::NICK(nickname.to_owned()).into()).await?;
@@ -326,64 +436,156 @@ where
         .into(),
     )
     .await?;
+    Ok(())
+}
 
+async fn negotiate_capabilities<S>(wire: &mut Framed<S, WireCodec>) -> Result<bool, Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let offered = receive_capabilities(wire).await?;
-    for required in ["sasl", "account-tag"] {
-        if !offered.contains(required) {
-            return Err(Error::MissingCapability(required));
-        }
+    require_capabilities(&offered)?;
+    let mut identity = vec!["sasl", "account-tag"];
+    let message_tags = offered.contains("message-tags");
+    if message_tags {
+        identity.push("message-tags");
     }
-    request_capabilities(wire, &["sasl", "account-tag"], true).await?;
+    request_capabilities(wire, &identity, true).await?;
     let history = ["draft/chathistory", "chathistory"]
         .into_iter()
         .find(|capability| offered.contains(*capability))
-        .filter(|_capability| offered.contains("batch"));
+        .filter(|_capability| offered.contains("batch") && message_tags);
     let history = if let Some(history) = history {
         request_capabilities(wire, &[history, "batch"], false).await?
     } else {
         false
     };
+    Ok(history)
+}
 
-    wire.send(Command::AUTHENTICATE("EXTERNAL".to_owned()).into())
-        .await?;
-    loop {
-        let message = receive_registration_message(wire).await?;
-        match message.command {
-            Command::AUTHENTICATE(challenge) if challenge == "+" => break,
-            Command::Response(response, _) if is_sasl_failure(response) => {
-                return Err(Error::SaslAuthentication);
+fn reply_parts(body: &str) -> Result<Vec<String>, Error> {
+    let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
+    let mut parts = Vec::new();
+    for line in normalized.split('\n').filter(|line| !line.is_empty()) {
+        let mut part = String::new();
+        for character in line.chars() {
+            if !part.is_empty()
+                && part.len().saturating_add(character.len_utf8()) > MAXIMUM_REPLY_BODY_BYTES
+            {
+                parts.push(std::mem::take(&mut part));
             }
-            _ => {}
+            part.push(character);
+        }
+        if !part.is_empty() {
+            parts.push(part);
         }
     }
+    if parts.is_empty() {
+        Err(Error::InvalidMessageBody)
+    } else {
+        Ok(parts)
+    }
+}
+
+fn require_capabilities(offered: &BTreeSet<String>) -> Result<(), Error> {
+    for required in ["sasl", "account-tag"] {
+        if !offered.contains(required) {
+            return Err(Error::MissingCapability(required));
+        }
+    }
+    Ok(())
+}
+
+async fn authenticate_external<S>(
+    wire: &mut Framed<S, WireCodec>,
+    account: &IrcAccount,
+) -> Result<(), Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    wire.send(Command::AUTHENTICATE("EXTERNAL".to_owned()).into())
+        .await?;
+    receive_authentication(wire, SaslStep::Challenge).await?;
     let authorization_identity = base64::engine::general_purpose::STANDARD.encode(account.as_str());
     wire.send(Command::AUTHENTICATE(authorization_identity).into())
         .await?;
-    loop {
-        let message = receive_registration_message(wire).await?;
-        match message.command {
-            Command::Response(Response::RPL_SASLSUCCESS, _) => break,
-            Command::Response(response, _) if is_sasl_failure(response) => {
-                return Err(Error::SaslAuthentication);
+    receive_authentication(wire, SaslStep::Success).await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SaslStep {
+    Challenge,
+    Success,
+}
+
+impl SaslStep {
+    fn completed_by(self, command: &Command) -> bool {
+        match self {
+            Self::Challenge => {
+                matches!(command, Command::AUTHENTICATE(challenge) if challenge == "+")
             }
-            _ => {}
+            Self::Success => {
+                matches!(command, Command::Response(Response::RPL_SASLSUCCESS, _))
+            }
         }
     }
+}
 
+async fn receive_authentication<S>(
+    wire: &mut Framed<S, WireCodec>,
+    step: SaslStep,
+) -> Result<(), Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let message = receive_registration_message(wire).await?;
+        if step.completed_by(&message.command) {
+            return Ok(());
+        }
+        if matches!(message.command, Command::Response(response, _) if is_sasl_failure(response)) {
+            return Err(Error::SaslAuthentication);
+        }
+    }
+}
+
+async fn complete_registration<S>(
+    wire: &mut Framed<S, WireCodec>,
+    channels: &BTreeSet<IrcChannel>,
+) -> Result<(), Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     wire.send(Command::CAP(None, CapSubCommand::END, None, None).into())
         .await?;
+    receive_welcome(wire).await?;
+    join_channels(wire, channels).await
+}
+
+async fn receive_welcome<S>(wire: &mut Framed<S, WireCodec>) -> Result<(), Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
         let message = receive_registration_message(wire).await?;
         if matches!(message.command, Command::Response(Response::RPL_WELCOME, _)) {
-            break;
+            return Ok(());
         }
     }
+}
+
+async fn join_channels<S>(
+    wire: &mut Framed<S, WireCodec>,
+    channels: &BTreeSet<IrcChannel>,
+) -> Result<(), Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     for channel in channels {
         wire.send(Command::JOIN(channel.to_string(), None, None).into())
             .await?;
     }
-
-    Ok(history)
+    Ok(())
 }
 
 async fn request_capabilities<S>(
@@ -481,6 +683,15 @@ fn capability_names<'a>(
                 .split_once('=')
                 .map_or(capability, |(name, _value)| name)
         })
+}
+
+fn message_tag<'a>(message: &'a Message, name: &str) -> Option<&'a str> {
+    message
+        .tags
+        .iter()
+        .flatten()
+        .find(|tag| tag.0 == name)
+        .and_then(|tag| tag.1.as_deref())
 }
 
 const fn is_sasl_failure(response: Response) -> bool {
@@ -582,18 +793,35 @@ pub(crate) enum Error {
     /// The IRC stream ended.
     #[error("IRC server disconnected")]
     Disconnected,
+    /// The server rejected a negotiated history request.
+    #[error("IRC history request failed: {0}")]
+    History(String),
     /// An outbound target was not provided by the manifest.
     #[error("IRC channel {0} is not bound by the manifest")]
     UnboundChannel(IrcChannel),
-    /// Outbound messages must be nonempty single lines.
-    #[error("IRC message body must be a nonempty single line")]
+    /// Outbound messages must contain at least one nonempty line.
+    #[error("IRC message body must contain a nonempty line")]
     InvalidMessageBody,
+}
+
+impl Error {
+    /// Returns whether reconnecting can plausibly recover without changing trusted configuration.
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::Io(_)
+                | Self::Disconnected
+                | Self::Protocol(irc_proto::error::ProtocolError::Io(_))
+        )
+    }
 }
 
 #[cfg(all(test, not(miri)))]
 mod tests {
     use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
+    use async_trait::async_trait;
     use config::{Config as ConfigLoader, File, FileFormat};
     use futures_util::{SinkExt as _, StreamExt as _};
     use irc_proto::{Command, Message};
@@ -616,12 +844,16 @@ mod tests {
     use crate::{
         chat::{
             AttestationPayload, ClientCertificateFingerprint, Config, IrcAccount, IrcChannel,
-            Server, ServerEndpoint, ServerPin,
+            MessageId, Server, ServerEndpoint, ServerPin, State,
+            classification::IncomingMessage,
+            runtime::{Delivery, Ingress},
             transport::{
                 ClientIdentity, Connection, Error, PinnedServerVerifier, WireCodec, register,
                 tls_configuration,
             },
         },
+        conversation,
+        manifest::{Limits, PriorityLabels, RepositoryPolicy, TriggerAccess},
         member::Member,
     };
 
@@ -670,6 +902,18 @@ mod tests {
             did,
         );
         let signature: Signature = signer.sign(payload.canonical().as_bytes());
+        let alice = MemorySigner::r#gen();
+        let alice_did = Did::from(*radicle::crypto::Signer::public_key(&alice));
+        let alice_account = "alice".parse::<IrcAccount>().expect("account should parse");
+        let alice_certificate = ClientCertificateFingerprint::from_digest([9; 32]);
+        let alice_payload = AttestationPayload::new(
+            repository,
+            server.clone(),
+            alice_account.clone(),
+            alice_certificate,
+            alice_did,
+        );
+        let alice_signature: Signature = alice.sign(alice_payload.canonical().as_bytes());
         let document = format!(
             concat!(
                 "repository = \"{}\"\n",
@@ -683,6 +927,11 @@ mod tests {
                 "certificate = \"{}\"\n",
                 "did = \"{}\"\n",
                 "signature = \"{}\"\n",
+                "[[participants]]\n",
+                "account = \"{}\"\n",
+                "certificate = \"{}\"\n",
+                "did = \"{}\"\n",
+                "signature = \"{}\"\n",
             ),
             repository,
             server.endpoint(),
@@ -691,6 +940,10 @@ mod tests {
             certificate,
             did,
             signature,
+            alice_account,
+            alice_certificate,
+            alice_did,
+            alice_signature,
         );
         let config = ConfigLoader::builder()
             .add_source(File::from_str(&document, FileFormat::Toml))
@@ -702,6 +955,70 @@ mod tests {
             .expect("chat fixture should validate");
 
         (config, did)
+    }
+
+    struct ConnectionFixture {
+        listener: TcpListener,
+        server_tls: Arc<ServerConfig>,
+        config: Config,
+        did: Did,
+        identity: ClientIdentity,
+        project: IrcChannel,
+        channels: BTreeSet<IrcChannel>,
+    }
+
+    async fn connection_fixture() -> ConnectionFixture {
+        let (server_certificate, server_key, server_spki) = certificate();
+        let (client_certificate, client_key, _client_spki) = certificate();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut client_roots = RootCertStore::empty();
+        client_roots
+            .add(client_certificate.clone())
+            .expect("client certificate should be a trust anchor");
+        let client_verifier =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(client_roots), provider.clone())
+                .build()
+                .expect("client verifier should build");
+        let server_tls = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions should be supported")
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(
+                vec![server_certificate],
+                PrivatePkcs8KeyDer::from(server_key).into(),
+            )
+            .expect("server TLS should build");
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test IRC server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test IRC address should be available");
+        let server = Server::new(
+            format!("ircs://127.0.0.1:{}", address.port())
+                .parse::<ServerEndpoint>()
+                .expect("test endpoint should parse"),
+            ServerPin::from_digest(Sha256::digest(server_spki).into()),
+        );
+        let client_fingerprint = ClientCertificateFingerprint::from_digest(
+            Sha256::digest(client_certificate.as_ref()).into(),
+        );
+        let signer = MemorySigner::r#gen();
+        let (config, did) = chat_config(&server, &signer, client_fingerprint);
+        let project = "#project"
+            .parse::<IrcChannel>()
+            .expect("channel should parse");
+        let channels = [project.clone()].into_iter().collect::<BTreeSet<_>>();
+
+        ConnectionFixture {
+            listener,
+            server_tls: Arc::new(server_tls),
+            config,
+            did,
+            identity: identity(client_certificate, client_key),
+            project,
+            channels,
+        }
     }
 
     #[test]
@@ -765,86 +1082,79 @@ mod tests {
 
     #[tokio::test]
     async fn opens_pinned_tls_and_exchanges_only_bound_messages() {
-        let (server_certificate, server_key, server_spki) = certificate();
-        let (client_certificate, client_key, _client_spki) = certificate();
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let mut client_roots = RootCertStore::empty();
-        client_roots
-            .add(client_certificate.clone())
-            .expect("client certificate should be a trust anchor");
-        let client_verifier =
-            WebPkiClientVerifier::builder_with_provider(Arc::new(client_roots), provider.clone())
-                .build()
-                .expect("client verifier should build");
-        let server_tls = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("protocol versions should be supported")
-            .with_client_cert_verifier(client_verifier)
-            .with_single_cert(
-                vec![server_certificate],
-                PrivatePkcs8KeyDer::from(server_key).into(),
-            )
-            .expect("server TLS should build");
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("test IRC server should bind");
-        let address = listener
-            .local_addr()
-            .expect("test IRC address should be available");
-        let server = Server::new(
-            format!("ircs://127.0.0.1:{}", address.port())
-                .parse::<ServerEndpoint>()
-                .expect("test endpoint should parse"),
-            ServerPin::from_digest(Sha256::digest(server_spki).into()),
-        );
-        let client_fingerprint = ClientCertificateFingerprint::from_digest(
-            Sha256::digest(client_certificate.as_ref()).into(),
-        );
-        let signer = MemorySigner::r#gen();
-        let (config, did) = chat_config(&server, &signer, client_fingerprint);
-        let project = "#project"
-            .parse::<IrcChannel>()
-            .expect("channel should parse");
-        let channels = [project.clone()].into_iter().collect::<BTreeSet<_>>();
+        let ConnectionFixture {
+            listener,
+            server_tls,
+            config,
+            did,
+            identity,
+            project,
+            channels,
+        } = connection_fixture().await;
 
         let serving = async move {
             let (tcp, _peer) = listener.accept().await.expect("client should connect");
-            let tls = TlsAcceptor::from(Arc::new(server_tls))
+            let tls = TlsAcceptor::from(server_tls)
                 .accept(tcp)
                 .await
                 .expect("client certificate should authenticate");
             let mut wire = Framed::new(tls, WireCodec::new().expect("codec should initialize"));
-            serve_registration(&mut wire, &channels, false).await;
+            serve_registration(&mut wire, &channels, true).await;
+            let history = receive(&mut wire).await;
+            assert!(matches!(
+                history.command,
+                Command::Raw(ref command, ref parameters)
+                    if command == "CHATHISTORY"
+                        && parameters == &["LATEST", "#project", "*", "1000"]
+            ));
+            send(
+                &mut wire,
+                "@account=alice;msgid=live-1 :alice!u@h PRIVMSG #project :@nico live",
+            )
+            .await;
+            send(&mut wire, ":server BATCH +history chathistory #project").await;
+            send(
+                &mut wire,
+                "@batch=history;account=alice;msgid=old-1 :alice!u@h PRIVMSG #project :@nico old",
+            )
+            .await;
             send(&mut wire, "PING :live").await;
             assert!(
                 matches!(receive(&mut wire).await.command, Command::PONG(ref value, None) if value == "live")
             );
-            send(
-                &mut wire,
-                "@account=alice;msgid=live-1 :alice!u@h PRIVMSG #project :@nico hello",
-            )
-            .await;
+            send(&mut wire, ":server BATCH -history").await;
             assert!(matches!(
                 receive(&mut wire).await.command,
                 Command::PRIVMSG(ref channel, ref body)
                     if channel == "#project" && body == "reply"
             ));
+            for expected in ["first", "second"] {
+                assert!(matches!(
+                    receive(&mut wire).await.command,
+                    Command::PRIVMSG(ref channel, ref body)
+                        if channel == "#project" && body == expected
+                ));
+            }
             send(&mut wire, ":server CAP nico DEL :account-tag").await;
         };
         let connecting = async move {
-            let mut connection = Connection::connect(
-                &config,
-                Member::Nico,
-                did,
-                identity(client_certificate, client_key),
-            )
-            .await
-            .expect("pinned IRC connection should open");
-            assert!(!connection.has_history());
+            let mut connection = Connection::connect(&config, Member::Nico, did, identity)
+                .await
+                .expect("pinned IRC connection should open");
+            assert!(connection.has_history());
+            let history = connection
+                .history(&project)
+                .await
+                .expect("history should replay");
+            assert!(matches!(
+                history.as_slice(),
+                [Message { command: Command::PRIVMSG(channel, body), .. }]
+                    if channel == "#project" && body == "@nico old"
+            ));
             assert!(matches!(
                 connection.next().await.expect("message should arrive").command,
                 Command::PRIVMSG(ref channel, ref body)
-                    if channel == "#project" && body == "@nico hello"
+                    if channel == "#project" && body == "@nico live"
             ));
             connection
                 .send(&project, "reply")
@@ -862,7 +1172,7 @@ mod tests {
             connection
                 .send(&project, "first\nsecond")
                 .await
-                .expect_err("multiline message must be rejected");
+                .expect("multiline reply should be split into IRC messages");
             assert!(matches!(
                 connection.next().await,
                 Err(Error::RequiredCapabilityLost("account-tag"))
@@ -870,6 +1180,109 @@ mod tests {
         };
 
         let ((), ()) = tokio::join!(serving, connecting);
+    }
+
+    #[derive(Debug)]
+    struct ReplyingDelivery {
+        repository: RepoId,
+        state: State,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl Delivery for ReplyingDelivery {
+        async fn deliver(
+            &self,
+            repository: RepoId,
+            identity: MessageId,
+            message: IncomingMessage,
+        ) -> Result<conversation::Acknowledgement, String> {
+            if repository != self.repository {
+                return Err("delivery reached another repository".to_owned());
+            }
+            tokio::time::sleep(self.delay).await;
+            self.state
+                .enqueue_reply(repository, &message.channel, identity, "reply".to_owned())
+                .await
+                .map(|_reply| conversation::Acknowledgement::completed())
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnects_after_a_transient_disconnect() {
+        let ConnectionFixture {
+            listener,
+            server_tls,
+            config,
+            did,
+            identity,
+            channels,
+            ..
+        } = connection_fixture().await;
+        let repository = REPOSITORY.parse::<RepoId>().expect("RID should parse");
+        let policy = RepositoryPolicy::new(
+            TriggerAccess::Anyone,
+            vec![did],
+            PriorityLabels::default(),
+            Limits::default(),
+        )
+        .with_chat_for_test(config);
+        let state = State::memory().await.expect("chat state should open");
+        let ingress = Ingress::for_test(
+            repository,
+            Member::Nico,
+            did,
+            policy,
+            vec![did],
+            identity,
+            state.clone(),
+            ReplyingDelivery {
+                repository,
+                state,
+                delay: Duration::from_millis(100),
+            },
+        );
+
+        let serving = async move {
+            for attempt in 0..2 {
+                let (tcp, _peer) = listener.accept().await.expect("client should connect");
+                let tls = TlsAcceptor::from(server_tls.clone())
+                    .accept(tcp)
+                    .await
+                    .expect("client certificate should authenticate");
+                let mut wire = Framed::new(tls, WireCodec::new().expect("codec should initialize"));
+                serve_registration(&mut wire, &channels, false).await;
+                if attempt == 1 {
+                    send(
+                        &mut wire,
+                        "@account=alice;msgid=reconnected-1 :alice!u@h PRIVMSG #project :@nico \
+                         hello",
+                    )
+                    .await;
+                    send(&mut wire, "PING :during-delivery").await;
+                    assert!(matches!(
+                        receive(&mut wire).await.command,
+                        Command::PONG(ref server, None) if server == "during-delivery"
+                    ));
+                    assert!(matches!(
+                        receive(&mut wire).await.command,
+                        Command::PRIVMSG(ref channel, ref body)
+                            if channel == "#project" && body == "reply"
+                    ));
+                    send(&mut wire, ":server CAP nico DEL :account-tag").await;
+                }
+            }
+        };
+        let reconnecting = ingress.run();
+        let ((), result) = tokio::join!(serving, reconnecting);
+
+        assert!(matches!(
+            result,
+            Err(crate::chat::runtime::Error::Transport(
+                Error::RequiredCapabilityLost("account-tag")
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -928,6 +1341,19 @@ mod tests {
             .expect_err("unbounded IRC input must be rejected");
     }
 
+    #[test]
+    fn splits_large_unicode_replies_below_the_wire_limit() {
+        let body = "é".repeat(10_000);
+        let parts = super::reply_parts(&body).expect("large reply should split");
+
+        assert!(
+            parts
+                .iter()
+                .all(|part| !part.is_empty() && part.len() <= super::MAXIMUM_REPLY_BODY_BYTES)
+        );
+        assert_eq!(parts.concat(), body);
+    }
+
     async fn serve_registration<S>(
         wire: &mut Framed<S, WireCodec>,
         expected_channels: &BTreeSet<IrcChannel>,
@@ -943,7 +1369,7 @@ mod tests {
             matches!(receive(wire).await.command, Command::PONG(ref value, None) if value == "registration")
         );
         let capabilities = if history {
-            ":server CAP * LS :sasl=EXTERNAL account-tag batch draft/chathistory"
+            ":server CAP * LS :sasl=EXTERNAL account-tag message-tags batch draft/chathistory"
         } else {
             ":server CAP * LS :sasl=EXTERNAL account-tag"
         };
@@ -958,8 +1384,14 @@ mod tests {
                 .collect::<BTreeSet<_>>();
             assert!(capabilities.contains("sasl"));
             assert!(capabilities.contains("account-tag"));
+            assert_eq!(capabilities.contains("message-tags"), history);
         }
-        send(wire, ":server CAP * ACK :sasl account-tag").await;
+        let acknowledgement = if history {
+            ":server CAP * ACK :sasl account-tag message-tags"
+        } else {
+            ":server CAP * ACK :sasl account-tag"
+        };
+        send(wire, acknowledgement).await;
         if history {
             let history_request = receive(wire).await;
             if let Command::CAP(_, _, parameter, trailing) = history_request.command {

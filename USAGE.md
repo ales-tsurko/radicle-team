@@ -259,7 +259,7 @@ like a member that is simply not responding.
 Setup creates an administrator-owned sandbox configuration for each member:
 
 ```text
-~/.radicle-team/members/<member>/sandbox.toml
+~/.radicle-team/repositories/<canonical-RID>/members/<member>/sandbox.toml
 ```
 
 The interactive wizard optionally adds readable, writable, and denied filesystem
@@ -569,10 +569,12 @@ radicle-team run maya --repo rad:...
 Their identities, nodes, storage, and state are isolated below:
 
 ```text
-~/.radicle-team/members/<member>/
+~/.radicle-team/repositories/<canonical-RID>/members/<member>/
 ```
 
-Two processes cannot use the same member home concurrently.
+Two processes cannot use the same repository-member home concurrently. The
+same named member can run for different repositories without sharing identity
+or state.
 
 
 
@@ -584,7 +586,7 @@ passphrases live in the operating-system credential store, never in the
 manifest. Node output is written to:
 
 ```text
-~/.radicle-team/members/<member>/node.log
+~/.radicle-team/repositories/<canonical-RID>/members/<member>/node.log
 ```
 
 Managed Radicle commands ignore an inherited `RAD_SOCKET`. Each member always

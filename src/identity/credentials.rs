@@ -122,14 +122,19 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
+    use radicle::identity::RepoId;
+
     use crate::{home::MemberHome, identity::CredentialId, member::Member};
+
+    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 
     #[test]
     fn credential_id_is_scoped_to_member_and_home() {
-        let home = MemberHome::at("/team", Member::Nico);
+        let repository = RepoId::from_urn(REPOSITORY).expect("repository should parse");
+        let home = MemberHome::at("/team", repository, Member::Nico);
         let id = CredentialId::new(Member::Nico, &home.radicle());
         let other_member = CredentialId::new(Member::Maya, &home.radicle());
-        let other_home = MemberHome::at("/other-team", Member::Nico);
+        let other_home = MemberHome::at("/other-team", repository, Member::Nico);
         let other_home = CredentialId::new(Member::Nico, &other_home.radicle());
 
         assert!(id.account().contains("nico"));

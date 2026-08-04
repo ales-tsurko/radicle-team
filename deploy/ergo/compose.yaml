@@ -1,0 +1,22 @@
+services:
+  ergo:
+    image: ghcr.io/ergochat/ergo:v2.19.0
+    init: true
+    restart: unless-stopped
+    ports:
+      - "6697:6697/tcp"
+    volumes:
+      - ergo-data:/ircd
+    environment:
+      ERGO__NETWORK__NAME: "${ERGO_NETWORK_NAME:-RadicleTeam}"
+      ERGO__SERVER__NAME: "${ERGO_SERVER_NAME:-irc.example.com}"
+      ERGO__ACCOUNTS__REGISTRATION__ENABLED: "false"
+      ERGO__ACCOUNTS__REQUIRE_SASL__ENABLED: "true"
+      ERGO__ACCOUNTS__REQUIRE_SASL__EXEMPTED: '${ERGO_SASL_EXEMPTED:-["localhost"]}'
+      ERGO__DATASTORE__SQLITE__ENABLED: "true"
+      ERGO__HISTORY__PERSISTENT__ENABLED: "true"
+      ERGO__HISTORY__PERSISTENT__REGISTERED_CHANNELS: "mandatory"
+      ERGO__HISTORY__RESTRICTIONS__EXPIRE_TIME: "${ERGO_HISTORY_RETENTION:-168h}"
+
+volumes:
+  ergo-data:

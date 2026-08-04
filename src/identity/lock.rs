@@ -76,7 +76,11 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use radicle::identity::RepoId;
+
     use crate::{home::MemberHome, identity::MemberLock, member::Member};
+
+    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -101,7 +105,11 @@ mod tests {
     #[test]
     fn rejects_a_second_lock() {
         let directory = TestDirectory::new();
-        let home = MemberHome::at(&directory.0, Member::Nico);
+        let home = MemberHome::at(
+            &directory.0,
+            RepoId::from_urn(REPOSITORY).expect("repository should parse"),
+            Member::Nico,
+        );
         let _lock = MemberLock::acquire(&home).expect("first lock should be acquired");
 
         MemberLock::acquire(&home).expect_err("second lock should be rejected");

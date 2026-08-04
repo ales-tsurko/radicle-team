@@ -129,13 +129,6 @@ pub struct ChatContext {
 
 impl ChatContext {
     /// Constructs context from sender evidence which only chat authorization can produce.
-    #[cfg_attr(
-        any(not(test), miri),
-        expect(
-            dead_code,
-            reason = "construction is restricted to authenticated sender evidence"
-        )
-    )]
     pub(crate) fn authenticated(
         repository: RepoId,
         channel: ChannelId,

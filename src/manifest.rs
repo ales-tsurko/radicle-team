@@ -525,6 +525,12 @@ impl RepositoryPolicy {
         self
     }
 
+    #[cfg(all(test, not(miri)))]
+    pub(crate) fn with_chat_for_test(mut self, chat: ChatConfig) -> Self {
+        self.chat = Some(Arc::new(chat));
+        self
+    }
+
     /// Returns the bounds on conversation between this repository's members.
     #[must_use]
     pub const fn limits(&self) -> &Limits {

@@ -12,13 +12,6 @@ pub(crate) struct AuthenticatedSender {
 }
 
 impl AuthenticatedSender {
-    #[cfg_attr(
-        any(not(test), miri),
-        expect(
-            dead_code,
-            reason = "construction is restricted to successful manifest authentication"
-        )
-    )]
     pub(super) const fn new(did: Did) -> Self {
         Self { did }
     }

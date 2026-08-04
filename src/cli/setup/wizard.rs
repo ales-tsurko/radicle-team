@@ -47,17 +47,33 @@ impl SetupWizard {
                 status @ (SetupStatus::ManifestMissing { .. } | SetupStatus::BindingMissing { .. }),
             ) => {
                 let entry = ManifestEntry::new(&self.application, &setup);
-                Self::explicit_manifest_output(path, entry, status)
+                Self::with_chat_certificate(
+                    Self::explicit_manifest_output(path, entry, status),
+                    self.application.member(),
+                    &setup,
+                )
             }
             (
                 None,
                 status @ (SetupStatus::ManifestMissing { .. } | SetupStatus::BindingMissing { .. }),
-            ) => Self::repository_manifest_output(
-                ManifestEntry::new(&self.application, &setup),
-                status,
+            ) => Self::with_chat_certificate(
+                Self::repository_manifest_output(
+                    ManifestEntry::new(&self.application, &setup),
+                    status,
+                ),
+                self.application.member(),
+                &setup,
             ),
             _ => setup.to_string(),
         }
+    }
+
+    fn with_chat_certificate(output: String, member: Member, setup: &Setup) -> String {
+        format!(
+            "{output}\n{} IRC certificate: {}",
+            member,
+            setup.chat_certificate()
+        )
     }
 
     pub(super) fn repository_manifest_output(entry: ManifestEntry, status: SetupStatus) -> String {

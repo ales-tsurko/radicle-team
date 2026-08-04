@@ -8,7 +8,10 @@
     )
 )]
 
-use std::{collections::BTreeMap, str::FromStr as _};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    str::FromStr as _,
+};
 
 use irc_proto::{Command, Message};
 use radicle::identity::{Did, RepoId};
@@ -55,6 +58,7 @@ pub(crate) enum Ignored {
     UnauthorizedSender,
     NotAddressed,
     AmbiguousMessageId,
+    DuplicateMessage,
     ConversationLimit,
 }
 
@@ -69,6 +73,7 @@ pub(crate) struct Classifier {
     triggers: Triggers,
     limits: Limits,
     turns: BTreeMap<ChannelId, Turn>,
+    seen: Seen,
 }
 
 impl Classifier {
@@ -127,7 +132,20 @@ impl Classifier {
             triggers: Triggers::new(access, delegates, members),
             limits,
             turns: BTreeMap::new(),
+            seen: Seen::default(),
         })
+    }
+
+    /// Refreshes the repository delegate set used for sender authorization.
+    pub(crate) fn update_delegates(&mut self, delegates: Vec<Did>) {
+        self.triggers.update_delegates(delegates);
+    }
+
+    /// Records that this member replied without depending on server echo support.
+    pub(crate) fn replied(&mut self, channel: &ChannelId) {
+        if let Some(turn) = self.turns.get_mut(channel) {
+            turn.begin(self.member_did);
+        }
     }
 
     /// Classifies one decoded IRC message without ever falling back to its nick for identity.
@@ -161,6 +179,13 @@ impl Classifier {
             return Classification::Ignored(Ignored::UnattestedAccount);
         };
         let author = sender.did();
+        let network_id = match unique_tag(message, "msgid") {
+            TagValue::Missing => None,
+            TagValue::Ambiguous => {
+                return Classification::Ignored(Ignored::AmbiguousMessageId);
+            }
+            TagValue::Present(message) => Some(message.to_owned()),
+        };
         let origin = self.triggers.author(author, self.member_did);
         let limits = self.limits.clone();
         let turn = self
@@ -179,13 +204,13 @@ impl Classifier {
             return Classification::Ignored(Ignored::NotAddressed);
         }
 
-        let network_id = match unique_tag(message, "msgid") {
-            TagValue::Missing => None,
-            TagValue::Ambiguous => {
-                return Classification::Ignored(Ignored::AmbiguousMessageId);
-            }
-            TagValue::Present(message) => Some(message.to_owned()),
-        };
+        if network_id
+            .as_ref()
+            .is_some_and(|message| !self.seen.insert((channel.clone(), message.clone())))
+        {
+            return Classification::Ignored(Ignored::DuplicateMessage);
+        }
+
         if let Err(error) = turn.admit(author, origin) {
             return Classification::Ignored(match error {
                 AdmissionError::Unauthorized => Ignored::UnauthorizedSender,
@@ -201,6 +226,29 @@ impl Classifier {
             nick: nick.to_owned(),
             body: body.clone(),
         })
+    }
+}
+
+const SEEN_CAPACITY: usize = 8_192;
+
+#[derive(Debug, Default)]
+struct Seen {
+    entries: BTreeSet<(ChannelId, String)>,
+    order: VecDeque<(ChannelId, String)>,
+}
+
+impl Seen {
+    fn insert(&mut self, identity: (ChannelId, String)) -> bool {
+        if !self.entries.insert(identity.clone()) {
+            return false;
+        }
+        self.order.push_back(identity);
+        if self.order.len() > SEEN_CAPACITY
+            && let Some(expired) = self.order.pop_front()
+        {
+            let _removed = self.entries.remove(&expired);
+        }
+        true
     }
 }
 
@@ -254,9 +302,9 @@ mod tests {
 
     use crate::{
         chat::{
-            AttestationPayload, ClientCertificateFingerprint, Config, IrcAccount, Server,
-            ServerPin,
-            classification::{Classification, Classifier, Error, Ignored},
+            AttestationPayload, ChannelId, ClientCertificateFingerprint, Config, IrcAccount,
+            Server, ServerPin,
+            classification::{Classification, Classifier, Error, Ignored, SEEN_CAPACITY, Seen},
             transport::VerifiedServer,
         },
         manifest::{Limits, PriorityLabels, RepositoryPolicy, TriggerAccess},
@@ -428,10 +476,17 @@ mod tests {
             classifier.classify(&message(Some("alice"), None, "#other", "@nico hello")),
             Classification::Ignored(Ignored::UnboundChannel)
         );
+        let seen = classifier.seen.entries.len();
         assert_eq!(
-            classifier.classify(&message(Some("alice"), None, "#project", "hello")),
+            classifier.classify(&message(
+                Some("alice"),
+                Some("ignored"),
+                "#project",
+                "hello",
+            )),
             Classification::Ignored(Ignored::NotAddressed)
         );
+        assert_eq!(classifier.seen.entries.len(), seen);
         assert_eq!(
             classifier.classify(&message(Some("nico"), None, "#project", "@nico echo")),
             Classification::Ignored(Ignored::OwnMessage)
@@ -477,15 +532,7 @@ mod tests {
                 )),
                 Classification::Relevant(_)
             ));
-            assert_eq!(
-                classifier.classify(&message(
-                    Some("nico"),
-                    Some(&format!("self-{sequence}")),
-                    "#project",
-                    "reply",
-                )),
-                Classification::Ignored(Ignored::OwnMessage)
-            );
+            classifier.replied(&ChannelId::from_str("team").expect("channel should parse"));
         }
         assert_eq!(
             classifier.classify(&message(
@@ -541,6 +588,55 @@ mod tests {
                 Classification::Relevant(_)
             ));
         }
+    }
+
+    #[test]
+    fn refreshes_delegates_without_reconnecting() {
+        let fixture = Fixture::new();
+        let mut classifier = fixture.classifier(TriggerAccess::Delegates);
+
+        assert_eq!(
+            classifier.classify(&message(
+                Some("alice"),
+                Some("before"),
+                "#project",
+                "@nico hi"
+            )),
+            Classification::Ignored(Ignored::UnauthorizedSender)
+        );
+        classifier.update_delegates(vec![fixture.alice]);
+        assert!(matches!(
+            classifier.classify(&message(
+                Some("alice"),
+                Some("during"),
+                "#project",
+                "@nico hi"
+            )),
+            Classification::Relevant(_)
+        ));
+        classifier.update_delegates(Vec::new());
+        assert_eq!(
+            classifier.classify(&message(
+                Some("alice"),
+                Some("after"),
+                "#project",
+                "@nico hi"
+            )),
+            Classification::Ignored(Ignored::UnauthorizedSender)
+        );
+    }
+
+    #[test]
+    fn bounds_recent_message_deduplication() {
+        let channel = ChannelId::from_str("team").expect("channel should parse");
+        let mut seen = Seen::default();
+
+        for sequence in 0..=SEEN_CAPACITY {
+            assert!(seen.insert((channel.clone(), format!("message-{sequence}"))));
+        }
+
+        assert_eq!(seen.entries.len(), SEEN_CAPACITY);
+        assert_eq!(seen.order.len(), SEEN_CAPACITY);
     }
 
     #[test]

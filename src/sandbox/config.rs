@@ -385,6 +385,8 @@ mod tests {
     #[cfg(not(miri))]
     use std::{fs, path::Path};
 
+    use radicle::identity::RepoId;
+
     use crate::{
         home::MemberHome,
         member::Member,
@@ -392,6 +394,16 @@ mod tests {
     };
     #[cfg(not(miri))]
     use crate::sandbox::ConfigError;
+
+    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+
+    fn member_home(root: impl Into<std::path::PathBuf>) -> MemberHome {
+        MemberHome::at(
+            root,
+            RepoId::from_urn(REPOSITORY).expect("repository should parse"),
+            Member::Nico,
+        )
+    }
 
     #[test]
     fn defaults_to_unrestricted_network_with_no_local_paths() {
@@ -408,7 +420,7 @@ mod tests {
     #[cfg(not(miri))]
     fn round_trips_every_policy_value() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let home = MemberHome::at(directory.path(), Member::Nico);
+        let home = member_home(directory.path());
         home.create().expect("member home should be created");
         let mut config = Config::default();
         config.set_allow_read(vec![directory.path().join("toolchain")]);
@@ -445,7 +457,7 @@ mod tests {
 
     #[test]
     fn missing_configuration_uses_defaults() {
-        let home = MemberHome::at("/missing", Member::Nico);
+        let home = member_home("/missing");
 
         assert_eq!(
             Config::load(&home).expect("missing configuration should use defaults"),
@@ -457,7 +469,7 @@ mod tests {
     #[cfg(not(miri))]
     fn accepts_disabled_network_and_rejects_relative_paths() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let home = MemberHome::at(directory.path(), Member::Nico);
+        let home = member_home(directory.path());
         home.create().expect("member home should be created");
         fs::write(
             home.sandbox_config(),

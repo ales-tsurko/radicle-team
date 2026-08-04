@@ -409,7 +409,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use radicle::crypto::ssh::Passphrase;
+    use radicle::{crypto::ssh::Passphrase, identity::RepoId};
 
     use crate::{
         home::MemberHome,
@@ -422,6 +422,7 @@ mod tests {
 
     const OTHER_DID: &str = "did:key:z6MkvUJtYD9dHDJfpevWRT98mzDDpdAtmUjwyDSkyqksUr7C";
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 
     #[derive(Debug, Default)]
     struct MemoryCredentials {
@@ -459,7 +460,11 @@ mod tests {
         }
 
         fn member_home(&self) -> MemberHome {
-            MemberHome::at(&self.0, Member::Nico)
+            MemberHome::at(
+                &self.0,
+                RepoId::from_urn(REPOSITORY).expect("repository should parse"),
+                Member::Nico,
+            )
         }
     }
 

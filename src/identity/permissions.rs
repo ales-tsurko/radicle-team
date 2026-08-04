@@ -10,13 +10,42 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-use std::{fs, io, path::Path};
+use std::{
+    fs::{self, File},
+    io,
+    path::Path,
+};
 
 pub(crate) struct Permissions;
 
 impl Permissions {
-    pub(super) fn private_file(path: &Path) -> Result<(), Error> {
+    pub(crate) fn private_file(path: &Path) -> Result<(), Error> {
         Self::file(path, FilePolicy::Private)
+    }
+
+    pub(crate) fn open_private(path: &Path) -> Result<File, Error> {
+        #[cfg(unix)]
+        let file = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|source| Error::Io {
+            path: path.into(),
+            source: io::Error::from_raw_os_error(source.raw_os_error()),
+        })?;
+        #[cfg(not(unix))]
+        let file = File::open(path).map_err(|source| Error::Io {
+            path: path.into(),
+            source,
+        })?;
+        let metadata = file.metadata().map_err(|source| Error::Io {
+            path: path.into(),
+            source,
+        })?;
+        Self::validate(path, &metadata, FilePolicy::Private)?;
+        Ok(file)
     }
 
     pub(crate) fn administrator_file(path: &Path) -> Result<(), Error> {
@@ -24,12 +53,19 @@ impl Permissions {
     }
 
     fn file(path: &Path, _policy: FilePolicy) -> Result<(), Error> {
-        let _metadata = Self::metadata(path)?;
+        let metadata = Self::metadata(path)?;
+        Self::validate(path, &metadata, _policy)
+    }
+
+    fn validate(path: &Path, metadata: &fs::Metadata, _policy: FilePolicy) -> Result<(), Error> {
+        if !metadata.file_type().is_file() {
+            return Err(Error::FileType { path: path.into() });
+        }
 
         #[cfg(unix)]
         {
-            Self::owner(path, &_metadata)?;
-            let mode = _metadata.mode() & 0o777;
+            Self::owner(path, metadata)?;
+            let mode = metadata.mode() & 0o777;
             if mode & _policy.denied_mode() != 0 {
                 return Err(Error::Mode {
                     path: path.into(),
@@ -115,6 +151,12 @@ pub enum Error {
         path: Box<Path>,
         /// Underlying filesystem error.
         source: io::Error,
+    },
+    /// A sensitive path is not a regular file.
+    #[error("'{path}' is not a regular file")]
+    FileType {
+        /// Path being validated.
+        path: Box<Path>,
     },
     #[cfg(unix)]
     /// A path is not owned by the current user.

@@ -13,6 +13,7 @@ use std::{
     process::ExitStatus,
 };
 
+use radicle::identity::RepoId;
 use radicle_team::{
     agent::McpEndpoint,
     home::MemberHome,
@@ -20,6 +21,8 @@ use radicle_team::{
     sandbox::{AgentSandbox, Config, NetworkAccess},
 };
 use url::Url;
+
+const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 
 type Check = fn() -> Pin<Box<dyn Future<Output = ()>>>;
 
@@ -269,7 +272,11 @@ impl Fixture {
             .prefix(name)
             .tempdir()
             .expect("temporary directory should be created");
-        let home = MemberHome::at(directory.path(), Member::Nico);
+        let home = MemberHome::at(
+            directory.path(),
+            RepoId::from_urn(REPOSITORY).expect("repository should parse"),
+            Member::Nico,
+        );
 
         Self { directory, home }
     }

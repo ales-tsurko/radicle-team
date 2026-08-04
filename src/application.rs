@@ -151,14 +151,31 @@ impl Application {
         self.synchronize(&runtime.identity).await?;
         let (status, security) = self.setup_status(runtime).await?;
         let did = runtime.identity.did();
+        let chat_certificate = Self::initialize_chat_identity(&runtime.home, self.member)
+            .await?
+            .fingerprint();
 
         Ok(Setup {
             member: self.member,
             repository: self.repository,
             did,
+            chat_certificate,
             status,
             security,
         })
+    }
+
+    async fn initialize_chat_identity(
+        home: &MemberHome,
+        member: Member,
+    ) -> Result<chat::credentials::Credentials, Error> {
+        let path = home.chat_identity();
+        tokio::task::spawn_blocking(move || {
+            chat::credentials::Credentials::load_or_generate(&path, member.id())
+                .map_err(|error| Error::Chat(error.to_string()))
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))?
     }
 
     fn finish_after_stop<T>(
@@ -268,8 +285,8 @@ impl Application {
 
     fn member_home(&self) -> Result<MemberHome, home::Error> {
         match &self.home {
-            Some(root) => Ok(MemberHome::at(root, self.member)),
-            None => MemberHome::discover(self.member),
+            Some(root) => Ok(MemberHome::at(root, self.repository, self.member)),
+            None => MemberHome::discover(self.repository, self.member),
         }
     }
 
@@ -716,6 +733,8 @@ struct AgentRuntime {
     runtime: Runtime,
     servers: Servers,
     queue: WorkQueue,
+    chat_state: chat::State,
+    chat_identity: Option<chat::credentials::Credentials>,
     policy: manifest::RepositoryPolicy,
 }
 
@@ -742,11 +761,13 @@ impl AgentRuntime {
         allowlist: manifest::McpAllowlist,
         policy: manifest::RepositoryPolicy,
     ) -> Result<Self, Error> {
-        match Self::initialize(application, &runtime, talker, coder, allowlist).await {
-            Ok((servers, queue)) => Ok(Self {
+        match Self::initialize(application, &runtime, talker, coder, allowlist, &policy).await {
+            Ok((servers, queue, chat_state, chat_identity)) => Ok(Self {
                 runtime,
                 servers,
                 queue,
+                chat_state,
+                chat_identity,
                 policy,
             }),
             Err(error) => Application::finish_after_stop(
@@ -762,9 +783,18 @@ impl AgentRuntime {
         talker: &mut (impl Talker + ?Sized),
         coder: &mut (impl Coder + ?Sized),
         allowlist: manifest::McpAllowlist,
-    ) -> Result<(Servers, WorkQueue), Error> {
-        let publisher = Self::initialize_publisher(application, runtime).await?;
-        let (queue, chat_state) = Self::initialize_state(application, runtime).await?;
+        policy: &manifest::RepositoryPolicy,
+    ) -> Result<
+        (
+            Servers,
+            WorkQueue,
+            chat::State,
+            Option<chat::credentials::Credentials>,
+        ),
+        Error,
+    > {
+        let (publisher, queue, chat_state, chat_identity) =
+            Self::initialize_resources(application, runtime, policy).await?;
         let servers = Self::start_mcp(
             application,
             runtime,
@@ -782,7 +812,41 @@ impl AgentRuntime {
             return Err(error);
         }
 
-        Ok((servers, queue))
+        Ok((servers, queue, chat_state, chat_identity))
+    }
+
+    async fn initialize_resources(
+        application: &Application,
+        runtime: &Runtime,
+        policy: &manifest::RepositoryPolicy,
+    ) -> Result<
+        (
+            agent::Publisher,
+            WorkQueue,
+            chat::State,
+            Option<chat::credentials::Credentials>,
+        ),
+        Error,
+    > {
+        let publisher = Self::initialize_publisher(application, runtime).await?;
+        let (queue, chat_state) = Self::initialize_state(application, runtime).await?;
+        let chat_identity = Self::initialize_chat(application, runtime, policy).await?;
+        Ok((publisher, queue, chat_state, chat_identity))
+    }
+
+    async fn initialize_chat(
+        application: &Application,
+        runtime: &Runtime,
+        policy: &manifest::RepositoryPolicy,
+    ) -> Result<Option<chat::credentials::Credentials>, Error> {
+        match policy.chat() {
+            Some(_config) => {
+                Application::initialize_chat_identity(&runtime.home, application.member)
+                    .await
+                    .map(Some)
+            }
+            None => Ok(None),
+        }
     }
 
     async fn initialize_state(
@@ -908,26 +972,34 @@ impl AgentRuntime {
             workspaces.clone(),
             self.servers.talker.scope(),
         );
-        let ran = {
-            let watching = watcher.run(
-                &profile,
-                self.runtime.node.node(),
-                &state_database,
-                watcher::DeliveryRuntime::new(
-                    profile.storage.clone(),
-                    self.queue.clone(),
-                    self.policy.priority().clone(),
-                    conversations.clone(),
-                ),
-            );
-            let dispatching = dispatcher.run(talker);
-            let building = builder.run(&*coder, &self.queue, &workspaces, &coder_scope);
-            tokio::select! {
-                watched = watching => watched.map_err(Error::from),
-                dispatched = dispatching => dispatched
-                    .map_err(|error| Error::Conversation(error.to_string())),
-                built = building => built.map_err(Error::from),
+        let chat = self.chat_ingress(application, conversations.clone());
+        let watching = watcher.run(
+            &profile,
+            self.runtime.node.node(),
+            &state_database,
+            watcher::DeliveryRuntime::new(
+                profile.storage.clone(),
+                self.queue.clone(),
+                self.policy.priority().clone(),
+                conversations.clone(),
+            ),
+        );
+        let dispatching = dispatcher.run(talker);
+        let building = builder.run(&*coder, &self.queue, &workspaces, &coder_scope);
+        let chatting = async move {
+            if let Some(ingress) = chat
+                && let Err(error) = ingress.run().await
+            {
+                tracing::error!(%error, "chat ingress stopped; repository work remains active");
             }
+            std::future::pending::<std::convert::Infallible>().await
+        };
+        let ran = tokio::select! {
+            watched = watching => watched.map_err(Error::from),
+            dispatched = dispatching => dispatched
+                .map_err(|error| Error::Conversation(error.to_string())),
+            built = building => built.map_err(Error::from),
+            never = chatting => match never {},
         };
         let interrupted = application.shutdown.is_requested();
         let cleanup = RunCleanup {
@@ -937,6 +1009,26 @@ impl AgentRuntime {
             node: self.runtime.stop(&application.shutdown).await,
         };
         cleanup.finish(ran, interrupted)
+    }
+
+    fn chat_ingress(
+        &self,
+        application: &Application,
+        conversations: conversation::Handle,
+    ) -> Option<chat::runtime::Ingress> {
+        let credentials = self.chat_identity.as_ref()?;
+        let storage = self.runtime.identity.profile().storage.clone();
+
+        Some(chat::runtime::Ingress::new(
+            application.repository,
+            application.member,
+            self.runtime.identity.did(),
+            self.policy.clone(),
+            storage,
+            credentials.identity(),
+            self.chat_state.clone(),
+            conversations,
+        ))
     }
 }
 
@@ -1113,6 +1205,7 @@ pub struct Setup {
     member: Member,
     repository: RepoId,
     did: Did,
+    chat_certificate: chat::ClientCertificateFingerprint,
     status: SetupStatus,
     security: Option<manifest::SecurityPolicy>,
 }
@@ -1122,6 +1215,12 @@ impl Setup {
     #[must_use]
     pub const fn did(&self) -> Did {
         self.did
+    }
+
+    /// Returns the persistent IRC client certificate fingerprint.
+    #[must_use]
+    pub const fn chat_certificate(&self) -> chat::ClientCertificateFingerprint {
+        self.chat_certificate
     }
 
     /// Returns the setup status.
@@ -1140,6 +1239,11 @@ impl Setup {
 impl fmt::Display for Setup {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(formatter, "{} identity: {}", self.member, self.did)?;
+        writeln!(
+            formatter,
+            "{} IRC certificate: {}",
+            self.member, self.chat_certificate
+        )?;
         match self.status {
             SetupStatus::Ready { generation } => write!(
                 formatter,
@@ -1420,12 +1524,14 @@ mod tests {
             member: Member::Nico,
             repository,
             did,
+            chat_certificate: crate::chat::ClientCertificateFingerprint::from_digest([1; 32]),
             status: SetupStatus::ManifestMissing { generation: 1 },
             security: None,
         };
         let output = setup.to_string();
 
         assert!(output.contains("nico identity: did:key:"));
+        assert!(output.contains("nico IRC certificate: cert-sha256:"));
         assert!(output.contains("run interactive setup"));
         assert!(output.contains("generation 1"));
     }
@@ -1441,7 +1547,7 @@ mod tests {
             .parse()
             .expect("DID should be valid");
         let application = Application::new(Member::Nico, repository);
-        let home = MemberHome::at(&root, Member::Nico);
+        let home = MemberHome::at(&root, repository, Member::Nico);
         let binding = ValidatedBinding::new(
             Member::Nico,
             did,

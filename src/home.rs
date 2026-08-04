@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::{env, fs, io, path::PathBuf};
 
 use directories::BaseDirs;
+use radicle::identity::RepoId;
 
 use crate::member::Member;
 
@@ -25,7 +26,7 @@ impl MemberHome {
     /// # Errors
     ///
     /// Returns an error when the operating-system home directory is unavailable.
-    pub fn discover(member: Member) -> Result<Self, Error> {
+    pub fn discover(repository: RepoId, member: Member) -> Result<Self, Error> {
         let root = env::var_os(ENVIRONMENT_VARIABLE)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -34,14 +35,19 @@ impl MemberHome {
             })
             .ok_or(Error::HomeUnavailable)?;
 
-        Ok(Self::at(root, member))
+        Ok(Self::at(root, repository, member))
     }
 
-    /// Creates member locations below an explicit application root.
+    /// Creates repository and member locations below an explicit application root.
     #[must_use]
-    pub fn at(root: impl Into<PathBuf>, member: Member) -> Self {
+    pub fn at(root: impl Into<PathBuf>, repository: RepoId, member: Member) -> Self {
         Self {
-            path: root.into().join("members").join(member.id()),
+            path: root
+                .into()
+                .join("repositories")
+                .join(repository.canonical())
+                .join("members")
+                .join(member.id()),
         }
     }
 
@@ -75,6 +81,12 @@ impl MemberHome {
     #[must_use]
     pub fn state_database(&self) -> PathBuf {
         self.path.join("state.db")
+    }
+
+    /// Returns the member's IRC client identity path.
+    #[must_use]
+    pub fn chat_identity(&self) -> PathBuf {
+        self.path.join("irc-identity.pem")
     }
 
     /// Returns the member process lock path.
@@ -114,30 +126,35 @@ pub enum Error {
 mod tests {
     use std::path::Path;
 
+    use radicle::identity::RepoId;
+
     use crate::{home::MemberHome, member::Member};
 
-    #[test]
-    fn creates_isolated_member_locations() {
-        let home = MemberHome::at("/team", Member::Nico);
+    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+    const OTHER_REPOSITORY: &str = "rad:z42hL2jL4Tn8K5qgKbQ3xYrxLX9rU";
 
-        assert_eq!(home.path(), Path::new("/team/members/nico"));
-        assert_eq!(home.radicle(), Path::new("/team/members/nico/radicle"));
+    #[test]
+    fn creates_repository_scoped_member_locations() {
+        let repository = RepoId::from_urn(REPOSITORY).expect("repository should parse");
+        let home = MemberHome::at("/team", repository, Member::Nico);
+        let root = "/team/repositories/z3cyotNHuasWowQ2h4yF9c3tFFdvc/members/nico";
+
+        assert_eq!(home.path(), Path::new(root));
+        assert_eq!(home.radicle(), Path::new(root).join("radicle"));
+        assert_eq!(home.state_database(), Path::new(root).join("state.db"));
         assert_eq!(
-            home.state_database(),
-            Path::new("/team/members/nico/state.db")
+            home.chat_identity(),
+            Path::new(root).join("irc-identity.pem")
         );
-        assert_eq!(
-            home.process_lock(),
-            Path::new("/team/members/nico/process.lock")
-        );
-        assert_eq!(home.node_log(), Path::new("/team/members/nico/node.log"));
-        assert_eq!(
-            home.workspaces(),
-            Path::new("/team/members/nico/workspaces")
-        );
-        assert_eq!(
-            home.sandbox_config(),
-            Path::new("/team/members/nico/sandbox.toml")
+        assert_eq!(home.process_lock(), Path::new(root).join("process.lock"));
+        assert_eq!(home.node_log(), Path::new(root).join("node.log"));
+        assert_eq!(home.workspaces(), Path::new(root).join("workspaces"));
+        assert_eq!(home.sandbox_config(), Path::new(root).join("sandbox.toml"));
+
+        let other = RepoId::from_urn(OTHER_REPOSITORY).expect("repository should parse");
+        assert_ne!(
+            home.path(),
+            MemberHome::at("/team", other, Member::Nico).path()
         );
     }
 }

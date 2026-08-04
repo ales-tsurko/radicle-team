@@ -46,6 +46,11 @@ impl Config {
         self.channels.iter()
     }
 
+    /// Returns the IRC channel bound to one repository-local channel.
+    pub(crate) fn irc_channel(&self, channel: &ChannelId) -> Option<&IrcChannel> {
+        self.channels.get(channel)
+    }
+
     /// Returns the attestation for `did`, when one exists.
     #[must_use]
     pub fn participant(&self, did: Did) -> Option<&Attestation> {
@@ -98,13 +103,6 @@ impl Config {
         Ok(self)
     }
 
-    #[cfg_attr(
-        any(not(test), miri),
-        expect(
-            dead_code,
-            reason = "only the pinned IRC transport may produce sender evidence"
-        )
-    )]
     pub(crate) fn authenticate(
         &self,
         repository: RepoId,
@@ -614,13 +612,6 @@ pub(super) enum Error {
     InvalidSignature { account: IrcAccount, did: Did },
 }
 
-#[cfg_attr(
-    any(not(test), miri),
-    expect(
-        dead_code,
-        reason = "authentication failures stay inside the crate's IRC trust boundary"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum AuthenticationError {
     #[error("chat channel belongs to another repository")]

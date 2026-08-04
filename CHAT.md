@@ -38,8 +38,10 @@ Three capabilities are required and one is optional.
 - **SASL** for authentication, preferring `EXTERNAL` with a client certificate.
 - **`account-tag`** so every message carries its sender's account.
 
-Capabilities are negotiated at connect. A server without `chathistory` costs
-backlog after downtime and nothing else, so it degrades.
+Capabilities are negotiated at connect. History additionally requires
+`message-tags` and `batch` so replayed messages carry stable `msgid` values. A
+server without that complete history capability set still connects, but cannot
+restore backlog or reconstruct pre-disconnect conversation turns.
 
 `account-tag` does not degrade. Without it a member cannot tell who is talking,
 and falling back to nicks would let anyone claim any identity. A member that
@@ -67,6 +69,10 @@ IRC client certificates are generated separately and never derived from the
 Radicle key. The same key material should not serve two protocols with
 different security arguments. The Radicle key signs the attestation instead,
 which gives the binding without the reuse.
+
+Every repository member has a separate certificate and SASL account. When one
+IRC server hosts multiple repositories, those accounts remain distinct and are
+granted access only to their repository's channels.
 
 Authorization itself stays in the member. Manifest policy and delegate checks
 are enforced by the agent, exactly as they are for repository activity. Chat
@@ -204,6 +210,12 @@ implementation language is not a dependency of this project.
 Account registration is a one-time operator step, documented rather than
 automated. Services syntax differs between IRC servers and automating it would
 put server-specific behavior in the source.
+
+[`deploy/ergo`](deploy/ergo) contains a Compose deployment with SASL-only
+access, closed registration, persistent SQLite history, and bounded retention.
+`radicle-team setup` creates each repository member's separate client
+certificate beside its Radicle home and prints the fingerprint used in the
+manifest.
 
 [Sable](https://github.com/Libera-Chat/sable) is the Rust server to revisit.
 Today it is experimental, its capability set is undocumented, and Libera Chat

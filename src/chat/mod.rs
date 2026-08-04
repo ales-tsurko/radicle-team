@@ -15,6 +15,8 @@ pub use crate::chat::config::{
 mod auth;
 pub(crate) mod classification;
 mod config;
+pub(crate) mod credentials;
+pub(crate) mod runtime;
 mod state;
 pub(crate) mod transport;
 

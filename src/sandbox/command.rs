@@ -473,14 +473,25 @@ pub enum Error {
 // `access` call that Miri cannot execute.
 #[cfg(all(test, not(miri), any(target_os = "macos", target_os = "linux")))]
 mod tests {
+    use radicle::identity::RepoId;
     use url::Url;
 
     use crate::{agent::McpEndpoint, home::MemberHome, member::Member, sandbox::AgentSandbox};
 
+    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+
+    fn member_home(root: &std::path::Path) -> MemberHome {
+        MemberHome::at(
+            root,
+            RepoId::from_urn(REPOSITORY).expect("repository should parse"),
+            Member::Nico,
+        )
+    }
+
     #[test]
     fn rejects_working_directories_outside_member_workspaces() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let home = MemberHome::at(directory.path(), Member::Nico);
+        let home = member_home(directory.path());
         let sandbox = sandbox(&home);
         let outside = directory.path().join("outside");
         std::fs::create_dir(&outside).expect("outside directory should be created");
@@ -504,7 +515,7 @@ mod tests {
     #[test]
     fn builds_every_configured_policy() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let home = MemberHome::at(directory.path(), Member::Nico);
+        let home = member_home(directory.path());
         let sandbox = sandbox(&home);
         let path = directory.path().to_owned();
 
