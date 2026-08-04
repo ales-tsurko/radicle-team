@@ -250,10 +250,16 @@ conversation runs at a time. The building adapter continues to run in parallel.
    targets the active channel implicitly, and writes to a durable outbox. This
    allows several replies without granting access to arbitrary channels.
 4. **Add manifest configuration and identity validation.**
-5. **Spike the `irc` crate** against certificate pinning, SASL `EXTERNAL`,
-   message tags, and history before deciding whether to drop to `irc-proto` and
-   a hand-written transport. The high-level client's TLS handling looks
-   unsuitable for strict pinning, but prove it rather than assume it.
+5. **Use `irc-proto` with an application-owned Tokio/Rustls transport.** The
+   spike proved that `irc::Client` exposes the required IRCv3 commands and tags,
+   but cannot enforce the manifest's exact SPKI pin. In `irc` 1.1.0
+   [`src/client/conn.rs:336-381`](https://docs.rs/crate/irc/1.1.0/source/src/client/conn.rs),
+   the crate privately constructs its TLS configuration with WebPKI and native
+   roots, optionally adds another root, and exposes only an accept-all
+   alternative. There is no custom verifier or transport injection point.
+   `irc-proto::IrcCodec` preserves `account` and `msgid` tags over a
+   caller-owned stream, leaving DNS, TCP, client certificates, and strict SPKI
+   verification under this application's control.
 6. **Implement connection, classification, replay, and delivery.**
 
 Repository-wide MCP scope is created only after the whole chain succeeds:
