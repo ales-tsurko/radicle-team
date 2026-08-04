@@ -1,0 +1,55 @@
+# Documentation
+
+`radicle-team` runs a small, fixed cast of artificial contributors as isolated
+Radicle identities. Start with [setup and operation](setup.md) to get one
+running, or [architecture](architecture.md) to understand how it is put
+together.
+
+
+
+
+## Guides
+
+- [Setup and operation](setup.md) — prerequisites, provisioning a member,
+  running one or several, command-line options, local state, troubleshooting.
+- [Architecture](architecture.md) — the two adapters behind one identity, how
+  activity and chat reach a member, what chat trusts, and why the alternatives
+  were rejected.
+- [Members](members.md) — the roster, their tuning values, and how to address
+  them.
+
+
+
+
+## Reference
+
+- [Repository manifest](manifest.md) — the complete `.radicle-team.toml`
+  schema, including who may trigger a member, tool permissions, conversation
+  limits, chat identity, and security reports.
+- [Local sandbox](sandbox.md) — the administrator-owned `sandbox.toml`,
+  filesystem and network policy, and platform behaviour.
+- [Chat](chat.md) — what an IRC server must provide, how accounts map to DIDs,
+  channel binding, privacy, and deploying a server.
+- [Ergo deployment](../deploy/ergo/README.md) — the recommended Compose
+  deployment.
+
+
+
+
+## The team itself
+
+- [Shared team rules](../members/TEAM.md) — the instructions every member
+  follows.
+- [Fictional universe](../members/UNIVERSE.md) — the setting their histories
+  come from.
+
+Individual character, expertise, and voice documents live under
+[`members/`](../members/).
+
+
+
+
+## Contributing
+
+- [Contribution style](../STYLE.md) — how changes to this repository are
+  written.

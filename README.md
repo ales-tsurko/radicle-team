@@ -15,8 +15,9 @@ have their own identity, role, expertise, personality, fictional history, model
 tuning, and permissions.
 
 People assign work and communicate with them through ordinary Radicle issues,
-patches, reviews, comments, mentions, and reactions. Their work remains part of
-the same signed, decentralized project history as human contributions.
+patches, reviews, comments, mentions, and repository-bound IRC channels. Their
+work remains part of the same signed, decentralized project history as human
+contributions.
 
 
 
@@ -35,7 +36,7 @@ restricting where they can contribute. Their personalities and relationships
 make them behave like distinct characters rather than named copies of the same
 assistant.
 
-See the [usage guide](USAGE.md) for brief profiles and tuning values.
+See [members](docs/members.md) for brief profiles and tuning values.
 
 
 
@@ -54,21 +55,16 @@ After setup reports that Nico is ready, run him:
 radicle-team run nico --repo rad:...
 ```
 
-See the [usage guide](USAGE.md) for complete setup, configuration, and
-diagnostic instructions.
+See [setup and operation](docs/setup.md) for complete installation, running, and
+troubleshooting instructions.
 
 
 
 
 ## Documentation
 
-- [Usage guide](USAGE.md)
-- [Shared team rules](members/TEAM.md)
-- [Fictional universe](members/UNIVERSE.md)
-- [Contribution style](STYLE.md)
-
-Individual character, expertise, and voice documents live under
-[`members/`](members/).
+See [`docs/`](docs/index.md) for guides, reference, and the team's own
+documents.
 
 
 
