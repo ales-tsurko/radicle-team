@@ -18,6 +18,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     str::{self, FromStr as _},
+    sync::Arc,
 };
 
 use age::x25519;
@@ -30,6 +31,7 @@ use radicle::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{
+    chat::Config as ChatConfig,
     identity::{Identity, permissions::Permissions},
     member::{Member, UnknownMember},
 };
@@ -49,6 +51,7 @@ pub struct Manifest {
     triggered_by: TriggerAccess,
     priority: PriorityLabels,
     limits: Limits,
+    chat: Option<Arc<ChatConfig>>,
     revision: Revision,
 }
 
@@ -57,6 +60,12 @@ impl Manifest {
     #[must_use]
     pub const fn security(&self) -> &SecurityPolicy {
         &self.security
+    }
+
+    /// Returns the repository's IRC configuration, when chat is enabled.
+    #[must_use]
+    pub fn chat(&self) -> Option<&ChatConfig> {
+        self.chat.as_deref()
     }
 
     /// Loads the manifest from the repository's canonical branch.
@@ -181,7 +190,8 @@ impl Manifest {
                 self.active_member_dids(),
                 self.priority.clone(),
                 self.limits.clone(),
-            ),
+            )
+            .with_chat(self.chat.clone()),
         ))
     }
 
@@ -203,11 +213,22 @@ impl Manifest {
                 actual: document.version,
             });
         }
-        let members = document
+        let members: BTreeMap<Member, Binding> = document
             .members
             .into_iter()
             .map(|(name, binding)| Ok((name.parse()?, binding)))
             .collect::<Result<_, Error>>()?;
+
+        let active_dids = members
+            .values()
+            .filter(|binding| binding.state == BindingState::Active)
+            .map(|binding| binding.signing_did)
+            .collect::<Vec<_>>();
+        let chat = document
+            .chat
+            .map(|chat| chat.validate(&active_dids).map_err(Error::Chat))
+            .transpose()?
+            .map(Arc::new);
 
         Ok(Self {
             members,
@@ -215,6 +236,7 @@ impl Manifest {
             triggered_by: document.triggered_by,
             priority: document.priority,
             limits: document.limits,
+            chat,
             revision,
         })
     }
@@ -477,6 +499,7 @@ pub struct RepositoryPolicy {
     members: Vec<Did>,
     priority: PriorityLabels,
     limits: Limits,
+    chat: Option<Arc<ChatConfig>>,
 }
 
 impl RepositoryPolicy {
@@ -493,7 +516,13 @@ impl RepositoryPolicy {
             members,
             priority,
             limits,
+            chat: None,
         }
+    }
+
+    fn with_chat(mut self, chat: Option<Arc<ChatConfig>>) -> Self {
+        self.chat = chat;
+        self
     }
 
     /// Returns the bounds on conversation between this repository's members.
@@ -518,6 +547,12 @@ impl RepositoryPolicy {
     #[must_use]
     pub fn members(&self) -> &[Did] {
         &self.members
+    }
+
+    /// Returns the repository's validated IRC configuration, when chat is enabled.
+    #[must_use]
+    pub fn chat(&self) -> Option<&ChatConfig> {
+        self.chat.as_deref()
     }
 }
 
@@ -595,6 +630,12 @@ impl ValidatedBinding {
     pub const fn security(&self) -> &SecurityPolicy {
         &self.security
     }
+
+    /// Returns the validated IRC configuration, when chat is enabled.
+    #[must_use]
+    pub fn chat(&self) -> Option<&ChatConfig> {
+        self.triggers.chat()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -608,6 +649,8 @@ struct Document {
     priority: PriorityLabels,
     #[serde(default)]
     limits: Limits,
+    #[serde(default)]
+    chat: Option<ChatConfig>,
     members: BTreeMap<String, Binding>,
 }
 
@@ -845,6 +888,9 @@ pub enum Error {
         /// Local identity.
         local: Did,
     },
+    /// Chat configuration or an identity attestation is invalid.
+    #[error("invalid chat configuration: {0}")]
+    Chat(String),
 }
 
 #[cfg(test)]
@@ -852,6 +898,8 @@ mod tests {
     use std::{collections::BTreeSet, fs, path::PathBuf};
 
     use radicle::identity::Did;
+    #[cfg(not(miri))]
+    use radicle::{git::Oid, identity::RepoId};
 
     use crate::{
         manifest::{Error, Manifest, McpAllowlist, QueuePosition, Revision, TriggerAccess},
@@ -903,6 +951,80 @@ mod tests {
         assert!(binding.mcp_allow().allows("get_subject"));
         assert!(binding.mcp_allow().allows("get_diff"));
         assert!(!binding.mcp_allow().allows("create_comment"));
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn validates_chat_configuration_and_authenticates_only_the_pinned_account() {
+        use radicle::crypto::{Signature, signature::Signer as _, ssh::keystore::MemorySigner};
+
+        use crate::chat::{
+            AttestationPayload, ClientCertificateFingerprint, IrcAccount, Server, ServerEndpoint,
+            ServerPin,
+        };
+
+        const SERVER_PIN: &str =
+            "spki-sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const OTHER_SERVER_PIN: &str =
+            "spki-sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const CERTIFICATE: &str =
+            "cert-sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        let signer = MemorySigner::r#gen();
+        let did = Did::from(*radicle::crypto::Signer::public_key(&signer));
+        let repository = REPOSITORY.parse().expect("RID should parse");
+        let server = Server::new(
+            "ircs://irc.example.com:6697"
+                .parse::<ServerEndpoint>()
+                .expect("endpoint should parse"),
+            SERVER_PIN.parse().expect("server pin should parse"),
+        );
+        let account = "nico".parse::<IrcAccount>().expect("account should parse");
+        let certificate = CERTIFICATE
+            .parse::<ClientCertificateFingerprint>()
+            .expect("certificate should parse");
+        let payload = AttestationPayload::new(repository, server, account, certificate, did);
+        let signature: Signature = signer.sign(payload.canonical().as_bytes());
+        let body = format!(
+            "version = 1\n[chat]\nrepository = \"{REPOSITORY}\"\n[chat.server]\nendpoint = \
+             \"ircs://irc.example.com:6697\"\npin = \"{SERVER_PIN}\"\n[chat.channels]\nteam = \
+             \"#project\"\n[[chat.participants]]\naccount = \"nico\"\ncertificate = \
+             \"{CERTIFICATE}\"\ndid = \"{did}\"\nsignature = \
+             \"{signature}\"\n[members.nico]\nsigning_did = \"{did}\"\ngeneration = 1\nstate = \
+             \"active\"\nmcp_allow = [\"chat\"]\n"
+        );
+        let manifest = Fixture::parse(&body).expect("signed chat manifest should parse");
+        let chat = manifest.chat().expect("chat should be configured");
+
+        let sender = chat
+            .authenticate(repository, chat.server().pin(), "nico")
+            .expect("attested account should authenticate");
+        assert_eq!(sender.did(), did);
+        assert!(
+            chat.authenticate(
+                repository,
+                OTHER_SERVER_PIN
+                    .parse::<ServerPin>()
+                    .expect("other server pin should parse"),
+                "nico",
+            )
+            .is_err(),
+            "another server must not authenticate the same account"
+        );
+        assert!(
+            chat.authenticate(repository, chat.server().pin(), "maya")
+                .is_err(),
+            "an unattested account must fail closed"
+        );
+        let another_repository = RepoId::from(Oid::from_sha1([1; 20]));
+        assert!(
+            chat.authenticate(another_repository, chat.server().pin(), "nico")
+                .is_err(),
+            "an attestation must not cross repositories"
+        );
+
+        let tampered = body.replace("account = \"nico\"", "account = \"maya\"");
+        assert!(matches!(Fixture::parse(&tampered), Err(Error::Chat(_))));
     }
 
     #[test]

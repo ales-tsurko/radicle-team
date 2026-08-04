@@ -487,6 +487,20 @@ Everything else follows `mcp_allow` on both. `reply_chat` is usable only while
 handling an authenticated chat message and targets that message's channel.
 
 
+### IRC chat identity
+
+Chat is enabled by an optional `[chat]` manifest section. It contains the RID,
+one canonical `ircs://host:port` endpoint, an `spki-sha256:` server-key pin,
+logical channel mappings, and `[[chat.participants]]` account attestations. See
+[CHAT.md](CHAT.md#manifest-format) for the exact TOML, fingerprint encodings,
+and canonical signed payload.
+
+Every active member must be attested. People may be attested too, but their DID
+must still pass `triggered_by` or delegate policy. Incoming nicks are never used
+for authorization: only an attested `account-tag` received over the pinned
+server can create authenticated chat work. Omitting `[chat]` disables chat.
+
+
 ### Where new work goes
 
 An assignment becomes a job in the member's queue. New work joins the end of

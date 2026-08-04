@@ -2,11 +2,18 @@
 
 use std::{fmt, str::FromStr};
 
+use serde::{Deserialize, Deserializer, de};
+
 pub(crate) use crate::chat::{auth::AuthenticatedSender, state::State};
 #[cfg(all(test, not(miri)))]
 pub(crate) use crate::chat::state::Receipt;
+pub use crate::chat::config::{
+    Attestation, AttestationPayload, ClientCertificateFingerprint, Config, IrcAccount, IrcChannel,
+    Server, ServerEndpoint, ServerPin,
+};
 
 mod auth;
+mod config;
 mod state;
 
 /// Logical repository-local channel identifier from the team manifest.
@@ -39,6 +46,17 @@ impl FromStr for ChannelId {
             return Err(InvalidChannelId(value.to_owned()));
         }
         Ok(Self(value.to_owned()))
+    }
+}
+
+impl<'de> Deserialize<'de> for ChannelId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
     }
 }
 

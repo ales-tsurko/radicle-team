@@ -133,7 +133,7 @@ impl ChatContext {
         any(not(test), miri),
         expect(
             dead_code,
-            reason = "the authenticated IRC ingress will construct this context in PR 6"
+            reason = "construction is restricted to authenticated sender evidence"
         )
     )]
     pub(crate) fn authenticated(

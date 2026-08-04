@@ -1053,7 +1053,7 @@ impl RunCleanup {
 
 #[derive(Debug)]
 enum SetupValidation {
-    Ready(manifest::ValidatedBinding),
+    Ready(Box<manifest::ValidatedBinding>),
     ManifestMissing,
     BindingMissing(manifest::SecurityPolicy),
 }
@@ -1064,7 +1064,7 @@ impl SetupValidation {
             return Ok(Self::ManifestMissing);
         };
         match manifest.validate_member(member, did) {
-            Ok(binding) => Ok(Self::Ready(binding)),
+            Ok(binding) => Ok(Self::Ready(Box::new(binding))),
             Err(manifest::Error::Missing { .. }) => {
                 Ok(Self::BindingMissing(manifest.security().clone()))
             }
@@ -1086,9 +1086,9 @@ impl SetupValidation {
     ) -> Result<(SetupStatus, Option<manifest::SecurityPolicy>), Error> {
         match self {
             Self::Ready(binding) => {
-                application.record_binding(home, binding.clone()).await?;
                 let generation = binding.generation();
                 let security = binding.security().clone();
+                application.record_binding(home, *binding).await?;
                 Ok((SetupStatus::Ready { generation }, Some(security)))
             }
             Self::ManifestMissing => Ok((
@@ -1461,7 +1461,7 @@ mod tests {
             .await
             .expect("maximum generation should be recorded");
 
-        let (status, security) = SetupValidation::Ready(binding)
+        let (status, security) = SetupValidation::Ready(Box::new(binding))
             .record(&application, &home)
             .await
             .expect("a ready maximum generation should not be incremented");

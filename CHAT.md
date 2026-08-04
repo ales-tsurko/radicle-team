@@ -3,8 +3,7 @@
 People working with a team need a way to reach its members quickly, without
 opening an issue for every question. Chat is that channel.
 
-This document records the design and the reasoning behind it. Nothing here is
-implemented yet.
+This document records the design, wire-independent formats, and reasoning.
 
 `radicle-team` speaks IRC. A member joins its team's channels as an ordinary
 IRC client under its own nick, and the people it works with join as ordinary
@@ -111,6 +110,69 @@ channel there publishes where the team talks. The server requires SASL and
 channels can be invite-only, so this is acceptable in the ordinary case. Where
 it is not, the endpoint belongs in the administrator-owned manifest instead of
 the repository.
+
+
+
+
+## Manifest format
+
+Chat is optional. When present, it names the repository again so every signed
+identity binding is repository-specific:
+
+```toml
+[chat]
+repository = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc"
+
+[chat.server]
+endpoint = "ircs://irc.example.com:6697"
+pin = "spki-sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[chat.channels]
+team = "#project"
+security = "#project-security"
+
+[[chat.participants]]
+account = "nico"
+certificate = "cert-sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+did = "did:key:z6Mk..."
+signature = "z..."
+```
+
+The left side of `[chat.channels]` is the logical `ChannelId`. The right side is
+the IRC channel. Account names and IRC channels use a lowercase portable subset
+so matching never depends on a server's casemapping. Every active member needs
+an attestation. Additional attestations map human accounts, and repository
+policy still decides whether their DIDs may act.
+
+`spki-sha256:` is followed by exactly 64 lowercase hexadecimal digits: SHA-256
+of the server certificate's DER-encoded SubjectPublicKeyInfo. This survives a
+certificate renewal that keeps the key. `cert-sha256:` has the same encoding
+but hashes the complete DER-encoded client certificate. The latter is enrollment
+evidence, not something IRC peers inspect at runtime.
+
+The signature is the Radicle Ed25519 signature in its normal multibase form. It
+covers this exact UTF-8 payload, including the final LF:
+
+```text
+radicle-team-chat-attestation-v1
+repository=rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc
+server=ircs://irc.example.com:6697
+server-pin=spki-sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+account=nico
+client-certificate=cert-sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+did=did:key:z6Mk...
+```
+
+Each DID signs its own binding. Manifest review authorizes the participant, but
+the self-signature separately proves that the DID owner accepted this IRC
+account and certificate. A rogue or compromised delegate therefore cannot bind
+Mallory's IRC account to Alice's DID and inherit Alice's permissions merely by
+editing the manifest.
+
+Parsing verifies every signature, rejects duplicate accounts, DIDs,
+certificates and IRC channel targets, and requires an attestation for every
+active member. Runtime authentication additionally requires the active RID and
+observed server pin to match before an `account-tag` can produce a sender DID.
 
 
 
@@ -249,6 +311,27 @@ XMPP was never considered in the original design and is a real alternative. It
 is lighter than Matrix with better mobile support than IRC, and its Rust
 libraries are maintained. It loses to IRC on simplicity and has no Rust server
 either.
+
+Backing chat with collaborative objects is appealing and was examined closely.
+It would delete the whole trust problem, since a message would be signed by the
+DID that wrote it, removing the attestation format, the account mapping, and any
+reliance on a server asserting identities. It would also reuse the watcher,
+classification, and conversation limits rather than running a second ingress.
+
+It fails on visibility. Radicle access control is repository-level only, either
+public or private with an allowed set of DIDs, and there is no per-object or
+per-type setting. Chat privacy would therefore equal repository visibility, so
+on a public repository every message a team ever sent would be world-readable
+and permanently archived. Fetching selectively does not help, because that lets
+a reader opt out rather than letting a writer restrict access. Gossip latency
+and the absence of any existing client are further costs on top.
+
+Redaction is not a way out. Redacting sets the comment to `None` in the
+materialized state and appends a new entry, leaving the original text in the
+object's history where plain git still reads it. Editing behaves the same way. A
+collaborative object is an append-only signed graph, so removing an entry would
+break the signature chain and every replica. Peers who already fetched a message
+keep it regardless.
 
 SimpleX and building on Radicle gossip, Iroh, or libp2p remain rejected for the
 reasons given when they were first considered.

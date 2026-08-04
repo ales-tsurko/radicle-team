@@ -2,7 +2,10 @@
 
 #![cfg_attr(
     any(not(test), miri),
-    expect(dead_code, reason = "the IRC ingress will consume this API in PR 6")
+    expect(
+        dead_code,
+        reason = "chat persistence is isolated behind one complete crate-private boundary"
+    )
 )]
 
 use std::{path::Path, str::FromStr as _};
