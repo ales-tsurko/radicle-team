@@ -1,17 +1,16 @@
 //! Repository manifest for a Radicle team.
 //!
-//! [`Manifest`](crate::manifest::Manifest) loads the single `.radicle-team.toml` manifest from a
-//! repository's canonical commit or from one explicitly selected administrator-owned file. The file
-//! is shared repository policy, not machine-local application state: contributors must agree on its
-//! reviewed character-to-DID bindings, while private identity material remains in the application
-//! home. `config-rs` parses the versioned document. Domain validation then rejects unknown
-//! members and duplicated active DIDs, and verifies that the selected member is active and bound
-//! to the locally loaded [`Identity`](crate::identity::Identity).
+//! [`Manifest`] loads the single `.radicle-team.toml` manifest from a repository's canonical commit
+//! or from one explicitly selected administrator-owned file. The file is shared repository policy,
+//! not machine-local application state: contributors must agree on its reviewed character-to-DID
+//! bindings, while private identity material remains in the application home. `config-rs` parses
+//! the versioned document. Domain validation then rejects unknown members and duplicated active
+//! DIDs, and verifies that the selected member is active and bound to the locally loaded
+//! [`Identity`].
 //!
 //! Member identity bindings are one security-sensitive section of the manifest. Validating one
-//! produces [`ValidatedBinding`](crate::manifest::ValidatedBinding), which carries the member, DID,
-//! generation, and source revision used by later processing. The watcher must not run before that
-//! validation succeeds.
+//! produces [`ValidatedBinding`], which carries the member, DID, generation, and source revision
+//! used by later processing. The watcher must not run before that validation succeeds.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

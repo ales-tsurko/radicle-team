@@ -1,10 +1,9 @@
 //! Lifecycle management for a team member's Radicle node.
 //!
-//! [`NodeManager`](crate::node::NodeManager) starts `radicle-node` with the selected
-//! [`Identity`](crate::identity::Identity), waits for its isolated control socket to become
-//! responsive, and verifies that the node uses the expected identity. The child inherits only the
-//! Radicle home and passphrase required by the identity provider. Its output is appended to the
-//! member's node log.
+//! [`NodeManager`] starts `radicle-node` with the selected [`Identity`], waits for its isolated
+//! control socket to become responsive, and verifies that the node uses the expected identity. The
+//! child inherits only the Radicle home and passphrase required by the identity provider. Its
+//! output is appended to the member's node log.
 //!
 //! Each managed identity has its own Radicle home and therefore its own control socket, storage,
 //! and databases. Radicle's default client profile does not open a listening TCP port, so multiple

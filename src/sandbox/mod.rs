@@ -1,8 +1,8 @@
 //! Host-local process sandboxing for agent adapters.
 //!
-//! [`AgentSandbox`](crate::sandbox::AgentSandbox) combines Zerobox's platform defaults with the
-//! selected member's local [`Config`](crate::sandbox::Config). Adapters may select and
-//! parameterize a command, but cannot change its filesystem or network permissions.
+//! [`AgentSandbox`] combines Zerobox's platform defaults with the selected member's local
+//! [`Config`]. Adapters may select and parameterize a command, but cannot change its filesystem or
+//! network permissions.
 
 #[cfg(target_os = "linux")]
 pub use crate::sandbox::linux::Error as LinuxHelperError;

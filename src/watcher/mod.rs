@@ -1,12 +1,11 @@
 //! Radicle activity watcher and agent delivery.
 //!
-//! A [`Watcher`](crate::watcher::Watcher) observes one repository as one
-//! [`Member`](crate::member::Member), classifies interactions requiring that member's attention,
-//! and emits deliveries to the member's serialized conversation dispatcher. The dispatcher invokes
-//! the `Talker` and acknowledges successful handling before the watcher checkpoints the activity.
-//! Assignments are the exception: they are work rather than conversation, so they join the member's
-//! [`WorkQueue`](crate::queue::WorkQueue) and reach the building half through
-//! [`Builder`](crate::builder::Builder).
+//! A [`Watcher`] observes one repository as one [`Member`](crate::member::Member), classifies
+//! interactions requiring that member's attention, and emits deliveries to the member's serialized
+//! conversation dispatcher. The dispatcher invokes the `Talker` and acknowledges successful
+//! handling before the watcher checkpoints the activity. Assignments are the exception: they are
+//! work rather than conversation, so they join the member's [`WorkQueue`](crate::queue::WorkQueue)
+//! and reach the building half through [`Builder`](crate::builder::Builder).
 //!
 //! # Lifecycle
 //!

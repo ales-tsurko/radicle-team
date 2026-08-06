@@ -1,5 +1,3 @@
-//! Identity, policy, node lifecycle, and activity watching for `radicle-team`.
-//!
 //! # Architecture
 //!
 //! One [`Application`] represents one fixed [`member::Member`] working in one Radicle repository.
@@ -29,15 +27,15 @@
 //!
 //! ```text
 //! Radicle node event
-//!     -> issue and patch history scan
-//!     -> Radicle action normalization
-//!     -> member-specific classification
-//!     -> internal activity
-//!     -> serialized conversation dispatcher
-//!     -> typed Talker method            (a message)
-//!        or the member's work queue     (an assignment)
-//!            -> Coder::work
-//!     -> work-scoped MCP reads and writes
+//!   - issue and patch history scan
+//!   - Radicle action normalization
+//!   - member-specific classification
+//!   - internal activity
+//!   - serialized conversation dispatcher
+//!   - typed Talker method            (a message)
+//!     or the member's work queue     (an assignment)
+//!       - Coder::work
+//!   - work-scoped MCP reads and writes
 //! ```
 //!
 //! [`watcher::Watcher`] rebuilds issue and patch state from their operation histories whenever a
@@ -82,33 +80,21 @@
 
 pub use crate::application::{Application, Error, Setup, SetupStatus};
 
-/// Agent adapter interface and its typed activity context.
 pub mod agent;
 mod application;
-/// Queued work carried out by a member's building adapter.
 pub mod builder;
-/// IRC chat identities and durable delivery state.
 pub mod chat;
-/// Command-line interface for selecting and running a team member.
 pub mod cli;
 mod conversation;
 mod database;
-/// Filesystem locations used by each team member.
 pub mod home;
-/// Radicle identity ownership and key management.
 pub mod identity;
-/// Repository-wide team manifest.
 pub mod manifest;
 mod mcp;
-/// Fixed team members and their profiles.
 pub mod member;
-/// Supervised Radicle node lifecycle.
 pub mod node;
-/// Durable per-member work queue.
 pub mod queue;
-/// Local process sandboxing for agent adapters.
 pub mod sandbox;
 mod shutdown;
-/// Radicle activity watching and agent delivery.
 pub mod watcher;
 mod workspace;
