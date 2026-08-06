@@ -52,20 +52,25 @@ pub(super) struct Policy {
     deny_read: Vec<PathBuf>,
     allow_write: Vec<PathBuf>,
     deny_write: Vec<PathBuf>,
-    mcp_host: String,
-    mcp_port: u16,
+    // Absent when the sandbox serves no MCP server, which is how the runtime's own commands run:
+    // nothing they do needs to reach this process.
+    mcp: Option<(String, u16)>,
 }
 
 impl Policy {
-    pub(super) fn load(cwd: &Path, endpoint: &McpEndpoint) -> Result<Self, Error> {
+    pub(super) fn load(
+        cwd: &Path,
+        endpoint: Option<&McpEndpoint>,
+        readable: &[PathBuf],
+        writable: &[PathBuf],
+        protected: &[PathBuf],
+    ) -> Result<Self, Error> {
         let home = BaseDirs::new()
             .map(|directories| directories.home_dir().to_owned())
             .ok_or(Error::HomeUnavailable)?;
         let temporary = env::temp_dir();
-        let (mcp_host, mcp_port) = Self::mcp_address(endpoint)?;
         let mut policy = Self {
-            mcp_host,
-            mcp_port,
+            mcp: endpoint.map(Self::mcp_address).transpose()?,
             ..Self::default()
         };
 
@@ -78,6 +83,14 @@ impl Policy {
             policy.extend(name, profile)?;
         }
         policy.deny_cargo_credentials(&home);
+        policy.allow_read.extend(readable.iter().cloned());
+        // Adapter caches, harness state and the shared object store live beside the working copies
+        // and have to be writable, or a build would have nowhere to put its output and an agent
+        // could edit files but never commit them.
+        policy.allow_write.extend(writable.iter().cloned());
+        // Applied after the grants above so a narrower fixed deny wins over the root it sits in,
+        // and so local configuration cannot open one back up.
+        policy.deny_write.extend(protected.iter().cloned());
 
         Ok(policy)
     }
@@ -192,11 +205,7 @@ impl Policy {
     }
 
     pub(super) fn network(&self, config: &Config) -> NetworkPolicy {
-        NetworkPolicy::new(
-            config.network().clone(),
-            self.mcp_host.clone(),
-            self.mcp_port,
-        )
+        NetworkPolicy::new(config.network().clone(), self.mcp.clone())
     }
 
     fn extend_entries<'a>(
@@ -319,25 +328,20 @@ impl Policy {
 #[derive(Debug, Clone)]
 pub(super) struct NetworkPolicy {
     access: NetworkAccess,
-    mcp_host: String,
-    mcp_port: u16,
+    mcp: Option<(String, u16)>,
 }
 
 impl NetworkPolicy {
-    pub(super) const fn new(access: NetworkAccess, mcp_host: String, mcp_port: u16) -> Self {
-        Self {
-            access,
-            mcp_host,
-            mcp_port,
-        }
+    pub(super) const fn new(access: NetworkAccess, mcp: Option<(String, u16)>) -> Self {
+        Self { access, mcp }
     }
 
     pub(super) const fn is_restricted(&self) -> bool {
         !matches!(self.access, NetworkAccess::All)
     }
 
-    pub(super) fn mcp_address(&self) -> (&str, u16) {
-        (&self.mcp_host, self.mcp_port)
+    pub(super) fn mcp_address(&self) -> Option<(&str, u16)> {
+        self.mcp.as_ref().map(|(host, port)| (host.as_str(), *port))
     }
 
     pub(super) fn domains(&self) -> &[String] {
@@ -360,22 +364,22 @@ mod tests {
     #[test]
     fn network_policy_keeps_mcp_separate_from_configured_domains() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let policy =
-            Policy::load(directory.path(), &endpoint()).expect("embedded policy should load");
+        let policy = Policy::load(directory.path(), Some(&endpoint()), &[], &[], &[])
+            .expect("embedded policy should load");
         let mut config = Config::default();
         config.set_network(NetworkAccess::Domains(vec!["example.com".to_owned()]));
         let network = policy.network(&config);
 
         assert!(network.is_restricted());
-        assert_eq!(network.mcp_address(), ("127.0.0.1", 12345));
+        assert_eq!(network.mcp_address(), Some(("127.0.0.1", 12345)));
         assert_eq!(network.domains(), ["example.com"]);
     }
 
     #[test]
     fn cargo_credentials_are_always_denied() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let policy =
-            Policy::load(directory.path(), &endpoint()).expect("embedded policy should load");
+        let policy = Policy::load(directory.path(), Some(&endpoint()), &[], &[], &[])
+            .expect("embedded policy should load");
         let home = directories::BaseDirs::new()
             .expect("home directory should be available")
             .home_dir()
@@ -391,8 +395,8 @@ mod tests {
     #[test]
     fn fixed_denies_reject_nested_local_allows() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let mut policy =
-            Policy::load(directory.path(), &endpoint()).expect("embedded policy should load");
+        let mut policy = Policy::load(directory.path(), Some(&endpoint()), &[], &[], &[])
+            .expect("embedded policy should load");
         let home = directories::BaseDirs::new()
             .expect("home directory should be available")
             .home_dir()
@@ -426,8 +430,8 @@ mod tests {
     #[test]
     fn fixed_denies_reject_dot_dot_traversal_around_local_allows() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let policy =
-            Policy::load(directory.path(), &endpoint()).expect("embedded policy should load");
+        let policy = Policy::load(directory.path(), Some(&endpoint()), &[], &[], &[])
+            .expect("embedded policy should load");
         let home = directories::BaseDirs::new()
             .expect("home directory should be available")
             .home_dir()

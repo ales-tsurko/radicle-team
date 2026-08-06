@@ -682,6 +682,11 @@ pub(super) fn write_result(value: impl ToString) -> Result<Json<Document>, Servi
     }))
 }
 
+/// Reads back the object a write reported creating.
+pub(super) fn written_id(document: &Json<Document>) -> Option<radicle::cob::ObjectId> {
+    document.0.data.get("id")?.as_str()?.parse().ok()
+}
+
 pub(super) fn require_kind(actual: SubjectKind, expected: SubjectKind) -> Result<(), ServiceError> {
     (actual == expected)
         .then_some(())

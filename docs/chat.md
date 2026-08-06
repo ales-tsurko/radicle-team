@@ -27,8 +27,8 @@ That is the price of an answer arriving now. An agent turn cannot be
 interrupted, so a shared adapter would make every question wait for whatever
 review happened to start first.
 
-Omitting `[chat]` from the manifest costs nothing. The adapter is never started
-and the member runs two.
+Omitting `[chat]` from the manifest costs nothing. Neither the adapter nor its
+MCP server is started, and the member runs two.
 
 
 

@@ -8,14 +8,15 @@
 
 pub use crate::{
     agent::interface::{
-        ChatContext, ChatMessage, Chatter, Coder, Context, DeliveryId, Error, InvalidSource,
-        McpEndpoint, Source, Talker, WorkId,
+        Adapter, ChatContext, ChatMessage, Context, DeliveryId, Error, InvalidSource, Layout,
+        McpEndpoint, Source, WorkId,
     },
     sandbox::{AgentChild, AgentCommand, AgentSandbox},
     watcher::{Change, Comment, Subject, Target},
 };
-pub(crate) use crate::agent::publisher::{
-    Authorizer, Error as PublishError, MutationKey, MutationValidation, Publisher,
+pub(crate) use crate::agent::{
+    interface::{Chatter, Coder, Idle, Stall, Supervised, Supervisor, Talker},
+    publisher::{Authorizer, Error as PublishError, MutationKey, MutationValidation, Publisher},
 };
 #[cfg(all(test, not(miri)))]
 pub(crate) use crate::agent::publisher::Announcer;

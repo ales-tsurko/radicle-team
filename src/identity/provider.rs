@@ -30,7 +30,7 @@ use radicle::{
         },
     },
     git,
-    identity::Did,
+    identity::{Did, RepoId},
     node::Alias,
     profile::{Config, Home as RadicleHome, Profile as RadicleProfile},
     storage::git::{Storage, transport},
@@ -167,10 +167,13 @@ where
         member_home: &MemberHome,
         provider: &Provider,
     ) -> Result<Identity, Error> {
+        let repository = member_home.marker()?.repository()?;
         match provider {
-            Provider::Managed { protection } => self.load_managed(member, member_home, *protection),
+            Provider::Managed { protection } => {
+                self.load_managed(member, repository, member_home, *protection)
+            }
             Provider::RadicleHome { home, expected_did } => {
-                self.load_existing(member, home, *expected_did)
+                self.load_existing(member, repository, home, *expected_did)
             }
         }
     }
@@ -178,21 +181,22 @@ where
     fn load_managed(
         &self,
         member: Member,
+        repository: RepoId,
         member_home: &MemberHome,
         protection: KeyProtection,
     ) -> Result<Identity, Error> {
         Permissions::secure_directory(member_home.path())?;
-        let home = RadicleHome::new(member_home.radicle())?;
+        let home = RadicleHome::new(member_home.identity())?;
         let keystore = Keystore::new(&home.keys());
         let initialized = Self::profile_files(&home, &keystore);
 
         let (profile, passphrase) = match initialized {
             ProfileFiles::Complete => {
-                let passphrase = self.existing_passphrase(member, &home, &keystore)?;
+                let passphrase = self.existing_passphrase(member, repository, &keystore)?;
                 (Self::load_profile(home)?, passphrase)
             }
             ProfileFiles::Empty => {
-                let passphrase = self.new_passphrase(member, &home, protection)?;
+                let passphrase = self.new_passphrase(member, repository, protection)?;
                 let alias = Alias::from_str(member.id())?;
                 let profile =
                     RadicleProfile::init(home, alias, passphrase.clone(), Seed::generate())?;
@@ -209,12 +213,13 @@ where
     fn load_existing(
         &self,
         member: Member,
+        repository: RepoId,
         path: &Path,
         expected_did: Option<Did>,
     ) -> Result<Identity, Error> {
         let home = RadicleHome::load(path)?;
         let keystore = Keystore::new(&home.keys());
-        let passphrase = self.existing_passphrase(member, &home, &keystore)?;
+        let passphrase = self.existing_passphrase(member, repository, &keystore)?;
         let profile = Self::load_profile(home)?;
         let identity = Identity::from_profile(profile, passphrase)?;
 
@@ -257,7 +262,7 @@ where
     fn existing_passphrase(
         &self,
         member: Member,
-        home: &RadicleHome,
+        repository: RepoId,
         keystore: &Keystore,
     ) -> Result<Option<Passphrase>, Error> {
         if !keystore.is_encrypted()? {
@@ -268,7 +273,7 @@ where
         }
 
         self.credentials
-            .load(&CredentialId::new(member, home.path()))?
+            .load(&CredentialId::new(member, repository))?
             .ok_or(Error::MissingPassphrase)
             .map(Some)
     }
@@ -276,7 +281,7 @@ where
     fn new_passphrase(
         &self,
         member: Member,
-        home: &RadicleHome,
+        repository: RepoId,
         protection: KeyProtection,
     ) -> Result<Option<Passphrase>, Error> {
         if protection == KeyProtection::Unencrypted {
@@ -286,7 +291,7 @@ where
             return Ok(Some(passphrase));
         }
 
-        let id = CredentialId::new(member, home.path());
+        let id = CredentialId::new(member, repository);
         if let Some(passphrase) = self.credentials.load(&id)? {
             return Ok(Some(passphrase));
         }
@@ -367,6 +372,12 @@ pub enum Error {
     /// Loading or initializing the Radicle profile failed.
     #[error("Radicle profile error: {0}")]
     Profile(#[from] radicle::profile::Error),
+    /// The member directory could not be read.
+    #[error("member directory error: {0}")]
+    Home(#[from] crate::home::Error),
+    /// The member directory records an unreadable repository.
+    #[error("member directory records an invalid repository: {0}")]
+    Repository(#[from] radicle::identity::IdError),
     /// The member name was not a valid Radicle alias.
     #[error("invalid Radicle alias for member: {0}")]
     Alias(#[from] radicle::node::AliasError),
@@ -409,7 +420,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use radicle::{crypto::ssh::Passphrase, identity::RepoId};
+    use radicle::crypto::ssh::Passphrase;
 
     use crate::{
         home::MemberHome,
@@ -422,7 +433,6 @@ mod tests {
 
     const OTHER_DID: &str = "did:key:z6MkvUJtYD9dHDJfpevWRT98mzDDpdAtmUjwyDSkyqksUr7C";
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 
     #[derive(Debug, Default)]
     struct MemoryCredentials {
@@ -460,11 +470,15 @@ mod tests {
         }
 
         fn member_home(&self) -> MemberHome {
-            MemberHome::at(
-                &self.0,
-                RepoId::from_urn(REPOSITORY).expect("repository should parse"),
+            let home = MemberHome::at(&self.0);
+            home.create().expect("member directory should be created");
+            home.record(
                 Member::Nico,
+                radicle::identity::RepoId::from_urn(REPOSITORY).expect("repository should parse"),
             )
+            .expect("marker should be recorded");
+
+            home
         }
     }
 
@@ -473,6 +487,8 @@ mod tests {
             let _result = fs::remove_dir_all(&self.0);
         }
     }
+
+    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 
     #[test]
     fn provisions_and_reloads_managed_identity() {
@@ -540,7 +556,7 @@ mod tests {
                 Member::Nico,
                 &home,
                 &Provider::RadicleHome {
-                    home: home.radicle(),
+                    home: home.identity(),
                     expected_did: Some(OTHER_DID.parse().expect("DID should parse")),
                 },
             ),
@@ -562,7 +578,7 @@ mod tests {
                 Member::Nico,
                 &home,
                 &Provider::RadicleHome {
-                    home: home.radicle(),
+                    home: home.identity(),
                     expected_did: None,
                 },
             ),
@@ -573,7 +589,7 @@ mod tests {
                 Member::Nico,
                 &home,
                 &Provider::RadicleHome {
-                    home: home.radicle(),
+                    home: home.identity(),
                     expected_did: None,
                 },
             )
@@ -584,8 +600,8 @@ mod tests {
     fn detects_partially_initialized_managed_home() {
         let directory = TestDirectory::new();
         let home = directory.member_home();
-        fs::create_dir_all(home.radicle()).expect("Radicle directory should be created");
-        fs::write(home.radicle().join("config.json"), "{}").expect("config should be written");
+        fs::create_dir_all(home.identity()).expect("Radicle directory should be created");
+        fs::write(home.identity().join("config.json"), "{}").expect("config should be written");
 
         assert!(matches!(
             Manager::new(MemoryCredentials::default()).load(

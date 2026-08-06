@@ -5,6 +5,8 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -22,19 +24,195 @@ use crate::{
     watcher::{Change, Comment, Subject, Target},
 };
 
+/// How long an agent may show no progress before the runtime treats it as stuck.
+///
+/// Nothing bounds a delivery's duration, because a real one can run for hours.
+pub(crate) const SILENCE: Duration = Duration::from_secs(15 * 60);
+/// How often the runtime asks an adapter whether its agent is still doing anything.
+pub(crate) const HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// One of the three agent adapters a member runs.
+///
+/// Each has its own MCP server, its own working copy, its own cache, and its own harness state, so
+/// none can disturb another's checked-out branch or block on another's build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Adapter {
+    /// Answers repository activity.
+    Talker,
+    /// Answers authenticated chat.
+    Chatter,
+    /// Carries out queued work.
+    Coder,
+}
+
+impl Adapter {
+    /// Every adapter, in a stable order.
+    pub const ALL: [Self; 3] = [Self::Talker, Self::Chatter, Self::Coder];
+
+    /// Returns the fixed directory name for this adapter.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Talker => "talker",
+            Self::Chatter => "chatter",
+            Self::Coder => "coder",
+        }
+    }
+
+    /// Returns whether this adapter's working copy stands on a branch.
+    #[must_use]
+    pub const fn owns_branches(self) -> bool {
+        matches!(self, Self::Coder)
+    }
+}
+
+impl fmt::Display for Adapter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.id())
+    }
+}
+
+/// Fixed directories one adapter owns for the life of the member.
+///
+/// Delivery workspaces arrive per call. These do not: a cache survives between deliveries on
+/// purpose, and a harness needs somewhere of its own to keep settings and logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    adapter: Adapter,
+    cache: PathBuf,
+    harness: PathBuf,
+}
+
+impl Layout {
+    /// Describes the directories belonging to `adapter`.
+    #[must_use]
+    pub const fn new(adapter: Adapter, cache: PathBuf, harness: PathBuf) -> Self {
+        Self {
+            adapter,
+            cache,
+            harness,
+        }
+    }
+
+    /// Returns which adapter these directories belong to.
+    #[must_use]
+    pub const fn adapter(&self) -> Adapter {
+        self.adapter
+    }
+
+    /// Returns the writable cache directory for build and dependency output.
+    ///
+    /// Point `CARGO_TARGET_DIR` and its equivalents here so build output stays out of the working
+    /// copy, which is wiped before every delivery.
+    #[must_use]
+    pub fn cache(&self) -> &Path {
+        &self.cache
+    }
+
+    /// Returns the directory the agent harness keeps its own state in.
+    ///
+    /// A harness writes settings, logs and transcripts under a user-level directory of its own by
+    /// default, which every member on the machine would then share. Point it here instead, so one
+    /// member's harness state stays that member's and goes when its directory goes.
+    #[must_use]
+    pub fn harness(&self) -> &Path {
+        &self.harness
+    }
+}
+
+/// Hands the runtime a shared view of a running agent.
+///
+/// The handle is separate from the adapter because the runtime watches an agent while that same
+/// adapter is busy handling the delivery, so the two cannot both borrow it.
+pub(crate) trait Supervised: Send {
+    /// Returns a handle which can watch and stop this adapter's agent.
+    fn supervisor(&self) -> Arc<dyn Supervisor>;
+}
+
+/// The part of every adapter the runtime supervises.
+///
+/// An agent can run for hours and still be working, so nothing bounds how long one may take. What
+/// is bounded is silence. Each adapter reports when it last saw its own agent do something, and
+/// the runtime decides what counts as too long and stops it. Reading that signal out of a
+/// particular harness belongs to the adapter, deciding what to do about it does not.
+#[async_trait]
+pub(crate) trait Supervisor: Send + Sync {
+    /// Reports when this adapter last saw its agent do anything.
+    fn last_progress(&self) -> Option<Instant>;
+
+    /// Stops the agent whether it agreed to or not.
+    async fn kill(&self) -> Result<(), Error>;
+}
+
+/// Watches one agent for silence, so the two places which run agents agree on what stuck means.
+pub(crate) struct Stall {
+    watch: Arc<dyn Supervisor>,
+    seen: Instant,
+}
+
+impl fmt::Debug for Stall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Stall").finish_non_exhaustive()
+    }
+}
+
+impl Stall {
+    pub(crate) fn new(watch: Arc<dyn Supervisor>) -> Self {
+        Self {
+            watch,
+            seen: Instant::now(),
+        }
+    }
+
+    /// Waits one heartbeat and reports whether the agent has gone silent for too long.
+    pub(crate) async fn silent(&mut self) -> bool {
+        tokio::time::sleep(HEARTBEAT).await;
+        if let Some(progress) = self.watch.last_progress() {
+            self.seen = self.seen.max(progress);
+        }
+
+        self.seen.elapsed() >= SILENCE
+    }
+
+    /// Stops the agent, reporting how long it had been silent.
+    pub(crate) async fn kill(&self) -> Result<(), Error> {
+        tracing::warn!(silent_for = ?self.seen.elapsed(), "agent stopped making progress");
+
+        self.watch.kill().await
+    }
+}
+
+/// A supervisor for an adapter which runs no separate process.
+///
+/// Reports no progress and has nothing to kill, so the runtime never stops it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Idle;
+
+#[async_trait]
+impl Supervisor for Idle {
+    fn last_progress(&self) -> Option<Instant> {
+        None
+    }
+
+    async fn kill(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 /// A backend capable of answering repository activity addressed to one team member.
 ///
 /// Two things this never sees. Being assigned is work rather than a message, so it joins the
 /// member's queue and reaches [`Coder`]. A chat message reaches [`Chatter`], because somebody is
 /// waiting on the other end of it and cannot wait behind a twenty-minute review.
 #[async_trait]
-pub trait Talker: Send {
+pub(crate) trait Talker: Supervised {
     /// Configures and starts the adapter for one member and run-scoped MCP server.
     async fn start(
         &mut self,
         profile: Profile,
         mcp: &McpEndpoint,
         sandbox: AgentSandbox,
+        layout: Layout,
     ) -> Result<(), Error>;
 
     /// Handles a mention in an issue or patch.
@@ -67,13 +245,14 @@ pub trait Talker: Send {
 /// Deciding that chat should produce work belongs here. Carrying it out belongs to [`Coder`],
 /// reached through the member's queue.
 #[async_trait]
-pub trait Chatter: Send {
+pub(crate) trait Chatter: Supervised {
     /// Configures and starts the adapter for one member and run-scoped MCP server.
     async fn start(
         &mut self,
         profile: Profile,
         mcp: &McpEndpoint,
         sandbox: AgentSandbox,
+        layout: Layout,
     ) -> Result<(), Error>;
 
     /// Handles an authenticated message which addresses this member in a bound channel.
@@ -92,13 +271,14 @@ pub trait Chatter: Send {
 /// identity, so this interface receives jobs rather than activity. Deciding what should be built
 /// belongs to [`Talker`]. Deciding how belongs here.
 #[async_trait]
-pub trait Coder: Send + Sync {
+pub(crate) trait Coder: Supervised + Sync {
     /// Configures and starts the adapter for one member and run-scoped MCP server.
     async fn start(
         &mut self,
         profile: Profile,
         mcp: &McpEndpoint,
         sandbox: AgentSandbox,
+        layout: Layout,
     ) -> Result<(), Error>;
 
     /// Carries out one queued job in `workspace`.

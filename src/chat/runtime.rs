@@ -20,7 +20,6 @@ use crate::{
         state::{MessageStatus, Receipt},
         transport::{ClientIdentity, Connection},
     },
-    conversation,
     manifest::RepositoryPolicy,
     member::Member,
 };
@@ -329,13 +328,12 @@ where
     async fn complete_delivery(
         &self,
         identity: MessageId,
-        delivered: Result<conversation::Acknowledgement, String>,
+        delivered: Result<(), String>,
     ) -> Result<(), Error> {
-        let acknowledgement = delivered.map_err(Error::Delivery)?;
+        delivered.map_err(Error::Delivery)?;
         self.state.mark_handled(identity).await?;
-        acknowledgement
-            .finish()
-            .map_err(|error| Error::Delivery(error.to_string()))
+
+        Ok(())
     }
 
     async fn drain_outbox(
@@ -377,7 +375,7 @@ pub(crate) trait Delivery: std::fmt::Debug + Send + Sync {
         repository: RepoId,
         identity: MessageId,
         message: IncomingMessage,
-    ) -> Result<conversation::Acknowledgement, String>;
+    ) -> Result<(), String>;
 }
 
 #[async_trait]
@@ -387,7 +385,7 @@ impl Delivery for dispatcher::Handle {
         repository: RepoId,
         identity: MessageId,
         message: IncomingMessage,
-    ) -> Result<conversation::Acknowledgement, String> {
+    ) -> Result<(), String> {
         self.message(repository, identity, message)
             .await
             .map_err(|error| error.to_string())
@@ -519,10 +517,8 @@ mod tests {
                 DelegateSource, Delivery, Ingress, RECONNECT_INITIAL, RECONNECT_STABLE, Source,
                 next_reconnect_delay,
             },
-            state::{MessageStatus, Receipt},
             transport::{ClientIdentity, VerifiedServer},
         },
-        conversation,
         manifest::{Limits, PriorityLabels, RepositoryPolicy, TriggerAccess},
         member::Member,
     };
@@ -539,12 +535,12 @@ mod tests {
             _repository: RepoId,
             identity: MessageId,
             _message: IncomingMessage,
-        ) -> Result<conversation::Acknowledgement, String> {
+        ) -> Result<(), String> {
             self.0
                 .lock()
                 .map_err(|error| error.to_string())?
                 .push(identity);
-            Ok(conversation::Acknowledgement::completed())
+            Ok(())
         }
     }
 
@@ -620,65 +616,6 @@ mod tests {
                 .await
                 .expect("unstable history should be ignored")
                 .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn checkpoints_delivery_before_reporting_cleanup_failure() {
-        let (repository, did, server, config, identity) = fixture();
-        let policy = RepositoryPolicy::new(
-            TriggerAccess::Anyone,
-            vec![did],
-            PriorityLabels::default(),
-            Limits::default(),
-        )
-        .with_chat_for_test(config);
-        let state = State::memory().await.expect("chat state should open");
-        let ingress = Ingress {
-            repository,
-            member: Member::Nico,
-            did,
-            policy,
-            delegates: DelegateSource::Fixed(vec![did]),
-            identity,
-            state: state.clone(),
-            delivery: RecordingDelivery::default(),
-        };
-        let mut classifier = classifier(&ingress, server);
-        let pending = ingress
-            .admit(&mut classifier, tagged("cleanup-1"), Source::History)
-            .await
-            .expect("message should be admitted")
-            .expect("message should need delivery");
-        let channel = pending.message.channel.clone();
-        let account = pending.message.account.to_string();
-        let author = pending.message.sender.did();
-
-        ingress
-            .complete_delivery(
-                pending.identity,
-                Ok(conversation::Acknowledgement::failed_cleanup(
-                    "busy workspace",
-                )),
-            )
-            .await
-            .expect_err("cleanup failure should still be reported");
-
-        assert_eq!(
-            state
-                .record(
-                    repository,
-                    &server.to_string(),
-                    &channel,
-                    Receipt::History {
-                        message: "cleanup-1"
-                    },
-                    &account,
-                    author,
-                )
-                .await
-                .expect("delivery state should remain readable"),
-            MessageStatus::Handled(pending.identity)
         );
     }
 

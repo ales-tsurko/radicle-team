@@ -101,6 +101,17 @@ impl Config {
         &self.deny_write
     }
 
+    /// Returns a configuration which grants nothing beyond the fixed policy.
+    ///
+    /// Used where the caller supplies its own grants and no local file may widen them.
+    #[must_use]
+    pub fn confined() -> Self {
+        Self {
+            network: NetworkAccess::Disabled,
+            ..Self::default()
+        }
+    }
+
     /// Returns the network policy.
     #[must_use]
     pub const fn network(&self) -> &NetworkAccess {
@@ -385,24 +396,15 @@ mod tests {
     #[cfg(not(miri))]
     use std::{fs, path::Path};
 
-    use radicle::identity::RepoId;
-
     use crate::{
         home::MemberHome,
-        member::Member,
         sandbox::{Config, NetworkAccess},
     };
     #[cfg(not(miri))]
     use crate::sandbox::ConfigError;
 
-    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
-
     fn member_home(root: impl Into<std::path::PathBuf>) -> MemberHome {
-        MemberHome::at(
-            root,
-            RepoId::from_urn(REPOSITORY).expect("repository should parse"),
-            Member::Nico,
-        )
+        MemberHome::at(root)
     }
 
     #[test]

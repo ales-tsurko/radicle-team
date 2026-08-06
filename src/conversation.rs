@@ -6,12 +6,12 @@ use radicle::identity::Did;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    agent::{self, Source, Talker, WorkId},
+    agent::{self, Adapter, Source, Talker, WorkId},
     manifest::{Limits, TriggerAccess},
     mcp::WorkScope,
     member::Member,
     watcher::{Activity, Delivery},
-    workspace::{WorkingCopy, Workspaces},
+    workspace::Workspaces,
 };
 
 const BUFFER: usize = 32;
@@ -124,6 +124,30 @@ impl Turn {
     }
 }
 
+/// Runs one delivery, killing the agent if it stops making progress.
+///
+/// A delivery has no time limit, because reading a long patch or a long thread legitimately takes
+/// a while. Silence is what is limited, on the terms [`Stall`](agent::Stall) sets.
+pub(crate) async fn supervise<T>(
+    handling: impl Future<Output = Result<T, agent::Error>>,
+    agent: std::sync::Arc<dyn agent::Supervisor>,
+) -> Result<T, Error> {
+    let mut stall = agent::Stall::new(agent);
+    tokio::pin!(handling);
+    loop {
+        tokio::select! {
+            handled = &mut handling => return handled.map_err(Error::Talker),
+            silent = stall.silent() => {
+                if silent {
+                    stall.kill().await.map_err(Error::Talker)?;
+
+                    return Err(Error::Stalled);
+                }
+            }
+        }
+    }
+}
+
 /// Reason an addressed author cannot continue a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum AdmissionError {
@@ -148,7 +172,7 @@ impl Handle {
         &self,
         activity: Activity,
         delivery: Delivery,
-    ) -> Result<Acknowledgement, Error> {
+    ) -> Result<(), Error> {
         let (completion, completed) = oneshot::channel();
         self.sender
             .send(Request::Deliver {
@@ -172,31 +196,6 @@ impl Handle {
     }
 }
 
-/// Completion acknowledged after handling and publication recovery succeed.
-#[derive(Debug)]
-pub(crate) struct Acknowledgement {
-    cleanup: Result<(), String>,
-}
-
-impl Acknowledgement {
-    /// Reports workspace cleanup after the watcher has durably checkpointed the delivery.
-    pub(crate) fn finish(self) -> Result<(), Error> {
-        self.cleanup.map_err(Error::Workspace)
-    }
-
-    #[cfg(all(test, not(miri)))]
-    pub(crate) const fn completed() -> Self {
-        Self { cleanup: Ok(()) }
-    }
-
-    #[cfg(all(test, not(miri)))]
-    pub(crate) fn failed_cleanup(error: impl Into<String>) -> Self {
-        Self {
-            cleanup: Err(error.into()),
-        }
-    }
-}
-
 /// The workspace and MCP scope one adapter works inside.
 ///
 /// Each adapter runs its own agent under its own MCP server, so each needs its own checkout and
@@ -204,50 +203,52 @@ impl Acknowledgement {
 #[derive(Debug)]
 pub(crate) struct Scoped {
     pub(crate) member: Member,
+    adapter: Adapter,
     workspaces: Workspaces,
     pub(crate) scope: WorkScope,
 }
 
 impl Scoped {
-    pub(crate) const fn new(member: Member, workspaces: Workspaces, scope: WorkScope) -> Self {
+    pub(crate) const fn new(
+        member: Member,
+        adapter: Adapter,
+        workspaces: Workspaces,
+        scope: WorkScope,
+    ) -> Self {
         Self {
             member,
+            adapter,
             workspaces,
             scope,
         }
     }
 
-    /// Checks out a working copy for `work` and reports its path.
-    pub(crate) async fn prepare(
-        &self,
-        work: WorkId,
-        source: Source,
-    ) -> Result<(WorkingCopy, std::path::PathBuf), Error> {
-        let workspace = self
-            .workspaces
-            .prepare(work, source)
+    /// Moves this adapter's working copy onto `source` and reports its path.
+    pub(crate) async fn prepare(&self, source: Source) -> Result<std::path::PathBuf, Error> {
+        self.workspaces
+            .prepare(self.adapter, source)
             .await
-            .map_err(|error| Error::Workspace(error.to_string()))?;
-        let path = workspace.path().to_path_buf();
-
-        Ok((workspace, path))
+            .map_err(|error| Error::Workspace(error.to_string()))
     }
 
-    /// Closes the scope, removes the working copy, and recovers interrupted publications.
+    /// Closes the scope and recovers interrupted publications.
     pub(crate) async fn finish(
         &self,
         work: WorkId,
-        workspace: WorkingCopy,
-        handled: Result<(), agent::Error>,
-    ) -> Result<Acknowledgement, Error> {
+        handled: Result<(), Error>,
+    ) -> Result<(), Error> {
         self.scope.deactivate().await;
-        let cleanup = workspace.cleanup().await.map_err(|error| error.to_string());
         handled.inspect_err(|error| {
             tracing::warn!(member = %self.member, %work, %error, "agent failed to handle conversation");
         })?;
-        self.reconcile(work).await?;
+        self.reconcile(work).await
+    }
 
-        Ok(Acknowledgement { cleanup })
+    /// Removes the working branch of a patch which has landed.
+    pub(crate) async fn retire(&self, subject: crate::watcher::Subject) {
+        if let Err(error) = self.workspaces.retire(subject).await {
+            tracing::warn!(%subject, %error, "could not remove the branch of a landed patch");
+        }
     }
 
     /// Recovers publications belonging to `work`.
@@ -273,7 +274,7 @@ impl Dispatcher {
         (
             Handle { sender },
             Self {
-                scoped: Scoped::new(member, workspaces, scope),
+                scoped: Scoped::new(member, Adapter::Talker, workspaces, scope),
                 receiver,
             },
         )
@@ -305,10 +306,10 @@ impl Dispatcher {
         activity: Activity,
         delivery: Delivery,
         agent: &mut (impl Talker + ?Sized),
-    ) -> Result<Acknowledgement, Error> {
+    ) -> Result<(), Error> {
         let identity = activity.delivery_id();
         let subject = activity.subject;
-        let (workspace, path) = self.scoped.prepare(identity.into(), subject.into()).await?;
+        let path = self.scoped.prepare(subject.into()).await?;
         self.scoped
             .scope
             .activate(activity.context(path.clone()))
@@ -323,10 +324,14 @@ impl Dispatcher {
             workspace = %path.display(),
             "dispatching activity to the agent"
         );
-        let handled = delivery.dispatch(activity.context(path), agent).await;
-        self.scoped
-            .finish(identity.into(), workspace, handled)
-            .await
+        let watch = agent::Supervised::supervisor(agent);
+        let handled = supervise(delivery.dispatch(activity.context(path), agent), watch).await;
+        let finished = self.scoped.finish(identity.into(), handled).await;
+        if matches!(delivery, Delivery::Changed(agent::Change::Merged)) {
+            self.scoped.retire(subject).await;
+        }
+
+        finished
     }
 }
 
@@ -334,7 +339,7 @@ enum Request {
     Deliver {
         activity: Activity,
         delivery: Delivery,
-        completion: oneshot::Sender<Result<Acknowledgement, Error>>,
+        completion: oneshot::Sender<Result<(), Error>>,
     },
     Reconcile {
         work: WorkId,
@@ -360,4 +365,7 @@ pub(crate) enum Error {
     /// The dispatcher is not running.
     #[error("conversation dispatcher is not running")]
     Unavailable,
+    /// The agent stopped making progress and was killed.
+    #[error("agent was killed after making no progress")]
+    Stalled,
 }

@@ -13,16 +13,12 @@ use std::{
     process::ExitStatus,
 };
 
-use radicle::identity::RepoId;
 use radicle_team::{
     agent::McpEndpoint,
     home::MemberHome,
-    member::Member,
     sandbox::{AgentSandbox, Config, NetworkAccess},
 };
 use url::Url;
-
-const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 
 type Check = fn() -> Pin<Box<dyn Future<Output = ()>>>;
 
@@ -42,6 +38,9 @@ const CHECKS: &[(&str, Check)] = &[
     }),
     ("reaches_the_mcp_endpoint_with_networking_disabled", || {
         Box::pin(reaches_the_mcp_endpoint_with_networking_disabled())
+    }),
+    ("guards_the_shared_git_store", || {
+        Box::pin(guards_the_shared_git_store())
     }),
 ];
 
@@ -261,6 +260,69 @@ async fn reaches_the_mcp_endpoint_with_networking_disabled() {
     );
 }
 
+// Proves the shared Git store's carveouts against a real sandbox rather than the policy alone.
+//
+// The runtime runs Git against this store outside the sandbox, so anything an adapter can write
+// there which Git later reads is a way of choosing what the runtime executes. The commit at the
+// end is the other half: the store has to stay writable enough to be usable at all.
+async fn guards_the_shared_git_store() {
+    let fixture = Fixture::new("git-store");
+    let common = fixture.git_store();
+    let sandbox = fixture.sandbox(Config::default());
+
+    check(
+        write(&sandbox, &common.join("objects").join("probe"))
+            .await
+            .success(),
+        "the object store must stay writable; without this control a denial proves nothing",
+    );
+    for denied in [
+        common.join("config"),
+        common.join("hooks").join("post-checkout"),
+        common.join("packed-refs"),
+        common.join("refs").join("heads").join("main"),
+        common.join("worktrees").join("coder").join("commondir"),
+        common.join("worktrees").join("talker").join("index"),
+        fixture.workspaces().join(".git"),
+    ] {
+        check(
+            !write(&sandbox, &denied).await.success(),
+            &format!(
+                "{} must not be writable inside the sandbox",
+                denied.display()
+            ),
+        );
+    }
+
+    let worktree = fixture.workspaces();
+    check(
+        run(sandbox
+            .command("/bin/sh")
+            .arg("-c")
+            .arg("echo agent > written.txt && git add written.txt && git commit -q -m Agent"))
+        .await
+        .success(),
+        "the building adapter must still be able to commit in its own working copy",
+    );
+    check(
+        std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "refs/heads/radicle-team/work"])
+            .current_dir(&worktree)
+            .status()
+            .expect("git should run")
+            .success(),
+        "the commit the adapter made must be on its branch in the shared store",
+    );
+}
+
+async fn write(sandbox: &AgentSandbox, path: &Path) -> ExitStatus {
+    run(sandbox
+        .command("/bin/sh")
+        .arg("-c")
+        .arg(format!("echo probe >> '{}'", path.display())))
+    .await
+}
+
 struct Fixture {
     directory: tempfile::TempDir,
     home: MemberHome,
@@ -272,11 +334,7 @@ impl Fixture {
             .prefix(name)
             .tempdir()
             .expect("temporary directory should be created");
-        let home = MemberHome::at(
-            directory.path(),
-            RepoId::from_urn(REPOSITORY).expect("repository should parse"),
-            Member::Nico,
-        );
+        let home = MemberHome::at(directory.path());
 
         Self { directory, home }
     }
@@ -286,12 +344,64 @@ impl Fixture {
     }
 
     fn workspaces(&self) -> PathBuf {
-        let workspaces = self.home.workspaces();
+        let workspaces = self.home.worktree(radicle_team::agent::Adapter::Coder);
         fs::create_dir_all(&workspaces).expect("workspaces should be created");
         workspaces
     }
 
-    /// Writes `config` as the member's sandbox configuration and loads a sandbox using it.
+    // Builds the shared object store and the working copies the way the runtime does.
+    fn git_store(&self) -> PathBuf {
+        let source = self.root().join("source");
+        fs::create_dir_all(&source).expect("source should be created");
+        git(&source, &["init", "-q", "."]);
+        fs::write(source.join("README.md"), "source\n").expect("README should be written");
+        git(&source, &["add", "--all"]);
+        git(&source, &["commit", "-q", "-m", "Initial"]);
+
+        let common = self.home.git_common();
+        fs::create_dir_all(common.parent().expect("the store has a parent"))
+            .expect("code directory should be created");
+        git(
+            self.root(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &source.display().to_string(),
+                &common.display().to_string(),
+            ],
+        );
+        git(&common, &["config", "user.name", "Sandbox Test"]);
+        git(&common, &["config", "user.email", "sandbox@example.com"]);
+        fs::create_dir_all(common.join("refs").join("heads").join("radicle-team"))
+            .expect("branch directory should be created");
+        for adapter in [
+            radicle_team::agent::Adapter::Talker,
+            radicle_team::agent::Adapter::Chatter,
+            radicle_team::agent::Adapter::Coder,
+        ] {
+            let worktree = self.home.worktree(adapter);
+            git(
+                &common,
+                &[
+                    "worktree",
+                    "add",
+                    "--relative-paths",
+                    "--detach",
+                    &worktree.display().to_string(),
+                    "HEAD",
+                ],
+            );
+        }
+        git(
+            &self.home.worktree(radicle_team::agent::Adapter::Coder),
+            &["checkout", "-q", "-B", "radicle-team/work"],
+        );
+
+        common
+    }
+
+    // Writes `config` as the member's sandbox configuration and loads a sandbox using it.
     fn sandbox(&self, config: Config) -> AgentSandbox {
         self.sandbox_for(config, &endpoint())
     }
@@ -299,7 +409,8 @@ impl Fixture {
     fn sandbox_for(&self, config: Config, endpoint: &McpEndpoint) -> AgentSandbox {
         self.write_config(&config);
 
-        AgentSandbox::load(&self.home, endpoint).expect("sandbox should load")
+        AgentSandbox::load(&self.home, radicle_team::agent::Adapter::Coder, endpoint)
+            .expect("sandbox should load")
     }
 
     fn write_config(&self, config: &Config) {
@@ -309,6 +420,15 @@ impl Fixture {
             .write(&path)
             .expect("sandbox configuration should be written");
     }
+}
+
+fn git(directory: &Path, arguments: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(arguments)
+        .current_dir(directory)
+        .status()
+        .expect("git should run");
+    assert!(status.success(), "git {arguments:?} failed");
 }
 
 fn endpoint() -> McpEndpoint {

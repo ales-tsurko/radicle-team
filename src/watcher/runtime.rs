@@ -703,13 +703,12 @@ impl PendingActivities {
         runtime: &DeliveryRuntime,
     ) -> Result<(), Error> {
         let identity = activity.delivery_id();
-        let acknowledgement = runtime
+        runtime
             .conversations
             .deliver(activity, delivery)
             .await
             .map_err(Error::from)?;
-        Self::record_delivery(identity, scope, state).await?;
-        acknowledgement.finish().map_err(Error::from)
+        Self::record_delivery(identity, scope, state).await
     }
 
     async fn checkpoint(
@@ -815,6 +814,9 @@ pub enum Error {
     /// The conversation dispatcher stopped accepting deliveries.
     #[error("conversation dispatcher is not running")]
     ConversationUnavailable,
+    /// The agent stopped making progress and was killed.
+    #[error("agent was killed after making no progress")]
+    Stalled,
     /// The node closed its event stream.
     #[error("Radicle node closed its event stream")]
     EventStreamClosed,
@@ -843,6 +845,7 @@ impl From<conversation::Error> for Error {
             conversation::Error::WorkScope(error) => Self::WorkScope(error),
             conversation::Error::PublicationRecovery(error) => Self::PublicationRecovery(error),
             conversation::Error::Unavailable => Self::ConversationUnavailable,
+            conversation::Error::Stalled => Self::Stalled,
         }
     }
 }
@@ -923,10 +926,10 @@ mod tests {
         let (conversations, dispatcher) = Dispatcher::new(
             Member::Nico,
             Workspaces::new(
-                root.path().join("workspaces"),
+                crate::home::MemberHome::at(root.path()),
                 profile.storage.clone(),
                 repository,
-                *profile.id(),
+                profile.info(),
             ),
             crate::mcp::WorkScope::default(),
         );
@@ -1056,15 +1059,17 @@ mod tests {
         let queue = WorkQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open");
+        let home = crate::home::MemberHome::at(root.path().join("member"));
+        home.create().expect("member directory should be created");
+        let workspaces = Workspaces::new(home, profile.storage.clone(), repository, profile.info());
+        workspaces
+            .initialize()
+            .await
+            .expect("working copies should be prepared");
         let delivery = || {
             let (conversations, dispatcher) = Dispatcher::new(
                 Member::Nico,
-                Workspaces::new(
-                    root.path().join("workspaces"),
-                    profile.storage.clone(),
-                    repository,
-                    *profile.id(),
-                ),
+                workspaces.clone(),
                 crate::mcp::WorkScope::default(),
             );
             let runtime = DeliveryRuntime::new(
@@ -1149,10 +1154,10 @@ mod tests {
         let (conversations, dispatcher) = Dispatcher::new(
             Member::Nico,
             Workspaces::new(
-                root.path().join("workspaces"),
+                crate::home::MemberHome::at(root.path()),
                 profile.storage.clone(),
                 repository,
-                *profile.id(),
+                profile.info(),
             ),
             crate::mcp::WorkScope::default(),
         );
@@ -1261,6 +1266,12 @@ mod tests {
         }
     }
 
+    impl crate::agent::Supervised for NoopAgent {
+        fn supervisor(&self) -> std::sync::Arc<dyn crate::agent::Supervisor> {
+            std::sync::Arc::new(crate::agent::Idle)
+        }
+    }
+
     #[async_trait::async_trait]
     impl Talker for NoopAgent {
         async fn start(
@@ -1268,6 +1279,7 @@ mod tests {
             _profile: MemberProfile,
             _mcp: &McpEndpoint,
             _sandbox: crate::sandbox::AgentSandbox,
+            _layout: crate::agent::Layout,
         ) -> Result<(), crate::agent::Error> {
             Ok(())
         }

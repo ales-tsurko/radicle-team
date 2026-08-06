@@ -21,6 +21,7 @@ lint:
 	@status=0; \
 	cargo clippy $(CARGO_PACKAGES) --all-targets --all-features -- -D warnings || status=$$?; \
 	cargo +nightly fmt --check $(CARGO_PACKAGES) || status=$$?; \
+	cargo doc ${CARGO_PACKAGES} --all-features || status=$$?; \
 	exit $$status
 
 fmt:

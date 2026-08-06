@@ -72,13 +72,24 @@ impl Cli {
     }
 
     /// Builds the configured application.
-    #[must_use]
-    pub fn application(self) -> Application {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `setup` was given no directory and the working directory cannot be
+    /// read.
+    pub fn application(self) -> Result<Application, Error> {
+        let mode = self.mode();
         let options = self.command.into_options();
         let mut application = Application::new(options.member, options.repo)
             .with_identity_provider(options.identity_provider());
-        if let Some(home) = options.home {
-            application = application.with_home(home);
+        match (options.home, mode) {
+            (Some(home), _) => application = application.with_home(home),
+            (None, Mode::Setup) => {
+                application = application.with_home(
+                    Application::default_setup_home(options.member, options.repo)?.path(),
+                );
+            }
+            (None, Mode::Run) => {}
         }
         if let Some(manifest) = options.manifest {
             application = application.with_manifest_file(manifest);
@@ -87,7 +98,7 @@ impl Cli {
             application = application.with_seed(seed);
         }
 
-        application
+        Ok(application)
     }
 
     /// Executes the selected command.
@@ -98,7 +109,7 @@ impl Cli {
     pub async fn execute(self) -> Result<(), Error> {
         let mode = self.mode();
         let shutdown = Shutdown::install()?;
-        let application = self.application().with_shutdown(shutdown);
+        let application = self.application()?.with_shutdown(shutdown);
         match mode {
             Mode::Setup => SetupWizard::new(application)
                 .run()
@@ -125,6 +136,9 @@ pub enum Error {
     /// Installing process signal handlers failed.
     #[error("failed to install process signal handlers: {0}")]
     Signal(#[from] ctrlc::Error),
+    /// The member directory could not be resolved.
+    #[error(transparent)]
+    Home(#[from] crate::home::Error),
 }
 
 impl From<crate::Error> for Error {
@@ -347,6 +361,7 @@ mod tests {
         .expect("CLI should parse")
         .application();
 
+        let application = application.expect("application should build");
         assert_eq!(application.member(), Member::Nico);
         assert_eq!(application.home(), Some(std::path::Path::new("/team")));
         assert_eq!(
@@ -378,6 +393,12 @@ mod tests {
         .expect("setup CLI should parse");
 
         assert_eq!(cli.mode(), Mode::Setup);
-        assert_eq!(cli.application().seeds().len(), 1);
+        assert_eq!(
+            cli.application()
+                .expect("application should build")
+                .seeds()
+                .len(),
+            1
+        );
     }
 }

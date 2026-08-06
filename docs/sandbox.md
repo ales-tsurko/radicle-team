@@ -3,7 +3,7 @@
 Setup creates an administrator-owned sandbox configuration for each member:
 
 ```text
-~/.radicle-team/repositories/<canonical-RID>/members/<member>/sandbox.toml
+<member folder>/sandbox.toml
 ```
 
 The interactive wizard optionally adds readable, writable, and denied filesystem
@@ -25,6 +25,27 @@ file at once.
 Agent adapters select commands and arguments but cannot weaken this policy.
 Every subprocess inherits the same sandbox.
 
+So does the runtime's own Git. It is the more trusted side, but it runs Git
+against working copies an adapter can write, and Git decides what to do from
+what it finds in the repository it is pointed at. Fencing off each way an
+adapter could reach that decision is guesswork, and one missed way would be a
+way out of the sandbox altogether. The runtime's Git therefore runs in a
+sandbox of its own. The working copy the command is preparing is writable, along
+with the shared object store. The other adapters' working copies are not,
+neither their files nor the entries the store keeps for them, so a command run
+for one adapter reaches no further into another than that adapter could itself.
+The one repository in Radicle storage a delivery is fetched from is readable,
+and the rest of storage is not.
+
+The member's identity is out of reach and external network access is denied.
+`sandbox.toml` does not apply either: widening what an agent may reach must not
+widen what code smuggled into a Git command may reach.
+
+Denied networking still leaves host loopback reachable on macOS, the same
+platform difference described under [Network](#network) below. A local service
+is therefore not isolated from a runtime Git command any more than it is from an
+agent.
+
 
 
 
@@ -32,10 +53,50 @@ Every subprocess inherits the same sandbox.
 
 Radicle Team loads Zerobox's embedded platform and sensitive-path policies
 directly, so user-defined Zerobox profiles cannot replace them. It also enables
-common Rust, Node.js, Python, Go, and Nix toolchain paths and grants the
-member's ephemeral workspaces. Local path entries extend or restrict those
-defaults, and denied paths take precedence. Paths in the file must be
-absolute.
+common Rust, Node.js, Python, Go, and Nix toolchain paths. It grants write
+access to the one working copy belonging to the adapter being run, that
+adapter's own `cache/` and `harness/` directories, and the shared object store
+in `.git-common`, without which the adapter could edit files but never commit
+them. One adapter therefore cannot write into another's checkout or state.
+
+Parts of that store stay read-only, because Git executes whatever its
+configuration and hooks name, and the runtime's own Git reads them too:
+
+- `.git-common/config` and `.git-common/hooks`, which say what Git runs.
+- `<adapter>/.git` and `.git-common/worktrees/<adapter>/{commondir,gitdir}`,
+  which say where Git looks. Repointed at a store the adapter controls, the
+  runtime's next Git command would read that store's configuration and hooks.
+- `.git-common/refs` and `.git-common/packed-refs`, so no adapter can move or
+  delete branches belonging to another. The building adapter is granted
+  `refs/heads/radicle-team` back, since that is where its own branches live.
+  The talking and chatting adapters answer from a detached head and need none.
+  Anything writing a reference outside that namespace fails inside the sandbox,
+  including `git stash`, `git tag`, and branches of the agent's own choosing.
+- Every other adapter's directory under `.git-common/worktrees`.
+
+Fencing paths off only covers what the runtime *reads*. The runtime also writes
+references there, and a name the building adapter can write may be made to
+stand for another reference entirely. So every reference the runtime writes is
+one it named itself, addressed in full and set without following it. An adapter
+can do what it likes inside `radicle-team/`; it cannot reach outside it.
+
+Neither of those is the boundary. They narrow what an adapter can put in a
+Git command's way; the sandbox above is what bounds the cost of one that gets
+through anyway.
+
+Two things follow from the store's configuration being read-only. The member's
+Git name and email are written there at startup, because an agent cannot set
+them and Git would otherwise stop at the first commit to ask who is making it.
+Automatic housekeeping is turned off, because it would try to rewrite
+`packed-refs`; run `git gc` in `.git-common` yourself if the store grows.
+
+Sandboxed commands also run with `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_NOSYSTEM`
+set to Git's defaults. The operating-system user's Git configuration is denied
+by the policy, and Git refuses to run at all when it cannot read a file it was
+told to read.
+
+Local path entries extend or restrict those defaults, and denied paths take
+precedence. Paths in the file must be absolute.
 
 ```toml
 version = 1

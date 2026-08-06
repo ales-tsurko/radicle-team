@@ -4,9 +4,9 @@ use radicle::identity::RepoId;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    agent::{ChatContext, ChatMessage, Chatter, Source},
+    agent::{Adapter, ChatContext, ChatMessage, Chatter, Source},
     chat::{MessageId, classification::IncomingMessage},
-    conversation::{Acknowledgement, Error, Scoped},
+    conversation::{Error, Scoped},
     mcp::WorkScope,
     member::Member,
     workspace::Workspaces,
@@ -27,7 +27,7 @@ impl Handle {
         repository: RepoId,
         identity: MessageId,
         message: IncomingMessage,
-    ) -> Result<Acknowledgement, Error> {
+    ) -> Result<(), Error> {
         let (completion, completed) = oneshot::channel();
         self.sender
             .send(Request {
@@ -56,7 +56,7 @@ impl Dispatcher {
         (
             Handle { sender },
             Self {
-                scoped: Scoped::new(member, workspaces, scope),
+                scoped: Scoped::new(member, Adapter::Chatter, workspaces, scope),
                 receiver,
             },
         )
@@ -83,9 +83,9 @@ impl Dispatcher {
         identity: MessageId,
         message: IncomingMessage,
         agent: &mut (impl Chatter + ?Sized),
-    ) -> Result<Acknowledgement, Error> {
+    ) -> Result<(), Error> {
         let source = Source::Chat(message.channel.clone());
-        let (workspace, path) = self.scoped.prepare(identity.into(), source).await?;
+        let path = self.scoped.prepare(source).await?;
         let context =
             ChatContext::authenticated(repository, message.channel, identity, message.sender, path);
         self.scoped
@@ -100,18 +100,19 @@ impl Dispatcher {
             message = %identity,
             "dispatching chat message to the agent"
         );
-        let handled = agent
-            .messaged(
+        let watch = crate::agent::Supervised::supervisor(agent);
+        let handled = crate::conversation::supervise(
+            agent.messaged(
                 context,
                 ChatMessage {
                     nick: message.nick,
                     body: message.body,
                 },
-            )
-            .await;
-        self.scoped
-            .finish(identity.into(), workspace, handled)
-            .await
+            ),
+            watch,
+        )
+        .await;
+        self.scoped.finish(identity.into(), handled).await
     }
 }
 
@@ -119,5 +120,122 @@ struct Request {
     repository: RepoId,
     identity: MessageId,
     message: IncomingMessage,
-    completion: oneshot::Sender<Result<Acknowledgement, Error>>,
+    completion: oneshot::Sender<Result<(), Error>>,
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use std::{path::PathBuf, str::FromStr as _, time::Duration};
+
+    use radicle::{
+        crypto::PublicKey, git::UserInfo, identity::RepoId, node::Alias, storage::git::Storage,
+    };
+
+    use crate::{
+        agent::{ChatContext, ChatMessage, Chatter, Error as AgentError, McpEndpoint},
+        chat::dispatcher::Dispatcher,
+        mcp::WorkScope,
+        member::{Member, Profile},
+        workspace::Workspaces,
+    };
+
+    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+    const MEMBER: &str = "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
+
+    #[derive(Debug, Default)]
+    struct SilentChatter;
+
+    impl crate::agent::Supervised for SilentChatter {
+        fn supervisor(&self) -> std::sync::Arc<dyn crate::agent::Supervisor> {
+            std::sync::Arc::new(crate::agent::Idle)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Chatter for SilentChatter {
+        async fn start(
+            &mut self,
+            _profile: Profile,
+            _mcp: &McpEndpoint,
+            _sandbox: crate::sandbox::AgentSandbox,
+            _layout: crate::agent::Layout,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn messaged(
+            &mut self,
+            _context: ChatContext,
+            _message: ChatMessage,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    // A member whose manifest has no chat section still creates this dispatcher, and the run
+    // holds its handle for the whole run. Dropping that handle instead would end the dispatcher
+    // at once and take the member down with it before it had answered anything.
+    #[tokio::test]
+    async fn runs_for_as_long_as_a_handle_is_held() {
+        let (handle, dispatcher) = Dispatcher::new(
+            Member::Nico,
+            workspaces("chat-dispatcher-held"),
+            WorkScope::default(),
+        );
+        let mut chatter = SilentChatter;
+
+        let ended =
+            tokio::time::timeout(Duration::from_millis(200), dispatcher.run(&mut chatter)).await;
+
+        assert!(
+            ended.is_err(),
+            "the dispatcher must keep running while somebody can still send it a message"
+        );
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn ends_once_every_handle_is_gone() {
+        let (handle, dispatcher) = Dispatcher::new(
+            Member::Nico,
+            workspaces("chat-dispatcher-gone"),
+            WorkScope::default(),
+        );
+        let mut chatter = SilentChatter;
+        drop(handle);
+
+        let ended = tokio::time::timeout(Duration::from_millis(200), dispatcher.run(&mut chatter))
+            .await
+            .expect("the dispatcher must end once nothing can reach it");
+
+        assert!(matches!(
+            ended,
+            Err(crate::conversation::Error::Unavailable)
+        ));
+    }
+
+    // Each test gets its own directory, because the harness runs them at the same time and one
+    // clearing the other's would fail whichever lost the race.
+    fn workspaces(name: &str) -> Workspaces {
+        let info = UserInfo {
+            alias: Alias::new("chat-test"),
+            key: PublicKey::from_str(MEMBER).expect("member should be valid"),
+        };
+        let storage = Storage::open(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(name)
+                .join("storage"),
+            info.clone(),
+        )
+        .expect("empty storage should open");
+
+        Workspaces::memory(
+            name,
+            storage,
+            RepoId::from_str(REPOSITORY).expect("repository should parse"),
+            info,
+        )
+        .expect("working copies should be created")
+    }
 }

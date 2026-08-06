@@ -140,11 +140,32 @@ impl Application {
     /// Returns an error when identity provisioning, node startup, synchronization, repository
     /// access, or manifest validation fails.
     pub async fn setup(&self) -> Result<Setup, Error> {
-        let runtime = Runtime::start(self).await?;
+        let runtime = Runtime::start(self, Ownership::Claim).await?;
         let setup = self.prepare_setup(&runtime).await;
         let stopped = runtime.stop(&self.shutdown).await;
 
         Self::finish_after_stop(setup, stopped)
+    }
+
+    /// Takes the member directory the way `ownership` asks for, under the process lock.
+    fn take_home(&self, home: &MemberHome, ownership: Ownership) -> Result<(), Error> {
+        match ownership {
+            Ownership::Claim => self.claim_home(home),
+            Ownership::Verify => self.validate_member_home(home),
+        }
+    }
+
+    /// Creates the member directory, refusing one which already belongs to somebody else.
+    ///
+    /// Checked before anything is written. A mistyped `--home` would otherwise stamp this member's
+    /// marker onto another member's directory and take its identity with it.
+    fn claim_home(&self, home: &MemberHome) -> Result<(), Error> {
+        if home.path().join(crate::home::MARKER).is_file() {
+            self.validate_member_home(home)?;
+        }
+
+        home.record(self.member, self.repository)
+            .map_err(Error::from)
     }
 
     async fn prepare_setup(&self, runtime: &Runtime) -> Result<Setup, Error> {
@@ -210,6 +231,10 @@ impl Application {
     /// Runs the team member with `talker` answering repository activity, `chatter` answering
     /// chat, and `coder` carrying out queued work.
     ///
+    /// Adapters are internal on purpose. The runtime holds each agent's process so it can stop one
+    /// which has gone silent or refused to stop, which it could not do for an implementation it
+    /// did not own.
+    ///
     /// The three adapters share one identity, one manifest binding, and one node, but not one
     /// train of thought. A half-written patch has no safe point to pause at, and an agent turn
     /// cannot be interrupted, so neither a queued job nor a review may hold up somebody waiting in
@@ -225,7 +250,7 @@ impl Application {
     /// # Errors
     ///
     /// Returns an error if preparation, watching, building, or agent dispatch fails.
-    pub async fn run_with_agents(
+    pub(crate) async fn run_with_agents(
         &self,
         talker: &mut (impl Talker + ?Sized),
         chatter: &mut (impl Chatter + ?Sized),
@@ -272,12 +297,16 @@ impl Application {
     }
 
     async fn start_run(&self) -> Result<(Runtime, manifest::ValidatedBinding), Error> {
-        let runtime = Runtime::start(self).await?;
-        let binding = self.prepare_run(&runtime).await;
-        match binding {
+        let runtime = Runtime::start(self, Ownership::Verify).await?;
+        match self.prepare_run(&runtime).await {
             Ok(binding) => Ok((runtime, binding)),
-            Err(error) => Self::finish_after_stop(Err(error), runtime.stop(&self.shutdown).await),
+            Err(error) => self.abandon_run(runtime, error).await,
         }
+    }
+
+    // Stops a runtime whose preparation failed, keeping the original failure.
+    async fn abandon_run<T>(&self, runtime: Runtime, error: Error) -> Result<T, Error> {
+        Self::finish_after_stop(Err(error), runtime.stop(&self.shutdown).await)
     }
 
     async fn prepare_run(&self, runtime: &Runtime) -> Result<manifest::ValidatedBinding, Error> {
@@ -291,11 +320,58 @@ impl Application {
         Ok(binding)
     }
 
+    // Resolves this member's directory.
     fn member_home(&self) -> Result<MemberHome, home::Error> {
         match &self.home {
-            Some(root) => Ok(MemberHome::at(root, self.repository, self.member)),
-            None => MemberHome::discover(self.repository, self.member),
+            // Canonicalised because Git resolves a worktree destination against the object store
+            // rather than the working directory, so a relative path would create it elsewhere.
+            Some(root) => Ok(MemberHome::at(
+                std::fs::canonicalize(root).unwrap_or_else(|_error| root.clone()),
+            )),
+            None => MemberHome::discover(),
         }
+    }
+
+    // Confirms the member directory belongs to the member and repository being run.
+    fn validate_member_home(&self, home: &MemberHome) -> Result<(), Error> {
+        let marker = home.marker()?;
+        let member = marker.member().map_err(|error| Error::MemberDirectory {
+            path: home.path().into(),
+            reason: error.to_string(),
+        })?;
+        let repository = marker
+            .repository()
+            .map_err(|error| Error::MemberDirectory {
+                path: home.path().into(),
+                reason: error.to_string(),
+            })?;
+        if member != self.member || repository != self.repository {
+            return Err(Error::MemberDirectory {
+                path: home.path().into(),
+                reason: format!("it belongs to {member} in {repository}"),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Returns the directory `setup` creates when none was given.
+    pub(crate) fn default_setup_home(
+        member: Member,
+        repository: RepoId,
+    ) -> Result<MemberHome, home::Error> {
+        let working = std::env::current_dir().map_err(home::Error::WorkingDirectory)?;
+        let urn = repository.urn();
+        let short: String = urn
+            .strip_prefix("rad:")
+            .unwrap_or(&urn)
+            .chars()
+            .take(8)
+            .collect();
+
+        Ok(MemberHome::at(
+            working.join(format!("{}-{short}", member.id())),
+        ))
     }
 
     pub(crate) fn sandbox_config_path(&self) -> Result<PathBuf, Error> {
@@ -572,6 +648,12 @@ impl Application {
 #[derive(Debug, Default, Clone, Copy)]
 struct LoggingAgent;
 
+impl crate::agent::Supervised for LoggingAgent {
+    fn supervisor(&self) -> std::sync::Arc<dyn crate::agent::Supervisor> {
+        std::sync::Arc::new(crate::agent::Idle)
+    }
+}
+
 #[async_trait::async_trait]
 impl Chatter for LoggingAgent {
     async fn start(
@@ -579,6 +661,7 @@ impl Chatter for LoggingAgent {
         profile: crate::member::Profile,
         _mcp: &agent::McpEndpoint,
         _sandbox: AgentSandbox,
+        _layout: crate::agent::Layout,
     ) -> Result<(), agent::Error> {
         tracing::info!(member = profile.member.id(), "chatter adapter started");
         Ok(())
@@ -601,6 +684,7 @@ impl Talker for LoggingAgent {
         profile: crate::member::Profile,
         _mcp: &agent::McpEndpoint,
         _sandbox: AgentSandbox,
+        _layout: crate::agent::Layout,
     ) -> Result<(), agent::Error> {
         tracing::info!(
             member = profile.member.id(),
@@ -646,6 +730,7 @@ impl Coder for LoggingAgent {
         profile: crate::member::Profile,
         _mcp: &agent::McpEndpoint,
         _sandbox: AgentSandbox,
+        _layout: crate::agent::Layout,
     ) -> Result<(), agent::Error> {
         tracing::info!(member = profile.member.id(), "coder adapter started");
         Ok(())
@@ -662,6 +747,15 @@ impl Coder for LoggingAgent {
     }
 }
 
+/// What a start does with the member directory once it holds the process lock.
+#[derive(Debug, Clone, Copy)]
+enum Ownership {
+    /// `setup` records the marker, taking a directory which is free or already this member's.
+    Claim,
+    /// A run only confirms the directory is this member's.
+    Verify,
+}
+
 #[derive(Debug)]
 struct Runtime {
     home: MemberHome,
@@ -671,9 +765,9 @@ struct Runtime {
 }
 
 impl Runtime {
-    async fn start(application: &Application) -> Result<Self, Error> {
+    async fn start(application: &Application, ownership: Ownership) -> Result<Self, Error> {
         let home = application.member_home()?;
-        let (lock, identity, node) = Self::initialize(application, &home).await?;
+        let (lock, identity, node) = Self::initialize(application, &home, ownership).await?;
 
         Ok(Self {
             home,
@@ -683,9 +777,11 @@ impl Runtime {
         })
     }
 
+    // Acquires the process lock, then settles the directory and loads the identity behind it.
     async fn initialize(
         application: &Application,
         home: &MemberHome,
+        ownership: Ownership,
     ) -> Result<(MemberLock, identity::Identity, NodeManager), Error> {
         let home = home.clone();
         let application = application.clone();
@@ -693,6 +789,7 @@ impl Runtime {
         let worker_application = application.clone();
         let (lock, identity) = tokio::task::spawn_blocking(move || {
             let lock = MemberLock::acquire(&worker_home)?;
+            worker_application.take_home(&worker_home, ownership)?;
             let identity = worker_application.load_identity(&worker_home)?;
             Ok::<_, Error>((lock, identity))
         })
@@ -752,24 +849,39 @@ impl Runtime {
 #[derive(Debug)]
 struct AgentRuntime {
     runtime: Runtime,
+    resources: Resources,
+    policy: manifest::RepositoryPolicy,
+}
+
+/// Everything a run needs beyond its identity and node.
+#[derive(Debug)]
+struct Resources {
     servers: Servers,
     queue: WorkQueue,
     chat_state: chat::State,
     chat_identity: Option<chat::credentials::Credentials>,
-    policy: manifest::RepositoryPolicy,
+    workspaces: crate::workspace::Workspaces,
 }
 
 #[derive(Debug)]
 struct Servers {
     talker: mcp::Server,
-    chatter: mcp::Server,
+    // Absent when the manifest has no chat section, so a repository without chat runs two adapters
+    // rather than paying for a third which would never be addressed.
+    chatter: Option<mcp::Server>,
     coder: mcp::Server,
 }
 
 impl Servers {
+    /// Stops all three at once, so one draining its connections does not delay the others.
     async fn stop(self) -> Result<(), mcp::Error> {
-        let (talker, chatter, coder) =
-            tokio::join!(self.talker.stop(), self.chatter.stop(), self.coder.stop());
+        let chatter = async {
+            match self.chatter {
+                Some(server) => server.stop().await,
+                None => Ok(()),
+            }
+        };
+        let (talker, chatter, coder) = tokio::join!(self.talker.stop(), chatter, self.coder.stop());
 
         talker.and(chatter).and(coder)
     }
@@ -796,12 +908,9 @@ impl AgentRuntime {
         )
         .await
         {
-            Ok((servers, queue, chat_state, chat_identity)) => Ok(Self {
+            Ok(resources) => Ok(Self {
                 runtime,
-                servers,
-                queue,
-                chat_state,
-                chat_identity,
+                resources,
                 policy,
             }),
             Err(error) => Application::finish_after_stop(
@@ -819,24 +928,19 @@ impl AgentRuntime {
         coder: &mut (impl Coder + ?Sized),
         allowlist: manifest::McpAllowlist,
         policy: &manifest::RepositoryPolicy,
-    ) -> Result<
-        (
-            Servers,
-            WorkQueue,
-            chat::State,
-            Option<chat::credentials::Credentials>,
-        ),
-        Error,
-    > {
+    ) -> Result<Resources, Error> {
         let (publisher, queue, chat_state, chat_identity) =
             Self::initialize_resources(application, runtime, policy).await?;
+        // Before any agent starts. The sandbox fences off the parts of the shared object store an
+        // agent must never write, and a path which is not there yet cannot be fenced.
+        let workspaces = Self::initialize_workspaces(application, runtime).await?;
         let servers = Self::start_mcp(
             application,
             runtime,
             publisher,
             allowlist,
-            &queue,
-            &chat_state,
+            mcp::ToolState::new(queue.clone(), chat_state.clone(), workspaces.clone()),
+            policy.chat().is_some(),
         )
         .await?;
         if let Err(error) =
@@ -849,7 +953,33 @@ impl AgentRuntime {
             return Err(error);
         }
 
-        Ok((servers, queue, chat_state, chat_identity))
+        Ok(Resources {
+            servers,
+            queue,
+            chat_state,
+            chat_identity,
+            workspaces,
+        })
+    }
+
+    // Creates the shared object store and every adapter's working copy.
+    async fn initialize_workspaces(
+        application: &Application,
+        runtime: &Runtime,
+    ) -> Result<crate::workspace::Workspaces, Error> {
+        let profile = runtime.identity.profile();
+        let workspaces = crate::workspace::Workspaces::new(
+            runtime.home.clone(),
+            profile.storage.clone(),
+            application.repository,
+            profile.info(),
+        );
+        workspaces
+            .initialize()
+            .await
+            .map_err(|error| Error::Workspace(error.to_string()))?;
+
+        Ok(workspaces)
     }
 
     async fn initialize_resources(
@@ -896,6 +1026,7 @@ impl AgentRuntime {
             application.member,
         )
         .await?;
+        queue.recover().await?;
         let chat_state = chat::State::open(&runtime.home.state_database())
             .await
             .map_err(|error| Error::Chat(error.to_string()))?;
@@ -907,43 +1038,94 @@ impl AgentRuntime {
         runtime: &Runtime,
         publisher: agent::Publisher,
         allowlist: manifest::McpAllowlist,
-        queue: &WorkQueue,
-        chat: &chat::State,
+        state: mcp::ToolState,
+        chat: bool,
     ) -> Result<Servers, Error> {
         let storage = runtime.identity.profile().storage.clone();
         let start = async |role| {
-            mcp::Server::start(
+            Self::start_server(
                 storage.clone(),
                 application.repository,
                 publisher.clone(),
                 allowlist.clone(),
                 role,
-                queue.clone(),
-                chat.clone(),
+                state.clone(),
             )
             .await
+        };
+
+        Self::assembled(Self::opened(Self::wanted_servers(chat), start).await?)
+    }
+
+    /// Starts one MCP server for one adapter.
+    async fn start_server(
+        storage: radicle::storage::git::Storage,
+        repository: RepoId,
+        publisher: agent::Publisher,
+        allowlist: manifest::McpAllowlist,
+        role: mcp::Role,
+        state: mcp::ToolState,
+    ) -> Result<mcp::Server, Error> {
+        mcp::Server::start(storage, repository, publisher, allowlist, role, state)
+            .await
             .map_err(|error| Error::Mcp(error.to_string()))
-        };
-        let talker = start(mcp::Role::Talker).await?;
-        let chatter = match start(mcp::Role::Chatter).await {
-            Ok(chatter) => chatter,
-            Err(error) => {
-                Application::warn_mcp_stop(talker.stop().await);
-                return Err(error);
-            }
-        };
-        match start(mcp::Role::Coder).await {
-            Ok(coder) => Ok(Servers {
-                talker,
-                chatter,
-                coder,
-            }),
-            Err(error) => {
-                Application::warn_mcp_stop(talker.stop().await);
-                Application::warn_mcp_stop(chatter.stop().await);
-                Err(error)
+    }
+
+    // Lists the servers to start.
+    fn wanted_servers(chat: bool) -> Vec<mcp::Role> {
+        match chat {
+            true => vec![mcp::Role::Talker, mcp::Role::Chatter, mcp::Role::Coder],
+            false => vec![mcp::Role::Talker, mcp::Role::Coder],
+        }
+    }
+
+    // Starts every wanted server, stopping the ones which did start if a later one fails.
+    async fn opened<F>(
+        wanted: Vec<mcp::Role>,
+        start: impl Fn(mcp::Role) -> F,
+    ) -> Result<Vec<(mcp::Role, mcp::Server)>, Error>
+    where
+        F: Future<Output = Result<mcp::Server, Error>>,
+    {
+        let mut started = Vec::new();
+        for role in wanted {
+            match start(role).await {
+                Ok(server) => started.push((role, server)),
+                Err(error) => {
+                    let running = started.into_iter().map(|(_role, server)| server).collect();
+
+                    return Err(Self::abandon(error, running).await);
+                }
             }
         }
+
+        Ok(started)
+    }
+
+    // Sorts the started servers back into the adapters they belong to.
+    fn assembled(mut started: Vec<(mcp::Role, mcp::Server)>) -> Result<Servers, Error> {
+        let mut take = |wanted| {
+            started
+                .iter()
+                .position(|(role, _server)| *role == wanted)
+                .map(|found| started.remove(found).1)
+        };
+        let missing = || Error::Mcp("an MCP server did not start".to_owned());
+
+        Ok(Servers {
+            talker: take(mcp::Role::Talker).ok_or_else(missing)?,
+            chatter: take(mcp::Role::Chatter),
+            coder: take(mcp::Role::Coder).ok_or_else(missing)?,
+        })
+    }
+
+    // Stops whatever was already running after a later server failed to start.
+    async fn abandon(error: Error, started: Vec<mcp::Server>) -> Error {
+        for server in started {
+            Application::warn_mcp_stop(server.stop().await);
+        }
+
+        error
     }
 
     async fn start_agents(
@@ -954,32 +1136,51 @@ impl AgentRuntime {
         chatter: &mut (impl Chatter + ?Sized),
         coder: &mut (impl Coder + ?Sized),
     ) -> Result<(), Error> {
-        let talker_sandbox = AgentSandbox::load(&runtime.home, servers.talker.endpoint())?;
-        let chatter_sandbox = AgentSandbox::load(&runtime.home, servers.chatter.endpoint())?;
-        let coder_sandbox = AgentSandbox::load(&runtime.home, servers.coder.endpoint())?;
+        let profile = application.member.profile();
+        let (sandbox, layout) = Self::prepared(runtime, agent::Adapter::Talker, &servers.talker)?;
         talker
-            .start(
-                application.member.profile(),
-                servers.talker.endpoint(),
-                talker_sandbox,
-            )
+            .start(profile, servers.talker.endpoint(), sandbox, layout)
             .await?;
-        chatter
-            .start(
-                application.member.profile(),
-                servers.chatter.endpoint(),
-                chatter_sandbox,
-            )
-            .await?;
+        Self::start_chatter(profile, runtime, servers.chatter.as_ref(), chatter).await?;
+        let (sandbox, layout) = Self::prepared(runtime, agent::Adapter::Coder, &servers.coder)?;
         coder
-            .start(
-                application.member.profile(),
-                servers.coder.endpoint(),
-                coder_sandbox,
-            )
-            .await?;
+            .start(profile, servers.coder.endpoint(), sandbox, layout)
+            .await
+            .map_err(Error::from)
+    }
 
-        Ok(())
+    // Starts the chatting adapter, if the manifest asked for chat at all.
+    async fn start_chatter(
+        profile: crate::member::Profile,
+        runtime: &Runtime,
+        server: Option<&mcp::Server>,
+        chatter: &mut (impl Chatter + ?Sized),
+    ) -> Result<(), Error> {
+        let Some(server) = server else {
+            return Ok(());
+        };
+        let (sandbox, layout) = Self::prepared(runtime, agent::Adapter::Chatter, server)?;
+
+        chatter
+            .start(profile, server.endpoint(), sandbox, layout)
+            .await
+            .map_err(Error::from)
+    }
+
+    // Prepares one adapter's sandbox and its fixed directories.
+    fn prepared(
+        runtime: &Runtime,
+        adapter: agent::Adapter,
+        server: &mcp::Server,
+    ) -> Result<(AgentSandbox, agent::Layout), Error> {
+        let sandbox = AgentSandbox::load(&runtime.home, adapter, server.endpoint())?;
+
+        Ok((sandbox, Self::layout(&runtime.home, adapter)))
+    }
+
+    // Returns the fixed directories one adapter owns, which [`MemberHome::create`] made.
+    fn layout(home: &MemberHome, adapter: agent::Adapter) -> agent::Layout {
+        agent::Layout::new(adapter, home.cache(adapter), home.harness(adapter))
     }
 
     async fn initialize_publisher(
@@ -1012,12 +1213,7 @@ impl AgentRuntime {
         coder: &mut (impl Coder + ?Sized),
     ) -> Result<(), Error> {
         let profile = self.runtime.identity.profile().clone();
-        let workspaces = crate::workspace::Workspaces::new(
-            self.runtime.home.workspaces(),
-            profile.storage.clone(),
-            application.repository,
-            *profile.id(),
-        );
+        let workspaces = self.resources.workspaces.clone();
         let state_database = self.runtime.home.state_database();
         let watcher = watcher::Watcher::new(
             application.member,
@@ -1025,32 +1221,39 @@ impl AgentRuntime {
             self.policy.clone(),
         );
         let builder = builder::Builder::new(application.member, application.repository);
-        let coder_scope = self.servers.coder.scope();
+        let coder_scope = self.resources.servers.coder.scope();
         let (conversations, dispatcher) = conversation::Dispatcher::new(
             application.member,
             workspaces.clone(),
-            self.servers.talker.scope(),
+            self.resources.servers.talker.scope(),
         );
         let (messages, chat_dispatcher) = chat::dispatcher::Dispatcher::new(
             application.member,
             workspaces.clone(),
-            self.servers.chatter.scope(),
+            self.resources
+                .servers
+                .chatter
+                .as_ref()
+                .map(mcp::Server::scope)
+                .unwrap_or_default(),
         );
-        let chat = self.chat_ingress(application, messages);
+        // Kept alive for the whole run. Dropped, its channel would close, the chat dispatcher
+        // would return at once, and a member with no chat would exit the moment it started.
+        let chat = self.chat_ingress(application, messages.clone());
         let watching = watcher.run(
             &profile,
             self.runtime.node.node(),
             &state_database,
             watcher::DeliveryRuntime::new(
                 profile.storage.clone(),
-                self.queue.clone(),
+                self.resources.queue.clone(),
                 self.policy.priority().clone(),
                 conversations.clone(),
             ),
         );
         let dispatching = dispatcher.run(talker);
         let messaging = chat_dispatcher.run(chatter);
-        let building = builder.run(&*coder, &self.queue, &workspaces, &coder_scope);
+        let building = builder.run(&*coder, &self.resources.queue, &workspaces, &coder_scope);
         let chatting = async move {
             if let Some(ingress) = chat
                 && let Err(error) = ingress.run().await
@@ -1073,7 +1276,7 @@ impl AgentRuntime {
             talker: talker.stop().await,
             chatter: chatter.stop().await,
             coder: coder.stop().await,
-            mcp: self.servers.stop().await,
+            mcp: self.resources.servers.stop().await,
             node: self.runtime.stop(&application.shutdown).await,
         };
         cleanup.finish(ran, interrupted)
@@ -1084,7 +1287,7 @@ impl AgentRuntime {
         application: &Application,
         messages: chat::dispatcher::Handle,
     ) -> Option<chat::runtime::Ingress> {
-        let credentials = self.chat_identity.as_ref()?;
+        let credentials = self.resources.chat_identity.as_ref()?;
         let storage = self.runtime.identity.profile().storage.clone();
 
         Some(chat::runtime::Ingress::new(
@@ -1094,7 +1297,7 @@ impl AgentRuntime {
             self.policy.clone(),
             storage,
             credentials.identity(),
-            self.chat_state.clone(),
+            self.resources.chat_state.clone(),
             messages,
         ))
     }
@@ -1430,9 +1633,20 @@ pub enum Error {
     /// Carrying out queued work failed.
     #[error("member builder error: {0}")]
     Builder(#[from] builder::Error),
+    /// The member directory does not belong to the member being run.
+    #[error("'{path}' is not this member's directory: {reason}")]
+    MemberDirectory {
+        /// Member directory path.
+        path: Box<Path>,
+        /// Why it was refused.
+        reason: String,
+    },
     /// The conversation dispatcher stopped.
     #[error("conversation dispatcher error: {0}")]
     Conversation(String),
+    /// Preparing the member's working copies failed.
+    #[error("workspace error: {0}")]
+    Workspace(String),
     /// Preparing durable chat state failed.
     #[error("chat state error: {0}")]
     Chat(String),
@@ -1455,6 +1669,48 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(not(miri))]
+    #[test]
+    fn refuses_a_directory_belonging_to_another_member_or_repository() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let repository =
+            RepoId::from_urn("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc").expect("repository should parse");
+        let other =
+            RepoId::from_urn("rad:z42hL2jL4Tn8K5qgKbQ3xYrxLX9rU").expect("repository should parse");
+        let home = crate::home::MemberHome::at(root.path().join("nico"));
+        home.create().expect("member directory should be created");
+        home.record(crate::member::Member::Nico, repository)
+            .expect("marker should be recorded");
+
+        super::Application::new(crate::member::Member::Nico, repository)
+            .validate_member_home(&home)
+            .expect("its own directory must be accepted");
+
+        for wrong in [
+            super::Application::new(crate::member::Member::Maya, repository),
+            super::Application::new(crate::member::Member::Nico, other),
+        ] {
+            assert!(
+                matches!(
+                    wrong.validate_member_home(&home),
+                    Err(super::Error::MemberDirectory { .. })
+                ),
+                "running in another member's directory would publish under the wrong identity"
+            );
+        }
+
+        let empty = crate::home::MemberHome::at(root.path().join("empty"));
+        empty.create().expect("directory should be created");
+        assert!(
+            matches!(
+                super::Application::new(crate::member::Member::Nico, repository)
+                    .validate_member_home(&empty),
+                Err(super::Error::Home(_))
+            ),
+            "a directory with no marker is not a member directory"
+        );
+    }
     #[cfg(not(miri))]
     use std::{fs, path::PathBuf};
     use std::str::FromStr as _;
@@ -1617,7 +1873,7 @@ mod tests {
             .parse()
             .expect("DID should be valid");
         let application = Application::new(Member::Nico, repository);
-        let home = MemberHome::at(&root, repository, Member::Nico);
+        let home = MemberHome::at(&root);
         let binding = ValidatedBinding::new(
             Member::Nico,
             did,

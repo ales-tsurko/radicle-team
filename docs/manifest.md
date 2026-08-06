@@ -10,7 +10,7 @@ create a repository patch. New explicit manifests use mode `0600` on Unix.
 
 The repository manifest defines shared policy: every contributor sees the same
 reviewed mapping between members and DIDs. Machine-private identity material,
-logs, locks, and watcher state remain under `~/.radicle-team`.
+logs, locks, and watcher state stay in the member's own folder.
 
 ```toml
 version = 1                              # required, must be 1
@@ -128,11 +128,12 @@ Five tools sit outside `mcp_allow` entirely, and naming one there is rejected:
 and the four queue tools, which reach only the member's own queue and never the
 repository.
 
-The two halves then divide what is left. The queue tools and `reply_chat` go to
-the talking half alone, while `create_patch` and `update_patch` go to the
-building half alone since they need commits the talking half cannot make.
-Everything else follows `mcp_allow` on both. `reply_chat` is usable only while
-handling an authenticated chat message and targets that message's channel.
+The three adapters then divide what is left. The queue tools go to the talking
+and chatting adapters, since both decide that work is needed. `reply_chat` goes
+to the chatting adapter alone, because only it holds a message to answer.
+`create_patch` and `update_patch` go to the building adapter alone, since they
+need commits the other two cannot make. Everything else follows `mcp_allow` on
+all three.
 
 
 

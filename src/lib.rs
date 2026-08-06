@@ -15,11 +15,11 @@
 //! adapters under one identity, one MCP server each. To everybody reading the repository it is one
 //! person.
 //!
-//! [`agent::Talker`] answers repository activity. [`agent::Chatter`] answers chat.
-//! [`agent::Coder`] builds. Being assigned is the one thing that is not a message, so it becomes a
-//! job in the member's [`queue`] instead of reaching a conversation. Talking and chatting can both
-//! add jobs of their own, send a correction to the running one, or ask it to stop.
-//! [`builder::Builder`] takes jobs and drives the building adapter alongside the other two.
+//! `Talker` answers repository activity. `Chatter` answers chat. `Coder` builds. Being assigned is
+//! the one thing that is not a message, so it becomes a job in the member's [`queue`] instead of
+//! reaching a conversation. Talking and chatting can both add jobs of their own, send a correction
+//! to the running one, or ask it to stop. [`builder::Builder`] takes jobs and drives the building
+//! adapter alongside the other two.
 //!
 //! Chat is what makes the third adapter necessary rather than convenient, and it is the reason
 //! enabling chat costs a third concurrent agent whenever a message arrives. A member with no
@@ -85,7 +85,7 @@ pub use crate::application::{Application, Error, Setup, SetupStatus};
 /// Agent adapter interface and its typed activity context.
 pub mod agent;
 mod application;
-/// Queued work carried out by a member's building half.
+/// Queued work carried out by a member's building adapter.
 pub mod builder;
 /// IRC chat identities and durable delivery state.
 pub mod chat;

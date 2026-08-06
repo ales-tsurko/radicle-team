@@ -2,18 +2,18 @@
 //!
 //! [`CredentialStore`] is the small boundary used by the identity provider to load and save
 //! key-encryption passphrases. [`SystemCredentialStore`] maps it to the operating system's
-//! credential service through `keyring`, with each entry scoped by the fixed member and its Radicle
-//! home.
+//! credential service through `keyring`, with each entry scoped by the fixed member and the
+//! repository it works in.
 //!
 //! This module never stores or reads the Radicle private key itself. It only supplies the
 //! passphrase needed by the provider to create or unlock that key. Service-provided
 //! `RAD_PASSPHRASE` values are handled directly by the provider and are not copied into the system
 //! credential store.
 
-use std::{fmt, path::Path};
+use std::fmt;
 
+use radicle::{crypto::ssh::Passphrase, identity::RepoId};
 use keyring::{Entry, Error as KeyringError};
-use radicle::crypto::ssh::Passphrase;
 
 use crate::member::Member;
 
@@ -43,9 +43,13 @@ pub struct CredentialId {
 }
 
 impl CredentialId {
-    pub(super) fn new(member: Member, radicle_home: &Path) -> Self {
+    /// Names the credential after the member and repository it belongs to.
+    ///
+    /// Keyed on identity rather than on where the member directory happens to sit, so moving that
+    /// directory does not lose the stored passphrase.
+    pub(super) fn new(member: Member, repository: RepoId) -> Self {
         Self {
-            account: format!("{}:{}", member.id(), radicle_home.display()),
+            account: format!("{}:{repository}", member.id()),
         }
     }
 
@@ -124,21 +128,24 @@ pub enum Error {
 mod tests {
     use radicle::identity::RepoId;
 
-    use crate::{home::MemberHome, identity::CredentialId, member::Member};
+    use crate::{identity::CredentialId, member::Member};
 
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+    const OTHER_REPOSITORY: &str = "rad:z42hL2jL4Tn8K5qgKbQ3xYrxLX9rU";
 
     #[test]
-    fn credential_id_is_scoped_to_member_and_home() {
+    fn credential_id_is_scoped_to_member_and_repository() {
         let repository = RepoId::from_urn(REPOSITORY).expect("repository should parse");
-        let home = MemberHome::at("/team", repository, Member::Nico);
-        let id = CredentialId::new(Member::Nico, &home.radicle());
-        let other_member = CredentialId::new(Member::Maya, &home.radicle());
-        let other_home = MemberHome::at("/other-team", repository, Member::Nico);
-        let other_home = CredentialId::new(Member::Nico, &other_home.radicle());
+        let other = RepoId::from_urn(OTHER_REPOSITORY).expect("repository should parse");
+        let id = CredentialId::new(Member::Nico, repository);
 
         assert!(id.account().contains("nico"));
-        assert_ne!(id, other_member);
-        assert_ne!(id, other_home);
+        assert_ne!(id, CredentialId::new(Member::Maya, repository));
+        assert_ne!(id, CredentialId::new(Member::Nico, other));
+        assert_eq!(
+            id,
+            CredentialId::new(Member::Nico, repository),
+            "a member's passphrase must survive moving its directory"
+        );
     }
 }

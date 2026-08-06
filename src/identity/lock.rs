@@ -26,10 +26,8 @@ impl MemberLock {
     /// Returns an error when the lock file cannot be opened or another process already holds the
     /// lock.
     pub fn acquire(home: &MemberHome) -> Result<Self, Error> {
-        home.create().map_err(|source| Error::Io {
-            path: home.path().into(),
-            source,
-        })?;
+        home.create()
+            .map_err(|error| Error::Home(error.to_string()))?;
         let path = home.process_lock();
         let file = fs::OpenOptions::new()
             .create(true)
@@ -56,6 +54,9 @@ impl MemberLock {
 /// Error acquiring exclusive ownership of a member home.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Preparing the member directory failed.
+    #[error("failed to prepare the member directory: {0}")]
+    Home(String),
     /// Creating the member directory or lock file failed.
     #[error("failed to open member process lock '{path}': {source}")]
     Io {
@@ -76,11 +77,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use radicle::identity::RepoId;
-
-    use crate::{home::MemberHome, identity::MemberLock, member::Member};
-
-    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+    use crate::{home::MemberHome, identity::MemberLock};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -105,11 +102,7 @@ mod tests {
     #[test]
     fn rejects_a_second_lock() {
         let directory = TestDirectory::new();
-        let home = MemberHome::at(
-            &directory.0,
-            RepoId::from_urn(REPOSITORY).expect("repository should parse"),
-            Member::Nico,
-        );
+        let home = MemberHome::at(&directory.0);
         let _lock = MemberLock::acquire(&home).expect("first lock should be acquired");
 
         MemberLock::acquire(&home).expect_err("second lock should be rejected");

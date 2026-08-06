@@ -27,7 +27,7 @@ use zerobox_sandboxing::{
 use zerobox_utils_absolute_path::AbsolutePathBuf;
 
 use crate::{
-    agent::McpEndpoint,
+    agent::{Adapter, McpEndpoint},
     home::MemberHome,
     sandbox::{
         Config,
@@ -37,11 +37,29 @@ use crate::{
 };
 
 const ENVIRONMENT: &[&str] = &["PATH", "HOME", "USER", "SHELL", "TERM", "LANG"];
+// How much of a command's output is kept. Enough for any diagnostic worth reading, and bounded so
+// a process which writes without stopping cannot exhaust this one's memory.
+const OUTPUT_KEPT: usize = 1 << 20;
+
+// Who a sandbox is built for.
+//
+// The runtime confines its own Git the same way it confines an agent's. It is the more trusted
+// side, but it runs Git against working copies an adapter can write, and Git derives what it does
+// from what it finds there. Fencing off each surface as it turns up is guesswork; running the
+// command inside a sandbox bounds what the guess costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    // One adapter's agent, held to its own working copy and the member's local configuration.
+    Agent(Adapter),
+    // The runtime's own Git, held to the working copies and nothing else.
+    Runtime,
+}
 
 /// Zerobox launcher configured for one member's agent workspaces.
 #[derive(Debug, Clone)]
 pub struct AgentSandbox {
     home: MemberHome,
+    purpose: Purpose,
     policy: Policy,
     workspaces: PathBuf,
     #[cfg(target_os = "linux")]
@@ -55,38 +73,100 @@ impl AgentSandbox {
     ///
     /// Returns an error when the platform has no enforcing backend, the workspace root cannot be
     /// prepared, or the local configuration is unsafe or invalid.
-    pub fn load(home: &MemberHome, endpoint: &McpEndpoint) -> Result<Self, Error> {
-        Self::ensure_supported()?;
-        let workspaces = home.workspaces();
-        fs::create_dir_all(&workspaces).map_err(|source| Error::Io {
-            path: workspaces.clone().into(),
-            source,
-        })?;
-        #[cfg(unix)]
-        fs::set_permissions(&workspaces, fs::Permissions::from_mode(0o700)).map_err(|source| {
-            Error::Io {
-                path: workspaces.clone().into(),
-                source,
-            }
-        })?;
-        let workspaces = fs::canonicalize(&workspaces).map_err(|source| Error::Io {
-            path: workspaces.into(),
-            source,
-        })?;
-
-        let policy = Policy::load(&workspaces, endpoint)?;
+    pub fn load(
+        home: &MemberHome,
+        adapter: Adapter,
+        endpoint: &McpEndpoint,
+    ) -> Result<Self, Error> {
+        // Scoped to this adapter's own working copy rather than the directory holding all three.
+        // Sharing that directory would let one adapter rewrite another's checked-out branch, which
+        // is exactly what running them separately is meant to prevent.
+        let workspaces = Self::rooted(&home.worktree(adapter))?;
+        let store = Store::new(home.clone(), adapter);
+        let policy = Policy::load(
+            &workspaces,
+            Some(endpoint),
+            &[],
+            &store.writable(),
+            &store.protected(&workspaces),
+        )?;
         // Validated once here so an unusable configuration fails startup rather than the first
         // command, even though `build` reloads it for every spawn.
         policy.validate(&Config::load(home)?)?;
 
+        Self::ready(home, Purpose::Agent(adapter), policy, workspaces)
+    }
+
+    /// Loads the sandbox the runtime runs its own Git in.
+    ///
+    /// Held to the shared object store and, when the command is preparing one, a single working
+    /// copy. The other adapters' working copies stay read-only, so a command run for one of them
+    /// reaches no further into the others than that adapter could itself. `repository` is the one
+    /// repository in Radicle storage a delivery is fetched from, and it is readable rather than
+    /// writable. Nothing else is reachable: not the member's identity, not the rest of storage,
+    /// and not whatever the local configuration happens to permit an agent.
+    ///
+    /// External network access is denied. On macOS host loopback stays reachable even so, which is
+    /// a platform difference described in [`NetworkAccess`](crate::sandbox::NetworkAccess).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform has no enforcing backend or the working copies cannot be
+    /// prepared.
+    pub fn runtime(
+        home: &MemberHome,
+        adapter: Option<Adapter>,
+        repository: &Path,
+    ) -> Result<Self, Error> {
+        let workspaces = Self::rooted(&home.code())?;
+        let policy = Policy::load(
+            &workspaces,
+            None,
+            std::slice::from_ref(&repository.to_path_buf()),
+            &[],
+            &Store::others(home, adapter),
+        )?;
+
+        Self::ready(home, Purpose::Runtime, policy, workspaces)
+    }
+
+    /// Creates the sandbox's root and reports where it really is on disk.
+    fn rooted(workspaces: &Path) -> Result<PathBuf, Error> {
+        Self::ensure_supported()?;
+        fs::create_dir_all(workspaces).map_err(|source| Error::Io {
+            path: workspaces.into(),
+            source,
+        })?;
+        #[cfg(unix)]
+        fs::set_permissions(workspaces, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            Error::Io {
+                path: workspaces.into(),
+                source,
+            }
+        })?;
+
+        fs::canonicalize(workspaces).map_err(|source| Error::Io {
+            path: workspaces.into(),
+            source,
+        })
+    }
+
+    fn ready(
+        home: &MemberHome,
+        purpose: Purpose,
+        policy: Policy,
+        workspaces: PathBuf,
+    ) -> Result<Self, Error> {
         tracing::info!(
+            ?purpose,
             workspaces = %workspaces.display(),
             configuration = %home.sandbox_config().display(),
-            "agent sandbox ready"
+            "sandbox ready"
         );
 
         Ok(Self {
             home: home.clone(),
+            purpose,
             policy,
             workspaces,
             #[cfg(target_os = "linux")]
@@ -113,7 +193,12 @@ impl AgentSandbox {
     /// spawn instead of silently reusing the previous one.
     fn build(&self, command: &AgentCommand) -> Result<Launch, Error> {
         let current_dir = self.validate_current_dir(&command.current_dir)?;
-        let config = Config::load(&self.home)?;
+        // The runtime's own Git ignores it. That file says what an agent may reach, and widening
+        // it must not widen what code smuggled into a Git command can reach.
+        let config = match self.purpose {
+            Purpose::Agent(_adapter) => Config::load(&self.home)?,
+            Purpose::Runtime => Config::confined(),
+        };
         self.policy.validate(&config)?;
         let file_system =
             self.policy
@@ -170,6 +255,98 @@ impl AgentSandbox {
     }
 }
 
+// Which parts of the shared Git object store one adapter may write.
+//
+// The store has to be writable at all, or an agent could edit files but never commit them: a
+// linked working copy keeps its objects, references and index there rather than beside itself.
+// What it may not have is a say in what the runtime runs. Git executes whatever its hooks and
+// configuration name, it finds both by following `commondir` out of the working copy's own
+// directory, and the runtime runs Git against this store outside the sandbox.
+#[derive(Debug)]
+struct Store {
+    home: MemberHome,
+    adapter: Adapter,
+    common: PathBuf,
+    mine: PathBuf,
+}
+
+impl Store {
+    fn new(home: MemberHome, adapter: Adapter) -> Self {
+        let common = home.git_common();
+        let mine = common.join("worktrees").join(adapter.id());
+
+        Self {
+            home,
+            adapter,
+            common,
+            mine,
+        }
+    }
+
+    // Returns everything this adapter may write.
+    //
+    // Its own working copy directory is granted separately from the store holding it, because
+    // Zerobox protects a working copy's Git directory by default and that default covers the
+    // entry this worktree keeps in the store.
+    fn writable(&self) -> Vec<PathBuf> {
+        let mut writable = vec![
+            self.home.cache(self.adapter),
+            self.home.harness(self.adapter),
+            self.common.clone(),
+            self.mine.clone(),
+        ];
+        // Branches are written only under the runtime's own namespace, and only by the adapter
+        // which stands on one. The others answer from a detached head and never move a reference.
+        if self.adapter.owns_branches() {
+            writable.push(self.branches());
+        }
+
+        writable
+    }
+
+    // Returns the paths inside those grants which must stay read-only.
+    fn protected(&self, worktree: &Path) -> Vec<PathBuf> {
+        [
+            // The pointer to the store. Replaced, it would send the runtime's Git somewhere else.
+            worktree.join(".git"),
+            self.common.join("config"),
+            self.common.join("hooks"),
+            // References belong to whichever adapter created them, and `packed-refs` holds all of
+            // them at once. The building adapter is given its own namespace back below.
+            self.common.join("refs"),
+            self.common.join("packed-refs"),
+            // Where this working copy finds the store. Repointed at one the adapter controls, the
+            // runtime's next Git command would read that one's configuration and hooks.
+            self.mine.join("commondir"),
+            self.mine.join("gitdir"),
+        ]
+        .into_iter()
+        .chain(Self::others(&self.home, Some(self.adapter)))
+        .collect()
+    }
+
+    // Returns the working copies belonging to every adapter but `adapter`.
+    //
+    // Both halves of one: the files, and the entry the shared store keeps for it. Writing the
+    // second is writing the first, since that entry holds the copy's index and head.
+    fn others(home: &MemberHome, adapter: Option<Adapter>) -> Vec<PathBuf> {
+        let entries = home.git_common().join("worktrees");
+
+        Adapter::ALL
+            .into_iter()
+            .filter(|other| Some(*other) != adapter)
+            .flat_map(|other| [home.worktree(other), entries.join(other.id())])
+            .collect()
+    }
+
+    fn branches(&self) -> PathBuf {
+        self.common
+            .join("refs")
+            .join("heads")
+            .join(crate::workspace::BRANCHES)
+    }
+}
+
 /// A command whose security policy is fixed by [`AgentSandbox`].
 #[derive(Debug)]
 pub struct AgentCommand {
@@ -219,6 +396,68 @@ impl AgentCommand {
         let launch = self.sandbox.build(&self)?;
         launch.spawn(self).await
     }
+
+    /// Runs the command to completion and collects what it wrote.
+    ///
+    /// Both streams are drained at once. Reading one to its end first would stop the process the
+    /// moment it filled the other's pipe, and neither side would ever move again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be started or its output cannot be read.
+    pub async fn output(self) -> Result<Output, Error> {
+        let mut child = self.spawn().await?;
+        let (out, errors) = (child.stdout(), child.stderr());
+        let (stdout, stderr) = tokio::join!(Self::drain(out), Self::drain(errors));
+
+        Ok(Output {
+            status: child.wait().await?,
+            stdout: stdout?,
+            stderr: stderr?,
+        })
+    }
+
+    /// Reads a stream to its end, keeping the first [`OUTPUT_KEPT`] bytes.
+    ///
+    /// Everything past that is read and dropped rather than left in the pipe, because a process
+    /// blocked writing output nobody collects never exits.
+    async fn drain(stream: Option<impl tokio::io::AsyncRead + Unpin>) -> Result<String, Error> {
+        use tokio::io::AsyncReadExt as _;
+
+        let Some(mut stream) = stream else {
+            return Ok(String::new());
+        };
+        let mut kept = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = stream.read(&mut buffer).await.map_err(Self::io)?;
+            if read == 0 {
+                break;
+            }
+            let room = OUTPUT_KEPT.saturating_sub(kept.len());
+            kept.extend_from_slice(buffer.get(..read.min(room)).unwrap_or_default());
+        }
+
+        Ok(String::from_utf8_lossy(&kept).into_owned())
+    }
+
+    fn io(source: io::Error) -> Error {
+        Error::Io {
+            path: Path::new("<sandboxed process>").into(),
+            source,
+        }
+    }
+}
+
+/// What a sandboxed command wrote and how it ended.
+#[derive(Debug)]
+pub struct Output {
+    /// How the process exited.
+    pub status: std::process::ExitStatus,
+    /// Everything the process wrote to its standard output.
+    pub stdout: String,
+    /// Everything the process wrote to its standard error.
+    pub stderr: String,
 }
 
 /// A running sandboxed agent process.
@@ -315,12 +554,23 @@ impl Launch {
         Ok(request)
     }
 
+    // Builds the environment one sandboxed command runs with.
+    //
+    // Git is reset to its defaults because it refuses to run at all when it cannot read the
+    // operating-system user's configuration, and the sandbox denies that file. Doing it here also
+    // keeps a member behaving the same on every machine it is deployed to. Who the member is
+    // comes from the shared object store's own configuration instead.
     fn environment(
         overrides: BTreeMap<String, String>,
     ) -> std::collections::HashMap<String, String> {
         let mut environment = std::env::vars()
             .filter(|(key, _value)| ENVIRONMENT.contains(&key.as_str()))
             .collect::<std::collections::HashMap<_, _>>();
+        environment.extend(
+            radicle::git::env::GIT_DEFAULT_CONFIG
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned())),
+        );
         environment.extend(overrides);
         environment
     }
@@ -473,19 +723,12 @@ pub enum Error {
 // `access` call that Miri cannot execute.
 #[cfg(all(test, not(miri), any(target_os = "macos", target_os = "linux")))]
 mod tests {
-    use radicle::identity::RepoId;
     use url::Url;
 
-    use crate::{agent::McpEndpoint, home::MemberHome, member::Member, sandbox::AgentSandbox};
-
-    const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+    use crate::{agent::McpEndpoint, home::MemberHome, sandbox::AgentSandbox};
 
     fn member_home(root: &std::path::Path) -> MemberHome {
-        MemberHome::at(
-            root,
-            RepoId::from_urn(REPOSITORY).expect("repository should parse"),
-            Member::Nico,
-        )
+        MemberHome::at(root)
     }
 
     #[test]
@@ -498,7 +741,8 @@ mod tests {
         let outside =
             std::fs::canonicalize(outside).expect("outside directory should be canonicalized");
         let expected_workspaces =
-            std::fs::canonicalize(home.workspaces()).expect("workspaces should be canonicalized");
+            std::fs::canonicalize(home.worktree(crate::agent::Adapter::Talker))
+                .expect("workspaces should be canonicalized");
         let error = sandbox
             .validate_current_dir(&outside)
             .expect_err("outside working directory should be rejected");
@@ -539,7 +783,88 @@ mod tests {
         }
     }
 
-    /// Replaces the member's configuration on disk, which `build` reloads for every command.
+    // The runtime runs Git against the shared store outside the sandbox, and Git runs whatever
+    // its hooks and configuration name. An adapter which could write either of those, or repoint
+    // its working copy at a store it controls, would be choosing what the runtime executes.
+    #[test]
+    fn keeps_the_shared_store_from_choosing_what_the_runtime_runs() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let home = member_home(directory.path());
+        let sandbox = sandbox(&home);
+        let common = home.git_common();
+        let worktrees = common.join("worktrees");
+        let policy = built(&home, &sandbox);
+
+        for denied in [
+            sandbox.workspaces.join(".git"),
+            common.join("config"),
+            common.join("hooks"),
+            common.join("refs"),
+            common.join("packed-refs"),
+            worktrees.join("talker").join("commondir"),
+            worktrees.join("talker").join("gitdir"),
+            worktrees.join("coder"),
+            worktrees.join("chatter"),
+        ] {
+            assert!(
+                !policy.can_write_path_with_cwd(&denied, &sandbox.workspaces),
+                "{} must not be writable by the talking adapter",
+                denied.display()
+            );
+        }
+        for allowed in [common.join("objects"), worktrees.join("talker")] {
+            assert!(
+                policy.can_write_path_with_cwd(&allowed, &sandbox.workspaces),
+                "{} must stay writable, or the adapter could never commit",
+                allowed.display()
+            );
+        }
+    }
+
+    // Only the building adapter has branches, and only under the runtime's own namespace. A
+    // talking adapter which could write references would be able to move or delete them.
+    #[test]
+    fn gives_branches_to_the_building_adapter_alone() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let home = member_home(directory.path());
+        let branches = home
+            .git_common()
+            .join("refs")
+            .join("heads")
+            .join(crate::workspace::BRANCHES);
+
+        for (adapter, expected) in [
+            (crate::agent::Adapter::Coder, true),
+            (crate::agent::Adapter::Talker, false),
+        ] {
+            crate::sandbox::dispatch_linux_helper();
+            let sandbox = AgentSandbox::load(&home, adapter, &endpoint())
+                .expect("default sandbox should load");
+            let policy = built(&home, &sandbox);
+
+            assert_eq!(
+                policy.can_write_path_with_cwd(&branches, &sandbox.workspaces),
+                expected,
+                "{adapter} should{} be able to write branches",
+                if expected { "" } else { " not" }
+            );
+        }
+    }
+
+    fn built(
+        home: &MemberHome,
+        sandbox: &AgentSandbox,
+    ) -> zerobox_protocol::permissions::FileSystemSandboxPolicy {
+        let config = crate::sandbox::Config::default();
+        write_config(home, &config);
+
+        sandbox
+            .policy
+            .file_system(&config, &sandbox.workspaces, None)
+            .expect("policy should build")
+    }
+
+    // Replaces the member's configuration on disk, which `build` reloads for every command.
     fn write_config(home: &MemberHome, config: &crate::sandbox::Config) {
         let path = home.sandbox_config();
         let _removed = std::fs::remove_file(&path);
@@ -550,7 +875,8 @@ mod tests {
 
     fn sandbox(home: &MemberHome) -> AgentSandbox {
         crate::sandbox::dispatch_linux_helper();
-        AgentSandbox::load(home, &endpoint()).expect("default sandbox should load")
+        AgentSandbox::load(home, crate::agent::Adapter::Talker, &endpoint())
+            .expect("default sandbox should load")
     }
 
     fn endpoint() -> McpEndpoint {

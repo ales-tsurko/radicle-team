@@ -313,6 +313,12 @@ mod tests {
         calls: Vec<Call>,
     }
 
+    impl crate::agent::Supervised for RecordingAgent {
+        fn supervisor(&self) -> std::sync::Arc<dyn crate::agent::Supervisor> {
+            std::sync::Arc::new(crate::agent::Idle)
+        }
+    }
+
     #[async_trait::async_trait]
     impl Talker for RecordingAgent {
         async fn start(
@@ -320,6 +326,7 @@ mod tests {
             _profile: Profile,
             _mcp: &McpEndpoint,
             _sandbox: crate::sandbox::AgentSandbox,
+            _layout: crate::agent::Layout,
         ) -> Result<(), Error> {
             Ok(())
         }

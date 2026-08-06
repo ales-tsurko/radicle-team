@@ -96,6 +96,15 @@ impl WorkQueue {
         Ok(Self::with_database(database, repository, member))
     }
 
+    /// Returns the storage behind the queue, so a test can take it away mid-run.
+    ///
+    /// Whether a write reached durable storage decides what a restart does, and a failure there
+    /// has to be provable rather than reasoned about.
+    #[cfg(all(test, not(miri)))]
+    pub(crate) const fn database(&self) -> &Database {
+        &self.database
+    }
+
     fn with_database(database: Database, repository: RepoId, member: Member) -> Self {
         Self {
             database,
@@ -163,10 +172,99 @@ impl WorkQueue {
         }
     }
 
-    /// Records that no job is running and discards anything said to the finished one.
-    pub async fn finish(&self) {
-        *self.running.write().await = None;
+    /// Records that a job finished, removing it and discarding anything said to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the finished job cannot be removed, which would otherwise leave it
+    /// looking like work an earlier run abandoned.
+    pub async fn finish(&self) -> Result<(), Error> {
+        let done = self.running.write().await.take();
         self.notes.lock().await.clear();
+        match done {
+            Some(job) => self.remove(job.id).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Puts jobs which were running when the process stopped back at the front of the queue.
+    ///
+    /// A job is marked taken while it runs and removed when it finishes, so anything still marked
+    /// taken at startup belonged to a run which died. Left alone it would sit there forever and
+    /// nobody would be told, which turns one failure into a silent second one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the queue cannot be read or updated.
+    pub async fn recover(&self) -> Result<usize, Error> {
+        let repository = self.repository.to_string();
+        let member = self.member.id().to_owned();
+        let recovered = self
+            .database
+            .call(move |connection| {
+                let mut update = connection.prepare(
+                    "UPDATE work_queue SET taken = 0, position = ?3
+                     WHERE repository = ?1 AND member = ?2 AND taken = 1",
+                )?;
+                update.bind((1, repository.as_str()))?;
+                update.bind((2, member.as_str()))?;
+                update.bind((3, rank(QueuePosition::Front)))?;
+                while update.next()? != State::Done {}
+
+                Ok(connection.change_count())
+            })
+            .await?;
+        if recovered > 0 {
+            tracing::warn!(
+                jobs = recovered,
+                "requeued work which was interrupted by an earlier run"
+            );
+            self.arrivals.notify_waiters();
+        }
+
+        Ok(recovered)
+    }
+
+    /// Records that a job is now about `source` rather than whatever it started on.
+    ///
+    /// A job taken from an issue becomes a job about the patch it produced. Written down because
+    /// the job may still fail after that, and the run which picks it up again has no other way to
+    /// know: it would otherwise start over on the issue and leave the patch behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the queue cannot be updated.
+    pub async fn retarget(&self, job: i64, source: Source) -> Result<(), Error> {
+        let target = source.to_string();
+        self.database
+            .call(move |connection| {
+                let mut update =
+                    connection.prepare("UPDATE work_queue SET source = ?2 WHERE id = ?1")?;
+                update.bind((1, job))?;
+                update.bind((2, target.as_str()))?;
+                while update.next()? != State::Done {}
+
+                Ok(())
+            })
+            .await?;
+        if let Some(running) = self.running.write().await.as_mut() {
+            running.source = source;
+        }
+
+        Ok(())
+    }
+
+    async fn remove(&self, job: i64) -> Result<(), Error> {
+        self.database
+            .call(move |connection| {
+                let mut delete = connection.prepare("DELETE FROM work_queue WHERE id = ?1")?;
+                delete.bind((1, job))?;
+                while delete.next()? != State::Done {}
+
+                Ok(())
+            })
+            .await
+            .map_err(Error::from)
     }
 
     /// Returns the job currently being carried out.
@@ -367,6 +465,7 @@ mod tests {
 
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
     const SUBJECT: &str = "1111111111111111111111111111111111111111";
+    const PRODUCED: &str = "2222222222222222222222222222222222222222";
 
     async fn queue() -> WorkQueue {
         let database = Database::memory().await.expect("database should open");
@@ -383,6 +482,40 @@ mod tests {
 
     fn subject() -> Source {
         Subject::Issue(ObjectId::from_str(SUBJECT).expect("subject should parse")).into()
+    }
+
+    /// A job which produced a patch and then failed must come back as a job about that patch.
+    /// Coming back as the issue it started on would begin the work again and orphan the patch.
+    #[tokio::test]
+    async fn remembers_the_patch_a_job_produced_across_a_restart() {
+        let queue = queue().await;
+        let patch: Source =
+            Subject::Patch(ObjectId::from_str(PRODUCED).expect("patch should parse")).into();
+        let id = queue
+            .push("answer it".to_owned(), subject(), QueuePosition::End)
+            .await
+            .expect("job should be recorded");
+        let taken = queue.next().await.expect("queue should be readable");
+        assert_eq!(taken.source, subject());
+
+        queue
+            .retarget(id, patch.clone())
+            .await
+            .expect("the job should be retargeted");
+        assert_eq!(
+            queue.running().await.map(|running| running.source),
+            Some(patch.clone()),
+            "the running job must be about the patch from here on"
+        );
+
+        assert_eq!(
+            queue.recover().await.expect("queue should be readable"),
+            1,
+            "a job which never finished must come back"
+        );
+        let recovered = queue.next().await.expect("queue should be readable");
+
+        assert_eq!(recovered.source, patch);
     }
 
     #[tokio::test]
@@ -446,6 +579,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn puts_work_interrupted_by_a_dead_run_back_at_the_front() {
+        let queue = queue().await;
+        queue
+            .push("first".to_owned(), subject(), QueuePosition::End)
+            .await
+            .expect("first job should be recorded");
+        queue
+            .push("second".to_owned(), subject(), QueuePosition::End)
+            .await
+            .expect("second job should be recorded");
+        let taken = queue
+            .take()
+            .await
+            .expect("queue should be readable")
+            .expect("a job should be takeable");
+        assert_eq!(taken.brief, "first");
+
+        // The run dies here, leaving the job marked taken and nothing to finish it.
+        assert_eq!(
+            queue.recover().await.expect("queue should recover"),
+            1,
+            "a job left marked taken belonged to a run which died"
+        );
+        assert_eq!(
+            queue
+                .take()
+                .await
+                .expect("queue should be readable")
+                .expect("the recovered job should be takeable")
+                .brief,
+            "first",
+            "recovered work must run before anything queued behind it"
+        );
+    }
+
+    #[tokio::test]
+    async fn forgets_work_which_actually_finished() {
+        let queue = queue().await;
+        queue
+            .push("only".to_owned(), subject(), QueuePosition::End)
+            .await
+            .expect("job should be recorded");
+        let _taken = queue.next().await.expect("job should be taken");
+        queue.finish().await.expect("job should be removed");
+
+        assert_eq!(
+            queue.recover().await.expect("queue should recover"),
+            0,
+            "a finished job must not come back as interrupted work"
+        );
+        assert_eq!(
+            queue.waiting().await.expect("queue should be readable"),
+            0,
+            "a finished job must not stay in the queue"
+        );
+    }
+
+    #[tokio::test]
     async fn waits_for_work_that_has_not_arrived_yet() {
         let queue = queue().await;
         let waiting = tokio::spawn({
@@ -469,7 +660,7 @@ mod tests {
             "a job handed out must be reportable as running while it lasts"
         );
 
-        queue.finish().await;
+        queue.finish().await.expect("job should be removed");
         assert!(queue.running().await.is_none());
     }
 
@@ -489,7 +680,7 @@ mod tests {
             Some(first.id),
             "a request to stop reports the job it reached"
         );
-        queue.finish().await;
+        queue.finish().await.expect("job should be removed");
         let second = queue.next().await.expect("queue should be readable");
 
         assert!(

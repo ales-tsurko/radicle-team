@@ -45,11 +45,97 @@ cargo install --path .
 
 ## Set up a member
 
-Run setup once for each member and repository:
+Run setup once for each member and repository, in the directory where you keep
+projects:
 
 ```sh
-radicle-team setup nico --repo rad:...
+cd ~/Desktop
+radicle-team setup nico --repo rad:z3cyot...
 ```
+
+This creates a folder named after the member and the repository, and everything
+Nico needs goes inside it:
+
+```text
+~/Desktop/nico-z3cyot.../
+├── .radicle-team        marks the folder and records member, repo, layout
+├── identity/            nico's key, storage, and node
+├── state.db             deliveries, job queue, chat messages
+├── sandbox.toml         what nico's agents may read, write, and reach
+├── irc-identity.pem
+├── node.log
+├── cache/               build output, one folder per adapter
+├── harness/             agent state, one folder per adapter
+└── code/
+    ├── .git-common      the commits, stored once
+    ├── talker/          issues and patches
+    ├── chatter/         chat
+    └── coder/           writing code
+```
+
+`talker/`, `chatter/` and `coder/` each behave like a normal Git clone. They
+share `.git-common`, so the history is stored once rather than three times, and
+each keeps its own branch.
+
+Before every delivery the runtime resets that adapter's copy to whatever it is
+about to work on.
+
+In the building copy, anything a previous run left uncommitted is committed to a
+`radicle-team/salvage/...` branch first and logged, rather than thrown away. The
+answering copies are simply cleaned: what they hold is what they looked at on
+the way to an answer, and the answer itself is already in the issue or the
+channel.
+
+The building adapter commits to `radicle-team/patch/<id>`, and that branch is
+removed once the patch merges. A job taken from an issue starts on
+`radicle-team/issue/<id>`, since the patch it will produce does not exist yet,
+and moves onto that patch's branch the moment it publishes one. The queue is
+told at the same time, so a job which crashes afterwards comes back as work on
+that patch rather than starting the issue over, and nothing it commits in
+between is stranded under a name the queue no longer knows. A job which
+publishes a second patch stays with the first, so the branch and the queue never
+name different ones. A job which published nothing keeps its issue name, and
+that branch goes when the issue is settled.
+
+A branch the adapter is still standing on is left alone and removed when it next
+moves to other work, so a landed patch never pulls the ground out from under a
+job which is still running. Every start reads the issues and patches back and
+removes the branches of anything settled while nobody was running.
+
+Pass `--home PATH` to name the folder yourself.
+
+
+### Looking inside a member's copies
+
+Read them freely. `git status`, `git log`, `git diff` and `git show` work as
+they do in any clone, and they are the quickest way to see what a member is
+holding right now.
+
+`rad` is the exception. The copies carry a `rad` remote, but `rad` finds its
+identity through `RAD_HOME`, which in a shell points at your own profile rather
+than the member's. Point it at the member's to ask about the member:
+
+```sh
+RAD_HOME=~/Desktop/nico-z3cyot.../identity rad patch list
+```
+
+**Do not edit anything in there, and do not commit to it.** Before every
+delivery the runtime resets that copy hard and cleans it, so an uncommitted edit
+is gone the next time the member is addressed — silently, in the answering
+copies. The `radicle-team/...` branches belong to the runtime, which moves and
+deletes them on its own schedule. And an edit made while the member is working
+races with its Git, in a directory that member is about to overwrite.
+
+Work in your own clone instead, and let the member reach it through Radicle like
+anybody else:
+
+```sh
+rad clone rad:z3cyot...
+```
+
+Every command afterwards checks that the folder belongs to the member and
+repository it was asked to run, and refuses if it does not, so a member cannot
+publish under another's identity by being started in the wrong directory.
 
 Setup creates or loads Nico's identity, starts Nico's node, synchronizes the
 repository, records a seeding policy, and prints the DID. That DID is Nico's
@@ -140,14 +226,19 @@ radicle-team run nico --repo rad:...
 radicle-team run maya --repo rad:...
 ```
 
-Their identities, nodes, storage, and state are isolated below:
+Each gets its own folder, side by side:
 
 ```text
-~/.radicle-team/repositories/<canonical-RID>/members/<member>/
+~/Desktop/nico-z3cyot.../
+~/Desktop/maya-z3cyot.../
 ```
 
-Two processes cannot use the same repository-member home concurrently. The
-same named member can run for different repositories without sharing identity
+Run `radicle-team run` from inside one of them, or from anywhere with `--home`.
+Commands search the current directory and its parents for `.radicle-team`, the
+way `git` finds a repository.
+
+Two processes cannot use one member folder at the same time. The same member can
+run for different repositories, in different folders, without sharing identity
 or state.
 
 
@@ -158,7 +249,8 @@ or state.
 Invocation-specific options stay command-line arguments rather than manifest
 values:
 
-- `--home PATH` overrides `RADICLE_TEAM_HOME`
+- `--home PATH` names the member folder, overriding `RADICLE_TEAM_HOME` and the
+  upward search
 - `--seed NID` adds a preferred synchronization seed and may be repeated, on
   `setup` and on `run`, which synchronizes before it starts watching
 - `--identity-home PATH` uses an existing dedicated Radicle identity
@@ -175,21 +267,36 @@ alone cannot unlock the managed `radicle-node` process.
 
 ## Local state
 
-Managed private keys live in the member's Radicle home. Encrypted-key
-passphrases live in the operating-system credential store, never in the
-manifest. Node output is written to:
+Everything is inside the member folder, so it can be moved, backed up, or
+deleted as a unit. There is no global directory. Working copies record their
+paths relatively and the stored passphrase is keyed on the member and
+repository, so renaming or relocating the folder keeps working. This needs Git
+2.48 or newer, and setup refuses an older one rather than failing obscurely
+later.
 
-```text
-~/.radicle-team/repositories/<canonical-RID>/members/<member>/node.log
-```
+Managed private keys live in `identity/`. Encrypted-key passphrases live in the
+operating-system credential store, never in the manifest. Node output goes to
+`node.log`.
+
+`cache/` holds build output and downloaded dependencies. It is disposable, and
+`rm -rf cache/` is always safe. Nothing that has to survive belongs there.
+
+`harness/` holds whatever each agent tool writes for itself, kept inside the
+member folder so deleting the folder deletes it too. Nothing is resumed between
+deliveries: every run starts fresh and reads the issue or patch it is answering
+through MCP, which is the record everyone can see.
 
 Managed Radicle commands ignore an inherited `RAD_SOCKET`. Each member always
-uses the control socket inside its isolated Radicle home.
+uses the control socket inside its own `identity/`.
 
 
 
 
 ## Troubleshooting
+
+A member folder written by an older version of `radicle-team` is refused by
+name rather than ignored, so a stale layout cannot quietly produce a second
+identity. Set those members up again in their own folders.
 
 If setup fails because a repository is private, use the DID shown in the error
 or identity log message to grant access, then rerun setup. Node startup failures

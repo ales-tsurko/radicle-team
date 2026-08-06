@@ -90,6 +90,18 @@ A repository whose manifest has no `[chat]` section never pays it.
 Each adapter serialises its own work, so a member is at most one repository
 delivery, one chat message, and one job at a time.
 
+Nothing limits how long a delivery or a job may take, because reading a long
+patch or building a real change legitimately takes a while. What is limited is
+silence. Each adapter reports when it last saw its agent act, and one which has
+shown nothing for fifteen minutes is stopped. A cancelled job is asked to commit
+what it has, then killed thirty seconds later if it has not. Deciding that
+belongs to the runtime, which is why adapters are internal to this crate rather
+than an open interface.
+
+A job which was running when the process died is still marked taken in the
+queue, so it is put back at the front on the next start rather than left
+silently lost.
+
 Each member opens one outbound TLS connection to the team's IRC server and
 joins the channels bound to its repository. Members run on separate machines,
 so each connects on its own. Nothing listens for inbound connections and no

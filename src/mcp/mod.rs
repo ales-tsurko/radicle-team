@@ -5,7 +5,7 @@
 
 pub(crate) use crate::mcp::{
     server::{Error, Role, Server, WorkContext, WorkScope},
-    tools::ToolService,
+    tools::{ToolService, ToolState},
 };
 
 mod protocol;

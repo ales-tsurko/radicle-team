@@ -416,8 +416,7 @@ impl Target {
 
 struct Route {
     domains: GlobSet,
-    mcp_host: String,
-    mcp_port: u16,
+    mcp: Option<(String, u16)>,
 }
 
 impl Route {
@@ -433,12 +432,11 @@ impl Route {
                 );
             }
         }
-        let (mcp_host, mcp_port) = policy.mcp_address();
-
         Ok(Self {
             domains: builder.build().map_err(anyhow::Error::from)?,
-            mcp_host: normalize_host(mcp_host),
-            mcp_port,
+            mcp: policy
+                .mcp_address()
+                .map(|(host, port)| (normalize_host(host), port)),
         })
     }
 
@@ -459,8 +457,11 @@ impl Route {
 
     async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host);
-        if host == self.mcp_host && port == self.mcp_port {
-            return self.mcp_address();
+        if let Some((mcp_host, mcp_port)) = &self.mcp
+            && &host == mcp_host
+            && port == *mcp_port
+        {
+            return Self::loopback(mcp_host, *mcp_port);
         }
         if !self.domains.is_match(&host) {
             return Err(Self::denied());
@@ -482,10 +483,9 @@ impl Route {
         Ok(addresses)
     }
 
-    fn mcp_address(&self) -> io::Result<Vec<SocketAddr>> {
-        self.mcp_host
-            .parse::<IpAddr>()
-            .map(|host| vec![SocketAddr::new(host, self.mcp_port)])
+    fn loopback(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        host.parse::<IpAddr>()
+            .map(|host| vec![SocketAddr::new(host, port)])
             .map_err(|_address| Self::denied())
     }
 
@@ -642,8 +642,7 @@ mod tests {
         });
         let policy = NetworkPolicy::new(
             NetworkAccess::Disabled,
-            std::net::Ipv4Addr::LOCALHOST.to_string(),
-            address.port(),
+            Some((std::net::Ipv4Addr::LOCALHOST.to_string(), address.port())),
         );
         let managed = ManagedNetwork::start(policy)
             .await
@@ -676,8 +675,7 @@ mod tests {
     async fn proxy_route_rejects_other_loopback_ports() {
         let route = Route::new(&NetworkPolicy::new(
             NetworkAccess::Disabled,
-            "127.0.0.1".to_owned(),
-            1234,
+            Some(("127.0.0.1".to_owned(), 1234)),
         ))
         .expect("route should build");
 

@@ -852,7 +852,6 @@ mod tests {
                 tls_configuration,
             },
         },
-        conversation,
         manifest::{Limits, PriorityLabels, RepositoryPolicy, TriggerAccess},
         member::Member,
     };
@@ -1196,7 +1195,7 @@ mod tests {
             repository: RepoId,
             identity: MessageId,
             message: IncomingMessage,
-        ) -> Result<conversation::Acknowledgement, String> {
+        ) -> Result<(), String> {
             if repository != self.repository {
                 return Err("delivery reached another repository".to_owned());
             }
@@ -1204,7 +1203,7 @@ mod tests {
             self.state
                 .enqueue_reply(repository, &message.channel, identity, "reply".to_owned())
                 .await
-                .map(|_reply| conversation::Acknowledgement::completed())
+                .map(|_reply| ())
                 .map_err(|error| error.to_string())
         }
     }
