@@ -179,7 +179,7 @@ mod tests {
     async fn runs_for_as_long_as_a_handle_is_held() {
         let (handle, dispatcher) = Dispatcher::new(
             Member::Nico,
-            workspaces("chat-dispatcher-held"),
+            workspaces("chat-dispatcher-held").await,
             WorkScope::default(),
         );
         let mut chatter = SilentChatter;
@@ -198,7 +198,7 @@ mod tests {
     async fn ends_once_every_handle_is_gone() {
         let (handle, dispatcher) = Dispatcher::new(
             Member::Nico,
-            workspaces("chat-dispatcher-gone"),
+            workspaces("chat-dispatcher-gone").await,
             WorkScope::default(),
         );
         let mut chatter = SilentChatter;
@@ -216,7 +216,11 @@ mod tests {
 
     // Each test gets its own directory, because the harness runs them at the same time and one
     // clearing the other's would fail whichever lost the race.
-    fn workspaces(name: &str) -> Workspaces {
+    async fn workspaces(name: &str) -> Workspaces {
+        let repository = RepoId::from_str(REPOSITORY).expect("repository should parse");
+        let queue = crate::queue::WorkQueue::memory(repository, Member::Nico)
+            .await
+            .expect("queue should open");
         let info = UserInfo {
             alias: Alias::new("chat-test"),
             key: PublicKey::from_str(MEMBER).expect("member should be valid"),
@@ -230,12 +234,7 @@ mod tests {
         )
         .expect("empty storage should open");
 
-        Workspaces::memory(
-            name,
-            storage,
-            RepoId::from_str(REPOSITORY).expect("repository should parse"),
-            info,
-        )
-        .expect("working copies should be created")
+        Workspaces::memory(name, storage, repository, info, queue)
+            .expect("working copies should be created")
     }
 }

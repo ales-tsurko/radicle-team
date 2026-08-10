@@ -79,11 +79,11 @@ impl SetupWizard {
     pub(super) fn repository_manifest_output(entry: ManifestEntry, status: SetupStatus) -> String {
         let action = match status {
             SetupStatus::ManifestMissing { .. } => {
-                "add .radicle-team.toml to the repository's canonical branch:\n\nversion = \
+                "add radicle-team.toml to the repository's canonical branch:\n\nversion = \
                  1\ntriggered_by = \"delegates\"\n\n[security]\nrepository = \
                  \"rad:...\"\nrecipients = [\"age1...\"]\n\n"
             }
-            SetupStatus::BindingMissing { .. } => "add this binding to .radicle-team.toml:\n\n",
+            SetupStatus::BindingMissing { .. } => "add this binding to radicle-team.toml:\n\n",
             SetupStatus::Ready { .. } => {
                 return format!("{} identity: {}", entry.member, entry.did);
             }

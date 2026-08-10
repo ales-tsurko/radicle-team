@@ -23,7 +23,7 @@ together.
 
 ## Reference
 
-- [Repository manifest](manifest.md) — the complete `.radicle-team.toml`
+- [Repository manifest](manifest.md) — the complete `radicle-team.toml`
   schema, including who may trigger a member, tool permissions, conversation
   limits, chat identity, and security reports.
 - [Local sandbox](sandbox.md) — the administrator-owned `sandbox.toml`,

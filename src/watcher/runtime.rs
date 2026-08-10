@@ -10,6 +10,7 @@ use radicle::{
         store::access::ReadOnly,
         stream::CobStream as _,
     },
+    crypto::PublicKey,
     identity::{Did, RepoId},
     node::{Handle as _, Node, NodeId, events::Event as NodeEvent},
     profile::Profile as RadicleProfile,
@@ -111,7 +112,7 @@ impl Watcher {
             .await
     }
 
-    async fn verify_profile(member_id: NodeId, node: Node) -> Result<NodeId, Error> {
+    async fn verify_profile(member_id: PublicKey, node: Node) -> Result<NodeId, Error> {
         let node_id = tokio::task::spawn_blocking(move || node.nid())
             .await
             .map_err(|error| Error::Task(error.to_string()))??;
@@ -123,7 +124,7 @@ impl Watcher {
     async fn watch(
         &self,
         storage: &Storage,
-        member_id: NodeId,
+        member_id: PublicKey,
         state: &ProcessedActivities,
         mut events: tokio::sync::mpsc::Receiver<Result<(), Error>>,
         delivery: &DeliveryRuntime,
@@ -187,7 +188,7 @@ impl Watcher {
     async fn scan_all(
         &self,
         storage: &Storage,
-        member_id: NodeId,
+        member_id: PublicKey,
         state: &ProcessedActivities,
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error> {
@@ -317,7 +318,7 @@ impl Watcher {
         &self,
         object: ObjectId,
         actionable: bool,
-        member_id: NodeId,
+        member_id: PublicKey,
         subject: fn(ObjectId) -> Subject,
         active: &mut Option<ActiveHistory>,
     ) -> Result<(), Error> {
@@ -578,14 +579,14 @@ struct ActiveHistory {
 
 #[derive(Clone, Copy)]
 struct HistorySource<'a> {
-    member_id: NodeId,
+    member_id: PublicKey,
     subject: fn(ObjectId) -> Subject,
     triggers: &'a Triggers,
 }
 
 impl<'a> HistorySource<'a> {
     const fn new(
-        member_id: NodeId,
+        member_id: PublicKey,
         subject: fn(ObjectId) -> Subject,
         triggers: &'a Triggers,
     ) -> Self {
@@ -600,7 +601,7 @@ impl<'a> HistorySource<'a> {
 #[derive(Debug, Clone, Copy)]
 struct ScanScope {
     member: Member,
-    member_id: NodeId,
+    member_id: PublicKey,
     repository: RepoId,
     object: ObjectId,
     subject: Subject,
@@ -610,7 +611,7 @@ struct ScanScope {
 impl ScanScope {
     const fn new(
         member: Member,
-        member_id: NodeId,
+        member_id: PublicKey,
         repository: RepoId,
         object: ObjectId,
         subject: Subject,
@@ -926,10 +927,12 @@ mod tests {
         let (conversations, dispatcher) = Dispatcher::new(
             Member::Nico,
             Workspaces::new(
+                Member::Nico,
                 crate::home::MemberHome::at(root.path()),
                 profile.storage.clone(),
                 repository,
                 profile.info(),
+                queue.clone(),
             ),
             crate::mcp::WorkScope::default(),
         );
@@ -1061,7 +1064,14 @@ mod tests {
             .expect("queue should open");
         let home = crate::home::MemberHome::at(root.path().join("member"));
         home.create().expect("member directory should be created");
-        let workspaces = Workspaces::new(home, profile.storage.clone(), repository, profile.info());
+        let workspaces = Workspaces::new(
+            Member::Nico,
+            home,
+            profile.storage.clone(),
+            repository,
+            profile.info(),
+            queue.clone(),
+        );
         workspaces
             .initialize()
             .await
@@ -1154,10 +1164,12 @@ mod tests {
         let (conversations, dispatcher) = Dispatcher::new(
             Member::Nico,
             Workspaces::new(
+                Member::Nico,
                 crate::home::MemberHome::at(root.path()),
                 profile.storage.clone(),
                 repository,
                 profile.info(),
+                queue.clone(),
             ),
             crate::mcp::WorkScope::default(),
         );

@@ -17,7 +17,7 @@ way. For operating instructions see [setup](setup.md), for configuration see
 
 Each configured member receives an isolated Radicle home, signing identity,
 node, repository storage, delivery workspace, and durable state. The
-repository's reviewed `.radicle-team.toml` manifest binds that member to its DID
+repository's reviewed `radicle-team.toml` manifest binds that member to its DID
 and allowed tools.
 
 A member answers, chats, and builds at the same time, which one conversation

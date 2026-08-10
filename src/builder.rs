@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use radicle::identity::RepoId;
 
 use crate::{
-    agent::{self, Adapter, Coder, WorkId},
+    agent::{self, Coder, WorkId},
     mcp::{WorkContext, WorkScope},
     member::Member,
     queue::{Job, WorkQueue},
@@ -68,7 +68,7 @@ impl Builder {
         let work = WorkId::Job(job.id);
         let source = job.source.clone();
         let path = workspaces
-            .prepare(Adapter::Coder, source.clone())
+            .prepare_job(&job)
             .await
             .map_err(|error| Error::Workspace(error.to_string()))?;
         scope
@@ -281,7 +281,7 @@ mod tests {
             .run(
                 &InterruptibleCoder::default(),
                 &queue,
-                &workspaces(repository),
+                &workspaces(repository, queue.clone()),
                 &WorkScope::default(),
             )
             .await
@@ -297,7 +297,7 @@ mod tests {
 
     /// Working copies over an empty storage, so preparing one fails the way a broken repository
     /// would.
-    fn workspaces(repository: RepoId) -> Workspaces {
+    fn workspaces(repository: RepoId, queue: WorkQueue) -> Workspaces {
         let info = UserInfo {
             alias: Alias::new("builder-test"),
             key: PublicKey::from_str(MEMBER).expect("member should be valid"),
@@ -308,7 +308,7 @@ mod tests {
         )
         .expect("empty storage should open");
 
-        Workspaces::memory("builder-failed-job", storage, repository, info)
+        Workspaces::memory("builder-failed-job", storage, repository, info, queue)
             .expect("working copies should be created")
     }
 }

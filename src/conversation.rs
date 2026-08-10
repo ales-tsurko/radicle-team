@@ -244,13 +244,6 @@ impl Scoped {
         self.reconcile(work).await
     }
 
-    /// Removes the working branch of a patch which has landed.
-    pub(crate) async fn retire(&self, subject: crate::watcher::Subject) {
-        if let Err(error) = self.workspaces.retire(subject).await {
-            tracing::warn!(%subject, %error, "could not remove the branch of a landed patch");
-        }
-    }
-
     /// Recovers publications belonging to `work`.
     pub(crate) async fn reconcile(&self, work: WorkId) -> Result<(), Error> {
         self.scope
@@ -326,12 +319,8 @@ impl Dispatcher {
         );
         let watch = agent::Supervised::supervisor(agent);
         let handled = supervise(delivery.dispatch(activity.context(path), agent), watch).await;
-        let finished = self.scoped.finish(identity.into(), handled).await;
-        if matches!(delivery, Delivery::Changed(agent::Change::Merged)) {
-            self.scoped.retire(subject).await;
-        }
 
-        finished
+        self.scoped.finish(identity.into(), handled).await
     }
 }
 

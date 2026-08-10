@@ -23,12 +23,7 @@
 use std::{collections::BTreeSet, ffi::OsStr, path::PathBuf, sync::Arc};
 
 use radicle::{
-    cob::{
-        ObjectId,
-        issue::{Issues, State as IssueState},
-        patch::{Patches, State},
-        store::access::ReadOnly,
-    },
+    cob::{patch::Patches, store::access::ReadOnly},
     git::{Url, UserInfo, Version},
     identity::RepoId,
     storage::{ReadRepository as _, ReadStorage as _, git::Storage},
@@ -38,12 +33,12 @@ use tokio::sync::{Mutex, OnceCell};
 use crate::{
     agent::{Adapter, Source},
     home::MemberHome,
+    member::Member,
+    queue::{Job, WorkQueue},
     sandbox::AgentSandbox,
     watcher::Subject,
 };
 
-/// Namespace holding every branch this runtime creates in a member's working copies.
-pub(crate) const BRANCHES: &str = "radicle-team";
 /// First Git which records a linked working copy's location relatively, keeping the member
 /// directory movable. Without it Git stores where the directory was created, and renaming it
 /// breaks every working copy.
@@ -52,6 +47,13 @@ const RELATIVE_WORKTREES: Version = Version {
     minor: 48,
     patch: 0,
 };
+
+/// Returns the branch namespace `member` owns in its own working copies.
+///
+/// Carries the member's name so branches stay apart in a mirror, and read clearly by hand.
+pub(crate) fn branches(member: Member) -> String {
+    format!("{}-rt", member.id())
+}
 
 // Where a Git command runs, and whose working copy it may write.
 //
@@ -79,17 +81,19 @@ impl In {
 /// Working copies for one member, one per adapter, sharing one object store.
 #[derive(Debug, Clone)]
 pub(crate) struct Workspaces {
+    member: Member,
     home: MemberHome,
     storage: Storage,
     repository: RepoId,
     info: UserInfo,
+    // Which branches still have work behind them. A branch belongs to one job and lives exactly as
+    // long as that job's row does, so the queue is the only thing that decides what may be
+    // removed.
+    queue: WorkQueue,
     // Serialises fetches and reference updates, which every adapter performs against the one
     // shared store. Git would refuse a concurrent reference update rather than corrupt anything,
     // so this exists to avoid spurious failures rather than to protect the repository.
     shared: Arc<Mutex<()>>,
-    // Branches whose work has landed but which were still checked out when that was noticed.
-    // Removed at the next preparation, by which time the adapter holding one has usually moved on.
-    retiring: Arc<Mutex<BTreeSet<String>>>,
     // One per working copy, plus one for the shared store alone. Loaded on first use rather than
     // at construction, because loading reads embedded profiles and creates directories, and a
     // member which never prepares a working copy needs none of them.
@@ -98,18 +102,21 @@ pub(crate) struct Workspaces {
 
 impl Workspaces {
     pub(crate) fn new(
+        member: Member,
         home: MemberHome,
         storage: Storage,
         repository: RepoId,
         info: UserInfo,
+        queue: WorkQueue,
     ) -> Self {
         Self {
+            member,
             home,
             storage,
             repository,
             info,
+            queue,
             shared: Arc::default(),
-            retiring: Arc::default(),
             sandboxes: Arc::default(),
         }
     }
@@ -131,6 +138,7 @@ impl Workspaces {
         storage: Storage,
         repository: RepoId,
         info: UserInfo,
+        queue: WorkQueue,
     ) -> Result<Self, Error> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -140,7 +148,14 @@ impl Workspaces {
         home.create()
             .map_err(|error| Error::Sandbox(error.to_string()))?;
 
-        Ok(Self::new(home, storage, repository, info))
+        Ok(Self::new(
+            Member::Nico,
+            home,
+            storage,
+            repository,
+            info,
+            queue,
+        ))
     }
 
     /// Creates the shared object store and every adapter's working copy.
@@ -175,46 +190,76 @@ impl Workspaces {
                 .await?;
             }
         }
+        self.detach_copies().await?;
 
-        self.retire_finished().await
+        self.sweep().await
     }
 
-    /// Moves `adapter`'s working copy onto whatever `source` addresses and reports its path.
+    // Takes every working copy off the branch it was left standing on.
+    //
+    // Nothing is running yet, so holding one would only keep a finished job's branch alive. The
+    // tree is untouched, so a crashed run's uncommitted work is still there to salvage.
+    async fn detach_copies(&self) -> Result<(), Error> {
+        for adapter in Adapter::ALL {
+            let place = In::Copy(adapter);
+            let head = self.capture(place, ["rev-parse", "HEAD"]).await?;
+            self.git(place, ["update-ref", "--no-deref", "HEAD", &head])
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Moves an answering adapter's working copy onto whatever `source` addresses.
     ///
-    /// A talking or chatting adapter is left on a detached head, because two working copies of one
-    /// repository cannot hold the same branch. A building adapter is given a real branch, since it
-    /// has commits to make.
+    /// Left on a detached head: two copies of one repository cannot hold the same branch, and
+    /// what an answering adapter produces is the answer it publishes, not commits.
     pub(crate) async fn prepare(&self, adapter: Adapter, source: Source) -> Result<PathBuf, Error> {
+        self.settle(adapter, source, None).await
+    }
+
+    /// Moves the building adapter's working copy onto the branch belonging to `job`.
+    ///
+    /// Named after the job alone, which is the only identifier both known before the work starts
+    /// and never shared with another piece of work.
+    pub(crate) async fn prepare_job(&self, job: &Job) -> Result<PathBuf, Error> {
+        self.settle(Adapter::Coder, job.source.clone(), Some(job.id))
+            .await
+    }
+
+    async fn settle(
+        &self,
+        adapter: Adapter,
+        source: Source,
+        job: Option<i64>,
+    ) -> Result<PathBuf, Error> {
         let worktree = self.home.worktree(adapter);
-        let head = self.head(source.clone()).await?;
+        let head = self.head(source).await?;
         // Held across the whole preparation, not only the fetch. Salvaging and placing a branch
         // both write references into the one shared store, and two adapters preparing at once
         // would otherwise collide there.
         let _shared = self.shared.lock().await;
         let place = In::Copy(adapter);
         self.fetch(place, &head).await?;
-        // Salvaging and placing a branch belong together to the adapter which owns branches. It
-        // is the only one whose working copy holds work: what the others produce is the answer
-        // they publish, and their copy holds only what they looked at on the way to it.
-        //
         // Placing the branch comes second because resetting while standing on one moves it, which
         // would throw away commits the agent made but had not published yet. It is also what moves
         // the copy off the branch salvaging left it on.
-        let head = if adapter.owns_branches() {
-            self.salvage(place, &source).await?;
-            self.place_branch(place, &source, &head).await?
-        } else {
-            head
+        let head = match job {
+            Some(job) => {
+                self.salvage(place, job).await?;
+                self.place_branch(place, job, &head).await?
+            }
+            None => head,
         };
         self.git(place, ["reset", "--hard", &head]).await?;
         // Ignored files are removed as well, so nothing a previous delivery left behind can reach
-        // the next one. Build output is kept out of the working copy instead, in the adapter's own
+        // the next one. Build output is kept out of the working copy instead, in the member's
         // cache directory.
         self.git(place, ["clean", "-ffdx"]).await?;
         // Last, because moving this working copy is what frees the branch it was standing on.
         // Tidy-up, so a failure is reported rather than allowed to fail a prepared delivery.
         if let Err(error) = self.sweep().await {
-            tracing::warn!(%error, "could not remove the branch of a landed patch");
+            tracing::warn!(%error, "could not remove the branches of finished jobs");
         }
 
         Ok(worktree)
@@ -234,11 +279,11 @@ impl Workspaces {
     }
 
     // Preserves anything the previous run left uncommitted before the tree is reset.
-    async fn salvage(&self, place: In, source: &Source) -> Result<(), Error> {
+    async fn salvage(&self, place: In, job: i64) -> Result<(), Error> {
         if self.status(place).await?.is_empty() {
             return Ok(());
         }
-        let branch = self.salvage_branch(place, source).await?;
+        let branch = self.salvage_branch(place, job).await?;
         let head = self.capture(place, ["rev-parse", "HEAD"]).await?;
         self.stand_on(place, &branch, &head).await?;
         self.git(place, ["add", "--all"]).await?;
@@ -249,7 +294,7 @@ impl Workspaces {
         .await?;
         tracing::warn!(
             adapter = ?place.adapter(),
-            %source,
+            job,
             %branch,
             "previous run left uncommitted work; it was committed rather than discarded"
         );
@@ -257,17 +302,17 @@ impl Workspaces {
         Ok(())
     }
 
-    // Puts the building adapter on the branch for `source` without losing commits.
+    // Puts the building adapter on the branch for `job` without losing commits.
     //
     // The branch may already be ahead of the published patch, because the agent commits before it
     // publishes. Forcing the branch back to the patch head would destroy exactly that work.
-    async fn place_branch(&self, place: In, source: &Source, head: &str) -> Result<String, Error> {
-        let branch = Self::branch(source);
+    async fn place_branch(&self, place: In, job: i64, head: &str) -> Result<String, Error> {
+        let branch = self.branch(job);
         let tip = self.tip(place, &branch).await?;
         let target = match tip {
             Some(tip) if self.contains(place, &branch, head).await? => tip,
             Some(tip) => {
-                self.copy_diverged(place, source, &tip).await?;
+                self.copy_diverged(place, job, &tip).await?;
                 head.to_owned()
             }
             None => head.to_owned(),
@@ -278,11 +323,11 @@ impl Workspaces {
     }
 
     // Keeps a copy of a branch which has drifted away from the published patch.
-    async fn copy_diverged(&self, place: In, source: &Source, tip: &str) -> Result<(), Error> {
-        let salvage = self.salvage_branch(place, source).await?;
+    async fn copy_diverged(&self, place: In, job: i64, tip: &str) -> Result<(), Error> {
+        let salvage = self.salvage_branch(place, job).await?;
         self.set_reference(place, &salvage, tip).await?;
         tracing::warn!(
-            %source,
+            job,
             %salvage,
             "branch had diverged from the published patch; kept a copy before resetting"
         );
@@ -315,82 +360,45 @@ impl Workspaces {
         format!("refs/heads/{branch}")
     }
 
-    /// Moves the branch a job worked on onto the identity of the patch it produced.
+    /// Removes every branch whose job is over.
     ///
-    /// A job taken from an issue names its branch after that issue, because the patch it will
-    /// become does not exist yet. Left there, nothing would ever settle that name: the issue can
-    /// stay open long after the patch lands. Renaming it means one rule retires every branch, and
-    /// somebody reading the working copy sees the patch they are looking at.
-    pub(crate) async fn adopt(&self, source: &Source, patch: ObjectId) -> Result<(), Error> {
-        let worked = Self::branch(source);
-        let adopted = Self::branch(&Source::Subject(Subject::Patch(patch)));
-        if worked == adopted {
-            return Ok(());
-        }
-        let _shared = self.shared.lock().await;
-        let Some(tip) = self.tip(In::Store, &worked).await? else {
-            return Ok(());
-        };
-        self.set_reference(In::Store, &adopted, &tip).await?;
-        self.follow(&worked, &adopted).await?;
-        self.remove_branch(&worked).await?;
-        tracing::info!(%worked, %adopted, "branch moved onto the patch it produced");
-
-        Ok(())
-    }
-
-    // Points whichever working copy stands on `worked` at `adopted` instead.
-    async fn follow(&self, worked: &str, adopted: &str) -> Result<(), Error> {
-        for adapter in Adapter::ALL {
-            let place = In::Copy(adapter);
-            let standing = self
-                .capture(place, ["symbolic-ref", "--quiet", "HEAD"])
-                .await
-                .unwrap_or_default();
-            if standing == Self::reference(worked) {
-                self.git(place, ["symbolic-ref", "HEAD", &Self::reference(adopted)])
-                    .await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Removes the branch belonging to a patch or issue whose work has landed.
-    ///
-    /// A branch a working copy is standing on is left alone and removed at the next preparation
-    /// instead. A landed patch is tidy-up, never a reason to pull the ground out from under a job
-    /// which is still running. Restarting the member forgets what is still waiting, which leaves a
-    /// stale branch behind and nothing worse.
-    pub(crate) async fn retire(&self, subject: Subject) -> Result<(), Error> {
-        let branch = Self::branch(&Source::Subject(subject));
-        let _shared = self.shared.lock().await;
-        let _inserted = self.retiring.lock().await.insert(branch);
-
-        self.sweep().await
-    }
-
-    ///Removes every branch waiting to be retired which no working copy is standing on.
+    /// The queue decides: a job which finished has had its row removed, one which failed has not.
+    /// A branch a working copy still stands on waits for the next preparation.
     async fn sweep(&self) -> Result<(), Error> {
-        if self.retiring.lock().await.is_empty() {
+        let present = self.namespace().await?;
+        if present.is_empty() {
             return Ok(());
         }
+        let live = self
+            .queue
+            .live()
+            .await
+            .map_err(|error| Error::Queue(error.to_string()))?;
         let held = self.checked_out().await?;
-        let present = self.namespace().await?;
-        let mut retiring = self.retiring.lock().await;
-        let mut waiting = BTreeSet::new();
-        for branch in retiring.iter() {
-            if held.contains(branch) {
-                let _waiting = waiting.insert(branch.clone());
+        for branch in present {
+            // Only names this runtime gave a job. A salvage branch is what a failed run left
+            // behind and is the one copy of work nobody published, and anything else under this
+            // namespace was not put there by the runtime at all.
+            let Some(job) = self.job_of(&branch) else {
                 continue;
-            }
-            if present.contains(branch) {
-                self.remove_branch(branch).await?;
+            };
+            if !live.contains(&job) && !held.contains(&branch) {
+                self.remove_branch(&branch).await?;
             }
         }
-        *retiring = waiting;
 
         Ok(())
+    }
+
+    // Reads back the job a branch was named after, and nothing for any other name.
+    //
+    // The inverse of [`Self::branch`].
+    fn job_of(&self, branch: &str) -> Option<i64> {
+        branch
+            .strip_prefix(&self.branches())?
+            .strip_prefix("/job-")?
+            .parse()
+            .ok()
     }
 
     async fn remove_branch(&self, branch: &str) -> Result<(), Error> {
@@ -412,7 +420,7 @@ impl Workspaces {
                 [
                     "for-each-ref",
                     "--format=%(refname:lstrip=2)",
-                    &Self::reference(BRANCHES),
+                    &Self::reference(&self.branches()),
                 ],
             )
             .await?;
@@ -435,16 +443,16 @@ impl Workspaces {
 
     // Picks a salvage branch name which is not already in use.
     //
-    // One name per subject would let a second crash overwrite what the first one preserved, which
-    // is the failure this whole path exists to prevent.
-    async fn salvage_branch(&self, place: In, source: &Source) -> Result<String, Error> {
-        let stem = format!("{BRANCHES}/salvage/{}", Self::slug(source));
+    // One name per job would let a second crash overwrite what the first one preserved, which is
+    // the failure this whole path exists to prevent.
+    async fn salvage_branch(&self, place: In, job: i64) -> Result<String, Error> {
+        let stem = format!("{}/salvage/{job}", self.branches());
         let taken = self
             .capture(
                 place,
                 [
                     "for-each-ref",
-                    "--format=%(refname:lstrip=4)",
+                    "--format=%(refname:lstrip=5)",
                     &Self::reference(&stem),
                 ],
             )
@@ -459,10 +467,6 @@ impl Workspaces {
             .checked_add(1)
             .map(|attempt| format!("{stem}/{attempt}"))
             .ok_or(Error::SalvageExhausted(stem))
-    }
-
-    fn slug(source: &Source) -> String {
-        source.to_string().replace(':', "/")
     }
 
     async fn status(&self, place: In) -> Result<String, Error> {
@@ -506,12 +510,12 @@ impl Workspaces {
             .is_ok())
     }
 
-    fn branch(source: &Source) -> String {
-        match source {
-            Source::Subject(Subject::Patch(id)) => format!("{BRANCHES}/patch/{id}"),
-            Source::Subject(Subject::Issue(id)) => format!("{BRANCHES}/issue/{id}"),
-            Source::Chat(channel) => format!("{BRANCHES}/chat/{channel}"),
-        }
+    fn branches(&self) -> String {
+        branches(self.member)
+    }
+
+    fn branch(&self, job: i64) -> String {
+        format!("{}/job-{job}", self.branches())
     }
 
     async fn head(&self, source: Source) -> Result<String, Error> {
@@ -572,12 +576,13 @@ impl Workspaces {
     async fn prepare_common(&self) -> Result<(), Error> {
         let common = self.home.git_common();
         let info = self.info.clone();
+        let namespace = self.branches();
         tokio::task::spawn_blocking(move || {
             let mut config = git2::Config::open(&common.join("config"))?;
             config.set_str("user.name", info.name().as_ref())?;
             config.set_str("user.email", &info.email())?;
             config.set_i32("gc.auto", 0)?;
-            std::fs::create_dir_all(common.join("refs").join("heads").join(BRANCHES))
+            std::fs::create_dir_all(common.join("refs").join("heads").join(&namespace))
                 .map_err(Error::Io)?;
             let packed = common.join("packed-refs");
             if !packed.is_file() {
@@ -588,79 +593,6 @@ impl Workspaces {
         })
         .await
         .map_err(|error| Error::Task(error.to_string()))?
-    }
-
-    // Queues the branches of every subject whose work is over.
-    //
-    // Run at every start rather than only when a merge is delivered, because a branch which was
-    // checked out at that moment is remembered nowhere but in memory. Reading the subjects back
-    // covers a restart, a merge nobody was running to see, and the branch a job took its name
-    // from, which is the issue it answered rather than the patch that answer became.
-    async fn retire_finished(&self) -> Result<(), Error> {
-        let branches = self
-            .capture(
-                In::Store,
-                [
-                    "for-each-ref",
-                    "--format=%(refname:lstrip=2)",
-                    &format!("refs/heads/{BRANCHES}"),
-                ],
-            )
-            .await?;
-        let finished = self.finished(branches).await?;
-        let _shared = self.shared.lock().await;
-        self.retiring.lock().await.extend(finished);
-
-        self.sweep().await
-    }
-
-    async fn finished(&self, branches: String) -> Result<Vec<String>, Error> {
-        let manager = self.clone();
-        tokio::task::spawn_blocking(move || manager.finished_blocking(&branches))
-            .await
-            .map_err(|error| Error::Task(error.to_string()))?
-    }
-
-    // Returns the branches among `branches` whose subject has been settled.
-    //
-    // A salvage branch is what a failed run left behind and is never removed here. A chat branch
-    // belongs to a conversation, which does not end.
-    fn finished_blocking(&self, branches: &str) -> Result<Vec<String>, Error> {
-        let storage = self.storage.repository(self.repository)?;
-        let patches = Patches::open(&storage, ReadOnly)?;
-        let issues = Issues::open(&storage, ReadOnly)?;
-        let mut finished = Vec::new();
-        for branch in branches.lines() {
-            let settled = match Self::subject_of(branch) {
-                Some(Subject::Patch(id)) => patches
-                    .get(&id)?
-                    .is_some_and(|patch| matches!(patch.state(), State::Merged { .. })),
-                Some(Subject::Issue(id)) => issues
-                    .get(&id)?
-                    .is_some_and(|issue| matches!(issue.state(), IssueState::Closed { .. })),
-                None => false,
-            };
-            if settled {
-                finished.push(branch.to_owned());
-            }
-        }
-
-        Ok(finished)
-    }
-
-    // Reads back the subject a branch was named after.
-    //
-    // The inverse of [`Self::branch`], and `None` for a name it never produced or for one whose
-    // fate no subject decides, such as a salvage or a chat branch.
-    fn subject_of(branch: &str) -> Option<Subject> {
-        let rest = branch.strip_prefix(BRANCHES)?.strip_prefix('/')?;
-        let (kind, id) = rest.split_once('/')?;
-        let id = id.parse::<ObjectId>().ok()?;
-        match kind {
-            "patch" => Some(Subject::Patch(id)),
-            "issue" => Some(Subject::Issue(id)),
-            _other => None,
-        }
     }
 
     async fn git<I, S>(&self, place: In, arguments: I) -> Result<(), Error>
@@ -757,6 +689,8 @@ pub(crate) enum Error {
     PatchNotFound(radicle::cob::ObjectId),
     #[error("workspace task failed: {0}")]
     Task(String),
+    #[error("workspace could not read the work queue: {0}")]
+    Queue(String),
     #[error(
         "Git 2.48 or newer is required so working copies survive moving the member directory, \
          found '{0}'"
@@ -784,21 +718,42 @@ mod tests {
     };
 
     use crate::{
-        agent::Adapter,
+        agent::{Adapter, Source},
         home::MemberHome,
+        manifest::QueuePosition,
+        member::Member,
+        queue::{Job, WorkQueue},
         watcher::Subject,
-        workspace::{BRANCHES, Workspaces},
+        workspace::Workspaces,
     };
+
+    // The namespace every branch in these tests lives under, named after the member the fixture
+    // builds. Spelled out rather than derived, so a change to the naming has to be seen here.
+    const NAMESPACE: &str = "nico-rt";
 
     struct Fixture {
         _root: Option<tempfile::TempDir>,
         profile: Profile,
         repository: radicle::identity::RepoId,
         workspaces: Workspaces,
+        queue: WorkQueue,
         home: MemberHome,
         patch: radicle::cob::ObjectId,
         issue: radicle::cob::ObjectId,
         head: git2::Oid,
+    }
+
+    impl Fixture {
+        // Records a job for `source` and starts it, the way the builder would.
+        async fn start(&self, source: impl Into<Source>) -> Job {
+            let _id = self
+                .queue
+                .push("do it".to_owned(), source.into(), QueuePosition::End)
+                .await
+                .expect("job should be recorded");
+
+            self.queue.next().await.expect("job should be taken")
+        }
     }
 
     async fn repository() -> Fixture {
@@ -901,57 +856,29 @@ mod tests {
         };
         let home = MemberHome::at(root.join("member"));
         home.create().expect("member directory should be created");
-        let workspaces = Workspaces::new(home.clone(), profile.storage.clone(), repository, info);
+        let queue = WorkQueue::memory(repository, Member::Nico)
+            .await
+            .expect("queue should open");
+        let workspaces = Workspaces::new(
+            Member::Nico,
+            home.clone(),
+            profile.storage.clone(),
+            repository,
+            info,
+            queue.clone(),
+        );
 
         Fixture {
             _root: temporary,
             profile,
             repository,
             workspaces,
+            queue,
             home,
             patch,
             issue,
             head,
         }
-    }
-
-    // Settles the issue, the way somebody closing it would.
-    fn close(fixture: &Fixture) {
-        let stored = fixture
-            .profile
-            .storage
-            .repository(fixture.repository)
-            .expect("stored repository should open");
-        let signer = fixture.profile.signer().expect("signer should load");
-        let mut issues = fixture
-            .profile
-            .issues_mut(&stored, &signer)
-            .expect("issue cache should open");
-        let mut issue = issues.get_mut(&fixture.issue).expect("issue should exist");
-        issue
-            .lifecycle(radicle::cob::issue::State::Closed {
-                reason: radicle::cob::issue::CloseReason::Solved,
-            })
-            .expect("issue should close");
-    }
-
-    // Records that the patch landed, the way a merge delivered by the watcher would.
-    fn merge(fixture: &Fixture) {
-        let stored = fixture
-            .profile
-            .storage
-            .repository(fixture.repository)
-            .expect("stored repository should open");
-        let signer = fixture.profile.signer().expect("signer should load");
-        let mut patches = fixture
-            .profile
-            .patches_mut(&stored, &signer)
-            .expect("patch cache should open");
-        let mut patch = patches.get_mut(&fixture.patch).expect("patch should exist");
-        let revision = patch.latest().0;
-        let _merged = patch
-            .merge(revision, fixture.head.into())
-            .expect("patch should merge");
     }
 
     #[tokio::test]
@@ -1026,26 +953,22 @@ mod tests {
     #[tokio::test]
     async fn keeps_work_a_crashed_run_left_behind() {
         let fixture = repository().await;
-        let (workspaces, home, patch, head) = (
-            &fixture.workspaces,
-            &fixture.home,
-            fixture.patch,
-            fixture.head,
-        );
+        let (workspaces, home, head) = (&fixture.workspaces, &fixture.home, fixture.head);
         workspaces
             .initialize()
             .await
             .expect("working copies should be created");
         let coder = home.worktree(Adapter::Coder);
+        let job = fixture.start(Subject::Patch(fixture.patch)).await;
 
         workspaces
-            .prepare(Adapter::Coder, Subject::Patch(patch).into())
+            .prepare_job(&job)
             .await
             .expect("coder should take the patch");
         fs::write(coder.join("half-done.rs"), "unfinished").expect("file should be written");
 
         workspaces
-            .prepare(Adapter::Coder, Subject::Patch(patch).into())
+            .prepare_job(&job)
             .await
             .expect("coder should take it again");
 
@@ -1053,7 +976,10 @@ mod tests {
             !coder.join("half-done.rs").exists(),
             "the next run must start from a clean tree"
         );
-        let salvaged = git(&coder, &["branch", "--list", "radicle-team/salvage/*"]);
+        let salvaged = git(
+            &coder,
+            &["branch", "--list", &format!("{NAMESPACE}/salvage/*")],
+        );
         assert!(
             !salvaged.is_empty(),
             "work left behind by a crashed run must be kept, not silently discarded"
@@ -1103,7 +1029,11 @@ mod tests {
             "the next answer must start from a clean tree"
         );
         assert!(
-            git(&talker, &["branch", "--list", "radicle-team/salvage/*"]).is_empty(),
+            git(
+                &talker,
+                &["branch", "--list", &format!("{NAMESPACE}/salvage/*")]
+            )
+            .is_empty(),
             "and nothing it touched on the way to an answer becomes a branch"
         );
     }
@@ -1131,7 +1061,7 @@ mod tests {
             common.join("config"),
             common.join("hooks"),
             common.join("packed-refs"),
-            common.join("refs").join("heads").join(BRANCHES),
+            common.join("refs").join("heads").join(NAMESPACE),
             common.join("worktrees").join("talker").join("commondir"),
             common.join("worktrees").join("talker").join("gitdir"),
             fixture.home.worktree(Adapter::Talker).join(".git"),
@@ -1225,6 +1155,7 @@ mod tests {
             .initialize()
             .await
             .expect("working copies should be created");
+        let job = fixture.start(Subject::Patch(fixture.patch)).await;
         // Somewhere the runtime is about to move its own branch away from: the reference below
         // stands for this one, so following it would carry this one along.
         let base = git(&coder, &["rev-parse", &format!("{}~1", fixture.head)]);
@@ -1233,14 +1164,14 @@ mod tests {
             &coder,
             &[
                 "symbolic-ref",
-                &format!("refs/heads/{BRANCHES}/patch/{}", fixture.patch),
+                &format!("refs/heads/{NAMESPACE}/job-{}", job.id),
                 "refs/heads/victim",
             ],
         );
 
         fixture
             .workspaces
-            .prepare(Adapter::Coder, Subject::Patch(fixture.patch).into())
+            .prepare_job(&job)
             .await
             .expect("coder should take the patch");
 
@@ -1252,117 +1183,187 @@ mod tests {
         );
     }
 
-    // Almost every job arrives as an issue, and the patch it produces is what eventually lands.
-    // The branch has to end up on that patch, or the work is filed under a name whose fate says
-    // nothing about it: an issue can stay open long after the patch answering it merges.
+    // Two jobs from one issue, or one chat channel, are two separate pieces of work. Naming a
+    // branch after where the request came from would put both on the same branch, where the
+    // second silently continues from whatever the first left.
     #[tokio::test]
-    async fn moves_the_branch_of_a_job_onto_the_patch_it_produced() {
+    async fn gives_two_jobs_from_one_source_a_branch_each() {
         let fixture = repository().await;
         let coder = fixture.home.worktree(Adapter::Coder);
-        let worked = format!("{BRANCHES}/issue/{}", fixture.issue);
-        let adopted = format!("{BRANCHES}/patch/{}", fixture.patch);
         fixture
             .workspaces
             .initialize()
             .await
             .expect("working copies should be created");
+        let first = fixture.start(Subject::Issue(fixture.issue)).await;
         fixture
             .workspaces
-            .prepare(Adapter::Coder, Subject::Issue(fixture.issue).into())
+            .prepare_job(&first)
             .await
-            .expect("coder should take the issue");
-        let tip = git(&coder, &["rev-parse", "HEAD"]);
+            .expect("coder should take the first job");
+        fixture
+            .queue
+            .finish()
+            .await
+            .expect("the first job should finish");
+        let second = fixture.start(Subject::Issue(fixture.issue)).await;
 
         fixture
             .workspaces
-            .adopt(&Subject::Issue(fixture.issue).into(), fixture.patch)
+            .prepare_job(&second)
             .await
-            .expect("the branch should move onto the patch");
+            .expect("coder should take the second job");
 
-        assert!(
-            git(&coder, &["branch", "--list", &worked]).is_empty(),
-            "the name the job started under must not be left behind"
-        );
+        assert_ne!(first.id, second.id);
         assert_eq!(
-            git(&coder, &["rev-parse", &format!("refs/heads/{adopted}")]),
-            tip,
-            "the patch's branch must hold the work the job did"
-        );
-        assert_eq!(
-            git(&coder, &["symbolic-ref", "HEAD"]),
-            format!("refs/heads/{adopted}"),
-            "the working copy must follow its branch rather than be left on a name which is gone"
+            git(&coder, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            format!("{NAMESPACE}/job-{}", second.id),
+            "the second job must stand on a branch of its own"
         );
     }
 
-    // A job which produced no patch keeps the name it started under, so something still has to
-    // settle that name. Reading only patch branches back would leave it there for good.
+    // The patch a job produces does not exist when the job starts, so a branch named after the
+    // patch could only ever be reached by renaming one. Naming it after the job means the name is
+    // right from the first commit and never has to move.
     #[tokio::test]
-    async fn removes_the_branch_of_an_issue_which_was_settled() {
+    async fn keeps_one_branch_name_from_the_first_commit_to_the_patch() {
         let fixture = repository().await;
-        let branch = format!("{BRANCHES}/issue/{}", fixture.issue);
         let coder = fixture.home.worktree(Adapter::Coder);
         fixture
             .workspaces
             .initialize()
             .await
             .expect("working copies should be created");
+        let job = fixture.start(Subject::Issue(fixture.issue)).await;
         fixture
             .workspaces
-            .prepare(Adapter::Coder, Subject::Issue(fixture.issue).into())
+            .prepare_job(&job)
             .await
             .expect("coder should take the issue");
+        let branch = git(&coder, &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+        // What the agent does when it publishes: the job is now answering a patch instead of the
+        // issue it came from.
+        fixture
+            .queue
+            .retarget(job.id, Subject::Patch(fixture.patch).into())
+            .await
+            .expect("the job should retarget");
+        let job = fixture
+            .queue
+            .running()
+            .await
+            .expect("the job should still be running");
         fixture
             .workspaces
-            .prepare(Adapter::Coder, Subject::Patch(fixture.patch).into())
+            .prepare_job(&job)
             .await
-            .expect("coder should move to other work");
-        assert!(!git(&coder, &["branch", "--list", &branch]).is_empty());
+            .expect("coder should carry on");
 
-        close(&fixture);
+        assert_eq!(
+            git(&coder, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch,
+            "producing a patch must not move the job onto another branch"
+        );
+        assert_eq!(branch, format!("{NAMESPACE}/job-{}", job.id));
+    }
+
+    // A branch is the working copy of one job and means nothing once that job is over. The queue
+    // is what says so: a job which finished has had its row removed, and one which failed has not.
+    #[tokio::test]
+    async fn removes_the_branch_of_a_job_which_finished() {
+        let fixture = repository().await;
+        let coder = fixture.home.worktree(Adapter::Coder);
         fixture
             .workspaces
             .initialize()
             .await
-            .expect("the next start should reuse the working copies");
+            .expect("working copies should be created");
+        let job = fixture.start(Subject::Issue(fixture.issue)).await;
+        let branch = format!("{NAMESPACE}/job-{}", job.id);
+        fixture
+            .workspaces
+            .prepare_job(&job)
+            .await
+            .expect("coder should take the issue");
+        fixture.queue.finish().await.expect("the job should finish");
+        assert!(!git(&coder, &["branch", "--list", &branch]).is_empty());
+
+        let next = fixture.start(Subject::Patch(fixture.patch)).await;
+        fixture
+            .workspaces
+            .prepare_job(&next)
+            .await
+            .expect("coder should move to other work");
 
         assert!(
             git(&coder, &["branch", "--list", &branch]).is_empty(),
-            "the branch a job took its name from must be removed once its issue is settled"
+            "the branch of a job which is over must be removed"
         );
     }
 
-    // A merge noticed while the branch was checked out is remembered nowhere but in memory, so a
-    // restart would otherwise leave that branch behind forever.
+    // A job which stalled, failed, or was interrupted keeps its row, and its branch holds commits
+    // nobody published. Removing it would throw that work away with nothing to recover it from.
     #[tokio::test]
-    async fn removes_a_landed_branch_after_a_restart() {
+    async fn keeps_the_branch_of_a_job_which_did_not_finish() {
         let fixture = repository().await;
-        let branch = format!("{BRANCHES}/patch/{}", fixture.patch);
         let coder = fixture.home.worktree(Adapter::Coder);
         fixture
             .workspaces
             .initialize()
             .await
             .expect("working copies should be created");
+        let failed = fixture.start(Subject::Issue(fixture.issue)).await;
+        let branch = format!("{NAMESPACE}/job-{}", failed.id);
         fixture
             .workspaces
-            .prepare(Adapter::Coder, Subject::Patch(fixture.patch).into())
+            .prepare_job(&failed)
             .await
-            .expect("coder should take the patch");
+            .expect("coder should take the issue");
+
+        // No `finish`, which is what the builder skips when a job fails.
+        let next = fixture.start(Subject::Patch(fixture.patch)).await;
         fixture
             .workspaces
-            .prepare(Adapter::Coder, Subject::Issue(fixture.patch).into())
+            .prepare_job(&next)
             .await
             .expect("coder should move to other work");
+
+        assert!(
+            !git(&coder, &["branch", "--list", &branch]).is_empty(),
+            "work a failed job left behind must survive until that job is actually carried out"
+        );
+    }
+
+    // A job finishing while its branch is checked out is noticed nowhere but in memory, so a
+    // restart would otherwise leave that branch behind forever.
+    #[tokio::test]
+    async fn removes_the_branch_of_a_finished_job_after_a_restart() {
+        let fixture = repository().await;
+        let coder = fixture.home.worktree(Adapter::Coder);
+        fixture
+            .workspaces
+            .initialize()
+            .await
+            .expect("working copies should be created");
+        let job = fixture.start(Subject::Patch(fixture.patch)).await;
+        let branch = format!("{NAMESPACE}/job-{}", job.id);
+        fixture
+            .workspaces
+            .prepare_job(&job)
+            .await
+            .expect("coder should take the patch");
+        fixture.queue.finish().await.expect("the job should finish");
         assert!(!git(&coder, &["branch", "--list", &branch]).is_empty());
 
-        merge(&fixture);
         // A different value, holding nothing of what the run before it was waiting to remove.
         let restarted = Workspaces::new(
+            Member::Nico,
             fixture.home.clone(),
             fixture.profile.storage.clone(),
             fixture.repository,
             fixture.profile.info(),
+            fixture.queue.clone(),
         );
         restarted
             .initialize()
@@ -1371,38 +1372,45 @@ mod tests {
 
         assert!(
             git(&coder, &["branch", "--list", &branch]).is_empty(),
-            "a branch whose patch has landed must be removed at the next start"
+            "the branch of a job which is over must be removed at the next start"
         );
     }
 
     #[tokio::test]
-    async fn keeps_a_landed_branch_until_the_copy_holding_it_moves_on() {
+    async fn keeps_a_finished_branch_until_the_copy_holding_it_moves_on() {
         let fixture = repository().await;
-        let (workspaces, home, patch) = (&fixture.workspaces, &fixture.home, fixture.patch);
-        workspaces
+        let coder = fixture.home.worktree(Adapter::Coder);
+        fixture
+            .workspaces
             .initialize()
             .await
             .expect("working copies should be created");
-        let coder = home.worktree(Adapter::Coder);
-        let branch = format!("radicle-team/patch/{patch}");
-
-        workspaces
-            .prepare(Adapter::Coder, Subject::Patch(patch).into())
+        let job = fixture.start(Subject::Patch(fixture.patch)).await;
+        let branch = format!("{NAMESPACE}/job-{}", job.id);
+        fixture
+            .workspaces
+            .prepare_job(&job)
             .await
             .expect("coder should take the patch");
         assert_eq!(git(&coder, &["rev-parse", "--abbrev-ref", "HEAD"]), branch);
 
-        workspaces
-            .retire(Subject::Patch(patch))
+        // Finishing does not move the copy off the branch, and the sweep runs anyway.
+        fixture.queue.finish().await.expect("the job should finish");
+        fixture
+            .workspaces
+            .prepare(Adapter::Talker, Subject::Patch(fixture.patch).into())
             .await
-            .expect("retiring a branch which is checked out must not fail");
+            .expect("another adapter should still be able to prepare");
+
         assert!(
             !git(&coder, &["branch", "--list", &branch]).is_empty(),
-            "a landed patch must not pull the branch out from under a job which is still running"
+            "tidying up must not pull the branch out from under a copy still standing on it"
         );
 
-        workspaces
-            .prepare(Adapter::Coder, Subject::Issue(patch).into())
+        let next = fixture.start(Subject::Issue(fixture.issue)).await;
+        fixture
+            .workspaces
+            .prepare_job(&next)
             .await
             .expect("coder should move to other work");
 
@@ -1415,15 +1423,16 @@ mod tests {
     #[tokio::test]
     async fn never_moves_the_building_branch_backwards() {
         let fixture = repository().await;
-        let (workspaces, home, patch) = (&fixture.workspaces, &fixture.home, fixture.patch);
+        let (workspaces, home) = (&fixture.workspaces, &fixture.home);
         workspaces
             .initialize()
             .await
             .expect("working copies should be created");
         let coder = home.worktree(Adapter::Coder);
+        let job = fixture.start(Subject::Patch(fixture.patch)).await;
 
         workspaces
-            .prepare(Adapter::Coder, Subject::Patch(patch).into())
+            .prepare_job(&job)
             .await
             .expect("coder should take the patch");
         fs::write(coder.join("README.md"), "agent's work\n").expect("README should be written");
@@ -1443,7 +1452,7 @@ mod tests {
         let committed = git(&coder, &["rev-parse", "HEAD"]);
 
         workspaces
-            .prepare(Adapter::Coder, Subject::Patch(patch).into())
+            .prepare_job(&job)
             .await
             .expect("coder should take it again");
 

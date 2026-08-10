@@ -1,6 +1,6 @@
 //! Repository manifest for a Radicle team.
 //!
-//! [`Manifest`] loads the single `.radicle-team.toml` manifest from a repository's canonical commit
+//! [`Manifest`] loads the single `radicle-team.toml` manifest from a repository's canonical commit
 //! or from one explicitly selected administrator-owned file. The file is shared repository policy,
 //! not machine-local application state: contributors must agree on its reviewed character-to-DID
 //! bindings, while private identity material remains in the application home. `config-rs` parses
@@ -36,7 +36,10 @@ use crate::{
 };
 
 /// Name of the repository manifest file.
-pub const FILE_NAME: &str = ".radicle-team.toml";
+///
+/// Not hidden, because it is read and edited by whoever reviews the team's composition, and a file
+/// nobody sees is a file nobody reviews.
+pub const FILE_NAME: &str = "radicle-team.toml";
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_FRONT_LABEL: &str = "urgent";
 const DEFAULT_NEXT_LABEL: &str = "next";

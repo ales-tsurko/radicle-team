@@ -29,6 +29,7 @@ use zerobox_utils_absolute_path::AbsolutePathBuf;
 use crate::{
     agent::{Adapter, McpEndpoint},
     home::MemberHome,
+    member::Member,
     sandbox::{
         Config,
         network::{ManagedNetwork, ProxyRuntime},
@@ -75,6 +76,7 @@ impl AgentSandbox {
     /// prepared, or the local configuration is unsafe or invalid.
     pub fn load(
         home: &MemberHome,
+        member: Member,
         adapter: Adapter,
         endpoint: &McpEndpoint,
     ) -> Result<Self, Error> {
@@ -82,7 +84,7 @@ impl AgentSandbox {
         // Sharing that directory would let one adapter rewrite another's checked-out branch, which
         // is exactly what running them separately is meant to prevent.
         let workspaces = Self::rooted(&home.worktree(adapter))?;
-        let store = Store::new(home.clone(), adapter);
+        let store = Store::new(home.clone(), member, adapter);
         let policy = Policy::load(
             &workspaces,
             Some(endpoint),
@@ -265,18 +267,20 @@ impl AgentSandbox {
 #[derive(Debug)]
 struct Store {
     home: MemberHome,
+    member: Member,
     adapter: Adapter,
     common: PathBuf,
     mine: PathBuf,
 }
 
 impl Store {
-    fn new(home: MemberHome, adapter: Adapter) -> Self {
+    fn new(home: MemberHome, member: Member, adapter: Adapter) -> Self {
         let common = home.git_common();
         let mine = common.join("worktrees").join(adapter.id());
 
         Self {
             home,
+            member,
             adapter,
             common,
             mine,
@@ -290,7 +294,7 @@ impl Store {
     // entry this worktree keeps in the store.
     fn writable(&self) -> Vec<PathBuf> {
         let mut writable = vec![
-            self.home.cache(self.adapter),
+            self.home.cache(),
             self.home.harness(self.adapter),
             self.common.clone(),
             self.mine.clone(),
@@ -343,7 +347,7 @@ impl Store {
         self.common
             .join("refs")
             .join("heads")
-            .join(crate::workspace::BRANCHES)
+            .join(crate::workspace::branches(self.member))
     }
 }
 
@@ -725,7 +729,7 @@ pub enum Error {
 mod tests {
     use url::Url;
 
-    use crate::{agent::McpEndpoint, home::MemberHome, sandbox::AgentSandbox};
+    use crate::{agent::McpEndpoint, home::MemberHome, member::Member, sandbox::AgentSandbox};
 
     fn member_home(root: &std::path::Path) -> MemberHome {
         MemberHome::at(root)
@@ -831,14 +835,14 @@ mod tests {
             .git_common()
             .join("refs")
             .join("heads")
-            .join(crate::workspace::BRANCHES);
+            .join(crate::workspace::branches(Member::Nico));
 
         for (adapter, expected) in [
             (crate::agent::Adapter::Coder, true),
             (crate::agent::Adapter::Talker, false),
         ] {
             crate::sandbox::dispatch_linux_helper();
-            let sandbox = AgentSandbox::load(&home, adapter, &endpoint())
+            let sandbox = AgentSandbox::load(&home, Member::Nico, adapter, &endpoint())
                 .expect("default sandbox should load");
             let policy = built(&home, &sandbox);
 
@@ -875,8 +879,13 @@ mod tests {
 
     fn sandbox(home: &MemberHome) -> AgentSandbox {
         crate::sandbox::dispatch_linux_helper();
-        AgentSandbox::load(home, crate::agent::Adapter::Talker, &endpoint())
-            .expect("default sandbox should load")
+        AgentSandbox::load(
+            home,
+            Member::Nico,
+            crate::agent::Adapter::Talker,
+            &endpoint(),
+        )
+        .expect("default sandbox should load")
     }
 
     fn endpoint() -> McpEndpoint {

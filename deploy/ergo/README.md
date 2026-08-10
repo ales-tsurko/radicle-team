@@ -21,10 +21,9 @@ first accounts. Remove it after provisioning:
 ERGO_SASL_EXEMPTED='[]' docker compose -f deploy/ergo/compose.yaml up -d
 ```
 
-Run `radicle-team setup` once for each repository member. It creates
-`~/.radicle-team/repositories/<canonical-RID>/members/<member>/irc-identity.pem`
-with mode `0600` and prints
-the certificate fingerprint needed by the manifest.
+Run `radicle-team setup` once for each repository member. It creates 
+`<member folder>/irc-identity.pem` with mode `0600` and prints the certificate
+fingerprint needed by the manifest.
 
 Account and channel provisioning stays an operator action. From an exempt
 connection, use the generated operator password and create a distinct SASL

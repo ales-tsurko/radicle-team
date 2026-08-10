@@ -55,9 +55,22 @@ Radicle Team loads Zerobox's embedded platform and sensitive-path policies
 directly, so user-defined Zerobox profiles cannot replace them. It also enables
 common Rust, Node.js, Python, Go, and Nix toolchain paths. It grants write
 access to the one working copy belonging to the adapter being run, that
-adapter's own `cache/` and `harness/` directories, and the shared object store
-in `.git-common`, without which the adapter could edit files but never commit
-them. One adapter therefore cannot write into another's checkout or state.
+adapter's own `harness/` directory, the member's `cache/` directory, and the
+shared object store in `.git-common`, without which the adapter could edit files
+but never commit them. One adapter therefore cannot write into another's
+checkout or state.
+
+`cache/` is the exception: the member's three adapters share it, because build
+output is far too large to keep three copies of. Sharing it there costs nothing.
+The separation between one member's adapters is about not standing on each
+other's work — a checked-out branch, a build lock, a transcript — and never
+about holding one of them away from the others. They are one person under one
+key, and the repository's own build scripts already run inside the building
+adapter's sandbox every time it builds.
+
+It never reaches further than the member, and that boundary is real. A build
+cache holds compiled build scripts and plugins which the next build runs, so two
+members sharing one would let either run code as the other.
 
 Parts of that store stay read-only, because Git executes whatever its
 configuration and hooks name, and the runtime's own Git reads them too:
@@ -68,7 +81,7 @@ configuration and hooks name, and the runtime's own Git reads them too:
   runtime's next Git command would read that store's configuration and hooks.
 - `.git-common/refs` and `.git-common/packed-refs`, so no adapter can move or
   delete branches belonging to another. The building adapter is granted
-  `refs/heads/radicle-team` back, since that is where its own branches live.
+  `refs/heads/<member>-rt` back, since that is where its own branches live.
   The talking and chatting adapters answer from a detached head and need none.
   Anything writing a reference outside that namespace fails inside the sandbox,
   including `git stash`, `git tag`, and branches of the agent's own choosing.
@@ -78,7 +91,7 @@ Fencing paths off only covers what the runtime *reads*. The runtime also writes
 references there, and a name the building adapter can write may be made to
 stand for another reference entirely. So every reference the runtime writes is
 one it named itself, addressed in full and set without following it. An adapter
-can do what it likes inside `radicle-team/`; it cannot reach outside it.
+can do what it likes inside `<member>-rt/`; it cannot reach outside it.
 
 Neither of those is the boundary. They narrow what an adapter can put in a
 Git command's way; the sandbox above is what bounds the cost of one that gets

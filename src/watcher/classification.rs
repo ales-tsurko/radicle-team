@@ -11,8 +11,8 @@ use radicle::{
         EntryId, Op,
         patch::{ReviewId, RevisionId},
     },
+    crypto::PublicKey,
     identity::{Did, RepoId},
-    node::NodeId,
 };
 
 use crate::{
@@ -60,7 +60,7 @@ impl Context {
         &mut self,
         operation: &Op<A>,
         member: Member,
-        member_id: NodeId,
+        member_id: PublicKey,
         repository: RepoId,
         subject: Subject,
         triggers: &Triggers,
@@ -265,11 +265,11 @@ impl<'a> NormalizedAction<'a> {
 pub(super) struct ActionEnvelope<'a, A> {
     action: &'a A,
     operation: &'a Op<A>,
-    member_id: NodeId,
+    member_id: PublicKey,
 }
 
 impl<'a, A> ActionEnvelope<'a, A> {
-    pub(super) const fn new(action: &'a A, operation: &'a Op<A>, member_id: NodeId) -> Self {
+    pub(super) const fn new(action: &'a A, operation: &'a Op<A>, member_id: PublicKey) -> Self {
         Self {
             action,
             operation,
@@ -277,7 +277,7 @@ impl<'a, A> ActionEnvelope<'a, A> {
         }
     }
 
-    pub(super) fn into_parts(self) -> (&'a A, &'a Op<A>, NodeId) {
+    pub(super) fn into_parts(self) -> (&'a A, &'a Op<A>, PublicKey) {
         (self.action, self.operation, self.member_id)
     }
 }

@@ -33,8 +33,9 @@ pub(crate) const HEARTBEAT: Duration = Duration::from_secs(10);
 
 /// One of the three agent adapters a member runs.
 ///
-/// Each has its own MCP server, its own working copy, its own cache, and its own harness state, so
-/// none can disturb another's checked-out branch or block on another's build.
+/// Each has its own MCP server, its own working copy, and its own harness state, so none can
+/// disturb another's checked-out branch or read another's transcripts. The build cache is the one
+/// thing they share, because build output is too large to keep three copies of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Adapter {
     /// Answers repository activity.
@@ -72,9 +73,9 @@ impl fmt::Display for Adapter {
     }
 }
 
-/// Fixed directories one adapter owns for the life of the member.
+/// Fixed directories one adapter is given for the life of the member.
 ///
-/// Delivery workspaces arrive per call. These do not: a cache survives between deliveries on
+/// Delivery workspaces arrive per call. These do not: a build cache survives between deliveries on
 /// purpose, and a harness needs somewhere of its own to keep settings and logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
@@ -102,8 +103,9 @@ impl Layout {
 
     /// Returns the writable cache directory for build and dependency output.
     ///
-    /// Point `CARGO_TARGET_DIR` and its equivalents here so build output stays out of the working
-    /// copy, which is wiped before every delivery.
+    /// Point `CARGO_TARGET_DIR` and its equivalents here, so build output stays out of the
+    /// working copy. Shared with this member's other adapters, which may make them wait on a
+    /// build lock.
     #[must_use]
     pub fn cache(&self) -> &Path {
         &self.cache

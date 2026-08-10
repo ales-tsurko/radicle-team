@@ -1,6 +1,6 @@
 # Repository manifest
 
-Exactly one `.radicle-team.toml` file is active. The default is the file on the
+Exactly one `radicle-team.toml` file is active. The default is the file on the
 repository's canonical branch. Use `--manifest PATH` to select an explicit file
 with the same schema instead. The two sources are never merged.
 

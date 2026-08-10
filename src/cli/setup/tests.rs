@@ -34,7 +34,7 @@ impl Fixture {
     }
 
     fn manifest(&self) -> PathBuf {
-        self.0.join(".radicle-team.toml")
+        self.0.join(FILE_NAME)
     }
 
     fn initialize_repository(&self) {

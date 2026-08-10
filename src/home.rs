@@ -2,8 +2,8 @@
 //!
 //! One member working in one repository owns one directory, created where `setup` was run rather
 //! than hidden under the user's home. Everything that member needs lives inside it: its signing
-//! identity, its durable state, one working copy per adapter, and disposable caches. There is no
-//! global layer, so a directory can be moved, backed up, or deleted as a unit.
+//! identity, its durable state, one working copy per adapter, and a disposable build cache. There
+//! is no global layer, so a directory can be moved, backed up, or deleted as a unit.
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
@@ -13,7 +13,6 @@ use std::{
     str::FromStr,
 };
 
-use directories::BaseDirs;
 use radicle::identity::RepoId;
 use serde::{Deserialize, Serialize};
 
@@ -23,10 +22,10 @@ use crate::{agent::Adapter, member::Member};
 pub const ENVIRONMENT_VARIABLE: &str = "RADICLE_TEAM_HOME";
 
 /// File identifying a directory as one member's home.
-pub const MARKER: &str = ".radicle-team";
-
-/// On-disk layout this build understands.
-pub const LAYOUT: u32 = 2;
+///
+/// Distinct from [`crate::manifest::FILE_NAME`], and named distinctly on purpose:
+/// [`MemberHome::discover`] walks up past repository content, which must never shadow it.
+pub const MARKER: &str = "radicle-team-member.toml";
 
 /// Filesystem locations owned by one team member.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,25 +36,45 @@ pub struct MemberHome {
 impl MemberHome {
     /// Locates the member directory for a command invoked without an explicit path.
     ///
-    /// Uses [`ENVIRONMENT_VARIABLE`] when set. Otherwise it searches the current directory and
-    /// each parent for a [`MARKER`] file, the way `git` finds a repository.
+    /// Uses [`ENVIRONMENT_VARIABLE`] when set, otherwise searches upwards for a readable
+    /// [`MARKER`], the way `git` finds a repository.
     ///
     /// # Errors
     ///
-    /// Returns an error when no member directory is found, or when the only thing found is a
-    /// directory written by an earlier layout.
+    /// Returns an error when no member directory is found.
     pub fn discover() -> Result<Self, Error> {
         if let Some(path) = env::var_os(ENVIRONMENT_VARIABLE).filter(|value| !value.is_empty()) {
             return Ok(Self::at(PathBuf::from(path)));
         }
         let start = env::current_dir().map_err(Error::WorkingDirectory)?;
+
+        Self::find(&start)
+    }
+
+    /// Returns the member directory at `start` or above it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when neither `start` nor any of its parents is a member directory.
+    pub fn find(start: &Path) -> Result<Self, Error> {
         for directory in start.ancestors() {
-            if directory.join(MARKER).is_file() {
-                return Ok(Self::at(directory));
+            let home = Self::at(directory);
+            if home.marker().is_ok() {
+                return Ok(home);
             }
         }
 
-        Err(Self::legacy_layout().map_or(Error::NotFound { start }, Error::LegacyLayout))
+        Err(Error::NotFound {
+            start: start.to_path_buf(),
+        })
+    }
+
+    /// Returns whether this directory already holds a member's Radicle identity.
+    ///
+    /// The marker is written first, so an identity without one means the marker was lost.
+    #[must_use]
+    pub fn holds_identity(&self) -> bool {
+        self.identity().exists()
     }
 
     /// Uses `path` as the member directory.
@@ -89,14 +108,14 @@ impl MemberHome {
         let owned = [
             self.path.clone(),
             self.code(),
-            self.caches(),
+            self.cache(),
             self.harnesses(),
         ]
         .into_iter()
         .chain(
             Adapter::ALL
                 .into_iter()
-                .flat_map(|adapter| [self.cache(adapter), self.harness(adapter)]),
+                .map(|adapter| self.harness(adapter)),
         );
         for directory in owned {
             fs::create_dir_all(&directory).map_err(Error::Create)?;
@@ -122,27 +141,18 @@ impl MemberHome {
     ///
     /// # Errors
     ///
-    /// Returns an error when the marker is missing, unreadable, malformed, or written by a layout
-    /// this build does not understand.
+    /// Returns an error when the marker is missing, unreadable, or malformed.
     pub fn marker(&self) -> Result<Marker, Error> {
         let path = self.marker_path();
         let body = fs::read_to_string(&path).map_err(|source| Error::MarkerUnreadable {
             path: path.clone(),
             source,
         })?;
-        let marker: Marker =
-            toml_edit::de::from_str(&body).map_err(|error| Error::MarkerMalformed {
-                path: path.clone(),
-                reason: error.to_string(),
-            })?;
-        if marker.layout != LAYOUT {
-            return Err(Error::LayoutVersion {
-                path,
-                found: marker.layout,
-            });
-        }
 
-        Ok(marker)
+        toml_edit::de::from_str(&body).map_err(|error| Error::MarkerMalformed {
+            path,
+            reason: error.to_string(),
+        })
     }
 
     /// Returns the member's Radicle home directory.
@@ -199,19 +209,15 @@ impl MemberHome {
         self.code().join(adapter.id())
     }
 
-    /// Returns the root for disposable build and dependency caches.
-    #[must_use]
-    pub fn caches(&self) -> PathBuf {
-        self.path.join("cache")
-    }
-
-    /// Returns one adapter's cache directory.
+    /// Returns the disposable build cache shared by this member's adapters.
     ///
-    /// Caches are persistent writable state and therefore weaken execution isolation. Nothing that
-    /// must survive belongs here, and removing the directory must always be safe.
+    /// Shared because build output is too large to keep three copies of, and safe to share
+    /// because the three adapters are one person under one key. Never shared between members: a
+    /// build cache holds compiled build scripts which the next build runs. Removing it must
+    /// always be safe.
     #[must_use]
-    pub fn cache(&self, adapter: Adapter) -> PathBuf {
-        self.caches().join(adapter.id())
+    pub fn cache(&self) -> PathBuf {
+        self.path.join("cache")
     }
 
     /// Returns the root for agent harness state.
@@ -236,7 +242,6 @@ impl MemberHome {
 
     fn write_marker(&self, member: Member, repository: RepoId) -> Result<(), Error> {
         let marker = Marker {
-            layout: LAYOUT,
             member: member.id().to_owned(),
             repository: repository.urn(),
         };
@@ -245,24 +250,15 @@ impl MemberHome {
 
         fs::write(self.marker_path(), body).map_err(Error::Create)
     }
-
-    fn legacy_layout() -> Option<PathBuf> {
-        let root = env::var_os(ENVIRONMENT_VARIABLE)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                BaseDirs::new().map(|directories| directories.home_dir().join(".radicle-team"))
-            })?;
-
-        root.join("repositories").is_dir().then_some(root)
-    }
 }
 
 /// Identity recorded in a member directory when it was created.
+///
+/// This is local state, not the team's manifest. The manifest lists every member of a repository
+/// and lives in that repository; this says which one of them owns the directory it is in, which
+/// nothing in the repository can know.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Marker {
-    /// On-disk layout the directory was written with.
-    pub layout: u32,
     /// Fixed name of the member owning the directory.
     pub member: String,
     /// Repository the member works in.
@@ -304,12 +300,6 @@ pub enum Error {
         /// Directory the search started from.
         start: PathBuf,
     },
-    /// A directory written by an earlier layout was found instead.
-    #[error(
-        "'{0}' was written by an earlier layout which is no longer read; its members must be set \
-         up again in their own directories"
-    )]
-    LegacyLayout(PathBuf),
     /// The member directory could not be created.
     #[error("could not create the member directory: {0}")]
     Create(#[source] io::Error),
@@ -333,17 +323,6 @@ pub enum Error {
     /// The marker could not be written.
     #[error("could not write the member marker: {0}")]
     MarkerUnwritable(String),
-    /// The marker records a layout this build does not understand.
-    #[error(
-        "'{path}' records layout {found}, but this build reads layout {LAYOUT}; set the member up \
-         again"
-    )]
-    LayoutVersion {
-        /// Marker path.
-        path: PathBuf,
-        /// Layout found in the marker.
-        found: u32,
-    },
 }
 
 #[cfg(test)]
@@ -355,7 +334,7 @@ mod tests {
     use radicle::identity::RepoId;
 
     #[cfg(not(miri))]
-    use crate::home::{LAYOUT, MARKER};
+    use crate::home::MARKER;
     use crate::{agent::Adapter, home::MemberHome, member::Member};
 
     #[cfg(not(miri))]
@@ -376,7 +355,7 @@ mod tests {
             home.sandbox_config(),
             home.git_common(),
             home.worktree(Adapter::Talker),
-            home.cache(Adapter::Coder),
+            home.cache(),
             home.harness(Adapter::Chatter),
         ] {
             assert!(
@@ -388,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn gives_each_adapter_its_own_worktree_cache_and_harness_state() {
+    fn gives_each_adapter_its_own_worktree_and_harness_state() {
         let home = MemberHome::for_project("/work", "myproject", Member::Nico);
 
         for (left, right) in [
@@ -401,13 +380,27 @@ mod tests {
                 home.worktree(right),
                 "adapters sharing a worktree would fight over the checked-out branch"
             );
-            assert_ne!(
-                home.cache(left),
-                home.cache(right),
-                "adapters sharing a cache would block on each other's build locks"
-            );
             assert_ne!(home.harness(left), home.harness(right));
         }
+    }
+
+    // Build output is the largest thing a member writes, and three copies of it per member would
+    // multiply the disk a team costs by three for nothing.
+    #[test]
+    fn gives_every_adapter_of_one_member_the_same_build_cache() {
+        let home = MemberHome::for_project("/work", "myproject", Member::Nico);
+
+        assert_eq!(home.cache(), Path::new("/work/myproject-nico/cache"));
+    }
+
+    // A build cache holds compiled build scripts and plugins which the next build runs. Two
+    // members sharing one would let either run code as the other.
+    #[test]
+    fn never_shares_a_build_cache_between_members() {
+        let nico = MemberHome::for_project("/work", "myproject", Member::Nico);
+        let maya = MemberHome::for_project("/work", "myproject", Member::Maya);
+
+        assert_ne!(nico.cache(), maya.cache());
     }
 
     #[cfg(not(miri))]
@@ -423,7 +416,6 @@ mod tests {
         assert!(home.path().join(MARKER).is_file());
 
         let marker = home.marker().expect("marker should be readable");
-        assert_eq!(marker.layout, LAYOUT);
         assert_eq!(marker.member().expect("member should parse"), Member::Nico);
         assert_eq!(
             marker.repository().expect("repository should parse"),
@@ -441,44 +433,59 @@ mod tests {
         home.record(Member::Nico, repository)
             .expect("marker should be recorded");
 
-        let mut found = None;
-        for directory in home.worktree(Adapter::Coder).ancestors() {
-            if directory.join(MARKER).is_file() {
-                found = Some(directory.to_path_buf());
-                break;
-            }
-        }
+        let found =
+            MemberHome::find(&home.worktree(Adapter::Coder)).expect("the home should be found");
 
         assert_eq!(
-            found.as_deref(),
-            Some(home.path()),
+            found.path(),
+            home.path(),
             "a command run inside a working copy must find the member directory above it"
         );
     }
 
+    // A member's working copies live inside its home, so everything below it is repository
+    // content. A file which happens to carry the marker's name there would otherwise end the
+    // search one directory short of the home it was looking for.
     #[cfg(not(miri))]
     #[test]
-    fn refuses_a_directory_written_by_another_layout() {
+    fn walks_past_a_repository_file_wearing_the_marker_name() {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let repository = RepoId::from_urn(REPOSITORY).expect("repository should parse");
         let home = MemberHome::for_project(root.path(), "myproject", Member::Nico);
         home.create().expect("member directory should be created");
         home.record(Member::Nico, repository)
             .expect("marker should be recorded");
-        let marker = home.path().join(MARKER);
-        let body = std::fs::read_to_string(&marker).expect("marker should be readable");
-        std::fs::write(
-            &marker,
-            body.replace(&format!("layout = {LAYOUT}"), "layout = 1"),
-        )
-        .expect("marker should be rewritten");
+        let planted = home.worktree(Adapter::Coder);
+        std::fs::create_dir_all(&planted).expect("working copy should be created");
+        std::fs::write(planted.join(MARKER), "member = \"maya\"\n")
+            .expect("planted file should be written");
+
+        let found = MemberHome::find(&planted).expect("the member home should be found");
+
+        assert_eq!(
+            found.path(),
+            home.path(),
+            "discovery must reach the real member home rather than stop at repository content"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn refuses_a_marker_it_cannot_read() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = RepoId::from_urn(REPOSITORY).expect("repository should parse");
+        let home = MemberHome::for_project(root.path(), "myproject", Member::Nico);
+        home.create().expect("member directory should be created");
+        home.record(Member::Nico, repository)
+            .expect("marker should be recorded");
+        std::fs::write(home.path().join(MARKER), "member = ").expect("marker should be rewritten");
 
         assert!(
             matches!(
                 home.marker(),
-                Err(crate::home::Error::LayoutVersion { found: 1, .. })
+                Err(crate::home::Error::MarkerMalformed { .. })
             ),
-            "an unreadable layout must be reported rather than acted on"
+            "a marker which cannot be read must be reported rather than guessed at"
         );
     }
 }

@@ -58,13 +58,13 @@ Nico needs goes inside it:
 
 ```text
 ~/Desktop/nico-z3cyot.../
-├── .radicle-team        marks the folder and records member, repo, layout
+├── radicle-team-member.toml   marks the folder, records which member owns it
 ├── identity/            nico's key, storage, and node
 ├── state.db             deliveries, job queue, chat messages
 ├── sandbox.toml         what nico's agents may read, write, and reach
 ├── irc-identity.pem
 ├── node.log
-├── cache/               build output, one folder per adapter
+├── cache/               build output, shared by nico's three adapters
 ├── harness/             agent state, one folder per adapter
 └── code/
     ├── .git-common      the commits, stored once
@@ -81,26 +81,24 @@ Before every delivery the runtime resets that adapter's copy to whatever it is
 about to work on.
 
 In the building copy, anything a previous run left uncommitted is committed to a
-`radicle-team/salvage/...` branch first and logged, rather than thrown away. The
+`nico-rt/salvage/...` branch first and logged, rather than thrown away. The
 answering copies are simply cleaned: what they hold is what they looked at on
 the way to an answer, and the answer itself is already in the issue or the
 channel.
 
-The building adapter commits to `radicle-team/patch/<id>`, and that branch is
-removed once the patch merges. A job taken from an issue starts on
-`radicle-team/issue/<id>`, since the patch it will produce does not exist yet,
-and moves onto that patch's branch the moment it publishes one. The queue is
-told at the same time, so a job which crashes afterwards comes back as work on
-that patch rather than starting the issue over, and nothing it commits in
-between is stranded under a name the queue no longer knows. A job which
-publishes a second patch stays with the first, so the branch and the queue never
-name different ones. A job which published nothing keeps its issue name, and
-that branch goes when the issue is settled.
+Only the building adapter has branches. Each one belongs to one job and is named
+after it:
 
-A branch the adapter is still standing on is left alone and removed when it next
-moves to other work, so a landed patch never pulls the ground out from under a
-job which is still running. Every start reads the issues and patches back and
-removes the branches of anything settled while nobody was running.
+```text
+nico-rt/job-17
+```
+
+A branch is removed once its job is over. The queue is what says so: a job which
+was carried out has had its row removed, and a job which stalled, failed, or was
+interrupted still has one, along with whatever it committed. A branch the
+adapter is still standing on is left alone and removed when it next moves to
+other work, so tidying up never pulls the ground out from under a job which is
+still running.
 
 Pass `--home PATH` to name the folder yourself.
 
@@ -122,7 +120,7 @@ RAD_HOME=~/Desktop/nico-z3cyot.../identity rad patch list
 **Do not edit anything in there, and do not commit to it.** Before every
 delivery the runtime resets that copy hard and cleans it, so an uncommitted edit
 is gone the next time the member is addressed — silently, in the answering
-copies. The `radicle-team/...` branches belong to the runtime, which moves and
+copies. The `nico-rt/...` branches belong to the runtime, which moves and
 deletes them on its own schedule. And an edit made while the member is working
 races with its Git, in a directory that member is about to overwrite.
 
@@ -155,7 +153,7 @@ the checkout. It prints the required action and exits.
 
 If the repository manifest or member binding is missing, run setup from the
 repository checkout. It shows the exact Git commands and asks before writing
-`.radicle-team.toml`, committing, and opening a Radicle patch under the user's
+`radicle-team.toml`, committing, and opening a Radicle patch under the user's
 identity.
 
 It publishes only when `HEAD` exactly matches the live canonical `rad` tip, so
@@ -234,8 +232,10 @@ Each gets its own folder, side by side:
 ```
 
 Run `radicle-team run` from inside one of them, or from anywhere with `--home`.
-Commands search the current directory and its parents for `.radicle-team`, the
-way `git` finds a repository.
+Commands search the current directory and its parents for
+`radicle-team-member.toml`, the way `git` finds a repository. A file of that name
+which does not read back as a marker does not end the search, since everything
+below a member's folder is repository content.
 
 Two processes cannot use one member folder at the same time. The same member can
 run for different repositories, in different folders, without sharing identity
@@ -293,10 +293,6 @@ uses the control socket inside its own `identity/`.
 
 
 ## Troubleshooting
-
-A member folder written by an older version of `radicle-team` is refused by
-name rather than ignored, so a stale layout cannot quietly produce a second
-identity. Set those members up again in their own folders.
 
 If setup fails because a repository is private, use the DID shown in the error
 or identity log message to grant access, then rerun setup. Node startup failures

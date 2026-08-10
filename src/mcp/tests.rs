@@ -169,19 +169,6 @@ impl RepositoryFixture {
         repository
     }
 
-    // Working copies over the fixture's own storage, never initialized.
-    //
-    // No test here prepares one, and the only path which touches them is renaming a branch after
-    // a job publishes a patch, which reports its own failure.
-    fn workspaces(&self) -> crate::workspace::Workspaces {
-        crate::workspace::Workspaces::new(
-            crate::home::MemberHome::at(self._root.path().join("member")),
-            self.profile.storage.clone(),
-            self.repository,
-            self.profile.info(),
-        )
-    }
-
     async fn queue(&self) -> WorkQueue {
         WorkQueue::memory(self.repository, Member::Nico)
             .await
@@ -203,7 +190,7 @@ impl RepositoryFixture {
             publisher,
             crate::manifest::McpAllowlist::default(),
             super::Role::Talker,
-            ToolState::new(self.queue().await, chat_state().await, self.workspaces()),
+            ToolState::new(self.queue().await, chat_state().await),
         )
     }
 
@@ -229,17 +216,22 @@ impl RepositoryFixture {
             publisher,
             crate::manifest::McpAllowlist::default(),
             super::Role::Talker,
-            ToolState::new(self.queue().await, chat_state().await, self.workspaces()),
+            ToolState::new(self.queue().await, chat_state().await),
         )
     }
 
     // Working copies created for real, so the branch a job works on exists.
-    async fn prepared_workspaces(&self, name: &str) -> crate::workspace::Workspaces {
+    async fn prepared_workspaces(
+        &self,
+        name: &str,
+        queue: WorkQueue,
+    ) -> crate::workspace::Workspaces {
         let workspaces = crate::workspace::Workspaces::memory(
             name,
             self.profile.storage.clone(),
             self.repository,
             self.profile.info(),
+            queue,
         )
         .expect("working copies should be created");
         workspaces
@@ -250,12 +242,7 @@ impl RepositoryFixture {
         workspaces
     }
 
-    async fn service_with(
-        &self,
-        role: super::Role,
-        queue: WorkQueue,
-        workspaces: crate::workspace::Workspaces,
-    ) -> ToolService {
+    async fn service_with(&self, role: super::Role, queue: WorkQueue) -> ToolService {
         let publisher = crate::agent::Publisher::new(
             self.profile.clone(),
             self.repository,
@@ -270,7 +257,7 @@ impl RepositoryFixture {
             publisher,
             crate::manifest::McpAllowlist::everything(),
             role,
-            ToolState::new(queue, chat_state().await, workspaces),
+            ToolState::new(queue, chat_state().await),
         )
     }
 
@@ -426,12 +413,6 @@ async fn starts_on_a_loopback_capability_url_and_stops() {
                 .await
                 .expect("queue should open"),
             chat_state().await,
-            crate::workspace::Workspaces::new(
-                crate::home::MemberHome::at(root.path().join("member")),
-                profile.storage.clone(),
-                repository,
-                profile.info(),
-            ),
         ),
     )
     .await
@@ -570,7 +551,7 @@ async fn chat_reply_targets_only_the_active_channel_and_message() {
         publisher,
         crate::manifest::McpAllowlist::everything(),
         super::Role::Talker,
-        ToolState::new(fixture.queue().await, chat.clone(), fixture.workspaces()),
+        ToolState::new(fixture.queue().await, chat.clone()),
     );
     scope
         .activate(crate::agent::ChatContext::authenticated(
@@ -815,11 +796,7 @@ async fn reconciles_security_writes_from_the_delivery_journal() {
         publisher,
         crate::manifest::McpAllowlist::default(),
         super::Role::Talker,
-        ToolState::new(
-            fixture.queue().await,
-            chat_state().await,
-            fixture.workspaces(),
-        ),
+        ToolState::new(fixture.queue().await, chat_state().await),
     );
     let context = crate::agent::Context {
         repository: fixture.repository,
@@ -1965,11 +1942,7 @@ async fn reloads_the_security_policy_before_reporting() {
         publisher,
         crate::manifest::McpAllowlist::default(),
         super::Role::Talker,
-        ToolState::new(
-            fixture.queue().await,
-            chat_state().await,
-            fixture.workspaces(),
-        ),
+        ToolState::new(fixture.queue().await, chat_state().await),
     );
     *policy.write().await = crate::manifest::SecurityPolicy::test_with_recipients(
         fixture.repository,
@@ -2719,14 +2692,12 @@ async fn each_adapter_offers_only_the_tools_its_side_can_use() {
     let fixture = RepositoryFixture::new();
     let queue = fixture.queue().await;
     let talker = fixture
-        .service_with(super::Role::Talker, queue.clone(), fixture.workspaces())
+        .service_with(super::Role::Talker, queue.clone())
         .await;
     let chatter = fixture
-        .service_with(super::Role::Chatter, queue.clone(), fixture.workspaces())
+        .service_with(super::Role::Chatter, queue.clone())
         .await;
-    let coder = fixture
-        .service_with(super::Role::Coder, queue, fixture.workspaces())
-        .await;
+    let coder = fixture.service_with(super::Role::Coder, queue).await;
 
     for tool in ["add_job", "cancel", "note", "work_status"] {
         assert!(
@@ -2787,10 +2758,10 @@ async fn carries_a_note_on_the_next_result_the_building_half_receives() {
     assert_eq!(taken.id, job);
 
     let talker = fixture
-        .service_with(super::Role::Talker, queue.clone(), fixture.workspaces())
+        .service_with(super::Role::Talker, queue.clone())
         .await;
     let coder = fixture
-        .service_with(super::Role::Coder, queue.clone(), fixture.workspaces())
+        .service_with(super::Role::Coder, queue.clone())
         .await;
     queue.note("use the existing parser".to_owned()).await;
 
@@ -2825,14 +2796,16 @@ async fn records_the_patch_a_job_produced_before_the_job_can_fail() {
         .push("answer it".to_owned(), issue.into(), QueuePosition::End)
         .await
         .expect("job should be recorded");
-    let _taken = queue.next().await.expect("queue should be readable");
-    let workspaces = fixture.prepared_workspaces("mcp-produced").await;
+    let taken = queue.next().await.expect("queue should be readable");
+    let workspaces = fixture
+        .prepared_workspaces("mcp-produced", queue.clone())
+        .await;
     workspaces
-        .prepare(crate::agent::Adapter::Coder, issue.into())
+        .prepare_job(&taken)
         .await
         .expect("the coder should take the issue");
     let coder = fixture
-        .service_with(super::Role::Coder, queue.clone(), workspaces.clone())
+        .service_with(super::Role::Coder, queue.clone())
         .await;
     coder
         .scope
@@ -2874,8 +2847,8 @@ async fn records_the_patch_a_job_produced_before_the_job_can_fail() {
     );
     assert_eq!(
         branches(&workspaces),
-        [format!("radicle-team/patch/{patch}")],
-        "the branch must move at the same moment, or commits made from here on would be stranded          on a name the queue no longer knows about"
+        [format!("nico-rt/job-{}", taken.id)],
+        "the branch is named after the job, so producing a patch leaves it exactly where it was"
     );
 
     let second = coder
@@ -2899,7 +2872,7 @@ async fn records_the_patch_a_job_produced_before_the_job_can_fail() {
                 .map(|running| running.source)
                 .or_else(|| Some(recovered.source.clone())),
             Some(Subject::Patch(patch).into()),
-            "a job which publishes a second patch stays with the first, so the queue and the              branch never name different ones"
+            "a job which publishes a second patch stays with the first"
         );
     }
 }
@@ -2908,12 +2881,7 @@ async fn records_the_patch_a_job_produced_before_the_job_can_fail() {
 #[cfg(not(miri))]
 fn branches(workspaces: &crate::workspace::Workspaces) -> Vec<String> {
     let output = std::process::Command::new("git")
-        .args([
-            "branch",
-            "--list",
-            "--format=%(refname:short)",
-            "radicle-team/*",
-        ])
+        .args(["branch", "--list", "--format=%(refname:short)", "nico-rt/*"])
         .current_dir(workspaces.store())
         .output()
         .expect("git should run");
@@ -2939,14 +2907,16 @@ async fn refuses_to_report_a_patch_it_could_not_record() {
         .push("answer it".to_owned(), issue.into(), QueuePosition::End)
         .await
         .expect("job should be recorded");
-    let _taken = queue.next().await.expect("queue should be readable");
-    let workspaces = fixture.prepared_workspaces("mcp-unrecorded").await;
+    let taken = queue.next().await.expect("queue should be readable");
+    let workspaces = fixture
+        .prepared_workspaces("mcp-unrecorded", queue.clone())
+        .await;
     workspaces
-        .prepare(crate::agent::Adapter::Coder, issue.into())
+        .prepare_job(&taken)
         .await
         .expect("the coder should take the issue");
     let coder = fixture
-        .service_with(super::Role::Coder, queue.clone(), workspaces.clone())
+        .service_with(super::Role::Coder, queue.clone())
         .await;
     coder
         .scope
@@ -2998,15 +2968,7 @@ async fn refuses_to_report_a_patch_it_could_not_record() {
     );
     assert_eq!(
         branches(&workspaces),
-        [format!("radicle-team/issue/{}", issue_id(&issue))],
-        "and the branch must not move, since the queue never learned the patch"
+        [format!("nico-rt/job-{}", taken.id)],
+        "and the branch is still the job's, which is the one thing a failed write cannot desync"
     );
-}
-
-/// Returns the identifier a subject was built from.
-#[cfg(not(miri))]
-fn issue_id(subject: &Subject) -> ObjectId {
-    match subject {
-        Subject::Issue(id) | Subject::Patch(id) => *id,
-    }
 }

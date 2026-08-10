@@ -157,11 +157,25 @@ impl Application {
 
     /// Creates the member directory, refusing one which already belongs to somebody else.
     ///
-    /// Checked before anything is written. A mistyped `--home` would otherwise stamp this member's
-    /// marker onto another member's directory and take its identity with it.
+    /// Checked before anything is written, and before the identity behind the directory is
+    /// loaded. A mistyped `--home` would otherwise stamp this member's marker onto another
+    /// member's directory and take its identity with it.
+    ///
+    /// A directory holding an identity but no marker is refused rather than claimed. The marker
+    /// is written before the identity is created, so the pair can only be missing the first if
+    /// something removed it, and guessing whose key is in there is exactly the mistake above.
     fn claim_home(&self, home: &MemberHome) -> Result<(), Error> {
         if home.path().join(crate::home::MARKER).is_file() {
             self.validate_member_home(home)?;
+        } else if home.holds_identity() {
+            return Err(Error::MemberDirectory {
+                path: home.path().into(),
+                reason: format!(
+                    "it holds a Radicle identity but no '{}', so which member owns it cannot be \
+                     established",
+                    crate::home::MARKER
+                ),
+            });
         }
 
         home.record(self.member, self.repository)
@@ -933,13 +947,13 @@ impl AgentRuntime {
             Self::initialize_resources(application, runtime, policy).await?;
         // Before any agent starts. The sandbox fences off the parts of the shared object store an
         // agent must never write, and a path which is not there yet cannot be fenced.
-        let workspaces = Self::initialize_workspaces(application, runtime).await?;
+        let workspaces = Self::initialize_workspaces(application, runtime, &queue).await?;
         let servers = Self::start_mcp(
             application,
             runtime,
             publisher,
             allowlist,
-            mcp::ToolState::new(queue.clone(), chat_state.clone(), workspaces.clone()),
+            mcp::ToolState::new(queue.clone(), chat_state.clone()),
             policy.chat().is_some(),
         )
         .await?;
@@ -966,13 +980,16 @@ impl AgentRuntime {
     async fn initialize_workspaces(
         application: &Application,
         runtime: &Runtime,
+        queue: &WorkQueue,
     ) -> Result<crate::workspace::Workspaces, Error> {
         let profile = runtime.identity.profile();
         let workspaces = crate::workspace::Workspaces::new(
+            application.member,
             runtime.home.clone(),
             profile.storage.clone(),
             application.repository,
             profile.info(),
+            queue.clone(),
         );
         workspaces
             .initialize()
@@ -1137,12 +1154,18 @@ impl AgentRuntime {
         coder: &mut (impl Coder + ?Sized),
     ) -> Result<(), Error> {
         let profile = application.member.profile();
-        let (sandbox, layout) = Self::prepared(runtime, agent::Adapter::Talker, &servers.talker)?;
+        let (sandbox, layout) = Self::prepared(
+            application,
+            runtime,
+            agent::Adapter::Talker,
+            &servers.talker,
+        )?;
         talker
             .start(profile, servers.talker.endpoint(), sandbox, layout)
             .await?;
-        Self::start_chatter(profile, runtime, servers.chatter.as_ref(), chatter).await?;
-        let (sandbox, layout) = Self::prepared(runtime, agent::Adapter::Coder, &servers.coder)?;
+        Self::start_chatter(application, runtime, servers.chatter.as_ref(), chatter).await?;
+        let (sandbox, layout) =
+            Self::prepared(application, runtime, agent::Adapter::Coder, &servers.coder)?;
         coder
             .start(profile, servers.coder.endpoint(), sandbox, layout)
             .await
@@ -1151,7 +1174,7 @@ impl AgentRuntime {
 
     // Starts the chatting adapter, if the manifest asked for chat at all.
     async fn start_chatter(
-        profile: crate::member::Profile,
+        application: &Application,
         runtime: &Runtime,
         server: Option<&mcp::Server>,
         chatter: &mut (impl Chatter + ?Sized),
@@ -1159,28 +1182,40 @@ impl AgentRuntime {
         let Some(server) = server else {
             return Ok(());
         };
-        let (sandbox, layout) = Self::prepared(runtime, agent::Adapter::Chatter, server)?;
+        let (sandbox, layout) =
+            Self::prepared(application, runtime, agent::Adapter::Chatter, server)?;
 
         chatter
-            .start(profile, server.endpoint(), sandbox, layout)
+            .start(
+                application.member.profile(),
+                server.endpoint(),
+                sandbox,
+                layout,
+            )
             .await
             .map_err(Error::from)
     }
 
     // Prepares one adapter's sandbox and its fixed directories.
     fn prepared(
+        application: &Application,
         runtime: &Runtime,
         adapter: agent::Adapter,
         server: &mcp::Server,
     ) -> Result<(AgentSandbox, agent::Layout), Error> {
-        let sandbox = AgentSandbox::load(&runtime.home, adapter, server.endpoint())?;
+        let sandbox = AgentSandbox::load(
+            &runtime.home,
+            application.member,
+            adapter,
+            server.endpoint(),
+        )?;
 
         Ok((sandbox, Self::layout(&runtime.home, adapter)))
     }
 
     // Returns the fixed directories one adapter owns, which [`MemberHome::create`] made.
     fn layout(home: &MemberHome, adapter: agent::Adapter) -> agent::Layout {
-        agent::Layout::new(adapter, home.cache(adapter), home.harness(adapter))
+        agent::Layout::new(adapter, home.cache(), home.harness(adapter))
     }
 
     async fn initialize_publisher(
@@ -1531,7 +1566,7 @@ impl fmt::Display for Setup {
             ),
             SetupStatus::BindingMissing { generation } => write!(
                 formatter,
-                "add this binding to .radicle-team.toml:\n\n[members.{}]\nsigning_did = \
+                "add this binding to radicle-team.toml:\n\n[members.{}]\nsigning_did = \
                  \"{}\"\ngeneration = {generation}\nstate = \"active\"",
                 self.member, self.did,
             ),
@@ -1547,7 +1582,7 @@ pub enum SetupStatus {
         /// Validated identity-binding generation.
         generation: u64,
     },
-    /// The repository has no `.radicle-team.toml` manifest.
+    /// The repository has no `radicle-team.toml` manifest.
     ManifestMissing {
         /// Generation to use for the new binding.
         generation: u64,
@@ -1709,6 +1744,33 @@ mod tests {
                 Err(super::Error::Home(_))
             ),
             "a directory with no marker is not a member directory"
+        );
+    }
+
+    // The marker is written before the identity is created, so a directory holding one without
+    // the other is a member's whose marker was lost. Claiming it writes this member's name over
+    // it, and the identity loaded a moment later is then somebody else's key under this member's
+    // name.
+    #[cfg(not(miri))]
+    #[test]
+    fn refuses_to_claim_a_directory_which_already_holds_an_identity() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let repository =
+            RepoId::from_urn("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc").expect("repository should parse");
+        let home = crate::home::MemberHome::at(root.path().join("unmarked"));
+        home.create().expect("member directory should be created");
+        fs::create_dir_all(home.identity()).expect("identity directory should be created");
+
+        let claimed =
+            super::Application::new(crate::member::Member::Nico, repository).claim_home(&home);
+
+        assert!(
+            matches!(claimed, Err(super::Error::MemberDirectory { .. })),
+            "an identity with no marker must be refused rather than adopted: {claimed:?}"
+        );
+        assert!(
+            !home.path().join(crate::home::MARKER).is_file(),
+            "and nothing may be written into it"
         );
     }
     #[cfg(not(miri))]

@@ -35,7 +35,6 @@ use crate::{
         server::{Role, ServiceError, WorkAccess, WorkScope},
     },
     queue::WorkQueue,
-    workspace::Workspaces,
 };
 
 // Tools which coordinate the member's two halves rather than write to the repository.
@@ -69,7 +68,6 @@ pub(crate) struct ToolService {
     role: Role,
     queue: WorkQueue,
     chat: ChatState,
-    workspaces: Workspaces,
     pub(super) mutation_repository: Option<RepoId>,
     pub(super) mutation_work: Option<crate::agent::WorkId>,
     pub(super) mutation_invocations: Option<Arc<tokio::sync::Mutex<BTreeMap<String, usize>>>>,
@@ -79,16 +77,11 @@ pub(crate) struct ToolService {
 pub(crate) struct ToolState {
     queue: WorkQueue,
     chat: ChatState,
-    workspaces: Workspaces,
 }
 
 impl ToolState {
-    pub(crate) const fn new(queue: WorkQueue, chat: ChatState, workspaces: Workspaces) -> Self {
-        Self {
-            queue,
-            chat,
-            workspaces,
-        }
+    pub(crate) const fn new(queue: WorkQueue, chat: ChatState) -> Self {
+        Self { queue, chat }
     }
 }
 
@@ -126,11 +119,7 @@ impl ToolService {
         role: Role,
         state: ToolState,
     ) -> Self {
-        let ToolState {
-            queue,
-            chat,
-            workspaces,
-        } = state;
+        let ToolState { queue, chat } = state;
         let security = SecurityReporting::new(&publisher);
         let mut tool_router = Self::tool_router();
         for method in Self::registered_tools() {
@@ -148,7 +137,6 @@ impl ToolService {
             role,
             queue,
             chat,
-            workspaces,
             mutation_repository: None,
             mutation_work: None,
             mutation_invocations: None,
@@ -488,17 +476,18 @@ impl ToolService {
         Ok(created)
     }
 
-    /// Records that the running job produced `patch` and moves its branch onto it.
+    /// Records that the running job produced `patch`.
     ///
     /// Done here rather than when the job ends, because the patch exists from this moment and the
     /// job may still crash. A run picking the job up again would otherwise start over on the issue
-    /// it came from and leave the patch behind, and every commit the agent makes from here on
-    /// would be stranded on a branch nothing points at.
+    /// it came from and leave the patch behind.
     ///
     /// The queue is the only record of which patch a job became, so a job which publishes a second
     /// one stays with the first. Failing to write it fails this call rather than reporting a
     /// success the runtime has not recorded: the write is journaled, so the agent's retry recovers
     /// the patch it already published instead of publishing another.
+    ///
+    /// The job's branch is not touched: it carries the job's name for its whole life.
     async fn produced(
         &self,
         active: &WorkAccess,
@@ -513,17 +502,11 @@ impl ToolService {
         if matches!(worked, Source::Subject(crate::watcher::Subject::Patch(_))) {
             return Ok(());
         }
+
         self.queue
             .retarget(job, crate::watcher::Subject::Patch(patch).into())
             .await
-            .map_err(|error| error.to_string())?;
-        // Tidy-up by comparison, because the queue already says what this job is and a preparation
-        // which finds no branch for it makes one.
-        if let Err(error) = self.workspaces.adopt(&worked, patch).await {
-            tracing::warn!(job, %patch, %error, "could not move the branch onto its patch");
-        }
-
-        Ok(())
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Add a revision from commits in the active workspace")]

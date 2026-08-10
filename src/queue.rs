@@ -14,7 +14,7 @@
 //! holding them. They live here anyway, because they are the same conversation as the queue and
 //! splitting them would mean handing both halves two objects instead of one.
 
-use std::{path::Path, str::FromStr as _, sync::Arc};
+use std::{collections::BTreeSet, path::Path, str::FromStr as _, sync::Arc};
 
 use radicle::identity::RepoId;
 use sqlite::State;
@@ -350,6 +350,32 @@ impl WorkQueue {
             })
             .await
             .map(|waiting| waiting.unsigned_abs() as usize)
+            .map_err(Error::from)
+    }
+
+    /// Returns the identifier of every job this member still has, running or waiting.
+    ///
+    /// A row is removed only once its job was carried out, so this is also which branches matter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the queue cannot be read.
+    pub async fn live(&self) -> Result<BTreeSet<i64>, Error> {
+        let repository = self.repository.to_string();
+        let member = self.member.id().to_owned();
+        self.database
+            .call(move |connection| {
+                let mut statement = connection
+                    .prepare("SELECT id FROM work_queue WHERE repository = ?1 AND member = ?2")?;
+                statement.bind((1, repository.as_str()))?;
+                statement.bind((2, member.as_str()))?;
+                let mut live = BTreeSet::new();
+                while statement.next()? == State::Row {
+                    let _added = live.insert(statement.read::<i64, _>("id")?);
+                }
+                Ok(live)
+            })
+            .await
             .map_err(Error::from)
     }
 

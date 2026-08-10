@@ -306,7 +306,7 @@ async fn guards_the_shared_git_store() {
     );
     check(
         std::process::Command::new("git")
-            .args(["rev-parse", "--verify", "refs/heads/radicle-team/work"])
+            .args(["rev-parse", "--verify", "refs/heads/nico-rt/job-1"])
             .current_dir(&worktree)
             .status()
             .expect("git should run")
@@ -373,7 +373,7 @@ impl Fixture {
         );
         git(&common, &["config", "user.name", "Sandbox Test"]);
         git(&common, &["config", "user.email", "sandbox@example.com"]);
-        fs::create_dir_all(common.join("refs").join("heads").join("radicle-team"))
+        fs::create_dir_all(common.join("refs").join("heads").join("nico-rt"))
             .expect("branch directory should be created");
         for adapter in [
             radicle_team::agent::Adapter::Talker,
@@ -395,7 +395,7 @@ impl Fixture {
         }
         git(
             &self.home.worktree(radicle_team::agent::Adapter::Coder),
-            &["checkout", "-q", "-B", "radicle-team/work"],
+            &["checkout", "-q", "-B", "nico-rt/job-1"],
         );
 
         common
@@ -409,8 +409,13 @@ impl Fixture {
     fn sandbox_for(&self, config: Config, endpoint: &McpEndpoint) -> AgentSandbox {
         self.write_config(&config);
 
-        AgentSandbox::load(&self.home, radicle_team::agent::Adapter::Coder, endpoint)
-            .expect("sandbox should load")
+        AgentSandbox::load(
+            &self.home,
+            radicle_team::member::Member::Nico,
+            radicle_team::agent::Adapter::Coder,
+            endpoint,
+        )
+        .expect("sandbox should load")
     }
 
     fn write_config(&self, config: &Config) {
