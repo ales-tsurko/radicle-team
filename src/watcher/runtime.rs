@@ -1327,7 +1327,7 @@ mod tests {
             Ok(())
         }
 
-        async fn stop(&mut self) -> Result<(), crate::agent::Error> {
+        async fn shutdown(&mut self) -> Result<(), crate::agent::Error> {
             Ok(())
         }
     }

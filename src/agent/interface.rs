@@ -142,8 +142,11 @@ pub(crate) trait Supervisor: Send + Sync {
     /// Reports when this adapter last saw its agent do anything.
     fn last_progress(&self) -> Option<Instant>;
 
-    /// Stops the agent whether it agreed to or not.
-    async fn kill(&self) -> Result<(), Error>;
+    /// Force-stops whatever the agent is doing, whether it agreed to or not.
+    ///
+    /// Weaker than [`Talker::shutdown`] and its counterparts: this ends one delivery, and the
+    /// agent stays running for the next one.
+    async fn abort(&self) -> Result<(), Error>;
 }
 
 /// Watches one agent for silence, so the two places which run agents agree on what stuck means.
@@ -176,17 +179,17 @@ impl Stall {
         self.seen.elapsed() >= SILENCE
     }
 
-    /// Stops the agent, reporting how long it had been silent.
-    pub(crate) async fn kill(&self) -> Result<(), Error> {
+    /// Force-stops the agent, reporting how long it had been silent.
+    pub(crate) async fn abort(&self) -> Result<(), Error> {
         tracing::warn!(silent_for = ?self.seen.elapsed(), "agent stopped making progress");
 
-        self.watch.kill().await
+        self.watch.abort().await
     }
 }
 
 /// A supervisor for an adapter which runs no separate process.
 ///
-/// Reports no progress and has nothing to kill, so the runtime never stops it.
+/// Reports no progress and has nothing to stop, so the runtime never interferes with it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Idle;
 
@@ -196,7 +199,7 @@ impl Supervisor for Idle {
         None
     }
 
-    async fn kill(&self) -> Result<(), Error> {
+    async fn abort(&self) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -231,8 +234,10 @@ pub(crate) trait Talker: Supervised {
     /// Handles another relevant change to an owned or assigned issue or patch.
     async fn changed(&mut self, context: Context, change: Change) -> Result<(), Error>;
 
-    /// Stops the adapter and releases its resources.
-    async fn stop(&mut self) -> Result<(), Error> {
+    /// Ends the adapter and releases everything it holds.
+    ///
+    /// Stronger than [`Supervisor::abort`], which ends one delivery and leaves the agent running.
+    async fn shutdown(&mut self) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -260,8 +265,10 @@ pub(crate) trait Chatter: Supervised {
     /// Handles an authenticated message which addresses this member in a bound channel.
     async fn messaged(&mut self, context: ChatContext, message: ChatMessage) -> Result<(), Error>;
 
-    /// Stops the adapter and releases its resources.
-    async fn stop(&mut self) -> Result<(), Error> {
+    /// Ends the adapter and releases everything it holds.
+    ///
+    /// Stronger than [`Supervisor::abort`], which ends one delivery and leaves the agent running.
+    async fn shutdown(&mut self) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -299,8 +306,10 @@ pub(crate) trait Coder: Supervised + Sync {
     /// [`work`](Self::work) call returns once that has happened.
     async fn interrupt(&self) -> Result<(), Error>;
 
-    /// Stops the adapter and releases its resources.
-    async fn stop(&mut self) -> Result<(), Error> {
+    /// Ends the adapter and releases everything it holds.
+    ///
+    /// Stronger than [`Supervisor::abort`], which ends one delivery and leaves the agent running.
+    async fn shutdown(&mut self) -> Result<(), Error> {
         Ok(())
     }
 }

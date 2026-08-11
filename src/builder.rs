@@ -21,7 +21,7 @@ use crate::{
     workspace::Workspaces,
 };
 
-// How long an interrupted job has to commit what it has before it is killed. Unlike the job
+// How long an interrupted job has to commit what it has before it is aborted. Unlike the job
 // itself this is bounded, because committing takes seconds. Silence is bounded by
 // [`agent::Stall`], on the same terms as every other agent the runtime runs.
 const GRACE: Duration = Duration::from_secs(30);
@@ -50,8 +50,8 @@ impl Builder {
     ) -> Result<(), Error> {
         loop {
             let job = queue.next().await?;
-            // Only a job which actually finished is forgotten. One which stalled, was killed, or
-            // failed stays marked taken, so the next start puts it back rather than losing it.
+            // Only a job which actually finished is forgotten. One which stalled, was aborted,
+            // or failed stays marked taken, so the next start puts it back rather than losing it.
             self.carry(coder, queue, workspaces, scope, job).await?;
             queue.finish().await?;
         }
@@ -125,12 +125,12 @@ impl Builder {
                     if let Some(deadline) = stop {
                         if Instant::now() >= deadline {
                             tracing::warn!(job = identifier, "job ignored the request to stop");
-                            stall.kill().await?;
+                            stall.abort().await?;
 
                             return Err(Error::Abandoned(identifier));
                         }
                     } else if silent {
-                        stall.kill().await?;
+                        stall.abort().await?;
 
                         return Err(Error::Stalled(identifier));
                     }
@@ -158,11 +158,11 @@ pub enum Error {
     /// Recovering durable MCP publications after a job failed.
     #[error("MCP publication recovery failed: {0}")]
     PublicationRecovery(String),
-    /// The agent stopped making progress and was killed.
-    #[error("job {0} was killed after making no progress")]
+    /// The agent stopped making progress and was aborted.
+    #[error("job {0} was stopped after making no progress")]
     Stalled(i64),
-    /// The agent ignored the request to stop and was killed.
-    #[error("job {0} was killed after ignoring the request to stop")]
+    /// The agent ignored the request to stop and was aborted.
+    #[error("job {0} was stopped after ignoring the request to stop")]
     Abandoned(i64),
 }
 

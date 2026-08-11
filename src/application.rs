@@ -292,7 +292,7 @@ impl Application {
         .await
     }
 
-    fn warn_agent_stop(stopped: Result<(), agent::Error>) {
+    fn warn_agent_shutdown(stopped: Result<(), agent::Error>) {
         if let Err(error) = stopped {
             tracing::warn!(%error, "failed to stop agent after application error");
         }
@@ -960,9 +960,9 @@ impl AgentRuntime {
         if let Err(error) =
             Self::start_agents(application, runtime, &servers, talker, chatter, coder).await
         {
-            Application::warn_agent_stop(talker.stop().await);
-            Application::warn_agent_stop(chatter.stop().await);
-            Application::warn_agent_stop(coder.stop().await);
+            Application::warn_agent_shutdown(talker.shutdown().await);
+            Application::warn_agent_shutdown(chatter.shutdown().await);
+            Application::warn_agent_shutdown(coder.shutdown().await);
             Application::warn_mcp_stop(servers.stop().await);
             return Err(error);
         }
@@ -1308,9 +1308,9 @@ impl AgentRuntime {
         };
         let interrupted = application.shutdown.is_requested();
         let cleanup = RunCleanup {
-            talker: talker.stop().await,
-            chatter: chatter.stop().await,
-            coder: coder.stop().await,
+            talker: talker.shutdown().await,
+            chatter: chatter.shutdown().await,
+            coder: coder.shutdown().await,
             mcp: self.resources.servers.stop().await,
             node: self.runtime.stop(&application.shutdown).await,
         };

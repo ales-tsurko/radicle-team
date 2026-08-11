@@ -124,7 +124,7 @@ impl Turn {
     }
 }
 
-/// Runs one delivery, killing the agent if it stops making progress.
+/// Runs one delivery, aborting the agent if it stops making progress.
 ///
 /// A delivery has no time limit, because reading a long patch or a long thread legitimately takes
 /// a while. Silence is what is limited, on the terms [`Stall`](agent::Stall) sets.
@@ -139,7 +139,7 @@ pub(crate) async fn supervise<T>(
             handled = &mut handling => return handled.map_err(Error::Talker),
             silent = stall.silent() => {
                 if silent {
-                    stall.kill().await.map_err(Error::Talker)?;
+                    stall.abort().await.map_err(Error::Talker)?;
 
                     return Err(Error::Stalled);
                 }
@@ -354,7 +354,7 @@ pub(crate) enum Error {
     /// The dispatcher is not running.
     #[error("conversation dispatcher is not running")]
     Unavailable,
-    /// The agent stopped making progress and was killed.
-    #[error("agent was killed after making no progress")]
+    /// The agent stopped making progress and was aborted.
+    #[error("agent was stopped after making no progress")]
     Stalled,
 }
