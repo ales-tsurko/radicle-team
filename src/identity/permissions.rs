@@ -12,7 +12,7 @@
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::{
     fs::{self, File},
-    io,
+    io::{self, Write as _},
     path::Path,
 };
 
@@ -24,7 +24,6 @@ impl Permissions {
     }
 
     pub(crate) fn open_private(path: &Path) -> Result<File, Error> {
-        #[cfg(unix)]
         let file = rustix::fs::open(
             path,
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
@@ -34,11 +33,6 @@ impl Permissions {
         .map_err(|source| Error::Io {
             path: path.into(),
             source: io::Error::from_raw_os_error(source.raw_os_error()),
-        })?;
-        #[cfg(not(unix))]
-        let file = File::open(path).map_err(|source| Error::Io {
-            path: path.into(),
-            source,
         })?;
         let metadata = file.metadata().map_err(|source| Error::Io {
             path: path.into(),
@@ -78,7 +72,61 @@ impl Permissions {
         Ok(())
     }
 
-    pub(super) fn secure_directory(path: &Path) -> Result<(), Error> {
+    /// Writes `contents` to `path` so that only its owner can ever read it.
+    ///
+    /// Atomic, so a write interrupted part-way leaves the previous contents rather than a truncated
+    /// file, and private from the moment the bytes exist rather than from the moment a later
+    /// `chmod` lands. Both matter most for the file this exists for: a stored secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be written, secured, or moved into place.
+    pub(crate) fn write_private(path: &Path, contents: &str) -> Result<(), Error> {
+        Self::persist(path, contents, Some(0o600))
+    }
+
+    /// Writes `contents` to `path`, replacing whatever is there in one step.
+    ///
+    /// For a file which is not a secret. Same durability as [`Permissions::write_private`] without
+    /// narrowing the mode: the file keeps whatever the umask gives it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be written or moved into place.
+    pub(crate) fn replace(path: &Path, contents: &str) -> Result<(), Error> {
+        Self::persist(path, contents, None)
+    }
+
+    // Renames into place, so an interrupted write leaves the previous contents rather than a
+    // truncated file, a symbolic link at `path` is replaced rather than written through, and the
+    // mode is on the bytes from the moment they exist rather than from a later `chmod`.
+    fn persist(path: &Path, contents: &str, _mode: Option<u32>) -> Result<(), Error> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let io = |source| Error::Io {
+            path: path.into(),
+            source,
+        };
+        let mut replacement = tempfile::NamedTempFile::new_in(parent).map_err(io)?;
+        #[cfg(unix)]
+        if let Some(mode) = _mode {
+            replacement
+                .as_file()
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(io)?;
+        }
+        replacement.write_all(contents.as_bytes()).map_err(io)?;
+        replacement.as_file().sync_all().map_err(io)?;
+
+        replacement
+            .persist(path)
+            .map(|_file| ())
+            .map_err(|error| io(error.error))
+    }
+
+    pub(crate) fn secure_directory(path: &Path) -> Result<(), Error> {
         fs::create_dir_all(path).map_err(|source| Error::Io {
             path: path.into(),
             source,

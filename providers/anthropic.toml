@@ -1,0 +1,49 @@
+# Anthropic models, reached through Claude Code.
+#
+# Claude Code is the only application which can use a Claude subscription:
+# Anthropic forbids subscription tokens in third-party tools. An API key works
+# either way.
+#
+# The names below are settings the adapter is asked for, not Claude Code's own
+# configuration keys -- this file is deserialized and its values handed over as
+# data. Model names and prices are checked against models.dev.
+#
+# To keep your own edits, copy this file under another name. This one is
+# replaced on update.
+
+adapter = "claude-code"
+
+[auth]
+ways = ["key", "subscription"]
+
+[auth.key]
+env = ["ANTHROPIC_API_KEY"]
+
+# Which model the member runs; higher picks the sharper (and slower) one.
+#
+# Only models supporting an effort level are on this ladder. Claude Haiku 4.5
+# is cheaper still but does not, and a ladder mixing the two would send a
+# setting one half rejects.
+[INT]
+param = "model"
+values = [
+  "claude-sonnet-5",
+  "claude-sonnet-5",
+  "claude-sonnet-5",
+  "claude-opus-5",
+  "claude-opus-5",
+]
+
+# How much work the model puts into a response, thinking and tool calls alike.
+# Not a thinking budget: the models above reject that older control outright.
+#
+# Ascending, because a high score means deliberating rather than answering from
+# the top of its head.
+[ACC]
+param = "effort"
+values = ["low", "medium", "high", "xhigh", "max"]
+
+# How long a member keeps at a problem before it stops.
+[STU]
+param = "max_steps"
+values = [20, 40, 60, 80, 120]

@@ -1,20 +1,31 @@
 # Members
 
-This is an overview: a sentence of description and the tuning values for each
+This is an overview: a sentence of description and the character sheet for each
 member. The documents that actually shape them — full character, expertise,
 history, and voice, which adapters supply to the model as context — live under
 [`members/`](../members/).
 
-Each member carries five tuning values, rated 1 to 5, which adapters receive at
-startup and map to provider-specific controls: `INT` preferred model capability,
-`SPD` response speed, `EXP` engineering autonomy, `CRE` solution exploration,
-and `CAU` risk-aware deliberation.
+Each member carries three values, rated 1 to 5. They are a character sheet: read
+them to decide who a job suits. They are the same for a member's three roles.
+
+- `INT` **Intelligence** — how sharp it is. Picks the model, so it carries speed
+  with it: the sharper models are the slower ones.
+- `ACC` **Accuracy** — how closely it sticks to the obvious answer. High is
+  deliberate and on-track; low ranges further and surprises you more often.
+- `STU` **Stubbornness** — how long it keeps at a problem. High digs through a
+  hard bug, and also keeps digging when it should have asked instead.
+
+The scale is relative to the provider a member runs on, which the repository
+manifest sets per member. `INT 5` means the best model that provider offers, so
+a member on a local endpoint and a member on a frontier API can carry the same
+number and be very different colleagues. Two members sharing a sheet is normal;
+compare their providers before reading anything into it.
 
 - **Nico — Junior Developer.** Curious, informal, and emotionally transparent.
   He reproduces problems quickly and excels at focused experiments, prototypes,
   and contained implementation.
 
-  `INT 3 · SPD 5 · EXP 1 · CRE 4 · CAU 2`
+  `INT 3 · ACC 2 · STU 2`
 
   Special trait: **Beginner's Luck**.
 
@@ -22,7 +33,7 @@ and `CAU` risk-aware deliberation.
   a working senior engineer who owns difficult delivery and delegates only
   when another member is materially better suited.
 
-  `INT 5 · SPD 3 · EXP 5 · CRE 4 · CAU 4`
+  `INT 5 · ACC 4 · STU 4`
 
   Special trait: **Gets It Done**.
 
@@ -30,7 +41,7 @@ and `CAU` risk-aware deliberation.
   difficult arguments. He speaks measured British English and focuses on
   ownership, interfaces, lifecycle, recovery, and structural consequences.
 
-  `INT 5 · SPD 2 · EXP 5 · CRE 4 · CAU 5`
+  `INT 5 · ACC 5 · STU 4`
 
   Special trait: **Sees Three Moves Ahead**.
 
@@ -38,7 +49,7 @@ and `CAU` risk-aware deliberation.
   and wasted words. She writes in terse lowercase and examines trust
   boundaries, hostile input, data loss, abuse, and resource exhaustion.
 
-  `INT 5 · SPD 2 · EXP 5 · CRE 3 · CAU 5`
+  `INT 5 · ACC 5 · STU 5`
 
   Special trait: **Trust Nothing**.
 
@@ -47,7 +58,7 @@ and `CAU` risk-aware deliberation.
   interaction, accessibility, visual design, and a strong understanding of
   human behavior.
 
-  `INT 4 · SPD 4 · EXP 4 · CRE 5 · CAU 3`
+  `INT 4 · ACC 3 · STU 3`
 
   Special trait: **Human Perspective**.
 
@@ -55,7 +66,7 @@ and `CAU` risk-aware deliberation.
   evidence. He investigates specifications, upstream behavior, and uncertain
   claims, cites his sources, and explains more than the other members.
 
-  `INT 5 · SPD 1 · EXP 5 · CRE 4 · CAU 5`
+  `INT 5 · ACC 5 · STU 5`
 
   Special trait: **Leave No Stone Unturned**.
 

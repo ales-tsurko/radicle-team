@@ -9,6 +9,10 @@ when something goes wrong. Configuration lives in
 
 ## Prerequisites
 
+Linux or macOS. Windows is not supported and the crate refuses to compile there:
+every agent runs inside a sandbox and is given unrestricted permissions within
+it, so a build without one would run agents unconfined.
+
 Install Radicle so that `rad` and `radicle-node` are available on `PATH`. You
 also need the repository RID and permission to propose or approve its project
 manifest.
@@ -64,8 +68,8 @@ Nico needs goes inside it:
 ├── sandbox.toml         what nico's agents may read, write, and reach
 ├── irc-identity.pem
 ├── node.log
-├── cache/               build output, shared by nico's three adapters
-├── harness/             agent state, one folder per adapter
+├── cache/               build output, shared by nico's three roles
+├── harness/             agent state, one folder per role
 └── code/
     ├── .git-common      the commits, stored once
     ├── talker/          issues and patches
@@ -77,7 +81,7 @@ Nico needs goes inside it:
 share `.git-common`, so the history is stored once rather than three times, and
 each keeps its own branch.
 
-Before every delivery the runtime resets that adapter's copy to whatever it is
+Before every delivery the runtime resets that role's copy to whatever it is
 about to work on.
 
 In the building copy, anything a previous run left uncommitted is committed to a
@@ -86,7 +90,7 @@ answering copies are simply cleaned: what they hold is what they looked at on
 the way to an answer, and the answer itself is already in the issue or the
 channel.
 
-Only the building adapter has branches. Each one belongs to one job and is named
+Only the building role has branches. Each one belongs to one job and is named
 after it:
 
 ```text
@@ -95,12 +99,55 @@ nico-rt/job-17
 
 A branch is removed once its job is over. The queue is what says so: a job which
 was carried out has had its row removed, and a job which stalled, failed, or was
-interrupted still has one, along with whatever it committed. A branch the
-adapter is still standing on is left alone and removed when it next moves to
-other work, so tidying up never pulls the ground out from under a job which is
-still running.
+interrupted still has one, along with whatever it committed. A branch the agent
+is still standing on is left alone and removed when it next moves to other work,
+so tidying up never pulls the ground out from under a job which is still
+running.
+
+Setup also asks which models the member runs on, and signs you in if that
+provider needs it. Answer "decide later" to leave it unset.
 
 Pass `--home PATH` to name the folder yourself.
+
+
+### Choosing models
+
+```sh
+radicle-team providers
+```
+
+```text
+~/.config/radicle-team/providers
+
+  anthropic    claude-code  not authorized
+  ollama       opencode     none needed
+  openai       opencode     not authorized
+```
+
+The same place on macOS as on Linux, and `XDG_CONFIG_HOME` moves it. The listing
+prints the directory, so there is no need to guess.
+
+One file per provider, named after it. The file says which agent application
+reaches that provider's models, how a member's three scores become that
+provider's settings, and how it accepts being authorized. Adding a model, a
+setting, or a whole provider is an edited file rather than a new release.
+
+```sh
+radicle-team login openai
+```
+
+Once per provider, per machine — one person's account is one account however
+many members use it. Add `--home PATH` to authorize one member alone, which is
+what you want when a project has to be billed to its own account. Pass the same
+`--home PATH` to `providers` to see that login; without it the listing reports
+only the machine-wide one.
+
+A provider you are already signed in to through its agent application is
+recorded as a subscription instead of asking for a key. That is the whole reason
+the Claude Code adapter is here.
+
+We replace the files we ship when the application is updated, so keep your own
+edits under a different name. Credentials are never touched.
 
 
 ### Looking inside a member's copies
@@ -200,7 +247,7 @@ RUST_LOG=radicle_team=debug radicle-team run nico --repo rad:...
 
 At `info` the process reports what it decided and why:
 
-- activity dispatched to an adapter, or ignored and for which reason
+- activity dispatched to a role, or ignored and for which reason
 - a mutation published, or recovered from an interrupted delivery
 - an MCP method the manifest no longer allows
 - the sandbox becoming ready

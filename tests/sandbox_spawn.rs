@@ -262,9 +262,9 @@ async fn reaches_the_mcp_endpoint_with_networking_disabled() {
 
 // Proves the shared Git store's carveouts against a real sandbox rather than the policy alone.
 //
-// The runtime runs Git against this store outside the sandbox, so anything an adapter can write
-// there which Git later reads is a way of choosing what the runtime executes. The commit at the
-// end is the other half: the store has to stay writable enough to be usable at all.
+// The runtime runs Git against this store outside the sandbox, so anything a role can write there
+// which Git later reads is a way of choosing what the runtime executes. The commit at the end is
+// the other half: the store has to stay writable enough to be usable at all.
 async fn guards_the_shared_git_store() {
     let fixture = Fixture::new("git-store");
     let common = fixture.git_store();
@@ -302,7 +302,7 @@ async fn guards_the_shared_git_store() {
             .arg("echo agent > written.txt && git add written.txt && git commit -q -m Agent"))
         .await
         .success(),
-        "the building adapter must still be able to commit in its own working copy",
+        "the building role must still be able to commit in its own working copy",
     );
     check(
         std::process::Command::new("git")
@@ -311,7 +311,7 @@ async fn guards_the_shared_git_store() {
             .status()
             .expect("git should run")
             .success(),
-        "the commit the adapter made must be on its branch in the shared store",
+        "the commit the role made must be on its branch in the shared store",
     );
 }
 
@@ -344,7 +344,7 @@ impl Fixture {
     }
 
     fn workspaces(&self) -> PathBuf {
-        let workspaces = self.home.worktree(radicle_team::agent::Adapter::Coder);
+        let workspaces = self.home.worktree(radicle_team::agent::Role::Coder);
         fs::create_dir_all(&workspaces).expect("workspaces should be created");
         workspaces
     }
@@ -375,12 +375,12 @@ impl Fixture {
         git(&common, &["config", "user.email", "sandbox@example.com"]);
         fs::create_dir_all(common.join("refs").join("heads").join("nico-rt"))
             .expect("branch directory should be created");
-        for adapter in [
-            radicle_team::agent::Adapter::Talker,
-            radicle_team::agent::Adapter::Chatter,
-            radicle_team::agent::Adapter::Coder,
+        for role in [
+            radicle_team::agent::Role::Talker,
+            radicle_team::agent::Role::Chatter,
+            radicle_team::agent::Role::Coder,
         ] {
-            let worktree = self.home.worktree(adapter);
+            let worktree = self.home.worktree(role);
             git(
                 &common,
                 &[
@@ -394,7 +394,7 @@ impl Fixture {
             );
         }
         git(
-            &self.home.worktree(radicle_team::agent::Adapter::Coder),
+            &self.home.worktree(radicle_team::agent::Role::Coder),
             &["checkout", "-q", "-B", "nico-rt/job-1"],
         );
 
@@ -412,7 +412,7 @@ impl Fixture {
         AgentSandbox::load(
             &self.home,
             radicle_team::member::Member::Nico,
-            radicle_team::agent::Adapter::Coder,
+            radicle_team::agent::Role::Coder,
             endpoint,
         )
         .expect("sandbox should load")

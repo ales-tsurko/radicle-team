@@ -1,24 +1,23 @@
 //! Reusable working copies supplied to agents.
 //!
-//! Each adapter owns one working copy for the lifetime of the member directory, and they share a
+//! Each role owns one working copy for the lifetime of the member directory, and they share a
 //! single Git object store. Moving one to a different issue, patch, or branch costs a checkout
-//! rather than a clone, and nothing an adapter does to its own copy is visible in another's.
+//! rather than a clone, and nothing done in one role's copy is visible in another's.
 //!
-//! Everything an adapter can write is untrusted, and Git decides what to do from what it finds in
-//! the repository it is pointed at. The runtime is pointed at repositories an adapter can write,
-//! so it runs Git inside a sandbox of its own: the working copy the command is for, the shared
-//! store, and the one repository it fetches from. Code which reaches a Git command from an
-//! adapter's files has got no further than that adapter's own files, and cannot reach another
-//! adapter's, the member's identity, or the rest of Radicle storage. External network access is
-//! denied, subject to the platform difference in
-//! [`NetworkAccess`](crate::sandbox::NetworkAccess).
+//! Everything an agent can write is untrusted, and Git decides what to do from what it finds in the
+//! repository it is pointed at. The runtime is pointed at repositories an agent can write, so it
+//! runs Git inside a sandbox of its own: the working copy the command is for, the shared store, and
+//! the one repository it fetches from. Code which reaches a Git command from a role's files has got
+//! no further than that role's own files, and cannot reach another role's, the member's identity,
+//! or the rest of Radicle storage. External network access is denied, subject to the platform
+//! difference in [`NetworkAccess`](crate::sandbox::NetworkAccess).
 //!
 //! Two rules narrow it further, so the sandbox is the last line rather than the only one. Nothing
-//! an adapter writes may say where Git looks: the sandbox holds hooks, configuration and every
-//! file naming a working copy's Git directory read-only. And nothing it writes may say which
-//! reference the runtime updates: every reference written here is one the runtime named itself,
-//! addressed in full and set with `--no-deref`, because a name in that namespace can be made to
-//! stand for another reference entirely.
+//! an agent writes may say where Git looks: the sandbox holds hooks, configuration and every file
+//! naming a working copy's Git directory read-only. And nothing it writes may say which reference
+//! the runtime updates: every reference written here is one the runtime named itself, addressed in
+//! full and set with `--no-deref`, because a name in that namespace can be made to stand for
+//! another reference entirely.
 
 use std::{collections::BTreeSet, ffi::OsStr, path::PathBuf, sync::Arc};
 
@@ -31,7 +30,7 @@ use radicle::{
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::{
-    agent::{Adapter, Source},
+    agent::{Role, Source},
     home::MemberHome,
     member::Member,
     queue::{Job, WorkQueue},
@@ -63,22 +62,22 @@ pub(crate) fn branches(member: Member) -> String {
 enum In {
     // The shared store, writing no working copy.
     Store,
-    // The shared store, creating one adapter's working copy.
-    Creating(Adapter),
-    // One adapter's working copy.
-    Copy(Adapter),
+    // The shared store, creating one role's working copy.
+    Creating(Role),
+    // One role's working copy.
+    Copy(Role),
 }
 
 impl In {
-    const fn adapter(self) -> Option<Adapter> {
+    const fn role(self) -> Option<Role> {
         match self {
             Self::Store => None,
-            Self::Creating(adapter) | Self::Copy(adapter) => Some(adapter),
+            Self::Creating(role) | Self::Copy(role) => Some(role),
         }
     }
 }
 
-/// Working copies for one member, one per adapter, sharing one object store.
+/// Working copies for one member, one per role, sharing one object store.
 #[derive(Debug, Clone)]
 pub(crate) struct Workspaces {
     member: Member,
@@ -90,14 +89,14 @@ pub(crate) struct Workspaces {
     // long as that job's row does, so the queue is the only thing that decides what may be
     // removed.
     queue: WorkQueue,
-    // Serialises fetches and reference updates, which every adapter performs against the one
-    // shared store. Git would refuse a concurrent reference update rather than corrupt anything,
-    // so this exists to avoid spurious failures rather than to protect the repository.
+    // Serialises fetches and reference updates, which every role performs against the one shared
+    // store. Git would refuse a concurrent reference update rather than corrupt anything, so this
+    // exists to avoid spurious failures rather than to protect the repository.
     shared: Arc<Mutex<()>>,
-    // One per working copy, plus one for the shared store alone. Loaded on first use rather than
-    // at construction, because loading reads embedded profiles and creates directories, and a
-    // member which never prepares a working copy needs none of them.
-    sandboxes: Arc<[OnceCell<AgentSandbox>; Adapter::ALL.len() + 1]>,
+    // One per working copy, plus one for the shared store alone. Loaded on first use rather than at
+    // construction, because loading reads embedded profiles and creates directories, and a member
+    // which never prepares a working copy needs none of them.
+    sandboxes: Arc<[OnceCell<AgentSandbox>; Role::ALL.len() + 1]>,
 }
 
 impl Workspaces {
@@ -158,7 +157,7 @@ impl Workspaces {
         ))
     }
 
-    /// Creates the shared object store and every adapter's working copy.
+    /// Creates the shared object store and every role's working copy.
     ///
     /// Safe to call again on an existing member directory, which is what happens on every start.
     pub(crate) async fn initialize(&self) -> Result<(), Error> {
@@ -171,13 +170,13 @@ impl Workspaces {
                 .map_err(|error| Error::Task(error.to_string()))??;
         }
         self.prepare_common().await?;
-        for adapter in Adapter::ALL {
-            let worktree = self.home.worktree(adapter);
+        for role in Role::ALL {
+            let worktree = self.home.worktree(role);
             if !worktree.join(".git").exists() {
-                // Relative paths keep the member directory movable. Without them Git records
-                // where the directory was created, and renaming it breaks every working copy.
+                // Relative paths keep the member directory movable. Without them Git records where
+                // the directory was created, and renaming it breaks every working copy.
                 self.git(
-                    In::Creating(adapter),
+                    In::Creating(role),
                     [
                         OsStr::new("worktree"),
                         OsStr::new("add"),
@@ -200,8 +199,8 @@ impl Workspaces {
     // Nothing is running yet, so holding one would only keep a finished job's branch alive. The
     // tree is untouched, so a crashed run's uncommitted work is still there to salvage.
     async fn detach_copies(&self) -> Result<(), Error> {
-        for adapter in Adapter::ALL {
-            let place = In::Copy(adapter);
+        for role in Role::ALL {
+            let place = In::Copy(role);
             let head = self.capture(place, ["rev-parse", "HEAD"]).await?;
             self.git(place, ["update-ref", "--no-deref", "HEAD", &head])
                 .await?;
@@ -210,36 +209,31 @@ impl Workspaces {
         Ok(())
     }
 
-    /// Moves an answering adapter's working copy onto whatever `source` addresses.
+    /// Moves an answering role's working copy onto whatever `source` addresses.
     ///
-    /// Left on a detached head: two copies of one repository cannot hold the same branch, and
-    /// what an answering adapter produces is the answer it publishes, not commits.
-    pub(crate) async fn prepare(&self, adapter: Adapter, source: Source) -> Result<PathBuf, Error> {
-        self.settle(adapter, source, None).await
+    /// Left on a detached head: two copies of one repository cannot hold the same branch, and what
+    /// an answering role produces is the answer it publishes, not commits.
+    pub(crate) async fn prepare(&self, role: Role, source: Source) -> Result<PathBuf, Error> {
+        self.settle(role, source, None).await
     }
 
-    /// Moves the building adapter's working copy onto the branch belonging to `job`.
+    /// Moves the building role's working copy onto the branch belonging to `job`.
     ///
     /// Named after the job alone, which is the only identifier both known before the work starts
     /// and never shared with another piece of work.
     pub(crate) async fn prepare_job(&self, job: &Job) -> Result<PathBuf, Error> {
-        self.settle(Adapter::Coder, job.source.clone(), Some(job.id))
+        self.settle(Role::Coder, job.source.clone(), Some(job.id))
             .await
     }
 
-    async fn settle(
-        &self,
-        adapter: Adapter,
-        source: Source,
-        job: Option<i64>,
-    ) -> Result<PathBuf, Error> {
-        let worktree = self.home.worktree(adapter);
+    async fn settle(&self, role: Role, source: Source, job: Option<i64>) -> Result<PathBuf, Error> {
+        let worktree = self.home.worktree(role);
         let head = self.head(source).await?;
         // Held across the whole preparation, not only the fetch. Salvaging and placing a branch
-        // both write references into the one shared store, and two adapters preparing at once
-        // would otherwise collide there.
+        // both write references into the one shared store, and two roles preparing at once would
+        // otherwise collide there.
         let _shared = self.shared.lock().await;
-        let place = In::Copy(adapter);
+        let place = In::Copy(role);
         self.fetch(place, &head).await?;
         // Placing the branch comes second because resetting while standing on one moves it, which
         // would throw away commits the agent made but had not published yet. It is also what moves
@@ -293,7 +287,7 @@ impl Workspaces {
         )
         .await?;
         tracing::warn!(
-            adapter = ?place.adapter(),
+            role = ?place.role(),
             job,
             %branch,
             "previous run left uncommitted work; it was committed rather than discarded"
@@ -302,7 +296,7 @@ impl Workspaces {
         Ok(())
     }
 
-    // Puts the building adapter on the branch for `job` without losing commits.
+    // Puts the building role on the branch for `job` without losing commits.
     //
     // The branch may already be ahead of the published patch, because the agent commits before it
     // publishes. Forcing the branch back to the patch head would destroy exactly that work.
@@ -344,9 +338,9 @@ impl Workspaces {
 
     // Points `branch` at `commit` without following it.
     //
-    // Every reference the runtime writes is one it named itself and set directly. An adapter can
-    // write inside its own namespace, so a name there may stand for another reference entirely,
-    // and updating through it would move whatever it stands for rather than the branch.
+    // Every reference the runtime writes is one it named itself and set directly. A role can write
+    // inside its own namespace, so a name there may stand for another reference entirely, and
+    // updating through it would move whatever it stands for rather than the branch.
     async fn set_reference(&self, place: In, branch: &str, commit: &str) -> Result<(), Error> {
         self.git(
             place,
@@ -606,7 +600,7 @@ impl Workspaces {
     fn directory(&self, place: In) -> PathBuf {
         match place {
             In::Store | In::Creating(_) => self.home.git_common(),
-            In::Copy(adapter) => self.home.worktree(adapter),
+            In::Copy(role) => self.home.worktree(role),
         }
     }
 
@@ -645,17 +639,17 @@ impl Workspaces {
 
     // Returns the sandbox a command belongs in.
     //
-    // One per working copy, plus one for commands which touch no working copy at all, so a
-    // command run for one adapter cannot write another's files. Each is loaded once.
+    // One per working copy, plus one for commands which touch no working copy at all, so a command
+    // run for one role cannot write another's files. Each is loaded once.
     async fn sandbox(&self, place: In) -> Result<&AgentSandbox, Error> {
-        let adapter = place.adapter();
+        let role = place.role();
         let cell = self
             .sandboxes
-            .get(adapter.map_or(Adapter::ALL.len(), |adapter| adapter as usize))
+            .get(role.map_or(Role::ALL.len(), |role| role as usize))
             .ok_or_else(|| Error::Sandbox("no sandbox for this working copy".to_owned()))?;
 
         cell.get_or_try_init(|| async {
-            AgentSandbox::runtime(&self.home, adapter, &self.repository_path())
+            AgentSandbox::runtime(&self.home, role, &self.repository_path())
                 .map_err(|error| Error::Sandbox(error.to_string()))
         })
         .await
@@ -718,7 +712,7 @@ mod tests {
     };
 
     use crate::{
-        agent::{Adapter, Source},
+        agent::{Role, Source},
         home::MemberHome,
         manifest::QueuePosition,
         member::Member,
@@ -882,7 +876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn moves_one_adapter_without_disturbing_the_others() {
+    async fn moves_one_role_without_disturbing_the_others() {
         let fixture = repository().await;
         let (workspaces, home, patch, head) = (
             &fixture.workspaces,
@@ -894,10 +888,10 @@ mod tests {
             .initialize()
             .await
             .expect("working copies should be created");
-        for adapter in Adapter::ALL {
+        for role in Role::ALL {
             assert!(
-                home.worktree(adapter).join("README.md").is_file(),
-                "{adapter} should have real files, not a pointer to somebody else's"
+                home.worktree(role).join("README.md").is_file(),
+                "{role} should have real files, not a pointer to somebody else's"
             );
         }
         assert!(
@@ -906,7 +900,7 @@ mod tests {
         );
 
         let talker = workspaces
-            .prepare(Adapter::Talker, Subject::Patch(patch).into())
+            .prepare(Role::Talker, Subject::Patch(patch).into())
             .await
             .expect("talker should move to the patch");
         let opened = git2::Repository::open(&talker).expect("worktree should open");
@@ -918,25 +912,23 @@ mod tests {
         drop(opened);
 
         fs::write(
-            home.worktree(Adapter::Chatter).join("untouched.txt"),
+            home.worktree(Role::Chatter).join("untouched.txt"),
             "chatter's own file",
         )
         .expect("chatter file should be written");
         workspaces
-            .prepare(Adapter::Talker, Subject::Issue(patch).into())
+            .prepare(Role::Talker, Subject::Issue(patch).into())
             .await
             .expect("talker should move again");
         assert!(
-            home.worktree(Adapter::Chatter)
-                .join("untouched.txt")
-                .is_file(),
-            "moving one adapter must not disturb another's working copy"
+            home.worktree(Role::Chatter).join("untouched.txt").is_file(),
+            "moving one role must not disturb another's working copy"
         );
 
         fs::write(talker.join("ignored.log"), "left over").expect("leftover should be written");
         fs::write(talker.join("README.md"), "dirty").expect("README should be dirtied");
         let talker = workspaces
-            .prepare(Adapter::Talker, Subject::Issue(patch).into())
+            .prepare(Role::Talker, Subject::Issue(patch).into())
             .await
             .expect("talker should move back to the canonical branch");
         assert!(
@@ -958,7 +950,7 @@ mod tests {
             .initialize()
             .await
             .expect("working copies should be created");
-        let coder = home.worktree(Adapter::Coder);
+        let coder = home.worktree(Role::Coder);
         let job = fixture.start(Subject::Patch(fixture.patch)).await;
 
         workspaces
@@ -1010,17 +1002,17 @@ mod tests {
             .initialize()
             .await
             .expect("working copies should be created");
-        let talker = home.worktree(Adapter::Talker);
+        let talker = home.worktree(Role::Talker);
 
         workspaces
-            .prepare(Adapter::Talker, Subject::Patch(patch).into())
+            .prepare(Role::Talker, Subject::Patch(patch).into())
             .await
             .expect("talker should take the patch");
         fs::write(talker.join("scratch.md"), "checking something").expect("file should be written");
         fs::write(talker.join("README.md"), "edited while reading").expect("README should change");
 
         workspaces
-            .prepare(Adapter::Talker, Subject::Patch(patch).into())
+            .prepare(Role::Talker, Subject::Patch(patch).into())
             .await
             .expect("talker should take it again");
 
@@ -1064,7 +1056,7 @@ mod tests {
             common.join("refs").join("heads").join(NAMESPACE),
             common.join("worktrees").join("talker").join("commondir"),
             common.join("worktrees").join("talker").join("gitdir"),
-            fixture.home.worktree(Adapter::Talker).join(".git"),
+            fixture.home.worktree(Role::Talker).join(".git"),
         ] {
             assert!(
                 path.exists(),
@@ -1074,10 +1066,10 @@ mod tests {
         }
     }
 
-    // Fencing off each surface an adapter could use to smuggle code into a Git command is
-    // guesswork, and one missed surface would be a way out of the sandbox entirely. This is the
-    // bound on what a missed one costs: the runtime's own Git can reach the working copies and
-    // nothing else, so code arriving through it gets no further than its adapter already was.
+    // Fencing off each surface a role could use to smuggle code into a Git command is guesswork,
+    // and one missed surface would be a way out of the sandbox entirely. This is the bound on what
+    // a missed one costs: the runtime's own Git can reach the working copies and nothing else, so
+    // code arriving through it gets no further than its role already was.
     #[tokio::test]
     async fn confines_a_hook_smuggled_into_the_shared_store() {
         let fixture = repository_beyond_reach("workspace-hook").await;
@@ -1088,15 +1080,15 @@ mod tests {
             .expect("working copies should be created");
         let reached = fixture.home.git_common().join("reached.txt");
         let escaped = fixture.home.identity().join("escaped.txt");
-        // The command below is run for the talking copy, so the building one is another adapter's
+        // The command below is run for the talking copy, so the building one is another role's
         // private state and out of reach even though both live side by side. Its files and the
         // entry the shared store keeps for it are the same thing: that entry holds its index.
-        let others = fixture.home.worktree(Adapter::Coder).join("others.txt");
+        let others = fixture.home.worktree(Role::Coder).join("others.txt");
         let metadata = fixture
             .home
             .git_common()
             .join("worktrees")
-            .join(Adapter::Coder.id())
+            .join(Role::Coder.id())
             .join("index");
         fs::create_dir_all(fixture.home.identity()).expect("identity should be created");
         let hook = fixture
@@ -1120,7 +1112,7 @@ mod tests {
 
         fixture
             .workspaces
-            .prepare(Adapter::Talker, Subject::Patch(fixture.patch).into())
+            .prepare(Role::Talker, Subject::Patch(fixture.patch).into())
             .await
             .expect("talker should take the patch");
 
@@ -1134,7 +1126,7 @@ mod tests {
         );
         assert!(
             !others.is_file(),
-            "nor another adapter's working copy, which the command it rode in on was not for"
+            "nor another role's working copy, which the command it rode in on was not for"
         );
         assert_ne!(
             fs::read_to_string(&metadata).unwrap_or_default(),
@@ -1143,13 +1135,13 @@ mod tests {
         );
     }
 
-    // A working copy belongs to its adapter, so a name in the runtime's own branch namespace can
-    // be made to stand for another reference entirely. Every reference the runtime writes is
-    // therefore set directly: updating through this one would move the canonical branch instead.
+    // A working copy belongs to its role, so a name in the runtime's own branch namespace can be
+    // made to stand for another reference entirely. Every reference the runtime writes is therefore
+    // set directly: updating through this one would move the canonical branch instead.
     #[tokio::test]
-    async fn never_writes_through_a_reference_an_adapter_left_behind() {
+    async fn never_writes_through_a_reference_a_role_left_behind() {
         let fixture = repository().await;
-        let coder = fixture.home.worktree(Adapter::Coder);
+        let coder = fixture.home.worktree(Role::Coder);
         fixture
             .workspaces
             .initialize()
@@ -1178,18 +1170,18 @@ mod tests {
         assert_eq!(
             git(&coder, &["rev-parse", "refs/heads/victim"]),
             base,
-            "a reference outside the runtime's namespace must not move because an adapter pointed \
-             a branch inside it at that reference"
+            "a reference outside the runtime's namespace must not move because a role pointed a \
+             branch inside it at that reference"
         );
     }
 
     // Two jobs from one issue, or one chat channel, are two separate pieces of work. Naming a
-    // branch after where the request came from would put both on the same branch, where the
-    // second silently continues from whatever the first left.
+    // branch after where the request came from would put both on the same branch, where the second
+    // silently continues from whatever the first left.
     #[tokio::test]
     async fn gives_two_jobs_from_one_source_a_branch_each() {
         let fixture = repository().await;
-        let coder = fixture.home.worktree(Adapter::Coder);
+        let coder = fixture.home.worktree(Role::Coder);
         fixture
             .workspaces
             .initialize()
@@ -1228,7 +1220,7 @@ mod tests {
     #[tokio::test]
     async fn keeps_one_branch_name_from_the_first_commit_to_the_patch() {
         let fixture = repository().await;
-        let coder = fixture.home.worktree(Adapter::Coder);
+        let coder = fixture.home.worktree(Role::Coder);
         fixture
             .workspaces
             .initialize()
@@ -1268,12 +1260,12 @@ mod tests {
         assert_eq!(branch, format!("{NAMESPACE}/job-{}", job.id));
     }
 
-    // A branch is the working copy of one job and means nothing once that job is over. The queue
-    // is what says so: a job which finished has had its row removed, and one which failed has not.
+    // A branch is the working copy of one job and means nothing once that job is over. The queue is
+    // what says so: a job which finished has had its row removed, and one which failed has not.
     #[tokio::test]
     async fn removes_the_branch_of_a_job_which_finished() {
         let fixture = repository().await;
-        let coder = fixture.home.worktree(Adapter::Coder);
+        let coder = fixture.home.worktree(Role::Coder);
         fixture
             .workspaces
             .initialize()
@@ -1307,7 +1299,7 @@ mod tests {
     #[tokio::test]
     async fn keeps_the_branch_of_a_job_which_did_not_finish() {
         let fixture = repository().await;
-        let coder = fixture.home.worktree(Adapter::Coder);
+        let coder = fixture.home.worktree(Role::Coder);
         fixture
             .workspaces
             .initialize()
@@ -1340,7 +1332,7 @@ mod tests {
     #[tokio::test]
     async fn removes_the_branch_of_a_finished_job_after_a_restart() {
         let fixture = repository().await;
-        let coder = fixture.home.worktree(Adapter::Coder);
+        let coder = fixture.home.worktree(Role::Coder);
         fixture
             .workspaces
             .initialize()
@@ -1379,7 +1371,7 @@ mod tests {
     #[tokio::test]
     async fn keeps_a_finished_branch_until_the_copy_holding_it_moves_on() {
         let fixture = repository().await;
-        let coder = fixture.home.worktree(Adapter::Coder);
+        let coder = fixture.home.worktree(Role::Coder);
         fixture
             .workspaces
             .initialize()
@@ -1398,9 +1390,9 @@ mod tests {
         fixture.queue.finish().await.expect("the job should finish");
         fixture
             .workspaces
-            .prepare(Adapter::Talker, Subject::Patch(fixture.patch).into())
+            .prepare(Role::Talker, Subject::Patch(fixture.patch).into())
             .await
-            .expect("another adapter should still be able to prepare");
+            .expect("another role should still be able to prepare");
 
         assert!(
             !git(&coder, &["branch", "--list", &branch]).is_empty(),
@@ -1428,7 +1420,7 @@ mod tests {
             .initialize()
             .await
             .expect("working copies should be created");
-        let coder = home.worktree(Adapter::Coder);
+        let coder = home.worktree(Role::Coder);
         let job = fixture.start(Subject::Patch(fixture.patch)).await;
 
         workspaces

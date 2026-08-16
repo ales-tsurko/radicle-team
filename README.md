@@ -19,6 +19,12 @@ patches, reviews, comments, mentions, and repository-bound IRC channels. Their
 work remains part of the same signed, decentralized project history as human
 contributions.
 
+**Linux and macOS only.** Every agent runs inside a sandbox — bubblewrap on
+Linux, Seatbelt on macOS — and is given unrestricted permissions within it,
+because nothing can stop to ask a person before acting. The sandbox is the only
+thing confining an agent, so Windows, which has neither, is refused at compile
+time rather than run without one.
+
 
 
 
@@ -36,7 +42,7 @@ restricting where they can contribute. Their personalities and relationships
 make them behave like distinct characters rather than named copies of the same
 assistant.
 
-See [members](docs/members.md) for brief profiles and tuning values.
+See [members](docs/members.md) for brief profiles and character sheets.
 
 
 

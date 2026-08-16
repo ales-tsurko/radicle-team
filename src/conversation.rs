@@ -1,4 +1,4 @@
-//! Shared conversation policy and serialized delivery to the talking half of a member.
+//! Shared conversation policy and serialized delivery to the talking role of a member.
 
 use std::collections::BTreeMap;
 
@@ -6,7 +6,7 @@ use radicle::identity::Did;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    agent::{self, Adapter, Source, Talker, WorkId},
+    agent::{self, Role, Source, Talker, WorkId},
     manifest::{Limits, TriggerAccess},
     mcp::WorkScope,
     member::Member,
@@ -159,7 +159,7 @@ pub(crate) enum AdmissionError {
     Limit,
 }
 
-/// Sends repository activity to the single dispatcher which owns the talking adapter.
+/// Sends repository activity to the single dispatcher which owns the talking role.
 #[derive(Debug, Clone)]
 pub(crate) struct Handle {
     sender: mpsc::Sender<Request>,
@@ -196,14 +196,14 @@ impl Handle {
     }
 }
 
-/// The workspace and MCP scope one adapter works inside.
+/// The workspace and MCP scope one role works inside.
 ///
-/// Each adapter runs its own agent under its own MCP server, so each needs its own checkout and
-/// its own active-work gate. Only the request types differ between them.
+/// Each role runs its own agent under its own MCP server, so each needs its own checkout and its
+/// own active-work gate. Only the request types differ between them.
 #[derive(Debug)]
 pub(crate) struct Scoped {
     pub(crate) member: Member,
-    adapter: Adapter,
+    role: Role,
     workspaces: Workspaces,
     pub(crate) scope: WorkScope,
 }
@@ -211,22 +211,22 @@ pub(crate) struct Scoped {
 impl Scoped {
     pub(crate) const fn new(
         member: Member,
-        adapter: Adapter,
+        role: Role,
         workspaces: Workspaces,
         scope: WorkScope,
     ) -> Self {
         Self {
             member,
-            adapter,
+            role,
             workspaces,
             scope,
         }
     }
 
-    /// Moves this adapter's working copy onto `source` and reports its path.
+    /// Moves this role's working copy onto `source` and reports its path.
     pub(crate) async fn prepare(&self, source: Source) -> Result<std::path::PathBuf, Error> {
         self.workspaces
-            .prepare(self.adapter, source)
+            .prepare(self.role, source)
             .await
             .map_err(|error| Error::Workspace(error.to_string()))
     }
@@ -253,7 +253,7 @@ impl Scoped {
     }
 }
 
-/// Owns the talking adapter's workspace and MCP scope while serializing deliveries.
+/// Owns the talking role's workspace and MCP scope while serializing deliveries.
 #[derive(Debug)]
 pub(crate) struct Dispatcher {
     scoped: Scoped,
@@ -267,7 +267,7 @@ impl Dispatcher {
         (
             Handle { sender },
             Self {
-                scoped: Scoped::new(member, Adapter::Talker, workspaces, scope),
+                scoped: Scoped::new(member, Role::Talker, workspaces, scope),
                 receiver,
             },
         )
@@ -339,7 +339,7 @@ enum Request {
 /// Failure while serializing or handling a conversation delivery.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
-    /// The talking adapter failed.
+    /// The talking agent failed.
     #[error(transparent)]
     Talker(#[from] agent::Error),
     /// Preparing or cleaning the delivery workspace failed.

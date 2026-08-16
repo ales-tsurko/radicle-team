@@ -59,7 +59,7 @@ use crate::mcp::{
 };
 #[cfg(not(miri))]
 use crate::{
-    manifest::QueuePosition, mcp::tools::ToolState, member::Member, queue::WorkQueue,
+    agent::Role, manifest::QueuePosition, mcp::tools::ToolState, member::Member, queue::WorkQueue,
     watcher::Subject,
 };
 
@@ -189,7 +189,7 @@ impl RepositoryFixture {
             super::WorkScope::default(),
             publisher,
             crate::manifest::McpAllowlist::default(),
-            super::Role::Talker,
+            Role::Talker,
             ToolState::new(self.queue().await, chat_state().await),
         )
     }
@@ -215,7 +215,7 @@ impl RepositoryFixture {
             scope,
             publisher,
             crate::manifest::McpAllowlist::default(),
-            super::Role::Talker,
+            Role::Talker,
             ToolState::new(self.queue().await, chat_state().await),
         )
     }
@@ -242,7 +242,7 @@ impl RepositoryFixture {
         workspaces
     }
 
-    async fn service_with(&self, role: super::Role, queue: WorkQueue) -> ToolService {
+    async fn service_with(&self, role: Role, queue: WorkQueue) -> ToolService {
         let publisher = crate::agent::Publisher::new(
             self.profile.clone(),
             self.repository,
@@ -407,7 +407,7 @@ async fn starts_on_a_loopback_capability_url_and_stops() {
         repository,
         publisher,
         crate::manifest::McpAllowlist::default(),
-        super::Role::Talker,
+        Role::Talker,
         ToolState::new(
             WorkQueue::memory(repository, Member::Nico)
                 .await
@@ -550,7 +550,7 @@ async fn chat_reply_targets_only_the_active_channel_and_message() {
         scope.clone(),
         publisher,
         crate::manifest::McpAllowlist::everything(),
-        super::Role::Talker,
+        Role::Talker,
         ToolState::new(fixture.queue().await, chat.clone()),
     );
     scope
@@ -795,7 +795,7 @@ async fn reconciles_security_writes_from_the_delivery_journal() {
         scope.clone(),
         publisher,
         crate::manifest::McpAllowlist::default(),
-        super::Role::Talker,
+        Role::Talker,
         ToolState::new(fixture.queue().await, chat_state().await),
     );
     let context = crate::agent::Context {
@@ -1941,7 +1941,7 @@ async fn reloads_the_security_policy_before_reporting() {
         super::WorkScope::default(),
         publisher,
         crate::manifest::McpAllowlist::default(),
-        super::Role::Talker,
+        Role::Talker,
         ToolState::new(fixture.queue().await, chat_state().await),
     );
     *policy.write().await = crate::manifest::SecurityPolicy::test_with_recipients(
@@ -2688,21 +2688,17 @@ fn includes_merges_in_revision_history() {
 
 #[tokio::test]
 #[cfg(not(miri))]
-async fn each_adapter_offers_only_the_tools_its_side_can_use() {
+async fn each_role_offers_only_the_tools_it_can_use() {
     let fixture = RepositoryFixture::new();
     let queue = fixture.queue().await;
-    let talker = fixture
-        .service_with(super::Role::Talker, queue.clone())
-        .await;
-    let chatter = fixture
-        .service_with(super::Role::Chatter, queue.clone())
-        .await;
-    let coder = fixture.service_with(super::Role::Coder, queue).await;
+    let talker = fixture.service_with(Role::Talker, queue.clone()).await;
+    let chatter = fixture.service_with(Role::Chatter, queue.clone()).await;
+    let coder = fixture.service_with(Role::Coder, queue).await;
 
     for tool in ["add_job", "cancel", "note", "work_status"] {
         assert!(
             talker.offers(tool),
-            "the talking adapter records work, so '{tool}' must reach it"
+            "the talking role records work, so '{tool}' must reach it"
         );
         assert!(
             chatter.offers(tool),
@@ -2710,32 +2706,32 @@ async fn each_adapter_offers_only_the_tools_its_side_can_use() {
         );
         assert!(
             !coder.offers(tool),
-            "'{tool}' would let the building adapter hand itself work"
+            "'{tool}' would let the building role hand itself work"
         );
     }
     for tool in ["create_patch", "update_patch"] {
         assert!(
             coder.offers(tool),
-            "the building adapter makes the commits '{tool}' needs"
+            "the building role makes the commits '{tool}' needs"
         );
         for other in [&talker, &chatter] {
             assert!(
                 !other.offers(tool),
-                "only the building adapter has commits to turn into a patch with '{tool}'"
+                "only the building role has commits to turn into a patch with '{tool}'"
             );
         }
     }
     assert!(
         chatter.offers("reply_chat"),
-        "the chatting adapter is the one holding an authenticated message to answer"
+        "the chatting role is the one holding an authenticated message to answer"
     );
     assert!(!talker.offers("reply_chat"));
     assert!(!coder.offers("reply_chat"));
     for tool in ["get_subject", "create_comment", "merge_patch"] {
-        for adapter in [&talker, &chatter, &coder] {
+        for role in [&talker, &chatter, &coder] {
             assert!(
-                adapter.offers(tool),
-                "'{tool}' belongs to whatever the manifest allows, not to one adapter"
+                role.offers(tool),
+                "'{tool}' belongs to whatever the manifest allows, not to one role"
             );
         }
     }
@@ -2757,12 +2753,8 @@ async fn carries_a_note_on_the_next_result_the_building_half_receives() {
     let taken = queue.next().await.expect("queue should be readable");
     assert_eq!(taken.id, job);
 
-    let talker = fixture
-        .service_with(super::Role::Talker, queue.clone())
-        .await;
-    let coder = fixture
-        .service_with(super::Role::Coder, queue.clone())
-        .await;
+    let talker = fixture.service_with(Role::Talker, queue.clone()).await;
+    let coder = fixture.service_with(Role::Coder, queue.clone()).await;
     queue.note("use the existing parser".to_owned()).await;
 
     assert!(
@@ -2804,9 +2796,7 @@ async fn records_the_patch_a_job_produced_before_the_job_can_fail() {
         .prepare_job(&taken)
         .await
         .expect("the coder should take the issue");
-    let coder = fixture
-        .service_with(super::Role::Coder, queue.clone())
-        .await;
+    let coder = fixture.service_with(Role::Coder, queue.clone()).await;
     coder
         .scope
         .activate(super::WorkContext {
@@ -2915,9 +2905,7 @@ async fn refuses_to_report_a_patch_it_could_not_record() {
         .prepare_job(&taken)
         .await
         .expect("the coder should take the issue");
-    let coder = fixture
-        .service_with(super::Role::Coder, queue.clone())
-        .await;
+    let coder = fixture.service_with(Role::Coder, queue.clone()).await;
     coder
         .scope
         .activate(super::WorkContext {

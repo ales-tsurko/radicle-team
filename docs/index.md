@@ -12,10 +12,10 @@ together.
 
 - [Setup and operation](setup.md) — prerequisites, provisioning a member,
   running one or several, command-line options, local state, troubleshooting.
-- [Architecture](architecture.md) — the three adapters behind one identity,
-  how activity and chat reach a member, what chat trusts, and why the
-  alternatives were rejected.
-- [Members](members.md) — the roster, their tuning values, and how to address
+- [Architecture](architecture.md) — the three roles behind one identity, how
+  activity and chat reach a member, what chat trusts, and why the alternatives
+  were rejected.
+- [Members](members.md) — the roster, their character sheets, and how to address
   them.
 
 
@@ -42,10 +42,10 @@ together.
   follows.
 - [Fictional universe](../members/UNIVERSE.md) — the setting their histories
   come from.
-- Half-specific instructions — [`TALKER.md`](../members/TALKER.md) for issues
+- Role-specific instructions — [`TALKER.md`](../members/TALKER.md) for issues
   and patches, [`CHATTER.md`](../members/CHATTER.md) for chat, and
-  [`CODER.md`](../members/CODER.md) for building. Each adapter is given the one
-  for the half it runs.
+  [`CODER.md`](../members/CODER.md) for building. Each agent is given the one
+  for the role it runs.
 
 Individual character, expertise, and voice documents live under
 [`members/`](../members/).

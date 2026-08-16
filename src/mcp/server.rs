@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-    agent::{ChatContext, Context as AgentContext, McpEndpoint, Publisher, Source, WorkId},
+    agent::{ChatContext, Context as AgentContext, McpEndpoint, Publisher, Role, Source, WorkId},
     manifest::McpAllowlist,
     mcp::{
         protocol::{SubjectKind, SubjectRequest},
@@ -38,14 +38,6 @@ impl std::fmt::Debug for Server {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("McpServer").finish_non_exhaustive()
     }
-}
-
-// Which adapter of a member one MCP server serves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Role {
-    Talker,
-    Chatter,
-    Coder,
 }
 
 impl Server {

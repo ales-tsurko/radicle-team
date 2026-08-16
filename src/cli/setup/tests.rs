@@ -79,6 +79,7 @@ impl Fixture {
             member,
             did: did.parse::<Did>().expect("DID should parse"),
             generation: 1,
+            provider: None,
         }
     }
 
@@ -157,6 +158,57 @@ fn emits_each_members_preconfigured_mcp_groups() {
         "mcp_allow = [\"read\", \"chat\", \"comments\", \"issues\", \"patches\", \"reactions\", \
          \"reviews\"]"
     ));
+}
+
+// What the operator is told to paste has to be what setup would have written. A provider chosen in
+// the wizard and then missing from the shown binding is a choice silently thrown away, and nothing
+// downstream can tell it was ever made.
+#[test]
+fn shows_the_chosen_provider_in_the_binding_it_tells_you_to_paste() {
+    let shown = Fixture::entry(Member::Nico, NICO)
+        .with_provider(Some("anthropic".to_owned()))
+        .to_string();
+
+    assert!(
+        shown.contains("provider = \"anthropic\""),
+        "the shown binding dropped the provider: {shown}"
+    );
+    assert!(
+        !Fixture::entry(Member::Nico, NICO)
+            .to_string()
+            .contains("provider"),
+        "a member which chose no provider must not be given one"
+    );
+}
+
+// The binding a non-interactive run prints is pasted into the shared manifest by hand, so the name
+// in it gets the same check the interactive run applies. A typo accepted here is accepted by every
+// reader forever, while the member it names has no credentials and no models.
+#[cfg(not(miri))]
+#[test]
+fn refuses_a_provider_name_nobody_installed_without_a_terminal() {
+    let wizard = SetupWizard::new(
+        crate::Application::new(
+            Member::Nico,
+            RepoId::from_str(REPOSITORY).expect("repository should parse"),
+        )
+        .with_provider("anthropc"),
+    );
+
+    let error = wizard
+        .named_provider()
+        .expect_err("a name nobody installed must be refused with no terminal to ask at");
+
+    assert!(
+        matches!(
+            error,
+            Error::Provider(boxed)
+                if matches!(*boxed, crate::cli::provider::Error::Provider(
+                    crate::provider::Error::Unknown(_)
+                ))
+        ),
+        "the operator has to be told the name is not one they have"
+    );
 }
 
 #[test]
@@ -620,4 +672,127 @@ fn accepts_any_checkout_at_the_live_canonical_head() {
     checkout
         .ensure_canonical_head()
         .expect("a detached canonical checkout should be accepted");
+}
+
+// Setup finishing without credentials would leave a member which fails at its first delivery, so
+// the wizard authorizes as part of choosing. A provider needing nothing must not be asked about.
+#[cfg(not(miri))]
+#[test]
+fn authorizes_only_a_chosen_provider_which_needs_it() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("setup-provider-auth");
+    let _removed = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("test directory should be created");
+    let providers = crate::provider::installed(&root).expect("providers should install");
+    let wizard = SetupWizard::new(crate::Application::new(
+        Member::Nico,
+        RepoId::from_str(REPOSITORY).expect("repository should parse"),
+    ));
+
+    let (local, provider) = providers
+        .iter()
+        .filter_map(|(name, provider)| provider.as_ref().ok().map(|provider| (name, provider)))
+        .find(|(_name, provider)| provider.ways() == [crate::provider::Way::None])
+        .expect("a provider needing no authorization should ship");
+
+    wizard
+        .authorize(&root, local, provider)
+        .expect("a provider needing nothing must not prompt");
+
+    let (keyed, provider) = providers
+        .iter()
+        .filter_map(|(name, provider)| provider.as_ref().ok().map(|provider| (name, provider)))
+        .find(|(_name, provider)| provider.ways().contains(&crate::provider::Way::Key))
+        .expect("a provider needing a key should ship");
+    crate::provider::credentials::store(
+        &root.join(crate::provider::credentials::DIRECTORY),
+        keyed,
+        &crate::provider::Credentials::subscription(),
+    )
+    .expect("credentials should be written");
+
+    wizard
+        .authorize(&root, keyed, provider)
+        .expect("an already authorized provider must not prompt again");
+}
+
+// A subscription is the whole reason the Claude Code adapter exists, so setup has to be able to
+// record one. Forcing an API key on somebody who holds a subscription makes them buy credit they
+// do not need, or abandon setup.
+#[cfg(not(miri))]
+#[test]
+fn records_a_subscription_without_demanding_an_api_key() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("setup-provider-subscription");
+    let _removed = fs::remove_dir_all(&root);
+    let directory = root.join(crate::provider::DIRECTORY);
+    fs::create_dir_all(&directory).expect("provider directory should be created");
+    fs::write(
+        crate::provider::path(&directory, "signed-in"),
+        "adapter = \"claude-code\"\n\n[auth]\nways = [\"subscription\"]\n",
+    )
+    .expect("provider should be written");
+    let provider = crate::provider::find(&directory, "signed-in").expect("provider should read");
+    let wizard = SetupWizard::new(crate::Application::new(
+        Member::Nico,
+        RepoId::from_str(REPOSITORY).expect("repository should parse"),
+    ));
+
+    wizard
+        .authorize(&root, "signed-in", &provider)
+        .expect("a subscription must be recordable with no key prompt");
+
+    let held = crate::provider::credentials::load(
+        &crate::provider::credentials::directory(&root),
+        None,
+        "signed-in",
+    )
+    .expect("credentials should read back")
+    .expect("the subscription must have been recorded");
+    assert_eq!(
+        held.way(),
+        crate::provider::Way::Subscription,
+        "recorded as a subscription, so nothing asks for a key again"
+    );
+    assert!(
+        held.variables().is_empty(),
+        "a subscription puts nothing in the agent's environment"
+    );
+}
+
+// A name nobody installed would be written into the shared manifest and accepted there forever,
+// while the member it names has no credentials and no models.
+#[cfg(not(miri))]
+#[test]
+fn refuses_a_provider_name_nobody_installed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("setup-provider-unknown");
+    let _removed = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("test directory should be created");
+    let providers = crate::provider::installed(&root).expect("providers should install");
+    let wizard = SetupWizard::new(
+        crate::Application::new(
+            Member::Nico,
+            RepoId::from_str(REPOSITORY).expect("repository should parse"),
+        )
+        .with_provider("anthropc"),
+    );
+
+    let error = wizard
+        .choice(&providers)
+        .expect_err("a provider nobody installed must be refused");
+
+    assert!(
+        matches!(
+            error,
+            Error::Provider(boxed)
+                if matches!(*boxed, crate::cli::provider::Error::Provider(
+                    crate::provider::Error::Unknown(_)
+                ))
+        ),
+        "the operator has to be told the name is not one they have"
+    );
 }

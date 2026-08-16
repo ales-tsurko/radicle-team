@@ -2,6 +2,8 @@
 
 use std::{fmt, str::FromStr};
 
+use serde::Deserialize;
+
 // Handle which mentions every member at once, for work with no obvious owner.
 const TEAM_MENTION: &str = "team";
 
@@ -53,8 +55,8 @@ impl Member {
             Self::Nico => Profile {
                 member: self,
                 name: "Nico",
-                role: "Junior Developer",
-                tuning: ModelTuning::new(3, 5, 1, 4, 2),
+                title: "Junior Developer",
+                tuning: ModelTuning::new(3, 2, 2),
                 mcp_allow: &[
                     "read",
                     "chat",
@@ -67,8 +69,8 @@ impl Member {
             Self::Maya => Profile {
                 member: self,
                 name: "Maya",
-                role: "Senior Developer & Team Lead",
-                tuning: ModelTuning::new(5, 3, 5, 4, 4),
+                title: "Senior Developer & Team Lead",
+                tuning: ModelTuning::new(5, 4, 4),
                 mcp_allow: &[
                     "read",
                     "chat",
@@ -82,22 +84,22 @@ impl Member {
             Self::Leon => Profile {
                 member: self,
                 name: "Leon",
-                role: "Software Architect",
-                tuning: ModelTuning::new(5, 2, 5, 4, 5),
+                title: "Software Architect",
+                tuning: ModelTuning::new(5, 5, 4),
                 mcp_allow: &["read", "chat", "comments", "issues", "reactions", "reviews"],
             },
             Self::Vera => Profile {
                 member: self,
                 name: "Vera",
-                role: "Security Engineer",
-                tuning: ModelTuning::new(5, 2, 5, 3, 5),
+                title: "Security Engineer",
+                tuning: ModelTuning::new(5, 5, 5),
                 mcp_allow: &["read", "chat", "comments", "issues", "reactions", "reviews"],
             },
             Self::Nora => Profile {
                 member: self,
                 name: "Nora",
-                role: "UX/UI Designer & Frontend Developer",
-                tuning: ModelTuning::new(4, 4, 4, 5, 3),
+                title: "UX/UI Designer & Frontend Developer",
+                tuning: ModelTuning::new(4, 3, 3),
                 mcp_allow: &[
                     "read",
                     "chat",
@@ -111,8 +113,8 @@ impl Member {
             Self::Theo => Profile {
                 member: self,
                 name: "Theo",
-                role: "Researcher",
-                tuning: ModelTuning::new(5, 1, 5, 4, 5),
+                title: "Researcher",
+                tuning: ModelTuning::new(5, 5, 5),
                 mcp_allow: &["read", "chat", "comments", "issues", "reactions", "reviews"],
             },
         }
@@ -167,37 +169,98 @@ pub struct Profile {
     pub member: Member,
     /// Display name.
     pub name: &'static str,
-    /// Team role.
-    pub role: &'static str,
+    /// Team title.
+    pub title: &'static str,
     /// Model behavior preferences interpreted by the agent adapter.
     pub tuning: ModelTuning,
     /// MCP permission groups used when setup creates this member's binding.
     pub mcp_allow: &'static [&'static str],
 }
 
-/// Provider-neutral model behavior preferences rated from 1 to 5.
+/// One of the scores a member is rated on.
+///
+/// The names are the ones the roster shows, so a reader comparing `docs/members.md` against a
+/// provider configuration is reading one vocabulary rather than two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+pub enum Stat {
+    /// How sharp the member is.
+    #[serde(rename = "INT")]
+    Intelligence,
+    /// How closely the member sticks to the obvious answer.
+    #[serde(rename = "ACC")]
+    Accuracy,
+    /// How long the member keeps at a problem before giving up.
+    #[serde(rename = "STU")]
+    Stubbornness,
+}
+
+impl Stat {
+    /// Every score, in the order the roster lists them.
+    pub const ALL: [Self; 3] = [Self::Intelligence, Self::Accuracy, Self::Stubbornness];
+
+    /// Returns the three-letter name this score is written as.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Intelligence => "INT",
+            Self::Accuracy => "ACC",
+            Self::Stubbornness => "STU",
+        }
+    }
+}
+
+impl fmt::Display for Stat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.id())
+    }
+}
+
+/// What a member is like, rated 1 to 5.
+///
+/// A character sheet: these are read to decide who a job suits, not set by whoever runs one.
+///
+/// Three, because three is what can actually be set. Every score moves a control the agent
+/// application has: a model, how far it ranges before answering, and how long it works before
+/// stopping. Anything else a member is -- how it writes, what it cares about, when it pushes back
+/// -- is in its documents under `members/`, where prose says it far better than a number could.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelTuning {
-    /// Preferred model capability and reasoning quality.
+    /// How sharp the member is.
+    ///
+    /// Picks the model, so it carries speed with it: the sharper models are the slower ones.
     pub intelligence: u8,
-    /// Preference for response and execution speed.
-    pub speed: u8,
-    /// Preferred engineering autonomy and verification depth.
-    pub experience: u8,
-    /// Preferred breadth of solution exploration.
-    pub creativity: u8,
-    /// Preferred deliberation and risk awareness.
-    pub caution: u8,
+    /// How closely the member sticks to the obvious answer.
+    ///
+    /// One score for two controls which never appear together: a model which reasons takes a
+    /// reasoning effort and rejects a temperature, and a model which does not is the other way
+    /// round. High means deliberate and on-track either way.
+    pub accuracy: u8,
+    /// How long the member keeps at a problem before giving up.
+    ///
+    /// Double-edged on purpose. High keeps digging through a hard bug; it also keeps digging when
+    /// somebody should have been asked instead.
+    pub stubbornness: u8,
 }
 
 impl ModelTuning {
-    const fn new(intelligence: u8, speed: u8, experience: u8, creativity: u8, caution: u8) -> Self {
+    /// Highest a score goes. Every score runs from 1 to this.
+    pub const HIGHEST: u8 = 5;
+
+    const fn new(intelligence: u8, accuracy: u8, stubbornness: u8) -> Self {
         Self {
             intelligence,
-            speed,
-            experience,
-            creativity,
-            caution,
+            accuracy,
+            stubbornness,
+        }
+    }
+
+    /// Returns this member's score for `stat`.
+    #[must_use]
+    pub const fn score(self, stat: Stat) -> u8 {
+        match stat {
+            Stat::Intelligence => self.intelligence,
+            Stat::Accuracy => self.accuracy,
+            Stat::Stubbornness => self.stubbornness,
         }
     }
 }
@@ -209,7 +272,7 @@ pub struct UnknownMember(String);
 
 #[cfg(test)]
 mod tests {
-    use crate::member::{Member, UnknownMember};
+    use crate::member::{Member, Stat, UnknownMember};
 
     #[test]
     fn parses_every_member_id() {
@@ -256,19 +319,13 @@ mod tests {
             (Member::Theo, "Theo", "Researcher"),
         ];
 
-        for (member, name, role) in expected {
+        for (member, name, title) in expected {
             let profile = member.profile();
             assert_eq!(profile.member, member);
             assert_eq!(profile.name, name);
-            assert_eq!(profile.role, role);
-            for value in [
-                profile.tuning.intelligence,
-                profile.tuning.speed,
-                profile.tuning.experience,
-                profile.tuning.creativity,
-                profile.tuning.caution,
-            ] {
-                assert!((1..=5).contains(&value));
+            assert_eq!(profile.title, title);
+            for stat in Stat::ALL {
+                assert!((1..=5).contains(&profile.tuning.score(stat)));
             }
         }
     }

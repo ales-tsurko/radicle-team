@@ -124,11 +124,11 @@ pub struct InvalidSubject(String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     Assigned,
-    // Something happened that the talking half should answer.
+    // Something happened that the talking role should answer.
     Delivered(Delivery),
 }
 
-// An interaction the talking half handles itself.
+// An interaction the talking role handles itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Delivery {
     Mentioned(Target),

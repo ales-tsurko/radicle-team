@@ -32,7 +32,14 @@ signing_did = "did:key:z6Mk..."          # required
 generation = 1                           # required, monotonic
 state = "active"                         # required, "active" or "inactive"
 mcp_allow = ["read", "comments"]         # required, may be empty
+provider = "anthropic"                   # optional, a name from `radicle-team providers`
 ```
+
+`provider` names which models a member runs on, never a model itself: which
+model of that provider it gets is decided from the member's character sheet by
+that provider's own configuration, which is machine-local. Whoever runs the
+member holds its credentials and pays for it, so `radicle-team run --provider
+NAME` overrides what the manifest says.
 
 Every value here is read once at startup, so changing one needs a restart. The
 single exception is the delegate set, which is re-read on every scan: granting
@@ -128,12 +135,11 @@ Five tools sit outside `mcp_allow` entirely, and naming one there is rejected:
 and the four queue tools, which reach only the member's own queue and never the
 repository.
 
-The three adapters then divide what is left. The queue tools go to the talking
-and chatting adapters, since both decide that work is needed. `reply_chat` goes
-to the chatting adapter alone, because only it holds a message to answer.
-`create_patch` and `update_patch` go to the building adapter alone, since they
-need commits the other two cannot make. Everything else follows `mcp_allow` on
-all three.
+The three roles then divide what is left. The queue tools go to the talking and
+chatting roles, since both decide that work is needed. `reply_chat` goes to the
+chatting role alone, because only it holds a message to answer. `create_patch`
+and `update_patch` go to the building role alone, since they need commits the
+other two cannot make. Everything else follows `mcp_allow` on all three.
 
 
 

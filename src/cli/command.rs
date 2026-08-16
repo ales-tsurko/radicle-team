@@ -10,7 +10,10 @@ use radicle::{
 
 use crate::{
     Application,
-    cli::setup::{Error as SetupError, SetupWizard},
+    cli::{
+        provider as provider_command,
+        setup::{Error as SetupError, SetupWizard},
+    },
     home::ENVIRONMENT_VARIABLE,
     identity::{KeyProtection, Provider},
     member::Member,
@@ -38,37 +41,39 @@ impl Cli {
         match self.command {
             Command::Setup(_) => Mode::Setup,
             Command::Run(_) => Mode::Run,
+            Command::Providers(_) => Mode::Providers,
+            Command::Login(_) => Mode::Login,
         }
     }
 
-    /// Returns the selected team member.
+    /// Returns the selected team member, for the commands which run one.
     #[must_use]
-    pub const fn member(&self) -> Member {
-        self.options().member
+    pub fn member(&self) -> Option<Member> {
+        self.options().map(|options| options.member)
     }
 
-    /// Returns the repository to use.
+    /// Returns the repository to use, for the commands which need one.
     #[must_use]
-    pub const fn repository(&self) -> RepoId {
-        self.options().repo
+    pub fn repository(&self) -> Option<RepoId> {
+        self.options().map(|options| options.repo)
     }
 
     /// Returns the explicit application home, if configured.
     #[must_use]
     pub fn home(&self) -> Option<&Path> {
-        self.options().home.as_deref()
+        self.options()?.home.as_deref()
     }
 
-    /// Returns the selected identity provider.
+    /// Returns the selected identity provider, for the commands which load one.
     #[must_use]
-    pub fn identity_provider(&self) -> Provider {
-        self.options().identity_provider()
+    pub fn identity_provider(&self) -> Option<Provider> {
+        self.options().map(Options::identity_provider)
     }
 
     /// Returns the explicit repository manifest, if configured.
     #[must_use]
     pub fn manifest_file(&self) -> Option<&Path> {
-        self.options().manifest.as_deref()
+        self.options()?.manifest.as_deref()
     }
 
     /// Builds the configured application.
@@ -79,7 +84,10 @@ impl Cli {
     /// read.
     pub fn application(self) -> Result<Application, Error> {
         let mode = self.mode();
-        let options = self.command.into_options();
+        let options = self
+            .command
+            .into_options()
+            .ok_or(Error::NotAMemberCommand)?;
         let mut application = Application::new(options.member, options.repo)
             .with_identity_provider(options.identity_provider());
         match (options.home, mode) {
@@ -89,10 +97,13 @@ impl Cli {
                     Application::default_setup_home(options.member, options.repo)?.path(),
                 );
             }
-            (None, Mode::Run) => {}
+            (None, _) => {}
         }
         if let Some(manifest) = options.manifest {
             application = application.with_manifest_file(manifest);
+        }
+        if let Some(provider) = options.provider {
+            application = application.with_provider(provider);
         }
         for seed in options.seeds {
             application = application.with_seed(seed);
@@ -107,19 +118,36 @@ impl Cli {
     ///
     /// Returns an error when setup or member execution fails.
     pub async fn execute(self) -> Result<(), Error> {
-        let mode = self.mode();
-        let shutdown = Shutdown::install()?;
-        let application = self.application()?.with_shutdown(shutdown);
-        match mode {
-            Mode::Setup => SetupWizard::new(application)
-                .run()
-                .await
-                .map_err(Error::from),
-            Mode::Run => Box::pin(application.run()).await.map_err(Error::from),
+        match self.command {
+            Command::Providers(options) => {
+                provider_command::list_configured(options.home).map_err(Error::from)
+            }
+            Command::Login(options) => {
+                provider_command::login_configured(&options.provider, options.home)
+                    .map_err(Error::from)
+            }
+            command @ (Command::Setup(_) | Command::Run(_)) => {
+                Box::pin(Self { command }.run_member()).await
+            }
         }
     }
 
-    const fn options(&self) -> &Options {
+    // Runs the commands which need a member identity and a repository.
+    async fn run_member(self) -> Result<(), Error> {
+        let prepare = self.mode() == Mode::Setup;
+        let shutdown = Shutdown::install()?;
+        let application = self.application()?.with_shutdown(shutdown);
+        if prepare {
+            return SetupWizard::new(application)
+                .run()
+                .await
+                .map_err(Error::from);
+        }
+
+        Box::pin(application.run()).await.map_err(Error::from)
+    }
+
+    const fn options(&self) -> Option<&Options> {
         self.command.options()
     }
 }
@@ -139,6 +167,18 @@ pub enum Error {
     /// The member directory could not be resolved.
     #[error(transparent)]
     Home(#[from] crate::home::Error),
+    /// Listing or authorizing a model provider failed.
+    #[error(transparent)]
+    Provider(Box<provider_command::Error>),
+    /// A command which runs no member was asked for one.
+    #[error("this command does not run a team member")]
+    NotAMemberCommand,
+}
+
+impl From<provider_command::Error> for Error {
+    fn from(error: provider_command::Error) -> Self {
+        Self::Provider(Box::new(error))
+    }
 }
 
 impl From<crate::Error> for Error {
@@ -160,6 +200,10 @@ pub enum Mode {
     Setup,
     /// Run the member activity watcher.
     Run,
+    /// List the model providers this machine has.
+    Providers,
+    /// Authorize a model provider.
+    Login,
 }
 
 #[derive(Debug, Subcommand)]
@@ -168,45 +212,77 @@ enum Command {
     Setup(Options),
     /// Run a member.
     Run(Options),
+    /// List the model providers this machine can run members on.
+    Providers(ProvidersOptions),
+    /// Authorize a model provider.
+    Login(LoginOptions),
 }
 
 impl Command {
-    const fn options(&self) -> &Options {
+    const fn options(&self) -> Option<&Options> {
         match self {
-            Self::Setup(options) | Self::Run(options) => options,
+            Self::Setup(options) | Self::Run(options) => Some(options),
+            Self::Providers(_) | Self::Login(_) => None,
         }
     }
 
-    fn into_options(self) -> Options {
+    fn into_options(self) -> Option<Options> {
         match self {
-            Self::Setup(options) | Self::Run(options) => options,
+            Self::Setup(options) | Self::Run(options) => Some(options),
+            Self::Providers(_) | Self::Login(_) => None,
         }
     }
 }
 
 #[derive(Debug, Args)]
+struct ProvidersOptions {
+    // Also report what this member alone was authorized with.
+    //
+    // The same store `login --home` writes to. Without it the listing sees only the machine-wide
+    // one, and a member-scoped login reads as never having happened.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct LoginOptions {
+    // Provider to authorize, as listed by `providers`.
+    provider: String,
+    // Authorize this member alone rather than everything on the machine.
+    //
+    // Deliberately not read from the environment, unlike the member commands. An exported member
+    // home would otherwise redirect a machine-wide login into one member's store, which nothing
+    // else looks in.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct Options {
-    /// Team member to select: nico, maya, leon, vera, nora, or theo.
+    // Team member to select: nico, maya, leon, vera, nora, or theo.
     member: Member,
-    /// Radicle repository to prepare or watch.
+    // Radicle repository to prepare or watch.
     #[arg(short, long)]
     repo: RepoId,
-    /// Application home containing isolated member data.
+    // Application home containing isolated member data.
     #[arg(long, env = ENVIRONMENT_VARIABLE, value_name = "PATH")]
     home: Option<PathBuf>,
-    /// Use a dedicated existing Radicle home instead of a managed identity.
+    // Use a dedicated existing Radicle home instead of a managed identity.
     #[arg(long, value_name = "PATH", conflicts_with = "unencrypted_identity")]
     identity_home: Option<PathBuf>,
-    /// Require an existing Radicle home to derive this DID.
+    // Require an existing Radicle home to derive this DID.
     #[arg(long, requires = "identity_home", value_name = "DID")]
     expected_did: Option<Did>,
-    /// Create a permissions-protected managed key without encryption.
+    // Create a permissions-protected managed key without encryption.
     #[arg(long)]
     unencrypted_identity: bool,
-    /// Use an explicit repository manifest.
+    // Run on this model provider instead of the one the manifest names.
+    #[arg(long, value_name = "NAME")]
+    provider: Option<String>,
+    // Use an explicit repository manifest.
     #[arg(long, value_name = "PATH")]
     manifest: Option<PathBuf>,
-    /// Prefer this seed while synchronizing. May be repeated.
+    // Prefer this seed while synchronizing. May be repeated.
     #[arg(long = "seed", value_name = "NID")]
     seeds: Vec<NodeId>,
 }
@@ -246,7 +322,7 @@ mod tests {
         for member in Member::ALL {
             assert!(matches!(
                 Cli::try_parse_from(["radicle-team", "run", member.id(), "--repo", REPOSITORY]),
-                Ok(cli) if cli.member() == member
+                Ok(cli) if cli.member() == Some(member)
             ));
         }
     }
@@ -257,9 +333,11 @@ mod tests {
             Cli::try_parse_from(["radicle-team", "run", "nico", "--repo", REPOSITORY]),
             Ok(cli)
                 if cli.repository()
-                    == REPOSITORY
-                        .parse::<RepoId>()
-                        .expect("repository ID should be valid")
+                    == Some(
+                        REPOSITORY
+                            .parse::<RepoId>()
+                            .expect("repository ID should be valid")
+                    )
         ));
     }
 
@@ -299,7 +377,7 @@ mod tests {
 
         assert!(matches!(
             cli.identity_provider(),
-            crate::identity::Provider::RadicleHome { home, expected_did }
+            Some(crate::identity::Provider::RadicleHome { home, expected_did })
                 if home == std::path::Path::new("/radicle")
                     && expected_did == Some(DID.parse().expect("DID should parse"))
         ));
@@ -323,9 +401,9 @@ mod tests {
 
         assert_eq!(
             cli.identity_provider(),
-            crate::identity::Provider::Managed {
+            Some(crate::identity::Provider::Managed {
                 protection: crate::identity::KeyProtection::Unencrypted,
-            }
+            })
         );
     }
 

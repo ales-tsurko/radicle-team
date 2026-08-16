@@ -5,7 +5,7 @@
 //! conversation dispatcher. The dispatcher invokes the `Talker` and acknowledges successful
 //! handling before the watcher checkpoints the activity. Assignments are the exception: they are
 //! work rather than conversation, so they join the member's [`WorkQueue`](crate::queue::WorkQueue)
-//! and reach the building half through [`Builder`](crate::builder::Builder).
+//! and reach the building role through [`Builder`](crate::builder::Builder).
 //!
 //! # Lifecycle
 //!

@@ -6,4 +6,5 @@ pub use crate::cli::{
 };
 
 mod command;
+pub(crate) mod provider;
 mod setup;

@@ -2,7 +2,7 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::{collections::BTreeMap, fs, io, io::Write as _, path::Path};
+use std::{collections::BTreeMap, fmt, fs, io, io::Write as _, path::Path};
 
 use radicle::identity::Did;
 use serde::Serialize;
@@ -19,16 +19,30 @@ use crate::{
 pub(crate) struct ManifestEntry {
     pub(super) member: Member,
     pub(super) did: Did,
-    pub(super) generation: u64,
+    /// Narrowed here rather than at each use, so rendering a binding cannot fail.
+    ///
+    /// TOML holds no integer wider than this, so a generation which does not fit is an entry that
+    /// could never be written. Saying so once, where it can be reported, beats every renderer
+    /// carrying a failure it has no way to express.
+    pub(super) generation: i64,
+    pub(super) provider: Option<String>,
 }
 
 impl ManifestEntry {
-    pub(super) fn new(application: &Application, setup: &Setup) -> Self {
-        Self {
+    pub(super) fn new(application: &Application, setup: &Setup) -> Result<Self, Error> {
+        Ok(Self {
             member: application.member(),
             did: setup.did(),
-            generation: setup.status().generation(),
-        }
+            generation: i64::try_from(setup.status().generation())?,
+            provider: None,
+        })
+    }
+
+    /// Records which model provider this member is to run on.
+    #[must_use]
+    pub(super) fn with_provider(mut self, provider: Option<String>) -> Self {
+        self.provider = provider;
+        self
     }
 }
 
@@ -70,6 +84,7 @@ impl<'a> SetupDocument<'a> {
                     generation: entry.generation,
                     state: "active",
                     mcp_allow: entry.member.profile().mcp_allow,
+                    provider: entry.provider.clone(),
                 },
             )]),
         }
@@ -89,9 +104,11 @@ struct SetupSecurity<'a> {
 #[derive(Serialize)]
 struct SetupBinding {
     signing_did: Did,
-    generation: u64,
+    generation: i64,
     state: &'static str,
     mcp_allow: &'static [&'static str],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
 }
 
 impl ManifestUpdate {
@@ -159,7 +176,7 @@ impl ManifestEntry {
                 _ => false,
             });
         match Manifest::validate_candidate(contents, self.member, self.did) {
-            Ok(binding) if binding.generation() == self.generation => {
+            Ok(binding) if binding.generation() == self.generation.unsigned_abs() => {
                 return Ok(contents.to_owned());
             }
             Ok(_)
@@ -177,10 +194,10 @@ impl ManifestEntry {
         let members = document.get_mut("members").ok_or(Error::MissingManifest)?;
         match members {
             Item::Table(members) => {
-                let _previous = members.insert(self.member.id(), Item::Table(self.table()?));
+                let _previous = members.insert(self.member.id(), Item::Table(self.table()));
             }
             Item::Value(Value::InlineTable(members)) => {
-                let _previous = members.insert(self.member.id(), self.inline_table()?);
+                let _previous = members.insert(self.member.id(), self.inline_table());
             }
             _ => return Err(Error::InvalidMembers),
         }
@@ -188,28 +205,30 @@ impl ManifestEntry {
         Ok(document.to_string())
     }
 
-    fn table(&self) -> Result<Table, Error> {
+    fn table(&self) -> Table {
         let mut binding = Table::new();
         let _previous = binding.insert("signing_did", value(self.did.to_string()));
-        let _previous = binding.insert("generation", value(self.generation()?));
+        let _previous = binding.insert("generation", value(self.generation));
         let _previous = binding.insert("state", value("active"));
         let _previous = binding.insert("mcp_allow", value(self.mcp_allow()));
+        if let Some(provider) = &self.provider {
+            let _previous = binding.insert("provider", value(provider));
+        }
 
-        Ok(binding)
+        binding
     }
 
-    fn inline_table(&self) -> Result<Value, Error> {
+    fn inline_table(&self) -> Value {
         let mut binding = InlineTable::new();
         let _previous = binding.insert("signing_did", self.did.to_string().into());
-        let _previous = binding.insert("generation", self.generation()?.into());
+        let _previous = binding.insert("generation", self.generation.into());
         let _previous = binding.insert("state", "active".into());
         let _previous = binding.insert("mcp_allow", self.mcp_allow().into());
+        if let Some(provider) = &self.provider {
+            let _previous = binding.insert("provider", provider.as_str().into());
+        }
 
-        Ok(binding.into())
-    }
-
-    fn generation(&self) -> Result<i64, Error> {
-        Ok(i64::try_from(self.generation)?)
+        binding.into()
     }
 
     fn mcp_allow(&self) -> Array {
@@ -264,22 +283,18 @@ impl ManifestEntry {
     }
 }
 
-impl std::fmt::Display for ManifestEntry {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+// Rendered from the same table the manifest is written from, so what an operator is told to paste
+// is what setup would have written. Two renderers is how a new field reaches the file and not the
+// instructions.
+impl fmt::Display for ManifestEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let binding = self.table().to_string();
+
         write!(
             formatter,
-            "[members.{member}]\nsigning_did = \"{did}\"\ngeneration = {generation}\nstate = \
-             \"active\"\nmcp_allow = [",
-            member = self.member,
-            did = self.did,
-            generation = self.generation,
-        )?;
-        for (index, permission) in self.member.profile().mcp_allow.iter().enumerate() {
-            if index > 0 {
-                formatter.write_str(", ")?;
-            }
-            write!(formatter, "\"{permission}\"")?;
-        }
-        formatter.write_str("]")
+            "[members.{}]\n{}",
+            self.member,
+            binding.trim_end()
+        )
     }
 }

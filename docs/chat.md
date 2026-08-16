@@ -18,17 +18,17 @@ IRC is in [the architecture notes](architecture.md#rejected-irc-alternatives).
 
 ## What chat costs
 
-A member answering chat runs a third agent adapter beside the talking and
-building ones, with its own MCP server and its own checked-out workspace. When a
-message arrives while the member is reviewing a patch and building another, all
-three are live at once.
+A member answering chat runs a third agent beside the talking and building ones,
+with its own MCP server and its own checked-out workspace. When a message
+arrives while the member is reviewing a patch and building another, all three
+are live at once.
 
 That is the price of an answer arriving now. An agent turn cannot be
-interrupted, so a shared adapter would make every question wait for whatever
+interrupted, so a shared agent would make every question wait for whatever
 review happened to start first.
 
-Omitting `[chat]` from the manifest costs nothing. Neither the adapter nor its
-MCP server is started, and the member runs two.
+Omitting `[chat]` from the manifest costs nothing. Neither the agent nor its MCP
+server is started, and the member runs two.
 
 
 

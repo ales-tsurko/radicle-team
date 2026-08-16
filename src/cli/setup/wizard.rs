@@ -15,7 +15,19 @@ use crate::{
     },
     manifest::{FILE_NAME, TriggerAccess},
     member::Member,
+    provider::{self, Installed, Provider, credentials},
 };
+
+// The provider a member is to run on, beside the name it is written into the manifest under, or
+// nothing when the operator left it to the agent application.
+type Chosen<'a> = Option<(&'a String, &'a Provider)>;
+
+// Pairs a name with its provider, dropping the files which could not be read.
+fn readable<'a>(
+    (name, provider): (&'a String, &'a Result<Provider, provider::Error>),
+) -> Option<(&'a String, &'a Provider)> {
+    provider.as_ref().ok().map(|provider| (name, provider))
+}
 
 /// Guides a user through identity and repository setup.
 #[derive(Debug)]
@@ -32,7 +44,7 @@ impl SetupWizard {
         if !Self::is_interactive() {
             let setup = self.application.setup().await?;
             self.initialize_sandbox()?;
-            println!("{}", self.noninteractive_output(setup));
+            println!("{}", self.noninteractive_output(setup)?);
             return Ok(());
         }
 
@@ -40,31 +52,48 @@ impl SetupWizard {
         self.run_interactive().await
     }
 
-    fn noninteractive_output(&self, setup: Setup) -> String {
-        match (self.application.manifest_file(), setup.status()) {
-            (
-                Some(path),
-                status @ (SetupStatus::ManifestMissing { .. } | SetupStatus::BindingMissing { .. }),
-            ) => {
-                let entry = ManifestEntry::new(&self.application, &setup);
-                Self::with_chat_certificate(
-                    Self::explicit_manifest_output(path, entry, status),
-                    self.application.member(),
-                    &setup,
-                )
+    fn noninteractive_output(&self, setup: Setup) -> Result<String, Error> {
+        let Some(status) = Self::pending(setup.status()) else {
+            return Ok(setup.to_string());
+        };
+        let entry =
+            ManifestEntry::new(&self.application, &setup)?.with_provider(self.named_provider()?);
+        let output = match self.application.manifest_file() {
+            Some(path) => Self::explicit_manifest_output(path, entry, status),
+            None => Self::repository_manifest_output(entry, status),
+        };
+
+        Ok(Self::with_chat_certificate(
+            output,
+            self.application.member(),
+            &setup,
+        ))
+    }
+
+    // Refuses a `--provider` nobody installed, on the path which cannot ask.
+    //
+    // The same guard the interactive run applies. Without it a typo is printed in the binding the
+    // operator is told to paste, accepted in the shared manifest forever because it is a plain
+    // name, and the member it names has no credentials and no models.
+    pub(super) fn named_provider(&self) -> Result<Option<String>, Error> {
+        let Some(named) = self.application.provider() else {
+            return Ok(None);
+        };
+        let providers = provider::installed(&provider::configuration()?)?;
+        if !matches!(providers.get(named), Some(Ok(_provider))) {
+            return Err(Self::unusable(&providers, named));
+        }
+
+        Ok(Some(named.to_owned()))
+    }
+
+    // The two statuses which still need a binding written. `Ready` needs none.
+    const fn pending(status: SetupStatus) -> Option<SetupStatus> {
+        match status {
+            SetupStatus::ManifestMissing { .. } | SetupStatus::BindingMissing { .. } => {
+                Some(status)
             }
-            (
-                None,
-                status @ (SetupStatus::ManifestMissing { .. } | SetupStatus::BindingMissing { .. }),
-            ) => Self::with_chat_certificate(
-                Self::repository_manifest_output(
-                    ManifestEntry::new(&self.application, &setup),
-                    status,
-                ),
-                self.application.member(),
-                &setup,
-            ),
-            _ => setup.to_string(),
+            SetupStatus::Ready { .. } => None,
         }
     }
 
@@ -127,32 +156,28 @@ impl SetupWizard {
     }
 
     async fn run_interactive(&self) -> Result<(), Error> {
-        let mut policy = None;
+        let mut decided = Decisions::default();
         loop {
-            if self.step(&mut policy).await? == Step::Complete {
+            if self.step(&mut decided).await? == Step::Complete {
                 return Ok(());
             }
         }
     }
 
-    async fn step(&self, policy: &mut Option<NewManifestPolicy>) -> Result<Step, Error> {
+    async fn step(&self, decided: &mut Decisions) -> Result<Step, Error> {
         match self.attempt().await {
-            Ok(setup) => self.handle_setup(setup, policy).await,
+            Ok(setup) => self.handle_setup(setup, decided).await,
             Err(error) => self.handle_error(error),
         }
     }
 
-    async fn handle_setup(
-        &self,
-        setup: Setup,
-        policy: &mut Option<NewManifestPolicy>,
-    ) -> Result<Step, Error> {
+    async fn handle_setup(&self, setup: Setup, decided: &mut Decisions) -> Result<Step, Error> {
         if matches!(setup.status(), SetupStatus::Ready { .. }) {
             self.configure_sandbox()?;
             cliclack::outro(setup)?;
             Ok(Step::Complete)
         } else {
-            self.prepare_manifest(setup, policy).await?;
+            self.prepare_manifest(setup, decided).await?;
             Ok(Step::Retry)
         }
     }
@@ -176,12 +201,8 @@ impl SetupWizard {
             .inspect_err(|_| spinner.error("Setup needs attention"))
     }
 
-    async fn prepare_manifest(
-        &self,
-        setup: Setup,
-        policy: &mut Option<NewManifestPolicy>,
-    ) -> Result<(), Error> {
-        let update = self.manifest_update(&setup, policy).await?;
+    async fn prepare_manifest(&self, setup: Setup, decided: &mut Decisions) -> Result<(), Error> {
+        let update = self.manifest_update(&setup, decided).await?;
         self.show_manifest(update.entry())?;
         if let Some(path) = self.application.manifest_file() {
             return self.prepare_explicit_manifest(path, update).await;
@@ -193,11 +214,13 @@ impl SetupWizard {
     async fn manifest_update(
         &self,
         setup: &Setup,
-        policy: &mut Option<NewManifestPolicy>,
+        decided: &mut Decisions,
     ) -> Result<ManifestUpdate, Error> {
         match setup.status() {
-            SetupStatus::ManifestMissing { .. } => self.create_manifest_update(setup, policy).await,
-            SetupStatus::BindingMissing { .. } => self.extend_manifest_update(setup).await,
+            SetupStatus::ManifestMissing { .. } => {
+                self.create_manifest_update(setup, decided).await
+            }
+            SetupStatus::BindingMissing { .. } => self.extend_manifest_update(setup, decided).await,
             SetupStatus::Ready { .. } => Err(Error::ReadyManifest),
         }
     }
@@ -205,21 +228,27 @@ impl SetupWizard {
     async fn create_manifest_update(
         &self,
         setup: &Setup,
-        policy: &mut Option<NewManifestPolicy>,
+        decided: &mut Decisions,
     ) -> Result<ManifestUpdate, Error> {
-        let policy = match policy {
+        let policy = match &mut decided.policy {
             Some(policy) => policy.clone(),
-            None => policy
+            policy => policy
                 .insert(self.prompt_new_policy(setup.did()).await?)
                 .clone(),
         };
-        let entry = ManifestEntry::new(&self.application, setup);
+        let entry = self.entry(setup, decided)?;
 
         Ok(ManifestUpdate::create(
             entry,
             policy.security,
             policy.triggered_by,
         ))
+    }
+
+    // The binding both paths write. Which provider it names is decided the same way whether the
+    // manifest is being created or extended, so it is settled in one place.
+    fn entry(&self, setup: &Setup, decided: &mut Decisions) -> Result<ManifestEntry, Error> {
+        Ok(ManifestEntry::new(&self.application, setup)?.with_provider(self.provider(decided)?))
     }
 
     async fn prompt_new_policy(&self, did: Did) -> Result<NewManifestPolicy, Error> {
@@ -273,11 +302,121 @@ impl SetupWizard {
         Ok(TriggerAccess::Dids(dids))
     }
 
-    async fn extend_manifest_update(&self, setup: &Setup) -> Result<ManifestUpdate, Error> {
+    async fn extend_manifest_update(
+        &self,
+        setup: &Setup,
+        decided: &mut Decisions,
+    ) -> Result<ManifestUpdate, Error> {
         self.grant_security_access(setup).await?;
-        let entry = ManifestEntry::new(&self.application, setup);
+        let entry = self.entry(setup, decided)?;
 
         Ok(ManifestUpdate::extend(entry))
+    }
+
+    // Asks which model provider this member should run on, and authorizes it if it needs it.
+    //
+    // Leaving it unset is allowed and means the agent application decides, which is what somebody
+    // setting up their first member before choosing a provider wants.
+    fn provider(&self, decided: &mut Decisions) -> Result<Option<String>, Error> {
+        if let Some(chosen) = &decided.provider {
+            return Ok(chosen.clone());
+        }
+
+        Ok(decided.provider.insert(self.decide_provider()?).clone())
+    }
+
+    fn decide_provider(&self) -> Result<Option<String>, Error> {
+        let configuration = provider::configuration()?;
+        let providers = provider::installed(&configuration)?;
+        let chosen = self.choice(&providers)?;
+        self.authorize_chosen(&configuration, chosen)?;
+
+        Ok(chosen.map(|(name, _provider)| name.clone()))
+    }
+
+    // The command line wins over the question, because whoever runs the member holds its
+    // credentials and pays for it.
+    //
+    // The provider comes back beside its name, so authorizing it is not a second lookup which has
+    // to invent an answer for a name that cannot be missing.
+    pub(super) fn choice<'a>(&self, providers: &'a Installed) -> Result<Chosen<'a>, Error> {
+        let Some(named) = self.application.provider() else {
+            return Self::ask(providers);
+        };
+
+        // A name nobody installed would be written into the shared manifest and accepted there
+        // forever, while the member it names has no credentials and no models. A name whose file
+        // is unreadable fails on that file, which is the thing to go and fix.
+        match providers.get_key_value(named) {
+            Some((name, Ok(provider))) => Ok(Some((name, provider))),
+            _ => Err(Self::unusable(providers, named)),
+        }
+    }
+
+    // Says why a named provider cannot be used, in its own file's words where it has any. "Unknown"
+    // would send the operator looking for a file which is sitting right there, broken.
+    fn unusable(providers: &Installed, named: &str) -> Error {
+        match providers.get(named) {
+            Some(Err(error)) => provider::Error::Unusable {
+                provider: named.to_owned(),
+                reason: error.to_string(),
+            },
+            _ => provider::Error::Unknown(named.to_owned()),
+        }
+        .into()
+    }
+
+    // Only the providers which read. One unusable file is not a choice to offer, and it must not
+    // stop the operator picking one of the others.
+    fn ask(providers: &Installed) -> Result<Chosen<'_>, Error> {
+        let mut select = cliclack::select("Which models should this member run on?").item(
+            None,
+            "decide later",
+            "the agent application's own default",
+        );
+        for (name, provider) in providers.iter().filter_map(readable) {
+            select = select.item(Some((name, provider)), name, provider.adapter());
+        }
+
+        select.interact().map_err(Error::from)
+    }
+
+    fn authorize_chosen(&self, configuration: &Path, chosen: Chosen<'_>) -> Result<(), Error> {
+        let Some((name, provider)) = chosen else {
+            return Ok(());
+        };
+
+        self.authorize(configuration, name, provider)
+    }
+
+    // Logs in when this provider has no credentials yet, so the member does not finish setup only
+    // to fail at its first delivery.
+    pub(super) fn authorize(
+        &self,
+        configuration: &Path,
+        name: &str,
+        provider: &Provider,
+    ) -> Result<(), Error> {
+        if !provider.needs_authorizing() {
+            return Ok(());
+        }
+        // Read and write the machine's own store, which is where one account for one person
+        // belongs. Billing a project separately is `login --home`, asked for deliberately.
+        let mine = self.application.home().map(credentials::directory);
+        let held = credentials::load(
+            &credentials::directory(configuration),
+            mine.as_deref(),
+            name,
+        )?;
+        if held.is_some() {
+            return Ok(());
+        }
+        let path = crate::cli::provider::login_with(provider, configuration, name, None)?;
+        // Logged, not an outro: the wizard still has questions to ask, and an outro closes the
+        // session out from under them.
+        cliclack::log::success(format!("{name} authorized in {}", path.display()))?;
+
+        Ok(())
     }
 
     async fn provision_security(&self, did: Did) -> Result<SecurityManifest, Error> {
@@ -544,6 +683,34 @@ enum SecurityRepositoryChoice {
     Existing,
 }
 
+impl From<crate::cli::provider::Error> for Error {
+    fn from(error: crate::cli::provider::Error) -> Self {
+        Self::Provider(Box::new(error))
+    }
+}
+
+impl From<crate::provider::Error> for Error {
+    fn from(error: crate::provider::Error) -> Self {
+        crate::cli::provider::Error::from(error).into()
+    }
+}
+
+impl From<crate::provider::CredentialsError> for Error {
+    fn from(error: crate::provider::CredentialsError) -> Self {
+        crate::cli::provider::Error::from(error).into()
+    }
+}
+
+// What the operator has already been asked, so a retry does not ask it again.
+//
+// The wizard loops until the manifest reaches the canonical branch, which on a fresh repository
+// takes several passes. Every question the operator answers belongs here.
+#[derive(Debug, Default)]
+struct Decisions {
+    policy: Option<NewManifestPolicy>,
+    provider: Option<Option<String>>,
+}
+
 /// Error running interactive setup.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -562,6 +729,12 @@ pub enum Error {
     /// Local sandbox configuration is unsafe or invalid.
     #[error(transparent)]
     Sandbox(#[from] crate::sandbox::ConfigError),
+    /// Choosing or authorizing a model provider failed.
+    ///
+    /// One variant rather than three: the same failure reaches here through the listing and
+    /// through the login, and two spellings of it is a match nobody can write correctly.
+    #[error(transparent)]
+    Provider(Box<crate::cli::provider::Error>),
     /// A binding generation cannot be represented as a TOML integer.
     #[error("binding generation is too large: {0}")]
     Generation(#[from] std::num::TryFromIntError),

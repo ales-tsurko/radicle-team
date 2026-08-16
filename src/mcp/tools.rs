@@ -16,7 +16,7 @@ use rmcp::{
 use serde::Serialize;
 
 use crate::{
-    agent::{Publisher, Source, WorkId},
+    agent::{Publisher, Role, Source, WorkId},
     chat::State as ChatState,
     manifest::McpAllowlist,
     mcp::{
@@ -32,22 +32,22 @@ use crate::{
         },
         read::serialize,
         security::SecurityReporting,
-        server::{Role, ServiceError, WorkAccess, WorkScope},
+        server::{ServiceError, WorkAccess, WorkScope},
     },
     queue::WorkQueue,
 };
 
-// Tools which coordinate the member's two halves rather than write to the repository.
+// Tools which coordinate the member's roles rather than write to the repository.
 const QUEUE_TOOLS: [&str; 4] = ["add_job", "cancel", "note", "work_status"];
-// Tools which need commits that only the building half can make.
+// Tools which need commits that only the building role can make.
 const BUILDING_TOOLS: [&str; 2] = ["create_patch", "update_patch"];
-// Tool which only the chatting adapter can use, while handling an authenticated message.
+// Tool which only the chatting role can use, while handling an authenticated message.
 const CHAT_TOOLS: [&str; 1] = ["reply_chat"];
 // Tool which every member may always reach, whatever the manifest allows.
 const SECURITY_TOOL: &str = "report_security_issue";
 
 impl Role {
-    // Returns whether this half of a member can make any use of `method`.
+    // Returns whether this role of a member can make any use of `method`.
     pub(super) fn allows(self, method: &str) -> bool {
         match self {
             Self::Talker => !BUILDING_TOOLS.contains(&method) && !CHAT_TOOLS.contains(&method),
@@ -630,7 +630,7 @@ impl ToolService {
     }
 
     #[tool(
-        description = "Record work for the building half of this member, which carries it out \
+        description = "Record work for the building role of this member, which carries it out \
                        under the same identity"
     )]
     async fn add_job(

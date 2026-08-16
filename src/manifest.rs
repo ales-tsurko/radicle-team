@@ -172,6 +172,7 @@ impl Manifest {
         if binding.state != BindingState::Active {
             return Err(Error::Inactive(member));
         }
+        Self::validate_provider_name(member, binding)?;
         if binding.signing_did != did {
             return Err(Error::DidMismatch {
                 member,
@@ -182,10 +183,8 @@ impl Manifest {
 
         Ok(ValidatedBinding::new(
             member,
-            binding.signing_did,
-            binding.generation,
+            binding,
             self.revision,
-            binding.mcp_allow.clone(),
             self.security.clone(),
             RepositoryPolicy::new(
                 self.triggered_by.clone(),
@@ -195,6 +194,26 @@ impl Manifest {
             )
             .with_chat(self.chat.clone()),
         ))
+    }
+
+    // Refuses a provider name which is not a plain name.
+    //
+    // This member's binding alone. The name is written by whoever writes the repository and becomes
+    // a file name under the operator's configuration directory, but only for the member being
+    // resolved -- one member's name can never reach another's filesystem. Checking the whole
+    // document instead would stop all six over a line five of them never read.
+    fn validate_provider_name(member: Member, binding: &Binding) -> Result<(), Error> {
+        let Some(provider) = &binding.provider else {
+            return Ok(());
+        };
+        if crate::provider::is_plain_name(provider) {
+            return Ok(());
+        }
+
+        Err(Error::ProviderName {
+            member,
+            provider: provider.clone(),
+        })
     }
 
     fn active_member_dids(&self) -> Vec<Did> {
@@ -270,6 +289,8 @@ pub struct Binding {
     generation: u64,
     state: BindingState,
     mcp_allow: McpAllowlist,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 impl Binding {
@@ -295,6 +316,26 @@ impl Binding {
     #[must_use]
     pub fn mcp_allow(&self) -> &McpAllowlist {
         &self.mcp_allow
+    }
+
+    /// Returns a binding for tests which need one without parsing a manifest.
+    #[cfg(all(test, not(miri)))]
+    pub(crate) fn test(signing_did: Did, generation: u64) -> Self {
+        Self {
+            signing_did,
+            generation,
+            state: BindingState::Active,
+            mcp_allow: McpAllowlist::default(),
+            provider: None,
+        }
+    }
+
+    /// Uses `provider` as the model provider this binding names.
+    #[cfg(all(test, not(miri)))]
+    #[must_use]
+    pub(crate) fn with_provider(mut self, provider: Option<&str>) -> Self {
+        self.provider = provider.map(str::to_owned);
+        self
     }
 }
 
@@ -571,30 +612,36 @@ pub struct ValidatedBinding {
     did: Did,
     generation: u64,
     revision: Revision,
+    provider: Option<String>,
     mcp_allow: McpAllowlist,
     security: SecurityPolicy,
     triggers: RepositoryPolicy,
 }
 
 impl ValidatedBinding {
-    pub(super) const fn new(
+    pub(super) fn new(
         member: Member,
-        did: Did,
-        generation: u64,
+        binding: &Binding,
         revision: Revision,
-        mcp_allow: McpAllowlist,
         security: SecurityPolicy,
         triggers: RepositoryPolicy,
     ) -> Self {
         Self {
             member,
-            did,
-            generation,
+            did: binding.signing_did,
+            generation: binding.generation,
             revision,
-            mcp_allow,
+            provider: binding.provider.clone(),
+            mcp_allow: binding.mcp_allow.clone(),
             security,
             triggers,
         }
+    }
+
+    /// Returns the model provider the manifest names for this member, if any.
+    #[must_use]
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
     }
 
     /// Returns the repository-wide policy this binding was validated against.
@@ -839,6 +886,17 @@ pub enum Error {
     /// The external manifest has unsafe ownership or permissions.
     #[error("unsafe repository manifest: {0}")]
     Permissions(#[from] crate::identity::PermissionError),
+    /// A member names a provider which is not a plain name.
+    #[error(
+        "member '{member}' names provider '{provider}', which is not a plain name; a provider is \
+         named with letters, digits, '-', '_' and '.'"
+    )]
+    ProviderName {
+        /// Member whose binding names it.
+        member: Member,
+        /// Name the manifest carries.
+        provider: String,
+    },
     /// Computing the canonical repository head failed.
     #[error("failed to resolve canonical repository head: {0}")]
     Repository(#[from] RepositoryError),
@@ -1171,6 +1229,69 @@ mod tests {
             )),
             Err(Error::Parse(_))
         ));
+    }
+
+    // The name comes from whoever writes the repository and becomes a file name under the
+    // operator's own configuration directory. Anything but a plain name is a path out of it.
+    #[test]
+    fn refuses_a_provider_name_which_is_a_path() {
+        let manifest = |provider: &str| {
+            format!(
+                "version = 1\n\n[security]\nrepository = \"{REPOSITORY}\"\nrecipients = \
+                 [\"{RECIPIENT}\"]\n\n[members.nico]\nsigning_did = \"{NICO}\"\ngeneration = \
+                 1\nstate = \"active\"\nmcp_allow = [\"read\"]\nprovider = \"{provider}\"\n"
+            )
+        };
+        let did = NICO.parse::<Did>().expect("DID should parse");
+
+        Manifest::validate_candidate(&manifest("openai"), Member::Nico, did)
+            .expect("a plain name must be accepted");
+
+        // An inactive binding's provider is read by nothing, so a stale line in a shared file must
+        // not fail every other member on the repository.
+        let retired = manifest("openai").replace(
+            "[members.nico]",
+            "[members.maya]\nsigning_did = \
+             \"did:key:z6MkvUJtYD9dHDJfpevWRT98mzDDpdAtmUjwyDSkyqksUr7C\"\ngeneration = 1\nstate \
+             = \"inactive\"\nmcp_allow = []\nprovider = \"../old\"\n\n[members.nico]",
+        );
+        Manifest::validate_candidate(&retired, Member::Nico, did)
+            .expect("a retired binding must not fail the members which are working");
+
+        // Nor may a working one. Only the resolved member's provider ever becomes a file name, so a
+        // name Maya cannot use is Maya's problem; failing Nico too takes the whole team down over a
+        // field Nico never reads.
+        let sibling = manifest("openai").replace(
+            "[members.nico]",
+            "[members.maya]\nsigning_did = \
+             \"did:key:z6MkvUJtYD9dHDJfpevWRT98mzDDpdAtmUjwyDSkyqksUr7C\"\ngeneration = 1\nstate \
+             = \"active\"\nmcp_allow = []\nprovider = \"../escape\"\n\n[members.nico]",
+        );
+        Manifest::validate_candidate(&sibling, Member::Nico, did)
+            .expect("another active member's bad provider name must not stop this one");
+        assert!(
+            matches!(
+                Manifest::validate_candidate(
+                    &sibling,
+                    Member::Maya,
+                    "did:key:z6MkvUJtYD9dHDJfpevWRT98mzDDpdAtmUjwyDSkyqksUr7C"
+                        .parse::<Did>()
+                        .expect("DID should parse")
+                ),
+                Err(Error::ProviderName { .. })
+            ),
+            "the member whose own name it is must still be refused"
+        );
+
+        for escape in ["../../etc/passwd", "/etc/passwd", ".hidden", ""] {
+            assert!(
+                matches!(
+                    Manifest::validate_candidate(&manifest(escape), Member::Nico, did),
+                    Err(Error::ProviderName { .. })
+                ),
+                "'{escape}' must be refused rather than turned into a path"
+            );
+        }
     }
 
     #[test]

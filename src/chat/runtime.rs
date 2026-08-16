@@ -481,7 +481,7 @@ pub(crate) enum Error {
     /// Reading the repository's current delegates failed.
     #[error("failed to resolve repository delegates: {0}")]
     Delegates(String),
-    /// The shared talking adapter rejected the message.
+    /// The shared talking agent rejected the message.
     #[error("chat delivery failed: {0}")]
     Delivery(String),
     /// Durable outbox state names a channel absent from current policy.

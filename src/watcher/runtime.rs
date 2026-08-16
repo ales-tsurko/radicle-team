@@ -472,7 +472,7 @@ impl Watcher {
     }
 }
 
-// Everything one scan needs in order to hand work to the member's two halves.
+// Everything one scan needs in order to hand work to the member's roles.
 #[derive(Debug, Clone)]
 pub(crate) struct DeliveryRuntime {
     storage: Storage,
@@ -497,7 +497,7 @@ impl DeliveryRuntime {
         }
     }
 
-    // Reads the assigned subject as a job the building half can start from.
+    // Reads the assigned subject as a job the building role can start from.
     async fn assignment(&self, repository: RepoId, subject: Subject) -> Result<Assignment, Error> {
         let storage = self.storage.clone();
         let priority = self.priority.clone();
@@ -1226,7 +1226,7 @@ mod tests {
         assert!(
             pending[0].brief.contains("Fix the parser")
                 && pending[0].brief.contains("It drops the last field."),
-            "the brief must carry the request, so the building half can start without rereading \
+            "the brief must carry the request, so the building role can start without rereading \
              the issue: {}",
             pending[0].brief
         );

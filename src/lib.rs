@@ -5,21 +5,24 @@
 //! watcher state. `setup` provisions and validates those resources, and `run` keeps them alive
 //! while repository activity is observed.
 //!
-//! # Three adapters, one member
+//! # Three roles, one member
+//!
+//! A role is the kind of work one of a member's agents takes — three run concurrently under its
+//! single Radicle identity, so one kind of work does not wait behind another.
 //!
 //! A member answers, chats, and builds at once, and one conversation cannot do all three. A
 //! half-written patch has no safe point to pause at, and an agent turn cannot be interrupted, so
 //! sharing one would put a question behind a twenty-minute job. Each member therefore runs three
-//! adapters under one identity, one MCP server each. To everybody reading the repository it is one
-//! person.
+//! agents under one identity, one per role, with one MCP server each. To everybody reading the
+//! repository it is one person.
 //!
-//! `Talker` answers repository activity. `Chatter` answers chat. `Coder` builds. Being assigned is
+//! `Talker` answers repository activity. `Chatter` answers chat. `Coder` builds. An assignment is
 //! the one thing that is not a message, so it becomes a job in the member's [`queue`] instead of
-//! reaching a conversation. Talking and chatting can both add jobs of their own, send a correction
-//! to the running one, or ask it to stop. [`builder::Builder`] takes jobs and drives the building
-//! adapter alongside the other two.
+//! reaching a conversation. `Talker` and `Chatter` can both add jobs of their own, send a
+//! correction to the running job, or ask the builder to stop it. [`builder::Builder`] takes jobs
+//! and drives the `Coder` role alongside the other two.
 //!
-//! Chat is what makes the third adapter necessary rather than convenient, and it is the reason
+//! Chat is what makes the third role necessary rather than convenient, and it is the reason
 //! enabling chat costs a third concurrent agent whenever a message arrives. A member with no
 //! `[chat]` section in the manifest never starts one.
 //!
@@ -51,23 +54,23 @@
 //! or failure. Repository actions are separate MCP calls, so an agent can perform any number of
 //! allowed actions while one unit of work is active.
 //!
-//! During `run`, the application starts two loopback-only MCP servers scoped to the selected
-//! repository and member profile. `start` receives the provider-neutral member profile, its
-//! unguessable capability URL, and a preconfigured [`sandbox::AgentSandbox`] before any work is
-//! delivered. Manifest allowlists control the exposed read, comment, issue, patch, and review
-//! methods, and the split between the halves only withholds what each could not use anyway.
+//! During `run`, the application starts one loopback-only MCP server per started role, scoped to
+//! the selected repository and member profile. `start` receives the provider-neutral member
+//! profile, its unguessable capability URL, and a preconfigured [`sandbox::AgentSandbox`] before
+//! any work is delivered. Manifest allowlists control the exposed read, comment, issue, patch, and
+//! review methods, and the split between the roles only withholds what each could not use anyway.
 //! Tools are usable only while one delivery or job is active and cannot address a different
-//! subject. Both adapters are stopped before the servers and node shut down.
+//! subject. Every started agent is stopped before the servers and node shut down.
 //!
 //! # State and delivery
 //!
 //! Full history replay is required because later operations depend on earlier assignment and
-//! ownership state. Successful action deliveries are stored in SQLite so rescans do not report
-//! them twice. Each delivery is recorded after its adapter call succeeds. Adapters receive a stable
+//! ownership state. Successful action deliveries are stored in SQLite so rescans do not report them
+//! twice. Each delivery is recorded after its adapter call succeeds. Adapters receive a stable
 //! [`agent::DeliveryId`] in [`agent::Context`]. Its action position distinguishes multiple
 //! deliveries from one Radicle operation. Repository writes are journalled under an
 //! [`agent::WorkId`], which names either a delivery or a job, so an interrupted write is recovered
-//! by whichever half issued it.
+//! by whichever role issued it.
 //!
 //! # Trust boundaries
 //!
@@ -93,6 +96,7 @@ pub mod manifest;
 mod mcp;
 pub mod member;
 pub mod node;
+pub mod provider;
 pub mod queue;
 pub mod sandbox;
 mod shutdown;

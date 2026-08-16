@@ -31,13 +31,14 @@ pub(crate) const SILENCE: Duration = Duration::from_secs(15 * 60);
 /// How often the runtime asks an adapter whether its agent is still doing anything.
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(10);
 
-/// One of the three agent adapters a member runs.
+/// A role is the kind of work one of a member's agents takes — three run concurrently under its
+/// single Radicle identity, so one kind of work does not wait behind another.
 ///
 /// Each has its own MCP server, its own working copy, and its own harness state, so none can
 /// disturb another's checked-out branch or read another's transcripts. The build cache is the one
 /// thing they share, because build output is too large to keep three copies of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Adapter {
+pub enum Role {
     /// Answers repository activity.
     Talker,
     /// Answers authenticated chat.
@@ -46,11 +47,11 @@ pub enum Adapter {
     Coder,
 }
 
-impl Adapter {
-    /// Every adapter, in a stable order.
+impl Role {
+    /// Every role, in a stable order.
     pub const ALL: [Self; 3] = [Self::Talker, Self::Chatter, Self::Coder];
 
-    /// Returns the fixed directory name for this adapter.
+    /// Returns the fixed directory name for this role.
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
@@ -60,52 +61,51 @@ impl Adapter {
         }
     }
 
-    /// Returns whether this adapter's working copy stands on a branch.
+    /// Returns whether this role's working copy stands on a branch.
     #[must_use]
     pub const fn owns_branches(self) -> bool {
         matches!(self, Self::Coder)
     }
 }
 
-impl fmt::Display for Adapter {
+impl fmt::Display for Role {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.id())
     }
 }
 
-/// Fixed directories one adapter is given for the life of the member.
+/// Fixed directories one role is given for the life of the member.
 ///
 /// Delivery workspaces arrive per call. These do not: a build cache survives between deliveries on
 /// purpose, and a harness needs somewhere of its own to keep settings and logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
-    adapter: Adapter,
+    role: Role,
     cache: PathBuf,
     harness: PathBuf,
 }
 
 impl Layout {
-    /// Describes the directories belonging to `adapter`.
+    /// Describes the directories belonging to `role`.
     #[must_use]
-    pub const fn new(adapter: Adapter, cache: PathBuf, harness: PathBuf) -> Self {
+    pub const fn new(role: Role, cache: PathBuf, harness: PathBuf) -> Self {
         Self {
-            adapter,
+            role,
             cache,
             harness,
         }
     }
 
-    /// Returns which adapter these directories belong to.
+    /// Returns which role these directories belong to.
     #[must_use]
-    pub const fn adapter(&self) -> Adapter {
-        self.adapter
+    pub const fn role(&self) -> Role {
+        self.role
     }
 
     /// Returns the writable cache directory for build and dependency output.
     ///
-    /// Point `CARGO_TARGET_DIR` and its equivalents here, so build output stays out of the
-    /// working copy. Shared with this member's other adapters, which may make them wait on a
-    /// build lock.
+    /// Point `CARGO_TARGET_DIR` and its equivalents here, so build output stays out of the working
+    /// copy. Shared with this member's other roles, which may make them wait on a build lock.
     #[must_use]
     pub fn cache(&self) -> &Path {
         &self.cache
@@ -187,7 +187,7 @@ impl Stall {
     }
 }
 
-/// A supervisor for an adapter which runs no separate process.
+/// A supervisor for a role which runs no separate process.
 ///
 /// Reports no progress and has nothing to stop, so the runtime never interferes with it.
 #[derive(Debug, Clone, Copy)]
@@ -211,7 +211,7 @@ impl Supervisor for Idle {
 /// waiting on the other end of it and cannot wait behind a twenty-minute review.
 #[async_trait]
 pub(crate) trait Talker: Supervised {
-    /// Configures and starts the adapter for one member and run-scoped MCP server.
+    /// Configures and starts the role for one member and run-scoped MCP server.
     async fn start(
         &mut self,
         profile: Profile,
@@ -234,7 +234,7 @@ pub(crate) trait Talker: Supervised {
     /// Handles another relevant change to an owned or assigned issue or patch.
     async fn changed(&mut self, context: Context, change: Change) -> Result<(), Error>;
 
-    /// Ends the adapter and releases everything it holds.
+    /// Ends the role and releases everything it holds.
     ///
     /// Stronger than [`Supervisor::abort`], which ends one delivery and leaves the agent running.
     async fn shutdown(&mut self) -> Result<(), Error> {
@@ -244,16 +244,16 @@ pub(crate) trait Talker: Supervised {
 
 /// A backend which answers authenticated chat addressed to one team member.
 ///
-/// Chat runs as its own adapter rather than as another kind of message for [`Talker`] because the
-/// two have different latency to meet. A person typing in a channel expects an answer now, and an
-/// agent turn cannot be interrupted, so sharing one conversation would put every question behind
-/// whatever review happened to start first.
+/// Chat runs as its own role rather than as another kind of message for [`Talker`] because the two
+/// have different latency to meet. A person typing in a channel expects an answer now, and an agent
+/// turn cannot be interrupted, so sharing one conversation would put every question behind whatever
+/// review happened to start first.
 ///
 /// Deciding that chat should produce work belongs here. Carrying it out belongs to [`Coder`],
 /// reached through the member's queue.
 #[async_trait]
 pub(crate) trait Chatter: Supervised {
-    /// Configures and starts the adapter for one member and run-scoped MCP server.
+    /// Configures and starts the role for one member and run-scoped MCP server.
     async fn start(
         &mut self,
         profile: Profile,
@@ -265,7 +265,7 @@ pub(crate) trait Chatter: Supervised {
     /// Handles an authenticated message which addresses this member in a bound channel.
     async fn messaged(&mut self, context: ChatContext, message: ChatMessage) -> Result<(), Error>;
 
-    /// Ends the adapter and releases everything it holds.
+    /// Ends the role and releases everything it holds.
     ///
     /// Stronger than [`Supervisor::abort`], which ends one delivery and leaves the agent running.
     async fn shutdown(&mut self) -> Result<(), Error> {
@@ -276,12 +276,12 @@ pub(crate) trait Chatter: Supervised {
 /// A backend which carries out queued work for one team member.
 ///
 /// A member answers messages and builds at the same time, which one conversation cannot do: a
-/// half-written patch has no safe point to pause at. The two run as separate adapters under one
+/// half-written patch has no safe point to pause at. The two run as separate roles under one
 /// identity, so this interface receives jobs rather than activity. Deciding what should be built
 /// belongs to [`Talker`]. Deciding how belongs here.
 #[async_trait]
 pub(crate) trait Coder: Supervised + Sync {
-    /// Configures and starts the adapter for one member and run-scoped MCP server.
+    /// Configures and starts the role for one member and run-scoped MCP server.
     async fn start(
         &mut self,
         profile: Profile,
@@ -292,21 +292,21 @@ pub(crate) trait Coder: Supervised + Sync {
 
     /// Carries out one queued job in `workspace`.
     ///
-    /// The job's brief states what was decided and its source addresses the discussion behind it.
-    /// A job may arrive from a conversation this adapter never saw.
+    /// The job's brief states what was decided and its source addresses the discussion behind it. A
+    /// job may arrive from a conversation this role never saw.
     ///
-    /// This takes a shared reference so that [`interrupt`](Self::interrupt) can reach the adapter
+    /// This takes a shared reference so that [`interrupt`](Self::interrupt) can reach the role
     /// while the job is still running.
     async fn work(&self, job: Job, workspace: PathBuf) -> Result<(), Error>;
 
-    /// Asks the adapter to stop the running job and preserve what it has.
+    /// Asks the role to stop the running job and preserve what it has.
     ///
-    /// Work in progress is committed to a branch rather than discarded, because the request to
-    /// stop usually means priorities moved, not that the work was worthless. The interrupted
+    /// Work in progress is committed to a branch rather than discarded, because the request to stop
+    /// usually means priorities moved, not that the work was worthless. The interrupted
     /// [`work`](Self::work) call returns once that has happened.
     async fn interrupt(&self) -> Result<(), Error>;
 
-    /// Ends the adapter and releases everything it holds.
+    /// Ends the role and releases everything it holds.
     ///
     /// Stronger than [`Supervisor::abort`], which ends one delivery and leaves the agent running.
     async fn shutdown(&mut self) -> Result<(), Error> {
@@ -393,7 +393,7 @@ impl ChatContext {
     }
 }
 
-/// Authenticated chat message delivered to the talking adapter.
+/// Authenticated chat message delivered to the talking role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
     /// Sender's transient IRC nickname, for presentation only.

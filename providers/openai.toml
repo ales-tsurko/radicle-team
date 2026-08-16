@@ -1,0 +1,44 @@
+# OpenAI models, reached through OpenCode.
+#
+# The names below are settings the adapter is asked for, not OpenCode's own
+# configuration keys -- this file is deserialized and its values handed over as
+# data. Model names and prices are checked against models.dev, the registry
+# OpenCode itself reads.
+#
+# To keep your own edits, copy this file under another name. This one is
+# replaced on update.
+
+adapter = "opencode"
+
+[auth]
+ways = ["key", "subscription"]
+
+[auth.key]
+env = ["OPENAI_API_KEY"]
+
+# Which model the member runs; higher picks the sharper (and slower) one.
+#
+# Cheapest to dearest: luna is the small model of the 5.6 generation, terra the
+# middle one.
+[INT]
+param = "model"
+values = [
+  "openai/gpt-5.6-luna",
+  "openai/gpt-5.6-luna",
+  "openai/gpt-5.6-terra",
+  "openai/gpt-5.6",
+  "openai/gpt-5.6",
+]
+
+# How hard the model thinks before answering.
+[ACC]
+param = "reasoning_effort"
+values = ["minimal", "low", "medium", "high", "high"]
+
+# How long a member keeps at a problem before it stops.
+[STU]
+param = "max_steps"
+values = [20, 40, 60, 80, 120]
+
+# ACC is a reasoning effort here rather than a temperature: every model above
+# reasons, and a reasoning model rejects a temperature.

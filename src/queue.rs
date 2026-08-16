@@ -1,7 +1,7 @@
-//! Work queue and handoff between one member's two halves.
+//! Work queue and handoff between one member's roles.
 //!
 //! A member answers messages while it builds, so the two cannot share one train of thought. The
-//! talking side records work here instead of performing it, and the building side takes jobs from
+//! talking role records work here instead of performing it, and the building role takes jobs from
 //! here instead of acting on whatever the watcher noticed most recently. The queue survives
 //! restarts because a job accepted in front of somebody is a promise, and losing it silently is
 //! worse than refusing it.
@@ -9,10 +9,10 @@
 //! Each job carries a brief and the place the request came from. A brief is written by whoever
 //! accepted the work, so the builder can start without reconstructing a discussion it never saw.
 //!
-//! Waiting work is durable, but everything the two halves say to each other while a job runs is
-//! not: a note, a request to stop, and which job is running only mean anything to the process
-//! holding them. They live here anyway, because they are the same conversation as the queue and
-//! splitting them would mean handing both halves two objects instead of one.
+//! Waiting work is durable, but everything the roles say to each other while a job runs is not: a
+//! note, a request to stop, and which job is running only mean anything to the process holding
+//! them. They live here anyway, because they are the same conversation as the queue and splitting
+//! them would mean handing each role two objects instead of one.
 
 use std::{collections::BTreeSet, path::Path, str::FromStr as _, sync::Arc};
 
@@ -50,7 +50,7 @@ pub struct Job {
     pub position: QueuePosition,
 }
 
-/// Per-member work queue and the signals its two halves exchange.
+/// Per-member work queue and the signals its roles exchange.
 #[derive(Clone)]
 pub struct WorkQueue {
     database: Database,

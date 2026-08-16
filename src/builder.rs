@@ -1,11 +1,11 @@
-//! Queued work carried out by one member's building half.
+//! Queued work carried out by one member's building role.
 //!
 //! This is the counterpart of [`Watcher`](crate::watcher::Watcher): where the watcher turns
 //! repository activity into conversation, this turns the queue into commits. It runs in the same
 //! process and under the same identity, but on its own MCP server, so a long job never delays an
 //! answer.
 //!
-//! One job runs at a time. Cancelling asks the adapter to stop and commit what it has, rather than
+//! One job runs at a time. Cancelling asks the agent to stop and commit what it has, rather than
 //! discarding it, because a request to stop usually means priorities moved. Work is taken in the
 //! order the queue hands it out, and nothing here decides what matters.
 
@@ -21,12 +21,12 @@ use crate::{
     workspace::Workspaces,
 };
 
-// How long an interrupted job has to commit what it has before it is aborted. Unlike the job
-// itself this is bounded, because committing takes seconds. Silence is bounded by
-// [`agent::Stall`], on the same terms as every other agent the runtime runs.
+// How long an interrupted job has to commit what it has before it is aborted. Unlike the job itself
+// this is bounded, because committing takes seconds. Silence is bounded by [`agent::Stall`], on the
+// same terms as every other agent the runtime runs.
 const GRACE: Duration = Duration::from_secs(30);
 
-/// Drives one member's building half through its queued work.
+/// Drives one member's building role through its queued work.
 #[derive(Debug, Clone)]
 pub struct Builder {
     member: Member,
@@ -146,7 +146,7 @@ pub enum Error {
     /// Reading the work queue failed.
     #[error("work queue error: {0}")]
     Queue(#[from] crate::queue::Error),
-    /// The building adapter failed.
+    /// The building agent failed.
     #[error(transparent)]
     Coder(#[from] agent::Error),
     /// Preparing or cleaning the workspace failed.
@@ -257,13 +257,13 @@ mod tests {
         assert_eq!(
             *coder.interruptions.lock().await,
             1,
-            "the adapter must be asked to stop rather than have its work dropped, so that it \
-             reaches a point where nothing is lost"
+            "the role must be asked to stop rather than have its work dropped, so that it reaches \
+             a point where nothing is lost"
         );
     }
 
-    /// A job is forgotten only once it has actually been carried out. One which failed stays
-    /// marked taken, so the next start puts it back rather than losing it without telling anybody.
+    /// A job is forgotten only once it has actually been carried out. One which failed stays marked
+    /// taken, so the next start puts it back rather than losing it without telling anybody.
     #[tokio::test]
     async fn keeps_a_failed_job_for_the_next_start() {
         let repository = RepoId::from_str(REPOSITORY).expect("repository should parse");

@@ -1,10 +1,10 @@
-//! Serialized delivery to the chatting adapter of a member.
+//! Serialized delivery to the chatting role of a member.
 
 use radicle::identity::RepoId;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    agent::{Adapter, ChatContext, ChatMessage, Chatter, Source},
+    agent::{ChatContext, ChatMessage, Chatter, Role, Source},
     chat::{MessageId, classification::IncomingMessage},
     conversation::{Error, Scoped},
     mcp::WorkScope,
@@ -14,7 +14,7 @@ use crate::{
 
 const BUFFER: usize = 32;
 
-/// Sends authenticated chat to the dispatcher which owns the chatting adapter.
+/// Sends authenticated chat to the dispatcher which owns the chatting role.
 #[derive(Debug, Clone)]
 pub(crate) struct Handle {
     sender: mpsc::Sender<Request>,
@@ -42,7 +42,7 @@ impl Handle {
     }
 }
 
-// Owns the chatting adapter's workspace and MCP scope while serializing messages.
+// Owns the chatting role's workspace and MCP scope while serializing messages.
 #[derive(Debug)]
 pub(crate) struct Dispatcher {
     scoped: Scoped,
@@ -56,7 +56,7 @@ impl Dispatcher {
         (
             Handle { sender },
             Self {
-                scoped: Scoped::new(member, Adapter::Chatter, workspaces, scope),
+                scoped: Scoped::new(member, Role::Chatter, workspaces, scope),
                 receiver,
             },
         )

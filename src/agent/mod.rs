@@ -7,8 +7,8 @@
 
 pub use crate::{
     agent::interface::{
-        Adapter, ChatContext, ChatMessage, Context, DeliveryId, Error, InvalidSource, Layout,
-        McpEndpoint, Source, WorkId,
+        ChatContext, ChatMessage, Context, DeliveryId, Error, InvalidSource, Layout, McpEndpoint,
+        Role, Source, WorkId,
     },
     sandbox::{AgentChild, AgentCommand, AgentSandbox},
     watcher::{Change, Comment, Subject, Target},
@@ -20,5 +20,6 @@ pub(crate) use crate::agent::{
 #[cfg(all(test, not(miri)))]
 pub(crate) use crate::agent::publisher::Announcer;
 
+pub mod documents;
 mod interface;
 mod publisher;

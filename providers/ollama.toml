@@ -1,0 +1,39 @@
+# Models served locally by Ollama, reached through OpenCode.
+#
+# The names below are settings the adapter is asked for, not OpenCode's own
+# configuration keys -- this file is deserialized and its values handed over as
+# data.
+#
+# Ollama is not in the models.dev registry, because what you can run is
+# whatever you have pulled. The names below are real Ollama tags. To use your
+# own, copy this file under another name and edit that -- this one is replaced
+# on update. `ollama list` shows what you have. Several rungs may name the same
+# model; a machine with one model runs every member on it.
+
+adapter = "opencode"
+
+[auth]
+ways = ["none"]
+
+# Which model the member runs; higher picks the sharper (and slower) one.
+[INT]
+param = "model"
+values = [
+  "ollama/qwen3.5:9b",
+  "ollama/qwen3.5:9b",
+  "ollama/qwen3.5:27b",
+  "ollama/qwen3.5:35b",
+  "ollama/qwen3.5:35b",
+]
+
+# Local models mostly have no reasoning control, so temperature is the lever
+# that works here. Descending, because a high score means sticking to the
+# obvious answer.
+[ACC]
+param = "temperature"
+values = [0.9, 0.7, 0.5, 0.3, 0.1]
+
+# How long a member keeps at a problem before it stops.
+[STU]
+param = "max_steps"
+values = [20, 40, 60, 80, 120]

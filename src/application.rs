@@ -40,6 +40,7 @@ pub struct Application {
     home: Option<PathBuf>,
     identity_provider: Provider,
     manifest_file: Option<PathBuf>,
+    provider: Option<String>,
     seeds: Vec<NodeId>,
     shutdown: Shutdown,
 }
@@ -56,6 +57,7 @@ impl Application {
                 protection: identity::KeyProtection::SystemCredential,
             },
             manifest_file: None,
+            provider: None,
             seeds: Vec::new(),
             shutdown: Shutdown::default(),
         }
@@ -85,6 +87,33 @@ impl Application {
     pub fn with_manifest_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.manifest_file = Some(path.into());
         self
+    }
+
+    /// Runs on `provider` instead of the one the manifest names.
+    ///
+    /// The operator running a member pays for it and holds its credentials, so their choice wins
+    /// over the team's recorded intent.
+    #[must_use]
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
+        self
+    }
+
+    /// Returns the model provider this run was told to use, if any.
+    #[must_use]
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    /// Returns the provider this member runs on, preferring the command line over the manifest.
+    ///
+    /// Neither is required. Without one the agent application uses whatever it is configured with,
+    /// which is what a first member set up before any provider was chosen needs.
+    #[must_use]
+    pub fn resolved_provider(&self, binding: &manifest::ValidatedBinding) -> Option<String> {
+        self.provider
+            .clone()
+            .or_else(|| binding.provider().map(str::to_owned))
     }
 
     /// Adds a preferred seed for repository synchronization.
@@ -242,20 +271,19 @@ impl Application {
             .await
     }
 
-    /// Runs the team member with `talker` answering repository activity, `chatter` answering
-    /// chat, and `coder` carrying out queued work.
+    /// Runs the team member with `talker` answering repository activity, `chatter` answering chat,
+    /// and `coder` carrying out queued work.
     ///
-    /// Adapters are internal on purpose. The runtime holds each agent's process so it can stop one
-    /// which has gone silent or refused to stop, which it could not do for an implementation it
-    /// did not own.
+    /// Roles are internal on purpose. The runtime holds each agent's process so it can stop one
+    /// which has gone silent or refused to stop, which it could not do for an implementation it did
+    /// not own.
     ///
-    /// The three adapters share one identity, one manifest binding, and one node, but not one
-    /// train of thought. A half-written patch has no safe point to pause at, and an agent turn
-    /// cannot be interrupted, so neither a queued job nor a review may hold up somebody waiting in
-    /// a channel.
+    /// The three roles share one identity, one manifest binding, and one node, but not one train of
+    /// thought. A half-written patch has no safe point to pause at, and an agent turn cannot be
+    /// interrupted, so neither a queued job nor a review may hold up somebody waiting in a channel.
     ///
     /// Enabling chat therefore costs a third concurrent agent for this member whenever a message
-    /// arrives, on top of the talking and building adapters.
+    /// arrives, on top of the talking and building roles.
     ///
     /// Linux executables must call
     /// [`sandbox::dispatch_linux_helper`](crate::sandbox::dispatch_linux_helper) as the first
@@ -274,7 +302,7 @@ impl Application {
         let profile = self.member.profile();
         tracing::info!(
             member = profile.name,
-            role = profile.role,
+            title = profile.title,
             generation = binding.generation(),
             "team member initialized"
         );
@@ -677,7 +705,7 @@ impl Chatter for LoggingAgent {
         _sandbox: AgentSandbox,
         _layout: crate::agent::Layout,
     ) -> Result<(), agent::Error> {
-        tracing::info!(member = profile.member.id(), "chatter adapter started");
+        tracing::info!(member = profile.member.id(), "chatter role started");
         Ok(())
     }
 
@@ -703,11 +731,9 @@ impl Talker for LoggingAgent {
         tracing::info!(
             member = profile.member.id(),
             intelligence = profile.tuning.intelligence,
-            speed = profile.tuning.speed,
-            experience = profile.tuning.experience,
-            creativity = profile.tuning.creativity,
-            caution = profile.tuning.caution,
-            "agent adapter started"
+            accuracy = profile.tuning.accuracy,
+            stubbornness = profile.tuning.stubbornness,
+            "agent role started"
         );
         Ok(())
     }
@@ -746,7 +772,7 @@ impl Coder for LoggingAgent {
         _sandbox: AgentSandbox,
         _layout: crate::agent::Layout,
     ) -> Result<(), agent::Error> {
-        tracing::info!(member = profile.member.id(), "coder adapter started");
+        tracing::info!(member = profile.member.id(), "coder role started");
         Ok(())
     }
 
@@ -880,7 +906,7 @@ struct Resources {
 #[derive(Debug)]
 struct Servers {
     talker: mcp::Server,
-    // Absent when the manifest has no chat section, so a repository without chat runs two adapters
+    // Absent when the manifest has no chat section, so a repository without chat runs two roles
     // rather than paying for a third which would never be addressed.
     chatter: Option<mcp::Server>,
     coder: mcp::Server,
@@ -976,7 +1002,7 @@ impl AgentRuntime {
         })
     }
 
-    // Creates the shared object store and every adapter's working copy.
+    // Creates the shared object store and every role's working copy.
     async fn initialize_workspaces(
         application: &Application,
         runtime: &Runtime,
@@ -1074,13 +1100,13 @@ impl AgentRuntime {
         Self::assembled(Self::opened(Self::wanted_servers(chat), start).await?)
     }
 
-    /// Starts one MCP server for one adapter.
+    /// Starts one MCP server for one role.
     async fn start_server(
         storage: radicle::storage::git::Storage,
         repository: RepoId,
         publisher: agent::Publisher,
         allowlist: manifest::McpAllowlist,
-        role: mcp::Role,
+        role: agent::Role,
         state: mcp::ToolState,
     ) -> Result<mcp::Server, Error> {
         mcp::Server::start(storage, repository, publisher, allowlist, role, state)
@@ -1089,18 +1115,22 @@ impl AgentRuntime {
     }
 
     // Lists the servers to start.
-    fn wanted_servers(chat: bool) -> Vec<mcp::Role> {
+    fn wanted_servers(chat: bool) -> Vec<agent::Role> {
         match chat {
-            true => vec![mcp::Role::Talker, mcp::Role::Chatter, mcp::Role::Coder],
-            false => vec![mcp::Role::Talker, mcp::Role::Coder],
+            true => vec![
+                agent::Role::Talker,
+                agent::Role::Chatter,
+                agent::Role::Coder,
+            ],
+            false => vec![agent::Role::Talker, agent::Role::Coder],
         }
     }
 
     // Starts every wanted server, stopping the ones which did start if a later one fails.
     async fn opened<F>(
-        wanted: Vec<mcp::Role>,
-        start: impl Fn(mcp::Role) -> F,
-    ) -> Result<Vec<(mcp::Role, mcp::Server)>, Error>
+        wanted: Vec<agent::Role>,
+        start: impl Fn(agent::Role) -> F,
+    ) -> Result<Vec<(agent::Role, mcp::Server)>, Error>
     where
         F: Future<Output = Result<mcp::Server, Error>>,
     {
@@ -1119,8 +1149,8 @@ impl AgentRuntime {
         Ok(started)
     }
 
-    // Sorts the started servers back into the adapters they belong to.
-    fn assembled(mut started: Vec<(mcp::Role, mcp::Server)>) -> Result<Servers, Error> {
+    // Sorts the started servers back into the roles they belong to.
+    fn assembled(mut started: Vec<(agent::Role, mcp::Server)>) -> Result<Servers, Error> {
         let mut take = |wanted| {
             started
                 .iter()
@@ -1130,9 +1160,9 @@ impl AgentRuntime {
         let missing = || Error::Mcp("an MCP server did not start".to_owned());
 
         Ok(Servers {
-            talker: take(mcp::Role::Talker).ok_or_else(missing)?,
-            chatter: take(mcp::Role::Chatter),
-            coder: take(mcp::Role::Coder).ok_or_else(missing)?,
+            talker: take(agent::Role::Talker).ok_or_else(missing)?,
+            chatter: take(agent::Role::Chatter),
+            coder: take(agent::Role::Coder).ok_or_else(missing)?,
         })
     }
 
@@ -1154,25 +1184,21 @@ impl AgentRuntime {
         coder: &mut (impl Coder + ?Sized),
     ) -> Result<(), Error> {
         let profile = application.member.profile();
-        let (sandbox, layout) = Self::prepared(
-            application,
-            runtime,
-            agent::Adapter::Talker,
-            &servers.talker,
-        )?;
+        let (sandbox, layout) =
+            Self::prepared(application, runtime, agent::Role::Talker, &servers.talker)?;
         talker
             .start(profile, servers.talker.endpoint(), sandbox, layout)
             .await?;
         Self::start_chatter(application, runtime, servers.chatter.as_ref(), chatter).await?;
         let (sandbox, layout) =
-            Self::prepared(application, runtime, agent::Adapter::Coder, &servers.coder)?;
+            Self::prepared(application, runtime, agent::Role::Coder, &servers.coder)?;
         coder
             .start(profile, servers.coder.endpoint(), sandbox, layout)
             .await
             .map_err(Error::from)
     }
 
-    // Starts the chatting adapter, if the manifest asked for chat at all.
+    // Starts the chatting role, if the manifest asked for chat at all.
     async fn start_chatter(
         application: &Application,
         runtime: &Runtime,
@@ -1182,8 +1208,7 @@ impl AgentRuntime {
         let Some(server) = server else {
             return Ok(());
         };
-        let (sandbox, layout) =
-            Self::prepared(application, runtime, agent::Adapter::Chatter, server)?;
+        let (sandbox, layout) = Self::prepared(application, runtime, agent::Role::Chatter, server)?;
 
         chatter
             .start(
@@ -1196,26 +1221,22 @@ impl AgentRuntime {
             .map_err(Error::from)
     }
 
-    // Prepares one adapter's sandbox and its fixed directories.
+    // Prepares one role's sandbox and its fixed directories.
     fn prepared(
         application: &Application,
         runtime: &Runtime,
-        adapter: agent::Adapter,
+        role: agent::Role,
         server: &mcp::Server,
     ) -> Result<(AgentSandbox, agent::Layout), Error> {
-        let sandbox = AgentSandbox::load(
-            &runtime.home,
-            application.member,
-            adapter,
-            server.endpoint(),
-        )?;
+        let sandbox =
+            AgentSandbox::load(&runtime.home, application.member, role, server.endpoint())?;
 
-        Ok((sandbox, Self::layout(&runtime.home, adapter)))
+        Ok((sandbox, Self::layout(&runtime.home, role)))
     }
 
-    // Returns the fixed directories one adapter owns, which [`MemberHome::create`] made.
-    fn layout(home: &MemberHome, adapter: agent::Adapter) -> agent::Layout {
-        agent::Layout::new(adapter, home.cache(), home.harness(adapter))
+    // Returns the fixed directories one role owns, which [`MemberHome::create`] made.
+    fn layout(home: &MemberHome, role: agent::Role) -> agent::Layout {
+        agent::Layout::new(role, home.cache(), home.harness(role))
     }
 
     async fn initialize_publisher(
@@ -1694,7 +1715,7 @@ pub enum Error {
     /// Loading the agent sandbox failed.
     #[error("agent sandbox error: {0}")]
     Sandbox(#[from] crate::sandbox::Error),
-    /// Starting or stopping the agent adapter failed.
+    /// Starting or stopping the agent role failed.
     #[error(transparent)]
     Talker(#[from] agent::Error),
     /// A blocking filesystem or Radicle task failed.
@@ -1747,10 +1768,54 @@ mod tests {
         );
     }
 
-    // The marker is written before the identity is created, so a directory holding one without
-    // the other is a member's whose marker was lost. Claiming it writes this member's name over
-    // it, and the identity loaded a moment later is then somebody else's key under this member's
-    // name.
+    // The manifest records what the team agreed; the operator running the member pays for it and
+    // holds the credentials. So a command-line choice wins, and neither being set is normal.
+    #[cfg(not(miri))]
+    #[test]
+    fn prefers_the_command_lines_provider_over_the_manifests() {
+        let repository =
+            RepoId::from_urn("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc").expect("repository should parse");
+        let application = super::Application::new(crate::member::Member::Nico, repository);
+        let named = |provider: Option<&str>| {
+            crate::manifest::ValidatedBinding::new(
+                crate::member::Member::Nico,
+                &crate::manifest::Binding::test(
+                    "did:key:z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7"
+                        .parse()
+                        .expect("DID should parse"),
+                    1,
+                )
+                .with_provider(provider),
+                crate::manifest::Revision::External,
+                crate::manifest::SecurityPolicy::test(repository),
+                crate::manifest::RepositoryPolicy::new(
+                    crate::manifest::TriggerAccess::Delegates,
+                    Vec::new(),
+                    crate::manifest::PriorityLabels::default(),
+                    crate::manifest::Limits::default(),
+                ),
+            )
+        };
+
+        assert_eq!(application.resolved_provider(&named(None)), None);
+        assert_eq!(
+            application.resolved_provider(&named(Some("anthropic"))),
+            Some("anthropic".to_owned()),
+            "the manifest decides when the operator did not"
+        );
+        assert_eq!(
+            application
+                .clone()
+                .with_provider("ollama")
+                .resolved_provider(&named(Some("anthropic"))),
+            Some("ollama".to_owned()),
+            "and the operator overrides it, because they hold the credentials"
+        );
+    }
+
+    // The marker is written before the identity is created, so a directory holding one without the
+    // other is a member's whose marker was lost. Claiming it writes this member's name over it, and
+    // the identity loaded a moment later is then somebody else's key under this member's name.
     #[cfg(not(miri))]
     #[test]
     fn refuses_to_claim_a_directory_which_already_holds_an_identity() {
@@ -1938,10 +2003,8 @@ mod tests {
         let home = MemberHome::at(&root);
         let binding = ValidatedBinding::new(
             Member::Nico,
-            did,
-            i64::MAX.unsigned_abs(),
+            &crate::manifest::Binding::test(did, i64::MAX.unsigned_abs()),
             Revision::Repository(Oid::from_sha1([0; 20])),
-            crate::manifest::McpAllowlist::default(),
             crate::manifest::SecurityPolicy::test(repository),
             crate::manifest::RepositoryPolicy::new(
                 crate::manifest::TriggerAccess::Delegates,

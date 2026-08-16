@@ -2,8 +2,8 @@
 //!
 //! One member working in one repository owns one directory, created where `setup` was run rather
 //! than hidden under the user's home. Everything that member needs lives inside it: its signing
-//! identity, its durable state, one working copy per adapter, and a disposable build cache. There
-//! is no global layer, so a directory can be moved, backed up, or deleted as a unit.
+//! identity, its durable state, one working copy per role, and a disposable build cache. There is
+//! no global layer, so a directory can be moved, backed up, or deleted as a unit.
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
@@ -16,7 +16,7 @@ use std::{
 use radicle::identity::RepoId;
 use serde::{Deserialize, Serialize};
 
-use crate::{agent::Adapter, member::Member};
+use crate::{agent::Role, member::Member};
 
 /// Environment variable naming the member directory.
 pub const ENVIRONMENT_VARIABLE: &str = "RADICLE_TEAM_HOME";
@@ -113,9 +113,9 @@ impl MemberHome {
         ]
         .into_iter()
         .chain(
-            Adapter::ALL
+            Role::ALL
                 .into_iter()
-                .map(|adapter| self.harness(adapter)),
+                .flat_map(|role| [self.harness(role), self.instructions(role)]),
         );
         for directory in owned {
             fs::create_dir_all(&directory).map_err(Error::Create)?;
@@ -203,18 +203,17 @@ impl MemberHome {
         self.code().join(".git-common")
     }
 
-    /// Returns one adapter's working copy.
+    /// Returns one role's working copy.
     #[must_use]
-    pub fn worktree(&self, adapter: Adapter) -> PathBuf {
-        self.code().join(adapter.id())
+    pub fn worktree(&self, role: Role) -> PathBuf {
+        self.code().join(role.id())
     }
 
-    /// Returns the disposable build cache shared by this member's adapters.
+    /// Returns the disposable build cache shared by this member's roles.
     ///
-    /// Shared because build output is too large to keep three copies of, and safe to share
-    /// because the three adapters are one person under one key. Never shared between members: a
-    /// build cache holds compiled build scripts which the next build runs. Removing it must
-    /// always be safe.
+    /// Shared because build output is too large to keep three copies of, and safe to share because
+    /// the three roles are one person under one key. Never shared between members: a build cache
+    /// holds compiled build scripts which the next build runs. Removing it must always be safe.
     #[must_use]
     pub fn cache(&self) -> PathBuf {
         self.path.join("cache")
@@ -226,14 +225,20 @@ impl MemberHome {
         self.path.join("harness")
     }
 
-    /// Returns one adapter's harness home.
+    /// Returns where one role's standing instructions are written.
+    #[must_use]
+    pub fn instructions(&self, role: Role) -> PathBuf {
+        self.harness(role).join("instructions")
+    }
+
+    /// Returns one role's harness home.
     ///
     /// An agent harness keeps its settings and logs in a user-level directory of its own by
-    /// default, which every member on the machine would then share. This is given to it instead,
-    /// so removing the member directory removes that state rather than orphaning it.
+    /// default, which every member on the machine would then share. This is given to it instead, so
+    /// removing the member directory removes that state rather than orphaning it.
     #[must_use]
-    pub fn harness(&self, adapter: Adapter) -> PathBuf {
-        self.harnesses().join(adapter.id())
+    pub fn harness(&self, role: Role) -> PathBuf {
+        self.harnesses().join(role.id())
     }
 
     fn marker_path(&self) -> PathBuf {
@@ -335,7 +340,7 @@ mod tests {
 
     #[cfg(not(miri))]
     use crate::home::MARKER;
-    use crate::{agent::Adapter, home::MemberHome, member::Member};
+    use crate::{agent::Role, home::MemberHome, member::Member};
 
     #[cfg(not(miri))]
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
@@ -354,9 +359,9 @@ mod tests {
             home.node_log(),
             home.sandbox_config(),
             home.git_common(),
-            home.worktree(Adapter::Talker),
+            home.worktree(Role::Talker),
             home.cache(),
-            home.harness(Adapter::Chatter),
+            home.harness(Role::Chatter),
         ] {
             assert!(
                 path.starts_with(root),
@@ -367,18 +372,18 @@ mod tests {
     }
 
     #[test]
-    fn gives_each_adapter_its_own_worktree_and_harness_state() {
+    fn gives_each_role_its_own_worktree_and_harness_state() {
         let home = MemberHome::for_project("/work", "myproject", Member::Nico);
 
         for (left, right) in [
-            (Adapter::Talker, Adapter::Chatter),
-            (Adapter::Talker, Adapter::Coder),
-            (Adapter::Chatter, Adapter::Coder),
+            (Role::Talker, Role::Chatter),
+            (Role::Talker, Role::Coder),
+            (Role::Chatter, Role::Coder),
         ] {
             assert_ne!(
                 home.worktree(left),
                 home.worktree(right),
-                "adapters sharing a worktree would fight over the checked-out branch"
+                "roles sharing a worktree would fight over the checked-out branch"
             );
             assert_ne!(home.harness(left), home.harness(right));
         }
@@ -387,7 +392,7 @@ mod tests {
     // Build output is the largest thing a member writes, and three copies of it per member would
     // multiply the disk a team costs by three for nothing.
     #[test]
-    fn gives_every_adapter_of_one_member_the_same_build_cache() {
+    fn gives_every_role_of_one_member_the_same_build_cache() {
         let home = MemberHome::for_project("/work", "myproject", Member::Nico);
 
         assert_eq!(home.cache(), Path::new("/work/myproject-nico/cache"));
@@ -434,7 +439,7 @@ mod tests {
             .expect("marker should be recorded");
 
         let found =
-            MemberHome::find(&home.worktree(Adapter::Coder)).expect("the home should be found");
+            MemberHome::find(&home.worktree(Role::Coder)).expect("the home should be found");
 
         assert_eq!(
             found.path(),
@@ -455,7 +460,7 @@ mod tests {
         home.create().expect("member directory should be created");
         home.record(Member::Nico, repository)
             .expect("marker should be recorded");
-        let planted = home.worktree(Adapter::Coder);
+        let planted = home.worktree(Role::Coder);
         std::fs::create_dir_all(&planted).expect("working copy should be created");
         std::fs::write(planted.join(MARKER), "member = \"maya\"\n")
             .expect("planted file should be written");

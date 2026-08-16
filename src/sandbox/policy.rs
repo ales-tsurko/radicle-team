@@ -84,9 +84,9 @@ impl Policy {
         }
         policy.deny_cargo_credentials(&home);
         policy.allow_read.extend(readable.iter().cloned());
-        // Adapter caches, harness state and the shared object store live beside the working copies
-        // and have to be writable, or a build would have nowhere to put its output and an agent
-        // could edit files but never commit them.
+        // Role caches, harness state and the shared object store live beside the working copies and
+        // have to be writable, or a build would have nowhere to put its output and an agent could
+        // edit files but never commit them.
         policy.allow_write.extend(writable.iter().cloned());
         // Applied after the grants above so a narrower fixed deny wins over the root it sits in,
         // and so local configuration cannot open one back up.

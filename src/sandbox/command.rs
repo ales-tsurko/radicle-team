@@ -27,7 +27,7 @@ use zerobox_sandboxing::{
 use zerobox_utils_absolute_path::AbsolutePathBuf;
 
 use crate::{
-    agent::{Adapter, McpEndpoint},
+    agent::{McpEndpoint, Role},
     home::MemberHome,
     member::Member,
     sandbox::{
@@ -45,13 +45,13 @@ const OUTPUT_KEPT: usize = 1 << 20;
 // Who a sandbox is built for.
 //
 // The runtime confines its own Git the same way it confines an agent's. It is the more trusted
-// side, but it runs Git against working copies an adapter can write, and Git derives what it does
+// side, but it runs Git against working copies an agent can write, and Git derives what it does
 // from what it finds there. Fencing off each surface as it turns up is guesswork; running the
 // command inside a sandbox bounds what the guess costs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Purpose {
-    // One adapter's agent, held to its own working copy and the member's local configuration.
-    Agent(Adapter),
+    // One role's agent, held to its own working copy and the member's local configuration.
+    Agent(Role),
     // The runtime's own Git, held to the working copies and nothing else.
     Runtime,
 }
@@ -77,14 +77,14 @@ impl AgentSandbox {
     pub fn load(
         home: &MemberHome,
         member: Member,
-        adapter: Adapter,
+        role: Role,
         endpoint: &McpEndpoint,
     ) -> Result<Self, Error> {
-        // Scoped to this adapter's own working copy rather than the directory holding all three.
-        // Sharing that directory would let one adapter rewrite another's checked-out branch, which
-        // is exactly what running them separately is meant to prevent.
-        let workspaces = Self::rooted(&home.worktree(adapter))?;
-        let store = Store::new(home.clone(), member, adapter);
+        // Scoped to this role's own working copy rather than the directory holding all three.
+        // Sharing that directory would let one role rewrite another's checked-out branch, which is
+        // exactly what running them separately is meant to prevent.
+        let workspaces = Self::rooted(&home.worktree(role))?;
+        let store = Store::new(home.clone(), member, role);
         let policy = Policy::load(
             &workspaces,
             Some(endpoint),
@@ -96,17 +96,17 @@ impl AgentSandbox {
         // command, even though `build` reloads it for every spawn.
         policy.validate(&Config::load(home)?)?;
 
-        Self::ready(home, Purpose::Agent(adapter), policy, workspaces)
+        Self::ready(home, Purpose::Agent(role), policy, workspaces)
     }
 
     /// Loads the sandbox the runtime runs its own Git in.
     ///
     /// Held to the shared object store and, when the command is preparing one, a single working
-    /// copy. The other adapters' working copies stay read-only, so a command run for one of them
-    /// reaches no further into the others than that adapter could itself. `repository` is the one
+    /// copy. The other roles' working copies stay read-only, so a command run for one of them
+    /// reaches no further into the others than that role could itself. `repository` is the one
     /// repository in Radicle storage a delivery is fetched from, and it is readable rather than
-    /// writable. Nothing else is reachable: not the member's identity, not the rest of storage,
-    /// and not whatever the local configuration happens to permit an agent.
+    /// writable. Nothing else is reachable: not the member's identity, not the rest of storage, and
+    /// not whatever the local configuration happens to permit an agent.
     ///
     /// External network access is denied. On macOS host loopback stays reachable even so, which is
     /// a platform difference described in [`NetworkAccess`](crate::sandbox::NetworkAccess).
@@ -117,7 +117,7 @@ impl AgentSandbox {
     /// prepared.
     pub fn runtime(
         home: &MemberHome,
-        adapter: Option<Adapter>,
+        role: Option<Role>,
         repository: &Path,
     ) -> Result<Self, Error> {
         let workspaces = Self::rooted(&home.code())?;
@@ -126,7 +126,7 @@ impl AgentSandbox {
             None,
             std::slice::from_ref(&repository.to_path_buf()),
             &[],
-            &Store::others(home, adapter),
+            &Store::others(home, role),
         )?;
 
         Self::ready(home, Purpose::Runtime, policy, workspaces)
@@ -198,7 +198,7 @@ impl AgentSandbox {
         // The runtime's own Git ignores it. That file says what an agent may reach, and widening
         // it must not widen what code smuggled into a Git command can reach.
         let config = match self.purpose {
-            Purpose::Agent(_adapter) => Config::load(&self.home)?,
+            Purpose::Agent(_role) => Config::load(&self.home)?,
             Purpose::Runtime => Config::confined(),
         };
         self.policy.validate(&config)?;
@@ -257,51 +257,51 @@ impl AgentSandbox {
     }
 }
 
-// Which parts of the shared Git object store one adapter may write.
+// Which parts of the shared Git object store one role may write.
 //
-// The store has to be writable at all, or an agent could edit files but never commit them: a
-// linked working copy keeps its objects, references and index there rather than beside itself.
-// What it may not have is a say in what the runtime runs. Git executes whatever its hooks and
-// configuration name, it finds both by following `commondir` out of the working copy's own
-// directory, and the runtime runs Git against this store outside the sandbox.
+// The store has to be writable at all, or an agent could edit files but never commit them: a linked
+// working copy keeps its objects, references and index there rather than beside itself. What it may
+// not have is a say in what the runtime runs. Git executes whatever its hooks and configuration
+// name, it finds both by following `commondir` out of the working copy's own directory, and the
+// runtime runs Git against this store outside the sandbox.
 #[derive(Debug)]
 struct Store {
     home: MemberHome,
     member: Member,
-    adapter: Adapter,
+    role: Role,
     common: PathBuf,
     mine: PathBuf,
 }
 
 impl Store {
-    fn new(home: MemberHome, member: Member, adapter: Adapter) -> Self {
+    fn new(home: MemberHome, member: Member, role: Role) -> Self {
         let common = home.git_common();
-        let mine = common.join("worktrees").join(adapter.id());
+        let mine = common.join("worktrees").join(role.id());
 
         Self {
             home,
             member,
-            adapter,
+            role,
             common,
             mine,
         }
     }
 
-    // Returns everything this adapter may write.
+    // Returns everything this role may write.
     //
     // Its own working copy directory is granted separately from the store holding it, because
-    // Zerobox protects a working copy's Git directory by default and that default covers the
-    // entry this worktree keeps in the store.
+    // Zerobox protects a working copy's Git directory by default and that default covers the entry
+    // this worktree keeps in the store.
     fn writable(&self) -> Vec<PathBuf> {
         let mut writable = vec![
             self.home.cache(),
-            self.home.harness(self.adapter),
+            self.home.harness(self.role),
             self.common.clone(),
             self.mine.clone(),
         ];
-        // Branches are written only under the runtime's own namespace, and only by the adapter
-        // which stands on one. The others answer from a detached head and never move a reference.
-        if self.adapter.owns_branches() {
+        // Branches are written only under the runtime's own namespace, and only by the role which
+        // stands on one. The others answer from a detached head and never move a reference.
+        if self.role.owns_branches() {
             writable.push(self.branches());
         }
 
@@ -311,34 +311,38 @@ impl Store {
     // Returns the paths inside those grants which must stay read-only.
     fn protected(&self, worktree: &Path) -> Vec<PathBuf> {
         [
+            // The member's standing instructions. They live inside the harness home, which the role
+            // must write, but an agent able to rewrite its own character and the team's rules could
+            // reword them mid-run and every later turn would read the rewrite.
+            self.home.instructions(self.role),
             // The pointer to the store. Replaced, it would send the runtime's Git somewhere else.
             worktree.join(".git"),
             self.common.join("config"),
             self.common.join("hooks"),
-            // References belong to whichever adapter created them, and `packed-refs` holds all of
-            // them at once. The building adapter is given its own namespace back below.
+            // References belong to whichever role created them, and `packed-refs` holds all of them
+            // at once. The building role is given its own namespace back below.
             self.common.join("refs"),
             self.common.join("packed-refs"),
-            // Where this working copy finds the store. Repointed at one the adapter controls, the
+            // Where this working copy finds the store. Repointed at one the role controls, the
             // runtime's next Git command would read that one's configuration and hooks.
             self.mine.join("commondir"),
             self.mine.join("gitdir"),
         ]
         .into_iter()
-        .chain(Self::others(&self.home, Some(self.adapter)))
+        .chain(Self::others(&self.home, Some(self.role)))
         .collect()
     }
 
-    // Returns the working copies belonging to every adapter but `adapter`.
+    // Returns the working copies belonging to every role but `role`.
     //
     // Both halves of one: the files, and the entry the shared store keeps for it. Writing the
     // second is writing the first, since that entry holds the copy's index and head.
-    fn others(home: &MemberHome, adapter: Option<Adapter>) -> Vec<PathBuf> {
+    fn others(home: &MemberHome, role: Option<Role>) -> Vec<PathBuf> {
         let entries = home.git_common().join("worktrees");
 
-        Adapter::ALL
+        Role::ALL
             .into_iter()
-            .filter(|other| Some(*other) != adapter)
+            .filter(|other| Some(*other) != role)
             .flat_map(|other| [home.worktree(other), entries.join(other.id())])
             .collect()
     }
@@ -744,9 +748,8 @@ mod tests {
         std::fs::create_dir(&outside).expect("outside directory should be created");
         let outside =
             std::fs::canonicalize(outside).expect("outside directory should be canonicalized");
-        let expected_workspaces =
-            std::fs::canonicalize(home.worktree(crate::agent::Adapter::Talker))
-                .expect("workspaces should be canonicalized");
+        let expected_workspaces = std::fs::canonicalize(home.worktree(crate::agent::Role::Talker))
+            .expect("workspaces should be canonicalized");
         let error = sandbox
             .validate_current_dir(&outside)
             .expect_err("outside working directory should be rejected");
@@ -787,9 +790,9 @@ mod tests {
         }
     }
 
-    // The runtime runs Git against the shared store outside the sandbox, and Git runs whatever
-    // its hooks and configuration name. An adapter which could write either of those, or repoint
-    // its working copy at a store it controls, would be choosing what the runtime executes.
+    // The runtime runs Git against the shared store outside the sandbox, and Git runs whatever its
+    // hooks and configuration name. A role which could write either of those, or repoint its
+    // working copy at a store it controls, would be choosing what the runtime executes.
     #[test]
     fn keeps_the_shared_store_from_choosing_what_the_runtime_runs() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -812,23 +815,23 @@ mod tests {
         ] {
             assert!(
                 !policy.can_write_path_with_cwd(&denied, &sandbox.workspaces),
-                "{} must not be writable by the talking adapter",
+                "{} must not be writable by the talking role",
                 denied.display()
             );
         }
         for allowed in [common.join("objects"), worktrees.join("talker")] {
             assert!(
                 policy.can_write_path_with_cwd(&allowed, &sandbox.workspaces),
-                "{} must stay writable, or the adapter could never commit",
+                "{} must stay writable, or the role could never commit",
                 allowed.display()
             );
         }
     }
 
-    // Only the building adapter has branches, and only under the runtime's own namespace. A
-    // talking adapter which could write references would be able to move or delete them.
+    // Only the building role has branches, and only under the runtime's own namespace. A talking
+    // role which could write references would be able to move or delete them.
     #[test]
-    fn gives_branches_to_the_building_adapter_alone() {
+    fn gives_branches_to_the_building_role_alone() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let home = member_home(directory.path());
         let branches = home
@@ -837,20 +840,40 @@ mod tests {
             .join("heads")
             .join(crate::workspace::branches(Member::Nico));
 
-        for (adapter, expected) in [
-            (crate::agent::Adapter::Coder, true),
-            (crate::agent::Adapter::Talker, false),
+        for (role, expected) in [
+            (crate::agent::Role::Coder, true),
+            (crate::agent::Role::Talker, false),
         ] {
             crate::sandbox::dispatch_linux_helper();
-            let sandbox = AgentSandbox::load(&home, Member::Nico, adapter, &endpoint())
+            let sandbox = AgentSandbox::load(&home, Member::Nico, role, &endpoint())
                 .expect("default sandbox should load");
             let policy = built(&home, &sandbox);
 
             assert_eq!(
                 policy.can_write_path_with_cwd(&branches, &sandbox.workspaces),
                 expected,
-                "{adapter} should{} be able to write branches",
+                "{role} should{} be able to write branches",
                 if expected { "" } else { " not" }
+            );
+        }
+    }
+
+    // The agent reads its own character and the team's rules from here every turn. An agent able to
+    // rewrite them could reword itself mid-run and every later turn would read the rewrite.
+    #[test]
+    fn never_lets_an_agent_rewrite_its_own_instructions() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let home = member_home(directory.path());
+        crate::sandbox::dispatch_linux_helper();
+
+        for role in crate::agent::Role::ALL {
+            let sandbox = AgentSandbox::load(&home, Member::Nico, role, &endpoint())
+                .expect("default sandbox should load");
+            let policy = built(&home, &sandbox);
+
+            assert!(
+                !policy.can_write_path_with_cwd(&home.instructions(role), &sandbox.workspaces),
+                "{role} must not be able to rewrite the documents it is instructed by"
             );
         }
     }
@@ -879,13 +902,8 @@ mod tests {
 
     fn sandbox(home: &MemberHome) -> AgentSandbox {
         crate::sandbox::dispatch_linux_helper();
-        AgentSandbox::load(
-            home,
-            Member::Nico,
-            crate::agent::Adapter::Talker,
-            &endpoint(),
-        )
-        .expect("default sandbox should load")
+        AgentSandbox::load(home, Member::Nico, crate::agent::Role::Talker, &endpoint())
+            .expect("default sandbox should load")
     }
 
     fn endpoint() -> McpEndpoint {
