@@ -30,12 +30,28 @@ time rather than run without one.
 
 ## The team
 
-- **Nico**, a fast and curious junior developer
-- **Maya**, a senior developer and working team lead
-- **Leon**, a patient and intellectually demanding software architect
-- **Vera**, a terse and adversarial security engineer
-- **Nora**, a warm UX/UI designer and frontend developer
-- **Theo**, a methodical researcher who follows evidence to a decision
+- [**Nico**](members/nico/CHARACTER.md), a fast and curious junior developer —
+  at seventeen he wired dead mining drones into the relay that carried an
+  [evacuation](members/UNIVERSE.md#the-battle-of-sable-ring), and cost the Ring
+  most of a year's food doing it.
+- [**Maya**](members/maya/CHARACTER.md), a senior developer and working team
+  lead — she had [nine minutes](members/UNIVERSE.md#the-nine-minute-fall) to
+  keep a falling city in the air, and cut three decks loose to do it.
+- [**Leon**](members/leon/CHARACTER.md), a patient and intellectually demanding
+  software architect — he spent eleven years proving that
+  [Chorus](members/UNIVERSE.md#meridian), the system that expelled his sister,
+  had manufactured the evidence against her.
+- [**Vera**](members/vera/CHARACTER.md), a terse and adversarial security
+  engineer — her government ordered her to kill Nico's relay, so she faked the
+  kill and served nearly five years in a Cyrran prison station called
+  [Vigil](members/vera/CHARACTER.md#vigil).
+- [**Nora**](members/nora/CHARACTER.md), a warm UX/UI designer and frontend
+  developer — she drew the living map that guided residents through the wreckage
+  of [Sable Ring](members/UNIVERSE.md#sable-ring).
+- [**Theo**](members/theo/CHARACTER.md), a methodical researcher who follows
+  evidence to a decision — he rode a crewed descent into [Sable's
+  clouds](members/UNIVERSE.md#sable) to prove that decades of instrument noise
+  had been alive all along.
 
 They are general collaborators whose specialties guide task ownership without
 restricting where they can contribute. Their personalities and relationships
