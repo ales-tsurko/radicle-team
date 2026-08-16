@@ -9,6 +9,10 @@ use std::{
 
 use crate::home::MemberHome;
 
+// Says that something in this process called `dispatch`, not that this executable dispatches before
+// its arguments are parsed. A libtest binary calling it from a test body sets it and still cannot
+// serve as the helper, because libtest owns `main`: the re-entered process rejects Zerobox's
+// arguments instead of becoming the sandbox.
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 pub(super) fn dispatch() {
@@ -25,14 +29,9 @@ pub(super) struct Helper {
 
 impl Helper {
     pub(super) fn prepare(home: &MemberHome) -> Result<Self, Error> {
-        Self::ensure_available()?;
-        fs::create_dir_all(home.path()).map_err(|source| Error::Io {
-            path: home.path().into(),
-            source,
-        })?;
+        let source = Self::available_source()?;
         let directory = Self::directory(home)?;
-        let executable = directory.path().join("zerobox-linux-sandbox");
-        Self::install(&executable)?;
+        let executable = Self::alias(directory.path(), &source)?;
 
         Ok(Self {
             _directory: directory,
@@ -40,17 +39,55 @@ impl Helper {
         })
     }
 
-    /// Rejects an environment that cannot launch a sandboxed process at all.
-    fn ensure_available() -> Result<(), Error> {
-        Self::ensure_initialized()?;
-        Self::ensure_bubblewrap()
+    /// Rejects an environment which cannot launch a sandboxed process at all, then reports the
+    /// executable Zerobox re-enters as the helper.
+    fn available_source() -> Result<PathBuf, Error> {
+        Self::ensure_bubblewrap()?;
+
+        Self::source()
     }
 
-    fn ensure_initialized() -> Result<(), Error> {
+    /// Returns the executable Zerobox re-enters as the helper.
+    ///
+    /// The running one, which must therefore dispatch before it parses its arguments.
+    #[cfg(not(test))]
+    fn source() -> Result<PathBuf, Error> {
         INITIALIZED
             .load(Ordering::Acquire)
             .then_some(())
-            .ok_or(Error::Uninitialized)
+            .ok_or(Error::Uninitialized)?;
+
+        std::env::current_exe().map_err(|source| Error::Io {
+            path: Path::new("/proc/self/exe").into(),
+            source,
+        })
+    }
+
+    /// Returns the `sandbox-helper` binary, built beside the test binary that is running.
+    ///
+    /// The running executable cannot serve here: libtest owns `main`, so the re-entered process
+    /// would reject Zerobox's arguments instead of becoming the sandbox.
+    #[cfg(test)]
+    fn source() -> Result<PathBuf, Error> {
+        let current = std::env::current_exe().map_err(|source| Error::Io {
+            path: Path::new("/proc/self/exe").into(),
+            source,
+        })?;
+        let helper = current
+            .parent()
+            .and_then(Path::parent)
+            .ok_or(Error::HelperMissing {
+                path: current.clone().into(),
+            })?
+            .join("sandbox-helper");
+
+        if helper.is_file() {
+            Ok(helper)
+        } else {
+            Err(Error::HelperMissing {
+                path: helper.into(),
+            })
+        }
     }
 
     /// Fails before any command runs when Zerobox has no bubblewrap to launch it with.
@@ -76,7 +113,13 @@ impl Helper {
         }
     }
 
+    /// Returns a directory of the helper's own inside the member's, creating both.
     fn directory(home: &MemberHome) -> Result<tempfile::TempDir, Error> {
+        fs::create_dir_all(home.path()).map_err(|source| Error::Io {
+            path: home.path().into(),
+            source,
+        })?;
+
         tempfile::Builder::new()
             .prefix("sandbox-helper-")
             .tempdir_in(home.path())
@@ -86,15 +129,15 @@ impl Helper {
             })
     }
 
-    fn install(executable: &Path) -> Result<(), Error> {
-        let current = std::env::current_exe().map_err(|source| Error::Io {
-            path: Path::new("/proc/self/exe").into(),
-            source,
+    /// Links `source` under the name Zerobox re-enters, and returns where that link is.
+    fn alias(directory: &Path, source: &Path) -> Result<PathBuf, Error> {
+        let executable = directory.join("zerobox-linux-sandbox");
+        symlink(source, &executable).map_err(|error| Error::Io {
+            path: executable.clone().into(),
+            source: error,
         })?;
-        symlink(current, executable).map_err(|source| Error::Io {
-            path: executable.into(),
-            source,
-        })
+
+        Ok(executable)
     }
 
     pub(super) fn executable(&self) -> &Path {
@@ -106,11 +149,22 @@ impl Helper {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The embedding executable omitted early helper dispatch.
+    #[cfg(not(test))]
     #[error(
         "Linux sandbox helper is uninitialized; call \
          radicle_team::sandbox::dispatch_linux_helper() as the first statement in main"
     )]
     Uninitialized,
+    /// The `sandbox-helper` binary the tests use as the helper was not built.
+    #[cfg(test)]
+    #[error(
+        "Linux sandbox helper '{path}' was not built; run the tests over the whole workspace, for \
+         example 'cargo test --workspace'"
+    )]
+    HelperMissing {
+        /// Where the helper was looked for.
+        path: Box<Path>,
+    },
     /// Bubblewrap is absent, so Zerobox cannot launch a sandboxed process.
     #[error(
         "bubblewrap is required for agent sandboxing on Linux; install it so that 'bwrap' is on \

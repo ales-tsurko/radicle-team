@@ -1,0 +1,19 @@
+# The executable Zerobox re-enters as the Linux sandbox helper during
+# radicle-team's own tests.
+#
+# Its own package rather than a binary of that crate, so `cargo install
+# radicle-team` never ships it, and rather than an example, because `cargo test
+# --all-targets` builds an example with libtest's `main` -- the one thing a
+# helper cannot have.
+[package]
+name = "sandbox-helper"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+publish = false
+
+[dependencies]
+radicle-team = { path = ".." }
+
+[lints]
+workspace = true

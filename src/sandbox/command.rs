@@ -311,16 +311,17 @@ impl Store {
     // Returns the paths inside those grants which must stay read-only.
     fn protected(&self, worktree: &Path) -> Vec<PathBuf> {
         [
-            // The member's standing instructions. They live inside the harness home, which the role
-            // must write, but an agent able to rewrite its own character and the team's rules could
-            // reword them mid-run and every later turn would read the rewrite.
+            // The member's standing instructions. They live inside the harness home, which the
+            // role must write, but an agent able to rewrite its own character and the
+            // team's rules could reword them mid-run and every later turn would read
+            // the rewrite.
             self.home.instructions(self.role),
             // The pointer to the store. Replaced, it would send the runtime's Git somewhere else.
             worktree.join(".git"),
             self.common.join("config"),
             self.common.join("hooks"),
-            // References belong to whichever role created them, and `packed-refs` holds all of them
-            // at once. The building role is given its own namespace back below.
+            // References belong to whichever role created them, and `packed-refs` holds all of
+            // them at once. The building role is given its own namespace back below.
             self.common.join("refs"),
             self.common.join("packed-refs"),
             // Where this working copy finds the store. Repointed at one the role controls, the
@@ -562,17 +563,38 @@ impl Launch {
         Ok(request)
     }
 
+    // Returns whether a sandboxed command inherits `key` from this process.
+    fn inherited_common(key: &str) -> bool {
+        ENVIRONMENT.contains(&key)
+    }
+
+    #[cfg(not(test))]
+    fn inherited(key: &str) -> bool {
+        Self::inherited_common(key)
+    }
+
+    // Adds where a coverage build writes its profile, which is measurement rather than policy.
+    //
+    // These tests run instrumented binaries, and one told nothing writes its profile into the
+    // working directory when it exits -- a working copy, where the runtime would find it as
+    // uncommitted work and salvage it to a branch. Passing the path through sends it to the
+    // directory the coverage run named, outside the sandbox, where the write is simply refused.
+    #[cfg(test)]
+    fn inherited(key: &str) -> bool {
+        Self::inherited_common(key) || key == "LLVM_PROFILE_FILE"
+    }
+
     // Builds the environment one sandboxed command runs with.
     //
     // Git is reset to its defaults because it refuses to run at all when it cannot read the
     // operating-system user's configuration, and the sandbox denies that file. Doing it here also
-    // keeps a member behaving the same on every machine it is deployed to. Who the member is
-    // comes from the shared object store's own configuration instead.
+    // keeps a member behaving the same on every machine it is deployed to. Who the member is comes
+    // from the shared object store's own configuration instead.
     fn environment(
         overrides: BTreeMap<String, String>,
     ) -> std::collections::HashMap<String, String> {
         let mut environment = std::env::vars()
-            .filter(|(key, _value)| ENVIRONMENT.contains(&key.as_str()))
+            .filter(|(key, _value)| Self::inherited(key))
             .collect::<std::collections::HashMap<_, _>>();
         environment.extend(
             radicle::git::env::GIT_DEFAULT_CONFIG
@@ -844,7 +866,6 @@ mod tests {
             (crate::agent::Role::Coder, true),
             (crate::agent::Role::Talker, false),
         ] {
-            crate::sandbox::dispatch_linux_helper();
             let sandbox = AgentSandbox::load(&home, Member::Nico, role, &endpoint())
                 .expect("default sandbox should load");
             let policy = built(&home, &sandbox);
@@ -864,7 +885,6 @@ mod tests {
     fn never_lets_an_agent_rewrite_its_own_instructions() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let home = member_home(directory.path());
-        crate::sandbox::dispatch_linux_helper();
 
         for role in crate::agent::Role::ALL {
             let sandbox = AgentSandbox::load(&home, Member::Nico, role, &endpoint())
@@ -901,7 +921,6 @@ mod tests {
     }
 
     fn sandbox(home: &MemberHome) -> AgentSandbox {
-        crate::sandbox::dispatch_linux_helper();
         AgentSandbox::load(home, Member::Nico, crate::agent::Role::Talker, &endpoint())
             .expect("default sandbox should load")
     }

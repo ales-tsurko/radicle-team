@@ -1,0 +1,4 @@
+# CRAP judges complexity against coverage, so a file that was never compiled
+# here -- every platform-gated module -- would otherwise be scored as untested
+# rather than as absent.
+missing = "skip"

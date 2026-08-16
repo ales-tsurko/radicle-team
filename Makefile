@@ -1,4 +1,5 @@
-CARGO_PACKAGES := -p radicle-team
+# The whole workspace, so the tests' Linux sandbox helper is built beside them.
+CARGO_PACKAGES := --workspace
 MEMBER ?= nico
 REPO ?=
 MIRI_FLAGS := -Zmiri-disable-isolation -Zmiri-tree-borrows
@@ -20,13 +21,13 @@ test-all:
 lint:
 	@status=0; \
 	cargo clippy $(CARGO_PACKAGES) --all-targets --all-features -- -D warnings || status=$$?; \
-	cargo +nightly fmt --check $(CARGO_PACKAGES) || status=$$?; \
+	cargo +nightly fmt --check --all || status=$$?; \
 	RUSTDOCFLAGS="-D warnings" cargo doc ${CARGO_PACKAGES} --all-features \
 		--no-deps --document-private-items || status=$$?; \
 	exit $$status
 
 fmt:
-	cargo +nightly fmt $(CARGO_PACKAGES)
+	cargo +nightly fmt --all
 
 code-health:
 	similarity-rs $(SIMILARITY_ARGS)

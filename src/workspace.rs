@@ -93,9 +93,9 @@ pub(crate) struct Workspaces {
     // store. Git would refuse a concurrent reference update rather than corrupt anything, so this
     // exists to avoid spurious failures rather than to protect the repository.
     shared: Arc<Mutex<()>>,
-    // One per working copy, plus one for the shared store alone. Loaded on first use rather than at
-    // construction, because loading reads embedded profiles and creates directories, and a member
-    // which never prepares a working copy needs none of them.
+    // One per working copy, plus one for the shared store alone. Loaded on first use rather than
+    // at construction, because loading reads embedded profiles and creates directories, and a
+    // member which never prepares a working copy needs none of them.
     sandboxes: Arc<[OnceCell<AgentSandbox>; Role::ALL.len() + 1]>,
 }
 

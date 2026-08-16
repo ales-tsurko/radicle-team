@@ -354,6 +354,9 @@ impl Fixture {
         let source = self.root().join("source");
         fs::create_dir_all(&source).expect("source should be created");
         git(&source, &["init", "-q", "."]);
+        // Named here rather than taken from the machine, which need not have a Git identity at all.
+        git(&source, &["config", "user.name", "Sandbox Test"]);
+        git(&source, &["config", "user.email", "sandbox@example.com"]);
         fs::write(source.join("README.md"), "source\n").expect("README should be written");
         git(&source, &["add", "--all"]);
         git(&source, &["commit", "-q", "-m", "Initial"]);
