@@ -1,8 +1,8 @@
 # Universe
 
-This document defines shared fictional canon for every member. Character
-documents describe personal history and perspective without redefining these
-places, technologies, or events.
+This document is shared canon for every member. Character documents describe
+personal history and perspective without redefining these places, technologies,
+or events.
 
 
 

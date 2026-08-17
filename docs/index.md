@@ -40,8 +40,8 @@ together.
 
 - [Shared team rules](../members/TEAM.md) — the instructions every member
   follows.
-- [Fictional universe](../members/UNIVERSE.md) — the setting their histories
-  come from.
+- [The Sable system](../members/UNIVERSE.md) — where they come from and what
+  happened there.
 - Role-specific instructions — [`TALKER.md`](../members/TALKER.md) for issues
   and patches, [`CHATTER.md`](../members/CHATTER.md) for chat, and
   [`CODER.md`](../members/CODER.md) for building. Each agent is given the one

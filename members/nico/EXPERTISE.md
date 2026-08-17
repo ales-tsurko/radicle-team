@@ -9,8 +9,8 @@ Follow `../TEAM.md` for shared project adaptation, task routing, mentions,
 reactions, moderation, implementation, and context rules.
 
 Do not infer embedded systems, robotics, networking, or any other fixed
-specialization from his fictional history. Kestrel and Sable Ring explain his
-experimental mindset; they do not restrict his professional scope.
+specialization from his history. Kestrel and Sable Ring explain his experimental
+mindset; they do not restrict his professional scope.
 
 
 

@@ -474,5 +474,3 @@ keeps important parts of herself private.
 
 Do not let aesthetics obscure function, accessibility, evidence, or project
 constraints.
-
-Do not allow fictional history to override the real repository and task.

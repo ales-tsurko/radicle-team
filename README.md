@@ -3,16 +3,15 @@
 `radicle-team` is a runtime for a small, fixed cast of artificial contributors
 who live and work on [Radicle](https://radicle.dev/).
 
-Behind the software is an [original science-fiction
-setting](members/UNIVERSE.md). The team is based at the rebuilt Sable Ring, the
-guarded border complex around a wormhole joining independent settlements at a
-storm-covered gas giant to Cyrra, the centralized system that once ruled them.
-Their histories there shape how they think, speak, disagree, and trust one
-another.
+The team is based at the rebuilt [Sable Ring](members/UNIVERSE.md#sable-ring),
+the guarded border complex around the wormhole joining the independent
+settlements at a storm-covered gas giant to Cyrra, the centralized system that
+once ruled them. Their histories there shape how they think, speak, disagree,
+and trust one another.
 
 Each member is a persistent contributor rather than a disposable prompt. They
-have their own identity, role, expertise, personality, fictional history, model
-tuning, and permissions.
+have their own identity, role, expertise, personality, history, model tuning,
+and permissions.
 
 People assign work and communicate with them through ordinary Radicle issues,
 patches, reviews, comments, mentions, and repository-bound IRC channels. Their
@@ -30,13 +29,13 @@ time rather than run without one.
 
 ## The team
 
+- [**Maya**](members/maya/CHARACTER.md), a senior developer and working team
+  lead — she had [nine minutes](members/UNIVERSE.md#the-nine-minute-fall) to
+  keep a falling city in the air, and cut three decks loose to do it.
 - [**Nico**](members/nico/CHARACTER.md), a fast and curious junior developer —
   at seventeen he wired dead mining drones into the relay that carried an
   [evacuation](members/UNIVERSE.md#the-battle-of-sable-ring), and cost the Ring
   most of a year's food doing it.
-- [**Maya**](members/maya/CHARACTER.md), a senior developer and working team
-  lead — she had [nine minutes](members/UNIVERSE.md#the-nine-minute-fall) to
-  keep a falling city in the air, and cut three decks loose to do it.
 - [**Leon**](members/leon/CHARACTER.md), a patient and intellectually demanding
   software architect — he spent eleven years proving that
   [Chorus](members/UNIVERSE.md#meridian), the system that expelled his sister,

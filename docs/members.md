@@ -2,8 +2,7 @@
 
 This is an overview: a sentence of description and the character sheet for each
 member. The documents that actually shape them — full character, expertise,
-history, and voice, which adapters supply to the model as context — live under
-[`members/`](../members/).
+history, and voice — live under [`members/`](../members/).
 
 Each member carries three values, rated 1 to 5. They are a character sheet: read
 them to decide who a job suits. They are the same for a member's three roles.
