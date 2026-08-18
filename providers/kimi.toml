@@ -1,0 +1,48 @@
+# Moonshot's Kimi models, reached through OpenCode.
+#
+# The names below are settings the adapter is asked for, not OpenCode's own
+# configuration keys -- this file is deserialized and its values handed over as
+# data. Model names, prices, and the settings each model accepts are checked
+# against models.dev, the registry OpenCode itself reads.
+#
+# To keep your own edits, copy this file under another name. This one is
+# replaced on update.
+
+# These models are hosted in China. Recent OpenCode asks you to opt in to that
+# before it will offer them, in OpenCode itself rather than here; until you do,
+# a member on this provider stops at startup saying the model is not offered.
+
+adapter = "opencode"
+
+[auth]
+ways = ["key"]
+
+[auth.key]
+env = ["MOONSHOT_API_KEY"]
+
+# Which model the member runs; higher picks the sharper (and slower) one.
+#
+# K3 is five times K2.5 on input and five times K2.7 on output, and is the only
+# rung with a million-token context. The two below it are the coding-tuned
+# models of the previous generation.
+[INT]
+param = "model"
+values = [
+  "moonshotai/kimi-k2.5",
+  "moonshotai/kimi-k2.7-code",
+  "moonshotai/kimi-k2.7-code",
+  "moonshotai/kimi-k3",
+  "moonshotai/kimi-k3",
+]
+
+# How hard the model thinks before answering.
+#
+# K3 is the only rung which reasons; K2.5 and K2.7 take neither an effort nor a
+# temperature. The adapter asks each model for what it actually offers, so
+# these values reach K3 and the rungs below it run at their own default --
+# which is what a ladder climbing from a model without reasoning to one with it
+# means.
+[ACC]
+param = "reasoning_effort"
+values = ["low", "low", "high", "high", "max"]
+

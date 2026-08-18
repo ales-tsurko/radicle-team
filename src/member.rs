@@ -56,7 +56,7 @@ impl Member {
                 member: self,
                 name: "Nico",
                 title: "Junior Developer",
-                tuning: ModelTuning::new(3, 2, 2),
+                tuning: ModelTuning::new(3, 2),
                 mcp_allow: &[
                     "read",
                     "chat",
@@ -70,7 +70,7 @@ impl Member {
                 member: self,
                 name: "Maya",
                 title: "Senior Developer & Team Lead",
-                tuning: ModelTuning::new(5, 4, 4),
+                tuning: ModelTuning::new(4, 4),
                 mcp_allow: &[
                     "read",
                     "chat",
@@ -85,21 +85,37 @@ impl Member {
                 member: self,
                 name: "Leon",
                 title: "Software Architect",
-                tuning: ModelTuning::new(5, 5, 4),
-                mcp_allow: &["read", "chat", "comments", "issues", "reactions", "reviews"],
+                tuning: ModelTuning::new(5, 5),
+                mcp_allow: &[
+                    "read",
+                    "chat",
+                    "comments",
+                    "issues",
+                    "patches",
+                    "reactions",
+                    "reviews",
+                ],
             },
             Self::Vera => Profile {
                 member: self,
                 name: "Vera",
                 title: "Security Engineer",
-                tuning: ModelTuning::new(5, 5, 5),
-                mcp_allow: &["read", "chat", "comments", "issues", "reactions", "reviews"],
+                tuning: ModelTuning::new(5, 5),
+                mcp_allow: &[
+                    "read",
+                    "chat",
+                    "comments",
+                    "issues",
+                    "patches",
+                    "reactions",
+                    "reviews",
+                ],
             },
             Self::Nora => Profile {
                 member: self,
                 name: "Nora",
                 title: "UX/UI Designer & Frontend Developer",
-                tuning: ModelTuning::new(4, 3, 3),
+                tuning: ModelTuning::new(4, 3),
                 mcp_allow: &[
                     "read",
                     "chat",
@@ -114,8 +130,16 @@ impl Member {
                 member: self,
                 name: "Theo",
                 title: "Researcher",
-                tuning: ModelTuning::new(5, 5, 5),
-                mcp_allow: &["read", "chat", "comments", "issues", "reactions", "reviews"],
+                tuning: ModelTuning::new(5, 5),
+                mcp_allow: &[
+                    "read",
+                    "chat",
+                    "comments",
+                    "issues",
+                    "patches",
+                    "reactions",
+                    "reviews",
+                ],
             },
         }
     }
@@ -177,10 +201,12 @@ pub struct Profile {
     pub mcp_allow: &'static [&'static str],
 }
 
-/// One of the scores a member is rated on.
+/// One of the scores a provider file sets a control for.
 ///
 /// The names are the ones the roster shows, so a reader comparing `docs/members.md` against a
-/// provider configuration is reading one vocabulary rather than two.
+/// provider configuration is reading one vocabulary rather than two. The roster carries more
+/// scores than these two; the others come from the member's documents rather than from a model
+/// control, so no provider file has a section for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 pub enum Stat {
     /// How sharp the member is.
@@ -189,14 +215,11 @@ pub enum Stat {
     /// How closely the member sticks to the obvious answer.
     #[serde(rename = "ACC")]
     Accuracy,
-    /// How long the member keeps at a problem before giving up.
-    #[serde(rename = "STU")]
-    Stubbornness,
 }
 
 impl Stat {
     /// Every score, in the order the roster lists them.
-    pub const ALL: [Self; 3] = [Self::Intelligence, Self::Accuracy, Self::Stubbornness];
+    pub const ALL: [Self; 2] = [Self::Intelligence, Self::Accuracy];
 
     /// Returns the three-letter name this score is written as.
     #[must_use]
@@ -204,7 +227,6 @@ impl Stat {
         match self {
             Self::Intelligence => "INT",
             Self::Accuracy => "ACC",
-            Self::Stubbornness => "STU",
         }
     }
 }
@@ -215,14 +237,14 @@ impl fmt::Display for Stat {
     }
 }
 
-/// What a member is like, rated 1 to 5.
+/// The part of a member's character sheet a provider file can set, rated 1 to 5.
 ///
 /// A character sheet: these are read to decide who a job suits, not set by whoever runs one.
 ///
-/// Three, because three is what can actually be set. Every score moves a control the agent
-/// application has: a model, how far it ranges before answering, and how long it works before
-/// stopping. Anything else a member is -- how it writes, what it cares about, when it pushes back
-/// -- is in its documents under `members/`, where prose says it far better than a number could.
+/// Two, because two is what a model control can carry: which model runs, and how far it ranges
+/// before answering. The rest of the sheet is no less real -- how much a member says, what it cares
+/// about, when it pushes back -- but it comes from the documents under `members/`, which give the
+/// model rules and examples rather than a number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelTuning {
     /// How sharp the member is.
@@ -235,22 +257,16 @@ pub struct ModelTuning {
     /// reasoning effort and rejects a temperature, and a model which does not is the other way
     /// round. High means deliberate and on-track either way.
     pub accuracy: u8,
-    /// How long the member keeps at a problem before giving up.
-    ///
-    /// Double-edged on purpose. High keeps digging through a hard bug; it also keeps digging when
-    /// somebody should have been asked instead.
-    pub stubbornness: u8,
 }
 
 impl ModelTuning {
     /// Highest a score goes. Every score runs from 1 to this.
     pub const HIGHEST: u8 = 5;
 
-    const fn new(intelligence: u8, accuracy: u8, stubbornness: u8) -> Self {
+    const fn new(intelligence: u8, accuracy: u8) -> Self {
         Self {
             intelligence,
             accuracy,
-            stubbornness,
         }
     }
 
@@ -260,7 +276,6 @@ impl ModelTuning {
         match stat {
             Stat::Intelligence => self.intelligence,
             Stat::Accuracy => self.accuracy,
-            Stat::Stubbornness => self.stubbornness,
         }
     }
 }

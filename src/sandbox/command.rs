@@ -357,13 +357,26 @@ impl Store {
 }
 
 /// A command whose security policy is fixed by [`AgentSandbox`].
-#[derive(Debug)]
 pub struct AgentCommand {
     sandbox: AgentSandbox,
     program: String,
     arguments: Vec<String>,
     current_dir: PathBuf,
     environment: BTreeMap<String, String>,
+}
+
+// Names the variables it carries and never their values. The provider's API key is placed here, and
+// a secret which can be rendered is a secret which eventually is.
+impl fmt::Debug for AgentCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentCommand")
+            .field("program", &self.program)
+            .field("arguments", &self.arguments)
+            .field("current_dir", &self.current_dir)
+            .field("environment", &self.environment.keys())
+            .finish()
+    }
 }
 
 impl AgentCommand {
@@ -388,7 +401,10 @@ impl AgentCommand {
         self
     }
 
-    /// Sets one explicit non-secret environment value.
+    /// Sets one explicit environment value.
+    ///
+    /// This is how a provider's API key reaches the agent, so the values never appear in this
+    /// type's [`Debug`] output or in anything the sandbox logs.
     #[must_use]
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         let _previous = self.environment.insert(key.into(), value.into());

@@ -17,6 +17,10 @@ Install Radicle so that `rad` and `radicle-node` are available on `PATH`. You
 also need the repository RID and permission to propose or approve its project
 manifest.
 
+Install the agent application the provider you pick is reached through, on the
+same `PATH`. Which that is, and what it needs, is in
+[adapters and providers](adapters/index.md).
+
 On Linux, install `bubblewrap` as well. Zerobox launches every sandboxed agent
 process through it, so without `bwrap` on `PATH` the sandbox cannot start and
 each agent command fails. macOS needs nothing extra, because it uses the
@@ -120,20 +124,25 @@ radicle-team providers
 ~/.config/radicle-team/providers
 
   anthropic    claude-code  not authorized
+  deepseek     opencode     not authorized
+  glm          opencode     not authorized
+  gpt          opencode     not authorized
+  grok         opencode     not authorized
+  kimi         opencode     not authorized
   ollama       opencode     none needed
-  openai       opencode     not authorized
+  qwen         opencode     not authorized
 ```
 
 The same place on macOS as on Linux, and `XDG_CONFIG_HOME` moves it. The listing
 prints the directory, so there is no need to guess.
 
 One file per provider, named after it. The file says which agent application
-reaches that provider's models, how a member's three scores become that
-provider's settings, and how it accepts being authorized. Adding a model, a
+reaches that provider's models, how a member's scores become that provider's
+settings, and how it accepts being authorized. Adding a model, a
 setting, or a whole provider is an edited file rather than a new release.
 
 ```sh
-radicle-team login openai
+radicle-team login gpt
 ```
 
 Once per provider, per machine — one person's account is one account however
@@ -142,12 +151,18 @@ what you want when a project has to be billed to its own account. Pass the same
 `--home PATH` to `providers` to see that login; without it the listing reports
 only the machine-wide one.
 
+The key you give is placed in the agent's environment under the variable that
+provider names, and nowhere else.
+
 A provider you are already signed in to through its agent application is
-recorded as a subscription instead of asking for a key. That is the whole reason
-the Claude Code adapter is here.
+recorded as a subscription instead of asking for a key, which is how a
+subscription rather than an API key pays for a member. The sign-in itself lives
+with that application, under the member's own `harness/<role>/` folder.
 
 We replace the files we ship when the application is updated, so keep your own
-edits under a different name. Credentials are never touched.
+edits under a different name. Credentials are never touched. A provider file we
+have stopped shipping is left where it is, so an older one keeps working until
+you remove it.
 
 
 ### Looking inside a member's copies
@@ -260,6 +275,25 @@ The ignored-activity records matter most in practice. Without them a
 like a member that is simply not responding.
 
 
+### What a delivery actually runs
+
+Starting a member starts its three roles, and each one checks itself before any
+work arrives: the agent application has to be there, and it has to offer the
+model the provider names for this member's INT. A missing application, a
+mistyped model, and a provider nobody logged into all stop the member here
+rather than on its first delivery.
+
+Each delivery is then one run of that application in the role's working copy,
+given the member's documents, the run-scoped MCP server, and a short message
+saying what happened, who did it, and where. Everything else it reads for itself
+through MCP, which is the record everybody else reads too. Nothing is resumed
+between deliveries.
+
+How one particular agent application is driven, what it writes, and what it
+needs beyond the provider's API is in
+[adapters and providers](adapters/index.md).
+
+
 
 
 ## Run multiple members
@@ -332,6 +366,11 @@ operating-system credential store, never in the manifest. Node output goes to
 member folder so deleting the folder deletes it too. Nothing is resumed between
 deliveries: every run starts fresh and reads the issue or patch it is answering
 through MCP, which is the record everyone can see.
+
+One folder per role, holding that role's `instructions/` — the member's
+documents, written out of this build every time it starts — and whatever its
+agent application keeps for itself. Removing it costs whatever that application
+downloads again on the next delivery, and nothing else.
 
 Managed Radicle commands ignore an inherited `RAD_SOCKET`. Each member always
 uses the control socket inside its own `identity/`.

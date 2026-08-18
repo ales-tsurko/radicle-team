@@ -32,7 +32,7 @@ signing_did = "did:key:z6Mk..."          # required
 generation = 1                           # required, monotonic
 state = "active"                         # required, "active" or "inactive"
 mcp_allow = ["read", "comments"]         # required, may be empty
-provider = "anthropic"                   # optional, a name from `radicle-team providers`
+provider = "gpt"                         # optional, a name from `radicle-team providers`
 ```
 
 `provider` names which models a member runs on, never a model itself: which

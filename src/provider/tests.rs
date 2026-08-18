@@ -23,9 +23,9 @@ env = ["OPENAI_API_KEY"]
 param  = "model"
 values = ["gpt-5-nano", "gpt-5-mini", "gpt-5-mini", "gpt-5", "gpt-5"]
 
-[STU]
-param  = "max_steps"
-values = [20, 40, 60, 80, 120]
+[ACC]
+param  = "temperature"
+values = [0.9, 0.7, 0.5, 0.3, 0.1]
 "#;
 
 // Everything a provider file can express, parsed from the shape a user actually writes.
@@ -51,12 +51,12 @@ fn resolves_settings_from_a_members_scores() {
     let settings = provider.settings(nico);
 
     assert_eq!(nico.score(Stat::Intelligence), 3);
-    assert_eq!(nico.score(Stat::Stubbornness), 2);
+    assert_eq!(nico.score(Stat::Accuracy), 2);
     assert_eq!(
         settings,
         [
             ("model".to_owned(), "gpt-5-mini".into()),
-            ("max_steps".to_owned(), 40.into()),
+            ("temperature".to_owned(), 0.7.into()),
         ],
         "a score must select the value at its own position and nothing else"
     );
@@ -66,7 +66,17 @@ fn resolves_settings_from_a_members_scores() {
 // providers those are, so this is the only way it can be expressed.
 #[test]
 fn contributes_nothing_for_a_score_the_provider_has_no_setting_for() {
-    let directory = write("provider-absent", &[("openai", OPENAI)]);
+    let modelless = r#"
+adapter = "opencode"
+
+[auth]
+ways = ["none"]
+
+[INT]
+param  = "model"
+values = ["gpt-5-nano", "gpt-5-mini", "gpt-5-mini", "gpt-5", "gpt-5"]
+"#;
+    let directory = write("provider-absent", &[("openai", modelless)]);
     let provider = provider::find(&directory, "openai").expect("provider should be read");
 
     let named = provider
@@ -75,7 +85,7 @@ fn contributes_nothing_for_a_score_the_provider_has_no_setting_for() {
         .map(|(param, _value)| param)
         .collect::<Vec<_>>();
 
-    assert_eq!(named, ["model", "max_steps"]);
+    assert_eq!(named, ["model"]);
     assert!(
         !named.contains(&"temperature".to_owned()),
         "a file with no ACC entry must produce no setting for it"
@@ -494,7 +504,7 @@ fn replaces_a_linked_provider_rather_than_what_it_points_at() {
     std::fs::create_dir_all(&directory).expect("provider directory should be created");
     let victim = root.join("victim.txt");
     std::fs::write(&victim, "not a provider").expect("victim should be written");
-    std::os::unix::fs::symlink(&victim, provider::path(&directory, "openai"))
+    std::os::unix::fs::symlink(&victim, provider::path(&directory, "gpt"))
         .expect("symlink should be created");
 
     provider::install(&directory).expect("shipped providers should install");
@@ -505,7 +515,7 @@ fn replaces_a_linked_provider_rather_than_what_it_points_at() {
         "installing must not write through a link and destroy what it points at"
     );
     assert!(
-        !provider::path(&directory, "openai")
+        !provider::path(&directory, "gpt")
             .symlink_metadata()
             .expect("the provider file should exist")
             .file_type()

@@ -21,6 +21,9 @@ env = ["ANTHROPIC_API_KEY"]
 
 # Which model the member runs; higher picks the sharper (and slower) one.
 #
+# Cheapest to dearest, per million tokens: Sonnet 5 is 2 in and 10 out, Opus 5
+# is 5 and 25, Fable 5 is 10 and 50.
+#
 # Only models supporting an effort level are on this ladder. Claude Haiku 4.5
 # is cheaper still but does not, and a ladder mixing the two would send a
 # setting one half rejects.
@@ -31,7 +34,7 @@ values = [
   "claude-sonnet-5",
   "claude-sonnet-5",
   "claude-opus-5",
-  "claude-opus-5",
+  "claude-fable-5",
 ]
 
 # How much work the model puts into a response, thinking and tool calls alike.
@@ -43,7 +46,3 @@ values = [
 param = "effort"
 values = ["low", "medium", "high", "xhigh", "max"]
 
-# How long a member keeps at a problem before it stops.
-[STU]
-param = "max_steps"
-values = [20, 40, 60, 80, 120]

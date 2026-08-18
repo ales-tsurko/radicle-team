@@ -17,6 +17,8 @@ together.
   were rejected.
 - [Members](members.md) — the roster, their character sheets, and how to address
   them.
+- [Adapters and providers](adapters/index.md) — which models ship, which agent
+  application reaches them, and what each of those needs.
 
 
 
@@ -30,6 +32,8 @@ together.
   filesystem and network policy, and platform behaviour.
 - [Chat](chat.md) — what an IRC server must provide, how accounts map to DIDs,
   channel binding, privacy, and deploying a server.
+- [The `opencode` adapter](adapters/opencode.md) — what it needs, which settings
+  it carries, and what it writes where.
 - [Ergo deployment](../deploy/ergo/README.md) — the recommended Compose
   deployment.
 

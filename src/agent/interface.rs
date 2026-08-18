@@ -74,25 +74,33 @@ impl fmt::Display for Role {
     }
 }
 
-/// Fixed directories one role is given for the life of the member.
+/// What one role is given for the life of the member.
 ///
 /// Delivery workspaces arrive per call. These do not: a build cache survives between deliveries on
-/// purpose, and a harness needs somewhere of its own to keep settings and logs.
+/// purpose, a harness needs somewhere of its own to keep settings and logs, and the documents
+/// instructing the role are the same ones from its first delivery to its last.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     role: Role,
     cache: PathBuf,
     harness: PathBuf,
+    documents: Vec<PathBuf>,
 }
 
 impl Layout {
-    /// Describes the directories belonging to `role`.
+    /// Describes what belongs to `role`, instructed by the documents at `documents`.
     #[must_use]
-    pub const fn new(role: Role, cache: PathBuf, harness: PathBuf) -> Self {
+    pub const fn new(
+        role: Role,
+        cache: PathBuf,
+        harness: PathBuf,
+        documents: Vec<PathBuf>,
+    ) -> Self {
         Self {
             role,
             cache,
             harness,
+            documents,
         }
     }
 
@@ -119,6 +127,21 @@ impl Layout {
     #[must_use]
     pub fn harness(&self) -> &Path {
         &self.harness
+    }
+
+    /// Returns the documents instructing this role, in the order they should be read.
+    ///
+    /// The documents are compiled into the binary, which ships without the repository they were
+    /// written in. The runtime writes this role's set out with
+    /// [`documents::install`](crate::agent::documents::install) before starting it and passes the
+    /// files here, because a harness reads its instructions from disk. They stay read-only to the
+    /// agent, so nothing can reword its own character mid-run.
+    ///
+    /// An adapter whose harness takes instructions some other way reads the files instead; the
+    /// order is the one the documents themselves establish.
+    #[must_use]
+    pub fn documents(&self) -> &[PathBuf] {
+        &self.documents
     }
 }
 
@@ -189,10 +212,14 @@ impl Stall {
 
 /// A supervisor for a role which runs no separate process.
 ///
-/// Reports no progress and has nothing to stop, so the runtime never interferes with it.
+/// Reports no progress and has nothing to stop, so the runtime never interferes with it. Every
+/// role the runtime starts runs one, so this is what the tests which stand in for one use. Those
+/// tests all spawn or wait, which Miri cannot do, so under Miri nothing here is built at all.
+#[cfg(all(test, not(miri)))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Idle;
 
+#[cfg(all(test, not(miri)))]
 #[async_trait]
 impl Supervisor for Idle {
     fn last_progress(&self) -> Option<Instant> {

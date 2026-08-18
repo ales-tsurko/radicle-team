@@ -47,8 +47,13 @@ pub const EXTENSION: &str = "toml";
 // application is updated. A user who wants an edit to survive keeps it under another name.
 const SHIPPED: &[(&str, &str)] = &[
     ("anthropic", include_str!("../../providers/anthropic.toml")),
+    ("deepseek", include_str!("../../providers/deepseek.toml")),
+    ("glm", include_str!("../../providers/glm.toml")),
+    ("gpt", include_str!("../../providers/gpt.toml")),
+    ("grok", include_str!("../../providers/grok.toml")),
+    ("kimi", include_str!("../../providers/kimi.toml")),
     ("ollama", include_str!("../../providers/ollama.toml")),
-    ("openai", include_str!("../../providers/openai.toml")),
+    ("qwen", include_str!("../../providers/qwen.toml")),
 ];
 
 /// One provider, as read from its file.

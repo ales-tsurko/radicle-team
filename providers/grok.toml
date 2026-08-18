@@ -1,0 +1,43 @@
+# xAI's Grok models, reached through OpenCode.
+#
+# The names below are settings the adapter is asked for, not OpenCode's own
+# configuration keys -- this file is deserialized and its values handed over as
+# data. Model names, prices, and the effort values below are checked against
+# models.dev, the registry OpenCode itself reads.
+#
+# To keep your own edits, copy this file under another name. This one is
+# replaced on update.
+
+adapter = "opencode"
+
+[auth]
+ways = ["key"]
+
+[auth.key]
+env = ["XAI_API_KEY"]
+
+# Which model the member runs; higher picks the sharper (and slower) one.
+#
+# 4.5 is the newer and stronger model at roughly twice 4.3's price. 4.3 keeps a
+# million-token context against 4.5's half million, which is the one thing the
+# cheaper rungs get more of.
+[INT]
+param = "model"
+values = [
+  "xai/grok-4.3",
+  "xai/grok-4.3",
+  "xai/grok-4.5",
+  "xai/grok-4.5",
+  "xai/grok-4.5",
+]
+
+# How hard the model thinks before answering.
+#
+# 4.3 will also not reason at all; 4.5 always reasons a little. The adapter
+# asks each model for the nearest effort it offers, so the bottom of this
+# ladder is whichever of the two the member's own model turns out to be
+# running.
+[ACC]
+param = "reasoning_effort"
+values = ["none", "low", "medium", "high", "high"]
+

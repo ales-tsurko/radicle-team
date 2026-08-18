@@ -152,8 +152,11 @@ impl SandboxSetup {
 
     fn prompt_domains(&self) -> Result<NetworkAccess, Error> {
         let default = self.current_domains().join("\n");
+        // A list has to cover whatever the agent application fetches as well as the provider's own
+        // API, or a member cannot start at all. Which hosts those are belongs to the adapter, and
+        // `docs/adapters` names them.
         let mut input = cliclack::input("Allowed domains (one per line)")
-            .placeholder("api.openai.com")
+            .placeholder("your provider's API, and what your agent application fetches")
             .multiline();
         if !default.is_empty() {
             input = input.default_input(&default);

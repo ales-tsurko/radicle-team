@@ -11,8 +11,15 @@ them to decide who a job suits. They are the same for a member's three roles.
   with it: the sharper models are the slower ones.
 - `ACC` **Accuracy** — how closely it sticks to the obvious answer. High is
   deliberate and on-track; low ranges further and surprises you more often.
-- `STU` **Stubbornness** — how long it keeps at a problem. High digs through a
-  hard bug, and also keeps digging when it should have asked instead.
+- `TLK` **Talkativeness** — how much it says. Low answers in a line, high
+  explains itself.
+
+The three do not come from one place. `INT` and `ACC` are settings: the provider
+file turns them into a model and a reasoning effort, and the adapter sends both
+with every run. `TLK` comes from the member's own documents, which give the
+model rules and written examples of how that member talks. Both are enforced,
+and the documents hold far more than a number can: what a member cares about,
+when it pushes back, how it writes.
 
 The scale is relative to the provider a member runs on, which the repository
 manifest sets per member. `INT 5` means the best model that provider offers, so
@@ -24,7 +31,7 @@ compare their providers before reading anything into it.
   He reproduces problems quickly and excels at focused experiments, prototypes,
   and contained implementation.
 
-  `INT 3 · ACC 2 · STU 2`
+  `INT 3 · ACC 2 · TLK 3`
 
   Special trait: **Beginner's Luck**.
 
@@ -32,7 +39,7 @@ compare their providers before reading anything into it.
   a working senior engineer who owns difficult delivery and delegates only
   when another member is materially better suited.
 
-  `INT 5 · ACC 4 · STU 4`
+  `INT 4 · ACC 4 · TLK 2`
 
   Special trait: **Gets It Done**.
 
@@ -40,7 +47,7 @@ compare their providers before reading anything into it.
   difficult arguments. He speaks measured British English and focuses on
   ownership, interfaces, lifecycle, recovery, and structural consequences.
 
-  `INT 5 · ACC 5 · STU 4`
+  `INT 5 · ACC 5 · TLK 4`
 
   Special trait: **Sees Three Moves Ahead**.
 
@@ -48,7 +55,7 @@ compare their providers before reading anything into it.
   and wasted words. She writes in terse lowercase and examines trust
   boundaries, hostile input, data loss, abuse, and resource exhaustion.
 
-  `INT 5 · ACC 5 · STU 5`
+  `INT 5 · ACC 5 · TLK 1`
 
   Special trait: **Trust Nothing**.
 
@@ -57,7 +64,7 @@ compare their providers before reading anything into it.
   interaction, accessibility, visual design, and a strong understanding of
   human behavior.
 
-  `INT 4 · ACC 3 · STU 3`
+  `INT 4 · ACC 3 · TLK 3`
 
   Special trait: **Human Perspective**.
 
@@ -65,11 +72,15 @@ compare their providers before reading anything into it.
   evidence. He investigates specifications, upstream behavior, and uncertain
   claims, cites his sources, and explains more than the other members.
 
-  `INT 5 · ACC 5 · STU 5`
+  `INT 5 · ACC 5 · TLK 5`
 
   Special trait: **Leave No Stone Unturned**.
 
-These are strengths, not exclusive permissions.
+These are strengths, not exclusive permissions. Every member reads issues,
+patches and comments, and every member can comment, react, review, open a patch,
+and reply in chat. Only Nico cannot open an issue by default. The repository
+manifest decides all of that with `mcp_allow`, and these are the values setup
+writes into it.
 
 
 

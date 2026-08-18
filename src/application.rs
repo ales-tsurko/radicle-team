@@ -7,7 +7,6 @@ use std::{
 };
 
 use radicle::{
-    cob::EntryId,
     identity::{Did, RepoId},
     node::{Node, NodeId, policy::Scope},
     profile::Profile as RadicleProfile,
@@ -15,10 +14,7 @@ use radicle::{
 };
 
 use crate::{
-    agent::{
-        self, Change, ChatContext, ChatMessage, Chatter, Coder, Comment, Context as AgentContext,
-        Talker, Target,
-    },
+    agent::{self, Chatter, Coder, Talker, adapter, documents},
     builder, chat, conversation,
     home::{self, MemberHome},
     identity::{self, GenerationStore, Manager, MemberLock, Provider},
@@ -26,7 +22,8 @@ use crate::{
     mcp,
     member::Member,
     node::{self, NodeManager},
-    queue::{Job, WorkQueue},
+    provider::{self, credentials},
+    queue::WorkQueue,
     sandbox::AgentSandbox,
     shutdown::Shutdown,
     watcher,
@@ -262,23 +259,11 @@ impl Application {
 
     /// Runs the team member.
     ///
-    /// # Errors
+    /// Each of the member's three roles is started as its own agent on the provider this member
+    /// runs on: the runtime holds each one's process, so it can stop an agent which has gone silent
+    /// or refused to stop.
     ///
-    /// Returns an error if manifest, identity, repository, node, event stream, or local state
-    /// validation fails.
-    pub async fn run(&self) -> Result<(), Error> {
-        Box::pin(self.run_with_agents(&mut LoggingAgent, &mut LoggingAgent, &mut LoggingAgent))
-            .await
-    }
-
-    /// Runs the team member with `talker` answering repository activity, `chatter` answering chat,
-    /// and `coder` carrying out queued work.
-    ///
-    /// Roles are internal on purpose. The runtime holds each agent's process so it can stop one
-    /// which has gone silent or refused to stop, which it could not do for an implementation it did
-    /// not own.
-    ///
-    /// The three roles share one identity, one manifest binding, and one node, but not one train of
+    /// The three share one identity, one manifest binding, and one node, but not one train of
     /// thought. A half-written patch has no safe point to pause at, and an agent turn cannot be
     /// interrupted, so neither a queued job nor a review may hold up somebody waiting in a channel.
     ///
@@ -291,14 +276,92 @@ impl Application {
     ///
     /// # Errors
     ///
-    /// Returns an error if preparation, watching, building, or agent dispatch fails.
-    pub(crate) async fn run_with_agents(
+    /// Returns an error if the provider cannot be reached, or if preparation, watching, building,
+    /// or agent dispatch fails.
+    pub async fn run(&self) -> Result<(), Error> {
+        let (runtime, binding) = self.start_run().await?;
+        let mut roles = match self.roles(&runtime, &binding) {
+            Ok(roles) => roles,
+            Err(error) => return self.abandon_run(runtime, error).await,
+        };
+
+        Box::pin(self.run_roles(
+            runtime,
+            &binding,
+            &mut *roles.talker,
+            &mut *roles.chatter,
+            &mut *roles.coder,
+        ))
+        .await
+    }
+
+    /// Builds one agent per role for the provider this member was told to run on.
+    ///
+    /// A provider is a file: its adapter, its models, and its settings are all strings an operator
+    /// may edit. Everything which can be checked before an agent starts is checked here, so a
+    /// mistake is reported at startup rather than on the first delivery. Which agent application
+    /// ends up behind the roles is [`crate::agent::adapter::select`]'s business.
+    fn roles(
         &self,
+        runtime: &Runtime,
+        binding: &manifest::ValidatedBinding,
+    ) -> Result<adapter::Roles, Error> {
+        let (configuration, name, selected) = self.selected(binding)?;
+        let held = Self::authorization(&configuration, runtime, &selected, &name)?;
+        let roles = adapter::select(selected.adapter(), &selected, held.as_ref())?;
+        tracing::info!(
+            provider = name,
+            adapter = selected.adapter(),
+            "running on provider"
+        );
+
+        Ok(roles)
+    }
+
+    /// Returns the provider this member runs on, with the directory it was read from.
+    fn selected(
+        &self,
+        binding: &manifest::ValidatedBinding,
+    ) -> Result<(PathBuf, String, provider::Provider), Error> {
+        let configuration = provider::configuration()?;
+        let name = self
+            .resolved_provider(binding)
+            .ok_or(Error::NoModelProvider)?;
+        let selected = provider::installed_named(&configuration, &name)?;
+
+        Ok((configuration, name, selected))
+    }
+
+    /// Returns what this member reaches `name` with, refusing a provider nobody has authorized.
+    ///
+    /// The member's own store wins over the machine's, which is how one project is billed to an
+    /// account of its own.
+    fn authorization(
+        configuration: &Path,
+        runtime: &Runtime,
+        selected: &provider::Provider,
+        name: &str,
+    ) -> Result<Option<provider::Credentials>, Error> {
+        let held = credentials::load(
+            &credentials::directory(configuration),
+            Some(&credentials::directory(runtime.home.path())),
+            name,
+        )?;
+        if selected.needs_authorizing() && held.is_none() {
+            return Err(Error::UnauthorizedProvider(name.to_owned()));
+        }
+
+        Ok(held)
+    }
+
+    async fn run_roles(
+        &self,
+        runtime: Runtime,
+        binding: &manifest::ValidatedBinding,
         talker: &mut (impl Talker + ?Sized),
         chatter: &mut (impl Chatter + ?Sized),
         coder: &mut (impl Coder + ?Sized),
     ) -> Result<(), Error> {
-        let (runtime, binding) = self.start_run().await?;
         let profile = self.member.profile();
         tracing::info!(
             member = profile.name,
@@ -684,106 +747,6 @@ impl Application {
         })
         .await
         .map_err(|error| Error::Task(error.to_string()))?
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct LoggingAgent;
-
-impl crate::agent::Supervised for LoggingAgent {
-    fn supervisor(&self) -> std::sync::Arc<dyn crate::agent::Supervisor> {
-        std::sync::Arc::new(crate::agent::Idle)
-    }
-}
-
-#[async_trait::async_trait]
-impl Chatter for LoggingAgent {
-    async fn start(
-        &mut self,
-        profile: crate::member::Profile,
-        _mcp: &agent::McpEndpoint,
-        _sandbox: AgentSandbox,
-        _layout: crate::agent::Layout,
-    ) -> Result<(), agent::Error> {
-        tracing::info!(member = profile.member.id(), "chatter role started");
-        Ok(())
-    }
-
-    async fn messaged(
-        &mut self,
-        context: ChatContext,
-        message: ChatMessage,
-    ) -> Result<(), agent::Error> {
-        tracing::info!(?context, ?message, "chat message received");
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl Talker for LoggingAgent {
-    async fn start(
-        &mut self,
-        profile: crate::member::Profile,
-        _mcp: &agent::McpEndpoint,
-        _sandbox: AgentSandbox,
-        _layout: crate::agent::Layout,
-    ) -> Result<(), agent::Error> {
-        tracing::info!(
-            member = profile.member.id(),
-            intelligence = profile.tuning.intelligence,
-            accuracy = profile.tuning.accuracy,
-            stubbornness = profile.tuning.stubbornness,
-            "agent role started"
-        );
-        Ok(())
-    }
-
-    async fn mentioned(
-        &mut self,
-        context: AgentContext,
-        target: Target,
-    ) -> Result<(), agent::Error> {
-        tracing::info!(?context, ?target, "mention received");
-        Ok(())
-    }
-
-    async fn replied(
-        &mut self,
-        context: AgentContext,
-        comment: Comment,
-        reply_to: EntryId,
-    ) -> Result<(), agent::Error> {
-        tracing::info!(?context, ?comment, %reply_to, "reply received");
-        Ok(())
-    }
-
-    async fn changed(&mut self, context: AgentContext, change: Change) -> Result<(), agent::Error> {
-        tracing::info!(?context, ?change, "relevant change received");
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl Coder for LoggingAgent {
-    async fn start(
-        &mut self,
-        profile: crate::member::Profile,
-        _mcp: &agent::McpEndpoint,
-        _sandbox: AgentSandbox,
-        _layout: crate::agent::Layout,
-    ) -> Result<(), agent::Error> {
-        tracing::info!(member = profile.member.id(), "coder role started");
-        Ok(())
-    }
-
-    async fn work(&self, job: Job, workspace: PathBuf) -> Result<(), agent::Error> {
-        tracing::info!(?job, workspace = %workspace.display(), "queued work received");
-        Ok(())
-    }
-
-    async fn interrupt(&self) -> Result<(), agent::Error> {
-        tracing::info!("queued work asked to stop");
-        Ok(())
     }
 }
 
@@ -1230,13 +1193,27 @@ impl AgentRuntime {
     ) -> Result<(AgentSandbox, agent::Layout), Error> {
         let sandbox =
             AgentSandbox::load(&runtime.home, application.member, role, server.endpoint())?;
+        // The documents are compiled in, so a role is instructed by this build rather than by
+        // whatever the last one left behind. Written here rather than by the adapter, because
+        // installing empties the directory first and only the member's home may say which
+        // directory that is.
+        let documents = documents::install(&runtime.home, application.member, role)
+            .map_err(Error::Documents)?;
+        tracing::debug!(
+            %role,
+            documents = documents.len(),
+            "installed the member's standing instructions"
+        );
 
-        Ok((sandbox, Self::layout(&runtime.home, role)))
-    }
-
-    // Returns the fixed directories one role owns, which [`MemberHome::create`] made.
-    fn layout(home: &MemberHome, role: agent::Role) -> agent::Layout {
-        agent::Layout::new(role, home.cache(), home.harness(role))
+        Ok((
+            sandbox,
+            agent::Layout::new(
+                role,
+                runtime.home.cache(),
+                runtime.home.harness(role),
+                documents,
+            ),
+        ))
     }
 
     async fn initialize_publisher(
@@ -1715,6 +1692,27 @@ pub enum Error {
     /// Loading the agent sandbox failed.
     #[error("agent sandbox error: {0}")]
     Sandbox(#[from] crate::sandbox::Error),
+    /// Reading the model provider failed.
+    #[error(transparent)]
+    Provider(#[from] crate::provider::Error),
+    /// Reading what the model provider is reached with failed.
+    #[error(transparent)]
+    Credentials(#[from] crate::provider::CredentialsError),
+    /// Nothing says which models this member runs on.
+    #[error(
+        "no model provider chosen for this member; name one in the manifest binding or pass \
+         --provider NAME, and see `radicle-team providers` for what this machine has"
+    )]
+    NoModelProvider,
+    /// The provider names an agent application this build has no adapter for.
+    #[error(transparent)]
+    UnknownAdapter(#[from] agent::adapter::Unknown),
+    /// The provider needs authorizing and nothing on this machine has authorized it.
+    #[error("provider '{0}' is not authorized on this machine; run `radicle-team login {0}`")]
+    UnauthorizedProvider(String),
+    /// Writing a role's standing instructions failed.
+    #[error("could not install the member's instructions: {0}")]
+    Documents(#[source] io::Error),
     /// Starting or stopping the agent role failed.
     #[error(transparent)]
     Talker(#[from] agent::Error),

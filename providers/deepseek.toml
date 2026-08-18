@@ -1,0 +1,46 @@
+# DeepSeek models, reached through OpenCode.
+#
+# The names below are settings the adapter is asked for, not OpenCode's own
+# configuration keys -- this file is deserialized and its values handed over as
+# data. Model names, prices, and the effort values below are checked against
+# models.dev, the registry OpenCode itself reads.
+#
+# To keep your own edits, copy this file under another name. This one is
+# replaced on update.
+
+# These models are hosted in China. Recent OpenCode asks you to opt in to that
+# before it will offer them, in OpenCode itself rather than here; until you do,
+# a member on this provider stops at startup saying the model is not offered.
+
+adapter = "opencode"
+
+[auth]
+ways = ["key"]
+
+[auth.key]
+env = ["DEEPSEEK_API_KEY"]
+
+# Which model the member runs; higher picks the sharper (and slower) one.
+#
+# One generation, both with a million-token context. Pro is three times the
+# price of Flash, so it is kept for the members who are meant to be expensive.
+[INT]
+param = "model"
+values = [
+  "deepseek/deepseek-v4-flash",
+  "deepseek/deepseek-v4-flash",
+  "deepseek/deepseek-v4-flash",
+  "deepseek/deepseek-v4-pro",
+  "deepseek/deepseek-v4-pro",
+]
+
+# How hard the model thinks before answering.
+#
+# Flash takes `low`, `high` and `max`; Pro takes only the last two. The two
+# scores are read independently -- a member can be sharp and hasty -- so the
+# ladder below says what the member is, and the adapter asks each model for the
+# nearest effort it actually offers.
+[ACC]
+param = "reasoning_effort"
+values = ["low", "low", "medium", "high", "max"]
+

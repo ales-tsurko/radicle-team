@@ -1,0 +1,52 @@
+# Z.AI's GLM models, reached through OpenCode.
+#
+# The names below are settings the adapter is asked for, not OpenCode's own
+# configuration keys -- this file is deserialized and its values handed over as
+# data. Model names and the settings each model accepts are checked against
+# models.dev, the registry OpenCode itself reads.
+#
+# The coding plan rather than the metered API, because GLM-5.3 is offered on
+# the plan alone. A plan is a flat monthly fee with its own rate limits, so
+# nothing here has a per-token price to rank by. Its key is the same Z.AI key,
+# and `zhipuai-coding-plan/...` is the same plan bought inside China.
+#
+# To keep your own edits, copy this file under another name. This one is
+# replaced on update.
+
+# These models are hosted in China. Recent OpenCode asks you to opt in to that
+# before it will offer them, in OpenCode itself rather than here; until you do,
+# a member on this provider stops at startup saying the model is not offered.
+
+adapter = "opencode"
+
+[auth]
+ways = ["key"]
+
+[auth.key]
+env = ["ZHIPU_API_KEY"]
+
+# Which model the member runs; higher picks the sharper (and slower) one.
+#
+# Ranked by generation rather than price: 4.7 is the previous one, Turbo is the
+# fast 5, and 5.2 and 5.3 carry the million-token context.
+[INT]
+param = "model"
+values = [
+  "zai-coding-plan/glm-4.7",
+  "zai-coding-plan/glm-5-turbo",
+  "zai-coding-plan/glm-5.2",
+  "zai-coding-plan/glm-5.3",
+  "zai-coding-plan/glm-5.3",
+]
+
+# How closely the member sticks to the obvious answer.
+#
+# A temperature rather than a reasoning effort: 5.2 and 5.3 offer an effort and
+# the two rungs below them do not, so an effort would move half this ladder and
+# leave the rest at its default. Temperature moves every rung.
+#
+# Descending, because a high score means sticking to the obvious answer.
+[ACC]
+param = "temperature"
+values = [0.9, 0.7, 0.5, 0.3, 0.1]
+

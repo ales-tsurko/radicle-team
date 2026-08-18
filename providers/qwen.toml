@@ -1,0 +1,50 @@
+# Alibaba's Qwen models, reached through OpenCode.
+#
+# The names below are settings the adapter is asked for, not OpenCode's own
+# configuration keys -- this file is deserialized and its values handed over as
+# data. Model names, prices, and the settings each model accepts are checked
+# against models.dev, the registry OpenCode itself reads.
+#
+# Authorized with a DashScope key, which is what Alibaba's international
+# console issues.
+#
+# To keep your own edits, copy this file under another name. This one is
+# replaced on update.
+
+# These models are hosted in China. Recent OpenCode asks you to opt in to that
+# before it will offer them, in OpenCode itself rather than here; until you do,
+# a member on this provider stops at startup saying the model is not offered.
+
+adapter = "opencode"
+
+[auth]
+ways = ["key"]
+
+[auth.key]
+env = ["DASHSCOPE_API_KEY"]
+
+# Which model the member runs; higher picks the sharper (and slower) one.
+#
+# Cheapest to dearest: Flash is a tenth of Max on input and a fifth on output,
+# and Plus sits between them. All three carry a million-token context.
+[INT]
+param = "model"
+values = [
+  "alibaba/qwen3.6-flash",
+  "alibaba/qwen3.7-plus",
+  "alibaba/qwen3.7-plus",
+  "alibaba/qwen3.8-max",
+  "alibaba/qwen3.8-max",
+]
+
+# How closely the member sticks to the obvious answer.
+#
+# A temperature rather than a reasoning effort: only Max offers an effort at
+# all, so an effort would leave the three rungs below it running at whatever
+# their default is. Temperature moves every rung, which is what a score is for.
+#
+# Descending, because a high score means sticking to the obvious answer.
+[ACC]
+param = "temperature"
+values = [0.9, 0.7, 0.5, 0.3, 0.1]
+

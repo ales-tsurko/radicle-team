@@ -1,0 +1,45 @@
+# OpenAI's GPT models, reached through OpenCode.
+#
+# The names below are settings the adapter is asked for, not OpenCode's own
+# configuration keys -- this file is deserialized and its values handed over as
+# data. Model names, prices, and the effort values below are checked against
+# models.dev, the registry OpenCode itself reads.
+#
+# To keep your own edits, copy this file under another name. This one is
+# replaced on update.
+
+adapter = "opencode"
+
+[auth]
+ways = ["key", "subscription"]
+
+[auth.key]
+env = ["OPENAI_API_KEY"]
+
+# Which model the member runs; higher picks the sharper (and slower) one.
+#
+# One generation, cheapest to dearest: Luna is the small model of the 5.6
+# generation, Terra the middle one, and Sol the frontier model at the top.
+#
+# `openai/gpt-5.6` is not a fourth model. It is the same frontier model as Sol,
+# at the same price, so naming it as well would only put one model on two
+# rungs.
+[INT]
+param = "model"
+values = [
+  "openai/gpt-5.6-luna",
+  "openai/gpt-5.6-luna",
+  "openai/gpt-5.6-terra",
+  "openai/gpt-5.6-sol",
+  "openai/gpt-5.6-sol",
+]
+
+# How hard the model thinks before answering.
+#
+# A reasoning effort rather than a temperature: every model above reasons, and
+# a reasoning model rejects a temperature. All five values are offered by every
+# rung, so the score moves the same control the whole way up.
+[ACC]
+param = "reasoning_effort"
+values = ["none", "low", "medium", "high", "max"]
+

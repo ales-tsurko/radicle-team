@@ -133,6 +133,11 @@ network = "disabled"
 network = ["api.openai.com", "crates.io", "github.com"]
 ```
 
+A restricted list has to cover the agent application as well as the provider's
+own API: agent applications fetch model registries and their own dependencies,
+and a list without those leaves a member unable to start. What each one needs is
+in [adapters and providers](adapters/index.md).
+
 Disabled and domain-restricted modes route external traffic through the managed
 proxy, which accepts only the capability-protected MCP endpoint.
 
