@@ -146,8 +146,8 @@ mod tests {
     struct SilentChatter;
 
     impl crate::agent::Supervised for SilentChatter {
-        fn supervisor(&self) -> std::sync::Arc<dyn crate::agent::Supervisor> {
-            std::sync::Arc::new(crate::agent::Idle)
+        fn supervisor(&self) -> std::sync::Arc<crate::agent::Session> {
+            std::sync::Arc::new(crate::agent::Session::new(crate::agent::Role::Chatter))
         }
     }
 

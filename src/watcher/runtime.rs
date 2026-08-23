@@ -1279,8 +1279,8 @@ mod tests {
     }
 
     impl crate::agent::Supervised for NoopAgent {
-        fn supervisor(&self) -> std::sync::Arc<dyn crate::agent::Supervisor> {
-            std::sync::Arc::new(crate::agent::Idle)
+        fn supervisor(&self) -> std::sync::Arc<crate::agent::Session> {
+            std::sync::Arc::new(crate::agent::Session::new(crate::agent::Role::Talker))
         }
     }
 

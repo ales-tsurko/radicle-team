@@ -1,8 +1,9 @@
 //! The configuration file one role runs OpenCode under.
 //!
-//! [`Controls`] is what every adapter is given. This turns one into OpenCode's own shape: a
-//! reasoning effort becomes a variant, and the whole set becomes an agent OpenCode runs the member
-//! as.
+//! [`Controls`] is what every adapter is given: the provider file's settings, under the names it
+//! wrote, valued as it wrote them. This turns one into OpenCode's own shape -- a reasoning effort
+//! becomes a variant, and the whole set becomes an agent OpenCode runs the member as -- after
+//! refusing any name OpenCode carries no control for.
 //!
 //! The file also carries everything about the run which is not tuning: which MCP server the member
 //! reaches, which documents instruct it, and the settings which keep a headless agent headless.
@@ -17,7 +18,7 @@ use serde::Serialize;
 
 use crate::{
     agent::{
-        Controls, Layout, McpEndpoint,
+        Controls, Layout, McpEndpoint, controls,
         opencode::{Error, catalogue::Catalogue},
     },
     member::{ModelTuning, Profile},
@@ -47,10 +48,19 @@ const PLUGIN_REPORT: &str = "\"__REPORT__\"";
 /// The controls one role runs with, as OpenCode takes them.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Settings {
-    controls: Controls,
+    // The `provider/model` OpenCode is asked to run.
+    model: String,
+    // The reasoning effort the file asked for, at this member's own score.
+    effort: Option<String>,
     // The effort actually sent, once it has been fitted to what this model offers.
     variant: Option<String>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
 }
+
+// The settings OpenCode carries. Anything else a provider file names would sit there looking active
+// while doing nothing, so the role refuses to start over one.
+const CARRIED: &[&str] = &["model", "reasoning_effort", "temperature", "top_p"];
 
 impl Settings {
     /// Reads what `provider` makes of a member scored `tuning`.
@@ -59,17 +69,29 @@ impl Settings {
     ///
     /// Returns an error when the provider file does not describe a member this crate can run.
     pub(super) fn read(provider: &Provider, tuning: ModelTuning) -> Result<Self, Error> {
-        let controls = Controls::read(provider, tuning)?;
+        let controls = Controls::read(provider, tuning);
+        controls.carried(CARRIED).map_err(Error::from)?;
+        let given = || controls.names().map(str::to_owned).collect::<Vec<_>>();
+        let model = controls
+            .text("model")
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::from(controls::Error::missing("model", given())))?;
+        let effort = controls.text("reasoning_effort").map_err(Error::from)?;
 
         Ok(Self {
-            variant: controls.reasoning_effort().map(str::to_owned),
-            controls,
+            model,
+            effort: effort.clone(),
+            // What is sent starts as what was asked for, and stays that way unless fitting below
+            // settles on something the model actually takes.
+            variant: effort,
+            temperature: controls.number("temperature").map_err(Error::from)?,
+            top_p: controls.number("top_p").map_err(Error::from)?,
         })
     }
 
     /// Returns the `provider/model` OpenCode is asked to run.
     pub(super) fn model(&self) -> &str {
-        self.controls.model()
+        &self.model
     }
 
     /// Fits the member's reasoning effort to what its own model takes.
@@ -79,7 +101,7 @@ impl Settings {
     /// error from the provider on the first delivery, so what is sent is what [`Catalogue::effort`]
     /// settles on, and a model with no efforts is sent none.
     pub(super) fn fit(&mut self, catalogue: &Catalogue) {
-        let Some(wanted) = self.controls.reasoning_effort() else {
+        let Some(wanted) = self.effort.as_deref() else {
             return;
         };
         let fitted = catalogue.effort(self.model(), wanted);
@@ -184,8 +206,8 @@ impl Settings {
             mode: "primary",
             model: self.model().to_owned(),
             variant: self.variant.clone(),
-            temperature: self.controls.temperature(),
-            top_p: self.controls.top_p(),
+            temperature: self.temperature,
+            top_p: self.top_p,
         }
     }
 }

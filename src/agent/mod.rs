@@ -18,18 +18,19 @@ pub use crate::{
 };
 pub(crate) use crate::agent::{
     controls::Controls,
-    interface::{Chatter, Coder, Stall, Supervised, Supervisor, Talker},
+    interface::{Chatter, Coder, Stall, Supervised, Talker},
     publisher::{Authorizer, Error as PublishError, MutationKey, MutationValidation, Publisher},
+    session::Session,
 };
-#[cfg(all(test, not(miri)))]
-pub(crate) use crate::agent::interface::Idle;
 #[cfg(all(test, not(miri)))]
 pub(crate) use crate::agent::publisher::Announcer;
 
 pub(crate) mod adapter;
+pub(crate) mod claude_code;
 pub(crate) mod controls;
 pub mod documents;
 mod interface;
 mod opencode;
 pub(crate) mod prompt;
 mod publisher;
+mod session;

@@ -43,4 +43,5 @@ These pages cover what is specific to one agent application: what has to be
 installed, which of a member's scores it can carry, and what it needs beyond the
 provider's own API.
 
+- [`claude-code`](claude-code.md)
 - [`opencode`](opencode.md)

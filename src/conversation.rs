@@ -130,7 +130,7 @@ impl Turn {
 /// a while. Silence is what is limited, on the terms [`Stall`](agent::Stall) sets.
 pub(crate) async fn supervise<T>(
     handling: impl Future<Output = Result<T, agent::Error>>,
-    agent: std::sync::Arc<dyn agent::Supervisor>,
+    agent: std::sync::Arc<agent::Session>,
 ) -> Result<T, Error> {
     let mut stall = agent::Stall::new(agent);
     tokio::pin!(handling);

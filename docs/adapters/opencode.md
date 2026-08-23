@@ -25,8 +25,9 @@ leaves a member unable to start.
 
 ## Settings
 
-A provider file names settings in the vocabulary the adapters share. The crate
-reads them into one type, and this adapter carries that type as OpenCode's own
+A provider file names settings in whatever words reach the adapter best — these
+are OpenCode's names. The crate reads them and hands them over as data, and this
+adapter refuses any it does not carry before carrying the rest as OpenCode's own
 controls, on an agent it defines for the member:
 
 | Provider file | OpenCode |

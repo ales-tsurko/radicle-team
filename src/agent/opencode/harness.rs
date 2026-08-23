@@ -14,13 +14,14 @@ use radicle::cob::EntryId;
 use crate::{
     agent::{
         self, Change, ChatContext, ChatMessage, Chatter, Coder, Comment, Context, Layout,
-        McpEndpoint, Role, Supervised, Supervisor, Talker, Target,
+        McpEndpoint, Role, Supervised, Talker, Target,
         opencode::{
             catalogue::Catalogue,
             config::{self, Settings},
-            run::{Outcome, Session},
+            run,
         },
         prompt,
+        session::{Outcome, Session},
     },
     member::Profile,
     provider::{Credentials, Provider, Way},
@@ -136,16 +137,16 @@ impl OpenCode {
     ) -> Result<Outcome, Error> {
         let started = self.started.as_ref().ok_or(Error::NotStarted(self.role))?;
 
-        self.session
-            .run(
-                self.arranged(started, started.sandbox.command(PROGRAM))
-                    .current_dir(workspace)
-                    .args(["run", "--auto", "--format", "json"])
-                    .args(["--agent", &started.agent])
-                    .args(["--title", title])
-                    .arg(prompt),
-            )
-            .await
+        run::supervise(
+            &self.session,
+            self.arranged(started, started.sandbox.command(PROGRAM))
+                .current_dir(workspace)
+                .args(["run", "--auto", "--format", "json"])
+                .args(["--agent", &started.agent])
+                .args(["--title", title])
+                .arg(prompt),
+        )
+        .await
     }
 
     // Runs one delivery which is expected to finish on its own.
@@ -287,8 +288,8 @@ impl fmt::Debug for OpenCode {
 }
 
 impl Supervised for OpenCode {
-    fn supervisor(&self) -> Arc<dyn Supervisor> {
-        Arc::clone(&self.session) as Arc<dyn Supervisor>
+    fn supervisor(&self) -> Arc<Session> {
+        Arc::clone(&self.session)
     }
 }
 
@@ -502,8 +503,9 @@ pub(crate) enum Error {
     /// A run was stopped before it was done.
     #[error("the {0} role was stopped before it finished")]
     Stopped(Role),
-    /// A run ended in failure.
-    #[error("opencode ended with {status}: {detail}")]
+    /// A run ended in failure. Whatever was said about it decides before the status does, and an
+    /// exit code alone would call some failed runs successes.
+    #[error("opencode failed (ended with {status}): {detail}")]
     Failed {
         /// How the process exited.
         status: ExitStatus,

@@ -19,7 +19,7 @@ pub(crate) use crate::agent::opencode::harness::{ADAPTER, Error, OpenCode};
 mod catalogue;
 mod config;
 mod harness;
-mod run;
+pub(crate) mod run;
 
 #[cfg(test)]
 mod tests;

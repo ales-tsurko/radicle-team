@@ -6,7 +6,8 @@
 #
 # The names below are settings the adapter is asked for, not Claude Code's own
 # configuration keys -- this file is deserialized and its values handed over as
-# data. Model names and prices are checked against models.dev.
+# data. There is no model listing to check a name against before the first
+# delivery, so a mistyped one shows up there.
 #
 # To keep your own edits, copy this file under another name. This one is
 # replaced on update.

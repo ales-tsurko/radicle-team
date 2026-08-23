@@ -17,6 +17,7 @@ use radicle::{
 use url::Url;
 
 use crate::{
+    agent::session::Session,
     chat::{AuthenticatedSender, ChannelId, MessageId as ChatMessageId},
     member::Profile,
     queue::Job,
@@ -148,33 +149,17 @@ impl Layout {
 /// Hands the runtime a shared view of a running agent.
 ///
 /// The handle is separate from the adapter because the runtime watches an agent while that same
-/// adapter is busy handling the delivery, so the two cannot both borrow it.
+/// adapter is busy handling the delivery, so the two cannot both borrow it. What the handle can do
+/// is [`Session`]'s watching half alone: when the agent last did anything, and how to end one
+/// delivery. Driving deliveries stays with the adapter.
 pub(crate) trait Supervised: Send {
     /// Returns a handle which can watch and stop this adapter's agent.
-    fn supervisor(&self) -> Arc<dyn Supervisor>;
-}
-
-/// The part of every adapter the runtime supervises.
-///
-/// An agent can run for hours and still be working, so nothing bounds how long one may take. What
-/// is bounded is silence. Each adapter reports when it last saw its own agent do something, and
-/// the runtime decides what counts as too long and stops it. Reading that signal out of a
-/// particular harness belongs to the adapter, deciding what to do about it does not.
-#[async_trait]
-pub(crate) trait Supervisor: Send + Sync {
-    /// Reports when this adapter last saw its agent do anything.
-    fn last_progress(&self) -> Option<Instant>;
-
-    /// Force-stops whatever the agent is doing, whether it agreed to or not.
-    ///
-    /// Weaker than [`Talker::shutdown`] and its counterparts: this ends one delivery, and the
-    /// agent stays running for the next one.
-    async fn abort(&self) -> Result<(), Error>;
+    fn supervisor(&self) -> Arc<Session>;
 }
 
 /// Watches one agent for silence, so the two places which run agents agree on what stuck means.
 pub(crate) struct Stall {
-    watch: Arc<dyn Supervisor>,
+    watch: Arc<Session>,
     seen: Instant,
 }
 
@@ -185,7 +170,7 @@ impl fmt::Debug for Stall {
 }
 
 impl Stall {
-    pub(crate) fn new(watch: Arc<dyn Supervisor>) -> Self {
+    pub(crate) fn new(watch: Arc<Session>) -> Self {
         Self {
             watch,
             seen: Instant::now(),
@@ -207,27 +192,6 @@ impl Stall {
         tracing::warn!(silent_for = ?self.seen.elapsed(), "agent stopped making progress");
 
         self.watch.abort().await
-    }
-}
-
-/// A supervisor for a role which runs no separate process.
-///
-/// Reports no progress and has nothing to stop, so the runtime never interferes with it. Every
-/// role the runtime starts runs one, so this is what the tests which stand in for one use. Those
-/// tests all spawn or wait, which Miri cannot do, so under Miri nothing here is built at all.
-#[cfg(all(test, not(miri)))]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Idle;
-
-#[cfg(all(test, not(miri)))]
-#[async_trait]
-impl Supervisor for Idle {
-    fn last_progress(&self) -> Option<Instant> {
-        None
-    }
-
-    async fn abort(&self) -> Result<(), Error> {
-        Ok(())
     }
 }
 
@@ -263,7 +227,7 @@ pub(crate) trait Talker: Supervised {
 
     /// Ends the role and releases everything it holds.
     ///
-    /// Stronger than [`Supervisor::abort`], which ends one delivery and leaves the agent running.
+    /// Stronger than [`Session::abort`], which ends one delivery and leaves the agent running.
     async fn shutdown(&mut self) -> Result<(), Error> {
         Ok(())
     }
@@ -294,7 +258,7 @@ pub(crate) trait Chatter: Supervised {
 
     /// Ends the role and releases everything it holds.
     ///
-    /// Stronger than [`Supervisor::abort`], which ends one delivery and leaves the agent running.
+    /// Stronger than [`Session::abort`], which ends one delivery and leaves the agent running.
     async fn shutdown(&mut self) -> Result<(), Error> {
         Ok(())
     }
@@ -335,7 +299,7 @@ pub(crate) trait Coder: Supervised + Sync {
 
     /// Ends the role and releases everything it holds.
     ///
-    /// Stronger than [`Supervisor::abort`], which ends one delivery and leaves the agent running.
+    /// Stronger than [`Session::abort`], which ends one delivery and leaves the agent running.
     async fn shutdown(&mut self) -> Result<(), Error> {
         Ok(())
     }

@@ -11,10 +11,10 @@
 //!
 //! A setting name is a request to the adapter, not a key in the agent application's own
 //! configuration. The file is read here and its values handed over as data; the application never
-//! sees it. So a name belongs in the vocabulary the two of us share -- `model`, `temperature`,
-//! `max_output_tokens` -- and how it reaches the application is the adapter's business. Nothing
-//! outside this crate validates these names, which is why a wrong one shows up when an adapter runs
-//! rather than when a file is read.
+//! sees it. The names are whatever reach the adapter best -- one asks for `reasoning_effort`,
+//! another for `effort` -- and how a name becomes a control is the adapter's business alone. Which
+//! names an adapter carries is its answer too: one refusing to start over a name it cannot use
+//! beats one silently dropping it.
 
 use std::{
     collections::BTreeMap,

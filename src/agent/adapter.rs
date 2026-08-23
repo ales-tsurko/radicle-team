@@ -6,12 +6,12 @@
 //! [`Chatter`] and [`Coder`] and it has never needed to know which harness is behind one.
 
 use crate::{
-    agent::{Chatter, Coder, Role, Talker, opencode},
+    agent::{Chatter, Coder, Role, Talker, claude_code, opencode},
     provider::{Credentials, Provider},
 };
 
 /// Every agent application this build can run a member on.
-pub const ADAPTERS: &[&str] = &[opencode::ADAPTER];
+pub const ADAPTERS: &[&str] = &[claude_code::ADAPTER, opencode::ADAPTER];
 
 /// One member's three roles, on whichever agent application its provider named.
 pub(crate) struct Roles {
@@ -42,16 +42,28 @@ pub(crate) fn select(
     provider: &Provider,
     credentials: Option<&Credentials>,
 ) -> Result<Roles, Unknown> {
-    let built = |role| opencode::OpenCode::new(role, provider.clone(), credentials.cloned());
     match adapter {
-        opencode::ADAPTER => Ok(Roles {
-            talker: Box::new(built(Role::Talker)),
-            chatter: Box::new(built(Role::Chatter)),
-            coder: Box::new(built(Role::Coder)),
-        }),
+        opencode::ADAPTER => Ok(roles(|role| {
+            opencode::OpenCode::new(role, provider.clone(), credentials.cloned())
+        })),
+        claude_code::ADAPTER => Ok(roles(|role| {
+            claude_code::ClaudeCode::new(role, provider.clone(), credentials.cloned())
+        })),
         _ => Err(Unknown {
             adapter: adapter.to_owned(),
         }),
+    }
+}
+
+// Builds one of each role on the agent application the given constructor makes them for.
+fn roles<T>(build: impl Fn(Role) -> T) -> Roles
+where
+    T: Talker + Chatter + Coder + 'static,
+{
+    Roles {
+        talker: Box::new(build(Role::Talker)),
+        chatter: Box::new(build(Role::Chatter)),
+        coder: Box::new(build(Role::Coder)),
     }
 }
 
