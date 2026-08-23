@@ -563,9 +563,9 @@ fn parse_digest(value: &str, prefix: &str) -> Result<[u8; SHA256_BYTES], ()> {
         return Err(());
     }
     let mut bytes = [0_u8; SHA256_BYTES];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = hex_digit(*pair.first().ok_or(())?).ok_or(())?;
-        let low = hex_digit(*pair.get(1).ok_or(())?).ok_or(())?;
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let high = hex_digit(pair[0]).ok_or(())?;
+        let low = hex_digit(pair[1]).ok_or(())?;
         let byte = bytes.get_mut(index).ok_or(())?;
         *byte = high * 16 + low;
     }
