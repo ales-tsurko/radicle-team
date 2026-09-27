@@ -27,6 +27,22 @@ time rather than run without one.
 
 
 
+## Quick start
+
+With the [prerequisites](docs/setup.md#prerequisites) installed, run from this
+checkout:
+
+```sh
+cargo install --path . --locked
+radicle-team setup nico --repo rad:... --home ../nico
+radicle-team run nico --repo rad:... --home ../nico
+```
+
+Replace `rad:...` with your repository ID and follow the setup prompts.
+
+
+
+
 ## The team
 
 Each member carries a character sheet, rated 1 to 5: `INT` intelligence, `ACC`
@@ -79,27 +95,6 @@ make them behave like distinct characters rather than named copies of the same
 assistant.
 
 See [members](docs/members.md) for brief profiles and character sheets.
-
-
-
-
-## Quick start
-
-Install `rad`, `radicle-node`, `radicle-team`, and the agent application your
-chosen provider is reached through, then prepare one member:
-
-```sh
-radicle-team setup nico --repo rad:...
-```
-
-After setup reports that Nico is ready, run him:
-
-```sh
-radicle-team run nico --repo rad:...
-```
-
-See [setup and operation](docs/setup.md) for complete installation, running, and
-troubleshooting instructions.
 
 
 

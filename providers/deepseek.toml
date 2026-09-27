@@ -27,9 +27,9 @@ env = ["DEEPSEEK_API_KEY"]
 [INT]
 param = "model"
 values = [
-  "deepseek/deepseek-v4-flash",
-  "deepseek/deepseek-v4-flash",
-  "deepseek/deepseek-v4-flash",
+  "deepseek/deepseek-v4.1-flash",
+  "deepseek/deepseek-v4.1-flash",
+  "deepseek/deepseek-v4.1-flash",
   "deepseek/deepseek-v4-pro",
   "deepseek/deepseek-v4-pro",
 ]
@@ -43,4 +43,3 @@ values = [
 [ACC]
 param = "reasoning_effort"
 values = ["low", "low", "medium", "high", "max"]
-

@@ -14,7 +14,7 @@ use crate::{
 const ENDPOINT: &str = "http://127.0.0.1:4321/mcp/capability";
 
 // A provider setting a control for each score, on the ladders a real one uses.
-const REASONING: &str = r#"
+pub(super) const REASONING: &str = r#"
 adapter = "opencode"
 
 [auth]
@@ -38,10 +38,10 @@ fn turns_a_members_scores_into_opencode_controls() {
 
     assert_eq!(settings.model(), "p/three");
     let file = written("scores", Member::Nico, &settings);
-    let agent = &file["agent"][Member::Nico.id()];
-    assert_eq!(agent["variant"], "low");
+    let agent = &file["agents"][Member::Nico.id()];
+    assert_eq!(agent["model"], "p/three#low");
     assert!(
-        agent["temperature"].is_null(),
+        file["providers"]["p"]["models"]["three"]["body"]["temperature"].is_null(),
         "a provider which sets no temperature must not have one invented for it, or a reasoning \
          model would be sent a control it rejects"
     );
@@ -85,12 +85,18 @@ values = [0.9, 0.7, 0.5, 0.3, 0.1]
     );
 
     let file = written("temperature", Member::Nico, &settings);
-    let agent = &file["agent"][Member::Nico.id()];
-    assert_eq!(agent["temperature"], 0.7);
-    assert!(agent["variant"].is_null());
+    let agent = &file["agents"][Member::Nico.id()];
+    assert_eq!(
+        file["providers"]["p"]["models"]["three"]["body"]["temperature"],
+        0.7
+    );
+    assert_eq!(agent["model"], "p/three");
 
     let file = written("top-p", Member::Nico, &narrowed);
-    assert_eq!(file["agent"][Member::Nico.id()]["top_p"], 0.7);
+    assert_eq!(
+        file["providers"]["p"]["models"]["three"]["body"]["top_p"],
+        0.7
+    );
 }
 
 // The documents are what make a member that member rather than a competent stranger, and their
@@ -118,7 +124,7 @@ fn instructs_the_agent_with_this_members_documents_in_order() {
 #[test]
 fn points_the_agent_at_the_run_scoped_mcp_server_alone() {
     let file = written("mcp", Member::Nico, &read("mcp", REASONING));
-    let servers = file["mcp"]
+    let servers = file["mcp"]["servers"]
         .as_object()
         .expect("MCP servers should be an object");
 
@@ -130,7 +136,7 @@ fn points_the_agent_at_the_run_scoped_mcp_server_alone() {
     let server = &servers["radicle"];
     assert_eq!(server["type"], "remote");
     assert_eq!(server["url"], ENDPOINT);
-    assert_eq!(server["enabled"], true);
+    assert_eq!(server["disabled"], false);
 }
 
 // Every one of these is a way a headless agent stops being headless, or stops being confined to
@@ -140,7 +146,11 @@ fn keeps_a_headless_run_headless() {
     let file = written("headless", Member::Nico, &read("headless", REASONING));
 
     assert_eq!(
-        file["permission"]["question"], "deny",
+        file["permissions"],
+        serde_json::json!([
+            {"action":"question","resource":"*","effect":"deny"},
+            {"action":"external_directory","resource":"*","effect":"allow"}
+        ]),
         "nobody is there to answer a question, so asking one would hold the run open until the \
          runtime stopped it for silence"
     );
@@ -148,13 +158,13 @@ fn keeps_a_headless_run_headless() {
         file["share"], "disabled",
         "a member's conversations are the repository's, not a third party's web page"
     );
-    assert_eq!(file["autoupdate"], false);
+    assert_eq!(file["update"], "disable");
     assert_eq!(
-        file["snapshot"], false,
+        file["snapshots"], false,
         "the runtime owns this working copy's Git state"
     );
     assert_eq!(
-        file["small_model"], file["model"],
+        file["agents"]["title"]["model"], file["model"],
         "a member is authorized for one provider, so the errands must not reach another"
     );
 }
@@ -187,23 +197,86 @@ fn installs_a_plugin_which_reports_where_the_adapter_reads() {
         "the placeholder must be replaced, or the plugin writes to a file nobody reads"
     );
     assert!(
-        installed.contains("event:"),
-        "the event hook is what carries session.idle and session.error, so a plugin without it \
-         reports nothing after the run starts"
+        installed.contains("event.subscribe"),
+        "live events must continue after the plugin starts"
     );
     assert!(
-        installed.contains("permission.ask"),
-        "an agent waiting on a permission looks exactly like a stuck one, so it has to be reported"
+        installed.contains("rpc.register"),
+        "the model query must wait for provider activation"
     );
+}
+
+// This exercises version detection, the real sandbox, plugin activation, catalogue RPC and
+// configuration together. The fake provider lists a model but no model request is made.
+#[cfg(all(target_os = "macos", not(miri)))]
+#[tokio::test]
+#[ignore = "requires OpenCode 2 on PATH and permission to start sandboxed processes"]
+async fn starts_with_installed_opencode_v2() {
+    use crate::{
+        agent::{
+            Talker as _,
+            opencode::{OpenCode, config},
+        },
+        home::MemberHome,
+        sandbox::AgentSandbox,
+    };
+
+    let temporary = tempfile::tempdir().expect("temporary home");
+    let home = MemberHome::at(temporary.path().canonicalize().expect("canonical home"));
+    home.create().expect("member directories");
+    let harness = home.harness(Role::Talker);
+    let configuration = harness.join(".config/opencode");
+    std::fs::create_dir_all(&configuration).expect("OpenCode configuration directory");
+    std::fs::write(
+        configuration.join("opencode.json"),
+        serde_json::json!({
+            "providers": {"p": {
+                "package": "@opencode/ai/providers/openai-compatible",
+                "settings": {"apiKey": "test", "baseURL": "http://127.0.0.1:9/v1"},
+                "models": {"three": {"variants": [{"id": "medium"}]}}
+            }}
+        })
+        .to_string(),
+    )
+    .expect("mock provider configuration");
+    let endpoint = McpEndpoint::new(Url::parse(ENDPOINT).expect("endpoint"));
+    let sandbox =
+        AgentSandbox::load(&home, Member::Nico, Role::Talker, &endpoint).expect("agent sandbox");
+    let layout = Layout::new(Role::Talker, home.cache(), harness.clone(), vec![]);
+    let mut agent = OpenCode::new(Role::Talker, provider("v2-smoke", REASONING), None);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        agent.start(Member::Nico.profile(), &endpoint, sandbox, layout),
+    )
+    .await
+    .expect("startup must finish")
+    .expect("OpenCode 2 must start");
+
+    let configured: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(harness.join(config::FILE)).expect("generated configuration"),
+    )
+    .expect("valid JSON");
+    assert_eq!(configured["agents"]["nico"]["model"], "p/three#medium");
+    assert!(
+        std::fs::read_to_string(config::report(&harness))
+            .expect("v2 plugin progress")
+            .contains("started")
+    );
+    agent.shutdown().await.expect("shutdown");
 }
 
 // A ladder may climb from a model which does not reason to one which does, so what reaches the
 // agent is the score fitted to its own model rather than what the file says flatly.
 #[test]
 fn asks_each_model_for_the_effort_that_model_takes() {
-    let listing = "p/plain\n{ \"variants\": {} }\np/thinking\n{ \"variants\": { \"high\": {}, \
-                   \"max\": {} } }\n";
-    let catalogue = Catalogue::read(listing);
+    let catalogue = Catalogue::read(
+        r#"{"output":[
+        {"providerID":"p","id":"plain","enabled":true,"variants":[]},
+        {"providerID":"p","id":"thinking","enabled":true,
+         "variants":[{"id":"high"},{"id":"max"}]}
+    ]}"#,
+    )
+    .expect("model catalogue");
     let ladder = r#"
 adapter = "opencode"
 
@@ -224,24 +297,25 @@ values = ["low", "low", "medium", "high", "max"]
             Settings::read(&provider, member.profile().tuning).expect("settings should be read");
         settings.fit(&catalogue);
 
-        written(name, member, &settings)["agent"][member.id()]["variant"].clone()
+        written(name, member, &settings)["agents"][member.id()]["model"].clone()
     };
 
-    assert!(
+    assert_eq!(
         // Nico is 3 sharp, so the model which does not reason at all.
-        fitted(Member::Nico, "plain").is_null(),
+        fitted(Member::Nico, "plain"),
+        "p/plain",
         "a model which does not reason must be sent no effort at all, or it fails the delivery"
     );
     assert_eq!(
         // Nora is 4 sharp and 3 accurate: the thinking model, at an effort it does not offer.
         fitted(Member::Nora, "nearest"),
-        "high",
+        "p/thinking#high",
         "an effort the model does not take must become the nearest it does"
     );
     assert_eq!(
         // Vera is 5 and 5, and this model does go that far.
         fitted(Member::Vera, "highest"),
-        "max"
+        "p/thinking#max"
     );
 }
 
@@ -318,7 +392,7 @@ fn layout() -> Layout {
     )
 }
 
-fn provider(name: &str, body: &str) -> Provider {
+pub(super) fn provider(name: &str, body: &str) -> Provider {
     let directory = clear(&format!("opencode-provider-{name}"));
     std::fs::write(provider::path(&directory, name), body).expect("provider should be written");
 

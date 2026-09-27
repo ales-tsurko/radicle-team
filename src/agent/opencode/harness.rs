@@ -26,7 +26,7 @@ use crate::{
     member::Profile,
     provider::{Credentials, Provider, Way},
     queue::Job,
-    sandbox::{AgentCommand, AgentSandbox},
+    sandbox::{AgentCommand, AgentSandbox, Output},
 };
 
 /// Name a provider file gives this adapter.
@@ -80,11 +80,17 @@ impl OpenCode {
         layout: Layout,
     ) -> Result<(), Error> {
         let mut settings = Settings::read(&self.provider, profile.tuning)?;
-        let (harness, started) = self.prepare(profile, sandbox, &layout)?;
+        let (harness, environment) = self.prepare(&sandbox, &layout).await?;
         // Asked before the file is written, because what OpenCode offers decides both whether this
         // member can run at all and which effort its model can be asked for. Boxed because the
-        // future holds the whole started role, and the runtime starts three of them.
-        settings.fit(&Box::pin(self.catalogue(&started, settings.model())).await?);
+        // query owns its command environment, and the runtime starts three roles.
+        settings.fit(
+            &Box::pin(Catalogue::query(
+                Self::arranged(&environment, sandbox.command(PROGRAM)),
+                settings.model(),
+            ))
+            .await?,
+        );
         settings.write(&harness.join(config::FILE), profile, &layout, mcp)?;
         tracing::info!(
             role = %self.role,
@@ -93,21 +99,34 @@ impl OpenCode {
             harness = %harness.display(),
             "OpenCode role started"
         );
-        self.started = Some(started);
+        self.started = Some(Started {
+            agent: Settings::agent(profile),
+            model: settings.selection(),
+            environment,
+            sandbox,
+        });
 
         Ok(())
     }
 
     // Makes the role's harness home ready to run in, and reports it with what runs there.
     //
-    // The plugin goes in before anything runs. A run without it looks silent from out here,
-    // whatever the agent is doing inside.
-    fn prepare(
+    // The plugin goes in before model discovery or deliveries. A run without it looks silent from
+    // out here, whatever the agent is doing inside.
+    async fn prepare(
         &self,
-        profile: Profile,
-        sandbox: AgentSandbox,
+        sandbox: &AgentSandbox,
         layout: &Layout,
-    ) -> Result<(PathBuf, Started), Error> {
+    ) -> Result<(PathBuf, BTreeMap<String, String>), Error> {
+        let (harness, environment) = self.prepare_home(layout)?;
+        Self::present(Self::arranged(&environment, sandbox.command(PROGRAM))).await?;
+        config::install_plugin(&harness)?;
+        self.session.reports_in(config::report(&harness));
+        Ok((harness, environment))
+    }
+
+    // Resolves the role's private directories before starting any processes.
+    fn prepare_home(&self, layout: &Layout) -> Result<(PathBuf, BTreeMap<String, String>), Error> {
         // A role given another role's directories would read another role's instructions and write
         // into a working copy which is not its own.
         if layout.role() != self.role {
@@ -117,15 +136,9 @@ impl OpenCode {
             });
         }
         let harness = config::prepare(layout.harness())?;
-        config::install_plugin(&harness)?;
-        self.session.reports_in(config::report(&harness));
-        let started = Started {
-            agent: Settings::agent(profile),
-            environment: self.environment(&harness, &harness.join(config::FILE), layout)?,
-            sandbox,
-        };
+        let environment = self.environment(&harness, &harness.join(config::FILE), layout)?;
 
-        Ok((harness, started))
+        Ok((harness, environment))
     }
 
     // Runs one delivery and reports how it ended.
@@ -139,10 +152,11 @@ impl OpenCode {
 
         run::supervise(
             &self.session,
-            self.arranged(started, started.sandbox.command(PROGRAM))
+            Self::arranged(&started.environment, started.sandbox.command(PROGRAM))
                 .current_dir(workspace)
-                .args(["run", "--auto", "--format", "json"])
+                .args(["run", "--standalone", "--auto", "--format", "json"])
                 .args(["--agent", &started.agent])
+                .args(["--model", &started.model])
                 .args(["--title", title])
                 .arg(prompt),
         )
@@ -184,51 +198,31 @@ impl OpenCode {
         }
     }
 
-    // Asks OpenCode what it is offering, and refuses a model it would refuse at the first delivery.
-    //
-    // Model names are strings in a file an operator may edit, and the answer depends on more than
-    // the spelling: OpenCode offers a provider's models only once it has been authorized for it.
-    async fn catalogue(&self, started: &Started, model: &str) -> Result<Catalogue, Error> {
-        let listed = Box::pin(
-            self.arranged(
-                started,
-                started
-                    .sandbox
-                    .command(PROGRAM)
-                    .args(["models", "--verbose"]),
-            )
-            .output(),
-        )
-        .await?;
-        if !listed.status.success() {
+    // Check the required CLI before installing a plugin or attempting model discovery.
+    async fn present(command: AgentCommand) -> Result<(), Error> {
+        let output = Box::pin(command.arg("--version").output()).await?;
+
+        Self::check_version(&output)
+    }
+
+    fn check_version(output: &Output) -> Result<(), Error> {
+        if !output.status.success() {
             return Err(Error::Unavailable {
-                status: listed.status,
-                detail: listed.stderr.trim().to_owned(),
+                status: output.status,
+                detail: output.stderr.trim().to_owned(),
             });
         }
-        let catalogue = Catalogue::read(&listed.stdout);
-        // A listing this adapter could not make sense of says nothing about the model, so it must
-        // not be read as the model being absent. The delivery reports it if it really is.
-        if catalogue.is_empty() {
-            tracing::warn!(
-                role = %self.role,
-                model,
-                "could not read back what OpenCode offers, so the model was not checked"
-            );
-
-            return Ok(catalogue);
-        }
-        if !catalogue.offers(model) {
-            return Err(Error::Model(model.to_owned()));
+        let version = output.stdout.trim();
+        if !version.starts_with("opencode v2.") {
+            return Err(Error::Version(version.to_owned()));
         }
 
-        Ok(catalogue)
+        Ok(())
     }
 
     // Gives a command the environment this role's OpenCode runs in, credentials included.
-    fn arranged(&self, started: &Started, command: AgentCommand) -> AgentCommand {
-        started
-            .environment
+    fn arranged(environment: &BTreeMap<String, String>, command: AgentCommand) -> AgentCommand {
+        environment
             .iter()
             .fold(command, |command, (key, value)| command.env(key, value))
     }
@@ -401,8 +395,7 @@ impl Coder for OpenCode {
             .map_err(agent::Error::new)?;
         match carried {
             Outcome::Finished => Ok(()),
-            // An agent turn cannot be interrupted, so a job which was asked to stop is ended and
-            // then asked, in a run of its own, to commit what it had reached.
+            // End the CLI delivery, then ask a fresh run to commit what the stopped job reached.
             Outcome::Stopped if self.session.was_interrupted() => self
                 .preserve(&job, &workspace)
                 .await
@@ -425,6 +418,7 @@ impl Coder for OpenCode {
 /// What one role was configured with, once the runtime has started it.
 struct Started {
     agent: String,
+    model: String,
     environment: BTreeMap<String, String>,
     sandbox: AgentSandbox,
 }
@@ -461,6 +455,20 @@ pub(crate) enum Error {
         /// How the listing ended.
         status: ExitStatus,
         /// What it wrote about it.
+        detail: String,
+    },
+    /// The CLI has changed beyond the interfaces supported here.
+    #[error("unsupported OpenCode version '{0}'; install OpenCode 2")]
+    Version(String),
+    /// A model API response could not be decoded.
+    #[error("could not read OpenCode's model catalogue: {0}")]
+    Catalogue(#[from] serde_json::Error),
+    /// The CLI could not obtain a usable model catalogue.
+    #[error("could not query OpenCode's models ({status}): {detail}")]
+    CatalogueUnavailable {
+        /// How the model query exited.
+        status: ExitStatus,
+        /// The CLI or API's explanation.
         detail: String,
     },
     /// A role's harness or cache directory could not be prepared.
@@ -524,4 +532,134 @@ fn title(job: &Job) -> String {
 
 fn path(path: &Path) -> String {
     path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, path::Path};
+
+    use crate::{
+        agent::{
+            Layout, Role,
+            opencode::{
+                config,
+                harness::{Error, OpenCode, path},
+                tests::{REASONING, provider},
+            },
+        },
+        provider::Credentials,
+        sandbox::Output,
+    };
+
+    #[test]
+    fn requires_opencode_two() {
+        let mut output = Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(0),
+            stdout: "opencode v2.0.13\n".to_owned(),
+            stderr: String::new(),
+        };
+        OpenCode::check_version(&output).expect("supported version");
+        for version in ["1.18.32", "opencode v3.0.0", "unrecognized output"] {
+            output.stdout = version.to_owned();
+            assert!(
+                matches!(OpenCode::check_version(&output), Err(Error::Version(given)) if given == version)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_failed_version_probe() {
+        let output = Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
+            stdout: "opencode v2.0.13".to_owned(),
+            stderr: " startup failed\n".to_owned(),
+        };
+        let error = OpenCode::check_version(&output).expect_err("failed probe");
+        assert!(error.to_string().contains("install OpenCode"));
+        assert!(matches!(error, Error::Unavailable { status, detail }
+            if status.code() == Some(1) && detail == "startup failed"));
+    }
+
+    #[test]
+    fn prepares_private_directories_and_supplies_only_the_roles_credentials() {
+        let temporary = tempfile::tempdir().expect("member home");
+        let layout = layout(temporary.path(), Role::Talker);
+        let credentials = Credentials::key(BTreeMap::from([(
+            "PROVIDER_API_KEY".to_owned(),
+            "test-secret".to_owned(),
+        )]));
+        let adapter = adapter("prepare-home", Some(credentials));
+
+        let (harness, environment) = adapter.prepare_home(&layout).expect("private home");
+        assert_eq!(
+            harness,
+            layout.harness().canonicalize().expect("resolved home")
+        );
+        assert_eq!(environment["HOME"], path(&harness));
+        assert_eq!(
+            environment["OPENCODE_CONFIG"],
+            path(&harness.join(config::FILE))
+        );
+        assert_eq!(
+            environment["XDG_CACHE_HOME"],
+            path(&layout.cache().canonicalize().expect("cache"))
+        );
+        assert_eq!(environment["OPENCODE_DISABLE_AUTOUPDATE"], "1");
+        assert_eq!(environment["PROVIDER_API_KEY"], "test-secret");
+        assert_eq!(environment.len(), 5);
+        assert!(!format!("{adapter:?}").contains("test-secret"));
+    }
+
+    #[test]
+    fn prepares_a_subscription_without_inventing_an_api_key() {
+        let temporary = tempfile::tempdir().expect("member home");
+        let (_, environment) = adapter("prepare-subscription", Some(Credentials::subscription()))
+            .prepare_home(&layout(temporary.path(), Role::Talker))
+            .expect("subscription home");
+
+        assert_eq!(environment.len(), 4);
+        assert!(!environment.contains_key("PROVIDER_API_KEY"));
+    }
+
+    #[test]
+    fn rejects_another_role_before_creating_its_directories() {
+        let temporary = tempfile::tempdir().expect("member home");
+        let layout = layout(temporary.path(), Role::Coder);
+
+        assert!(matches!(
+            adapter("prepare-wrong-role", None).prepare_home(&layout),
+            Err(Error::Role {
+                expected: Role::Talker,
+                given: Role::Coder
+            })
+        ));
+        assert!(!layout.harness().exists());
+        assert!(!layout.cache().exists());
+    }
+
+    #[test]
+    fn reports_the_directory_that_cannot_be_prepared() {
+        for directory in ["harness", "cache"] {
+            let temporary = tempfile::tempdir().expect("member home");
+            let blocked = temporary.path().join(directory);
+            std::fs::write(&blocked, "occupied").expect("blocker");
+            let error = adapter(&format!("prepare-blocked-{directory}"), None)
+                .prepare_home(&layout(temporary.path(), Role::Talker))
+                .expect_err("a file cannot serve as a directory");
+
+            assert!(matches!(error, Error::Harness { path, .. } if path == blocked));
+            assert_eq!(
+                std::fs::read_to_string(&blocked).expect("preserved blocker"),
+                "occupied"
+            );
+        }
+    }
+
+    fn adapter(name: &str, credentials: Option<Credentials>) -> OpenCode {
+        OpenCode::new(Role::Talker, provider(name, REASONING), credentials)
+    }
+
+    fn layout(root: &Path, role: Role) -> Layout {
+        Layout::new(role, root.join("cache"), root.join("harness"), Vec::new())
+    }
 }

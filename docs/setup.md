@@ -45,7 +45,7 @@ that persist across reboots.
 Build the application from this repository:
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
 ```
 
 
@@ -60,6 +60,10 @@ projects:
 cd ~/Desktop
 radicle-team setup nico --repo rad:z3cyot...
 ```
+
+Setup starts and stops its own Radicle node; no running node is required. If
+macOS asks for keychain access, approve it to unlock the member identity. The
+spinner shows each stage, including seed connections and synchronization.
 
 This creates a folder named after the member and the repository, and everything
 Nico needs goes inside it:
@@ -197,8 +201,8 @@ Every command afterwards checks that the folder belongs to the member and
 repository it was asked to run, and refuses if it does not, so a member cannot
 publish under another's identity by being started in the wrong directory.
 
-Setup creates or loads Nico's identity, starts Nico's node, synchronizes the
-repository, records a seeding policy, and prints the DID. That DID is Nico's
+Setup creates or loads Nico's identity, starts Nico's node, waits for seed
+connections, synchronizes the repository, and prints the DID. That DID is Nico's
 own, not the operator's, so a private repository has to grant it access before
 synchronization can succeed — the wizard waits and retries while that happens.
 It finishes with:
@@ -254,7 +258,7 @@ resolutions, lifecycle changes, and merges until stopped. `SIGINT` and
 
 Operational events are emitted as structured records through `tracing`, so the
 destination and verbosity are chosen by the process rather than fixed in the
-library. `RUST_LOG` selects both, defaulting to `info`:
+library. `RUST_LOG` selects the verbosity, defaulting to `warn`:
 
 ```sh
 RUST_LOG=radicle_team=debug radicle-team run nico --repo rad:...

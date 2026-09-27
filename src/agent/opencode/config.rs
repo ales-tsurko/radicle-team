@@ -27,17 +27,15 @@ use crate::{
 
 /// Name OpenCode is told to call the run-scoped MCP server.
 ///
-/// OpenCode prefixes the tools it takes from a server with that server's name, so this is the word
-/// the agent sees in front of every Radicle tool.
+/// OpenCode exposes these tools through Code Mode as `tools.radicle.<name>`.
 pub(super) const SERVER: &str = "radicle";
 /// File OpenCode reads a role's configuration from.
 pub(super) const FILE: &str = "opencode.json";
 
-const SCHEMA: &str = "https://opencode.ai/config.json";
 // What the plugin writes and the adapter reads, inside the role's own harness home.
 const REPORT: &str = "progress.jsonl";
 // Where OpenCode looks for plugins under the home it is given, and the name this one is written as.
-// Anything in that directory is loaded; the `plugin` setting is for packages instead.
+// Anything in that directory is loaded; the `plugins` setting is for packages instead.
 const PLUGINS: [&str; 3] = [".config", "opencode", "plugins"];
 const PLUGIN: &str = "progress.js";
 // The path is written into the plugin when it is installed, because a plugin is handed no
@@ -94,6 +92,14 @@ impl Settings {
         &self.model
     }
 
+    /// Selects the configured model and fitted variant for a delivery.
+    pub(super) fn selection(&self) -> String {
+        match &self.variant {
+            Some(variant) => format!("{}#{variant}", self.model()),
+            None => self.model().to_owned(),
+        }
+    }
+
     /// Fits the member's reasoning effort to what its own model takes.
     ///
     /// A ladder can climb from a model which does not reason to one which does, and two models of
@@ -135,7 +141,7 @@ impl Settings {
         mcp: &McpEndpoint,
     ) -> Result<(), Error> {
         let body =
-            serde_json::to_string_pretty(&self.file(profile, layout, mcp)).map_err(|error| {
+            serde_json::to_string_pretty(&self.file(profile, layout, mcp)?).map_err(|error| {
                 Error::Configuration {
                     path: path.to_path_buf(),
                     reason: error.to_string(),
@@ -156,58 +162,92 @@ impl Settings {
         profile.member.id().to_owned()
     }
 
-    fn file(&self, profile: Profile, layout: &Layout, mcp: &McpEndpoint) -> File {
-        File {
-            schema: SCHEMA,
-            // The same model for the errands OpenCode runs a cheaper one on. A member is authorized
-            // for the provider it was given and no other, and a title generated on whatever
-            // OpenCode would otherwise reach for is a request to a provider nobody paid.
-            small_model: self.model().to_owned(),
+    fn file(&self, profile: Profile, layout: &Layout, mcp: &McpEndpoint) -> Result<File, Error> {
+        let (provider, model) = self
+            .model()
+            .split_once('/')
+            .ok_or_else(|| Error::Model(self.model().to_owned()))?;
+
+        Ok(File {
             model: self.model().to_owned(),
             instructions: layout
                 .documents()
                 .iter()
                 .map(|document| document.display().to_string())
                 .collect(),
-            mcp: BTreeMap::from([(
-                SERVER,
-                Server {
-                    kind: "remote",
-                    url: mcp.url().to_string(),
-                    enabled: true,
+            mcp: Mcp {
+                servers: BTreeMap::from([(
+                    SERVER,
+                    Server {
+                        kind: "remote",
+                        url: mcp.url().to_string(),
+                        disabled: false,
+                    },
+                )]),
+            },
+            agents: BTreeMap::from([
+                (Self::agent(profile), self.described(profile)),
+                // Titles use the same authorized provider as the member's work.
+                (
+                    "title".to_owned(),
+                    Agent {
+                        model: self.model().to_owned(),
+                        description: None,
+                        mode: None,
+                    },
+                ),
+            ]),
+            // Model request overlays reach the provider directly. OpenCode 2.0.13 loads agent
+            // request settings but does not apply them to deliveries.
+            providers: BTreeMap::from([(
+                provider.to_owned(),
+                ProviderModels {
+                    models: BTreeMap::from([(
+                        model.to_owned(),
+                        ModelRequest {
+                            body: Parameters {
+                                temperature: self.temperature,
+                                top_p: self.top_p,
+                            },
+                        },
+                    )]),
                 },
             )]),
-            agent: BTreeMap::from([(Self::agent(profile), self.described(profile))]),
-            permission: BTreeMap::from([
+            permissions: [
                 // Nobody is on the other end of a delivery to answer, so a question would hold the
                 // run open until the runtime stopped it for silence.
-                ("question", "deny"),
+                Permission {
+                    action: "question",
+                    resource: "*",
+                    effect: "deny",
+                },
                 // The build cache and the harness are outside the working copy on purpose, and
                 // reaching them is not the escape it would be anywhere else: the sandbox, not
                 // OpenCode, is what says where this process may write.
-                ("external_directory", "allow"),
-            ]),
+                Permission {
+                    action: "external_directory",
+                    resource: "*",
+                    effect: "allow",
+                },
+            ],
             // A member's conversations are the repository's, and sharing publishes them to a third
             // party's web page.
             share: "disabled",
             // Updating itself would rewrite the binary the operator installed, from inside a
             // sandbox which denies exactly that.
-            autoupdate: false,
+            update: "disable",
             // OpenCode's undo history is a second thing writing Git state into a working copy the
             // runtime resets before every delivery, and whose references it owns.
-            snapshot: false,
-        }
+            snapshots: false,
+        })
     }
 
     // Returns the agent OpenCode runs this member as: who it is, and what it runs with.
     fn described(&self, profile: Profile) -> Agent {
         Agent {
-            description: format!("{}, {}", profile.name, profile.title),
-            mode: "primary",
-            model: self.model().to_owned(),
-            variant: self.variant.clone(),
-            temperature: self.temperature,
-            top_p: self.top_p,
+            description: Some(format!("{}, {}", profile.name, profile.title)),
+            mode: Some("primary"),
+            model: self.selection(),
         }
     }
 }
@@ -215,31 +255,55 @@ impl Settings {
 // The configuration file itself, in OpenCode's own schema.
 #[derive(Debug, Serialize)]
 struct File {
-    #[serde(rename = "$schema")]
-    schema: &'static str,
     model: String,
-    small_model: String,
     instructions: Vec<String>,
-    mcp: BTreeMap<&'static str, Server>,
-    agent: BTreeMap<String, Agent>,
-    permission: BTreeMap<&'static str, &'static str>,
+    mcp: Mcp,
+    agents: BTreeMap<String, Agent>,
+    providers: BTreeMap<String, ProviderModels>,
+    permissions: [Permission; 2],
     share: &'static str,
-    autoupdate: bool,
-    snapshot: bool,
+    update: &'static str,
+    snapshots: bool,
 }
 
 // The agent OpenCode runs the member as, in OpenCode's own schema.
 #[derive(Debug, Serialize)]
 struct Agent {
-    description: String,
-    mode: &'static str,
-    model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    variant: Option<String>,
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
+    model: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderModels {
+    models: BTreeMap<String, ModelRequest>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelRequest {
+    body: Parameters,
+}
+
+#[derive(Debug, Serialize)]
+struct Parameters {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct Permission {
+    action: &'static str,
+    resource: &'static str,
+    effect: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct Mcp {
+    servers: BTreeMap<&'static str, Server>,
 }
 
 // One MCP server OpenCode connects the agent to.
@@ -248,7 +312,7 @@ struct Server {
     #[serde(rename = "type")]
     kind: &'static str,
     url: String,
-    enabled: bool,
+    disabled: bool,
 }
 
 /// Returns the file the plugin reports this role's progress in.

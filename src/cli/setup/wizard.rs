@@ -193,10 +193,20 @@ impl SetupWizard {
 
     async fn attempt(&self) -> Result<Setup, crate::Error> {
         let spinner = cliclack::spinner();
-        spinner.start("Preparing identity and synchronizing repository");
-        self.application
-            .setup()
-            .await
+        spinner.start("Preparing member directory");
+        let (progress, mut updates) = tokio::sync::watch::channel(String::new());
+        let application = self.application.clone().with_setup_progress(progress);
+        let setup = application.setup();
+        tokio::pin!(setup);
+        let result = loop {
+            tokio::select! {
+                result = &mut setup => break result,
+                Ok(()) = updates.changed() => {
+                    spinner.set_message(updates.borrow_and_update().as_str());
+                }
+            }
+        };
+        result
             .inspect(|_| spinner.stop("Repository synchronized"))
             .inspect_err(|_| spinner.error("Setup needs attention"))
     }
@@ -608,10 +618,11 @@ impl SetupWizard {
     fn show_access_error(&self, error: &crate::Error) -> Result<(), Error> {
         cliclack::log::warning(error.to_string())?;
         if let Some(did) = Self::error_did(error) {
-            cliclack::note(
-                "Member identity",
-                format!("{did}\n\nFor a private repository, grant this DID access."),
-            )?;
+            let mut message = did.to_string();
+            if matches!(error, crate::Error::RepositoryAccess { .. }) {
+                message.push_str("\n\nGrant this DID access to the private repository.");
+            }
+            cliclack::note("Member identity", message)?;
         }
 
         Ok(())
@@ -631,15 +642,18 @@ impl SetupWizard {
     const fn can_retry(error: &crate::Error) -> bool {
         matches!(
             error,
-            crate::Error::Sync { .. } | crate::Error::RepositoryAccess { .. }
+            crate::Error::Sync { .. }
+                | crate::Error::SyncTimeout { .. }
+                | crate::Error::RepositoryAccess { .. }
+                | crate::Error::Node(crate::node::Error::SeedsUnavailable { .. })
         )
     }
 
     const fn error_did(error: &crate::Error) -> Option<Did> {
         match error {
-            crate::Error::Sync { did, .. } | crate::Error::RepositoryAccess { did, .. } => {
-                Some(*did)
-            }
+            crate::Error::Sync { did, .. }
+            | crate::Error::SyncTimeout { did, .. }
+            | crate::Error::RepositoryAccess { did, .. } => Some(*did),
             _ => None,
         }
     }

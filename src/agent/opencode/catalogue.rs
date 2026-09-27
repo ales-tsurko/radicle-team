@@ -7,49 +7,82 @@
 
 use std::collections::BTreeMap;
 
+use crate::{
+    agent::{opencode::Error, session},
+    sandbox::{AgentCommand, Output},
+};
+
 // Every effort OpenCode knows, weakest first. A model offers some run of these, and which run
 // differs between models of one provider, so a score has to be fitted to what its own model takes.
 const EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// What `opencode models --verbose` reported.
+/// Models and reasoning variants returned by the plugin RPC.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Catalogue {
     models: BTreeMap<String, Vec<String>>,
 }
 
 impl Catalogue {
-    /// Reads a listing, which names each model and then describes it.
-    ///
-    /// A model whose description cannot be read keeps its name and loses its variants, because
-    /// being offered at all is the part which decides whether a member can start.
-    pub(super) fn read(listing: &str) -> Self {
-        let mut models = BTreeMap::new();
-        let mut named: Option<&str> = None;
-        let mut described = String::new();
-        for line in listing.lines() {
-            if !Self::names_a_model(line) {
-                described.push_str(line);
-                continue;
-            }
-            if let Some(name) = named {
-                let _replaced = models.insert(name.to_owned(), Self::variants(&described));
-            }
-            named = Some(line.trim());
-            described.clear();
-        }
-        if let Some(name) = named {
-            let _replaced = models.insert(name.to_owned(), Self::variants(&described));
-        }
+    /// Waits for provider activation, then queries the configured model through the plugin RPC.
+    pub(super) async fn query(command: AgentCommand, model: &str) -> Result<Self, Error> {
+        let listed = Box::pin(
+            command
+                .args([
+                    "api",
+                    "--standalone",
+                    "rpc.call",
+                    "--param",
+                    "rpcID=radicle-team",
+                    "--param",
+                    "method=models",
+                    "--data",
+                ])
+                .arg(serde_json::json!({"input": {"model": model}}).to_string())
+                .output(),
+        )
+        .await?;
 
-        Self { models }
+        Self::checked(&listed, model)
     }
 
-    /// Returns whether anything was read back at all.
-    ///
-    /// An empty catalogue is a listing this adapter could not make sense of rather than an OpenCode
-    /// offering nothing, so it is reported rather than acted on.
-    pub(super) fn is_empty(&self) -> bool {
-        self.models.is_empty()
+    fn checked(listed: &Output, model: &str) -> Result<Self, Error> {
+        if !listed.status.success() {
+            return Err(Error::CatalogueUnavailable {
+                status: listed.status,
+                detail: session::shorten(
+                    format!("{} {}", listed.stderr.trim(), listed.stdout.trim()).trim(),
+                ),
+            });
+        }
+        let catalogue = Self::read(&listed.stdout)?;
+        if !catalogue.offers(model) {
+            return Err(Error::Model(model.to_owned()));
+        }
+
+        Ok(catalogue)
+    }
+
+    /// Reads the plugin RPC's OpenCode 2 models, whose variants are objects in a list.
+    pub(super) fn read(response: &str) -> Result<Self, serde_json::Error> {
+        let response: Listed = serde_json::from_str(response)?;
+
+        Ok(Self {
+            models: response
+                .output
+                .into_iter()
+                .filter(|model| model.enabled)
+                .map(|model| {
+                    (
+                        format!("{}/{}", model.provider_id, model.id),
+                        model
+                            .variants
+                            .into_iter()
+                            .map(|variant| variant.id)
+                            .collect(),
+                    )
+                })
+                .collect(),
+        })
     }
 
     /// Returns whether OpenCode offers `model` to this member.
@@ -81,66 +114,49 @@ impl Catalogue {
             .cloned()
     }
 
-    // A model's name is the only thing in the listing written flush against the left margin.
-    fn names_a_model(line: &str) -> bool {
-        !line.is_empty() && !line.starts_with(char::is_whitespace) && !line.starts_with(['{', '}'])
-    }
-
-    fn variants(described: &str) -> Vec<String> {
-        serde_json::from_str::<Described>(described)
-            .map(|described| described.variants.into_keys().collect())
-            .unwrap_or_default()
-    }
-
     fn rank(effort: &str) -> Option<usize> {
         EFFORTS.iter().position(|known| *known == effort)
     }
 }
 
-/// The part of a model's description this adapter reads.
 #[derive(Debug, serde::Deserialize)]
-struct Described {
-    #[serde(default)]
-    variants: BTreeMap<String, serde_json::Value>,
+struct Listed {
+    output: Vec<Model>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Model {
+    id: String,
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    enabled: bool,
+    variants: Vec<Variant>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Variant {
+    id: String,
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::opencode::catalogue::Catalogue;
+    use crate::{
+        agent::opencode::{Error, catalogue::Catalogue},
+        sandbox::Output,
+    };
 
-    // Verbatim from `opencode models --verbose`, trimmed to the fields this reads.
-    const LISTING: &str = r#"deepseek/deepseek-chat
-{
-  "id": "deepseek-chat",
-  "providerID": "deepseek",
-  "variants": {}
-}
-deepseek/deepseek-v4-pro
-{
-  "id": "deepseek-v4-pro",
-  "providerID": "deepseek",
-  "variants": {
-    "high": { "reasoningEffort": "high" },
-    "max": { "reasoningEffort": "max" }
-  }
-}
-openai/gpt-5.6-sol
-{
-  "id": "gpt-5.6-sol",
-  "variants": {
-    "none": {},
-    "low": {},
-    "medium": {},
-    "high": {},
-    "xhigh": {},
-    "max": {}
-  }
-}
-"#;
+    const LISTING: &str = r#"{"output":[
+        {"providerID":"deepseek","id":"deepseek-chat","enabled":true,"variants":[]},
+        {"providerID":"deepseek","id":"deepseek-v4-pro","enabled":true,
+         "variants":[{"id":"high"},{"id":"max"}]},
+        {"providerID":"openai","id":"gpt-5.6-sol","enabled":true,
+         "variants":[{"id":"none"},{"id":"low"},{"id":"medium"},{"id":"high"},
+                     {"id":"xhigh"},{"id":"max"}]}
+    ]}"#;
 
     #[test]
     fn reads_back_what_opencode_offers() {
-        let catalogue = Catalogue::read(LISTING);
+        let catalogue = Catalogue::read(LISTING).expect("model catalogue");
 
         assert!(catalogue.offers("deepseek/deepseek-v4-pro"));
         assert!(catalogue.offers("openai/gpt-5.6-sol"));
@@ -148,18 +164,35 @@ openai/gpt-5.6-sol
             !catalogue.offers("deepseek/deepseek-v4-flash"),
             "a model OpenCode did not list is one this member cannot run"
         );
-        assert!(!catalogue.is_empty());
-        assert!(
-            Catalogue::read("").is_empty(),
-            "nothing read back is not the same as a model being absent"
+    }
+
+    #[test]
+    fn reads_models_and_their_variants() {
+        let catalogue = Catalogue::read(
+            r#"{"output":[
+            {"providerID":"p","id":"thinking","enabled":true,
+             "variants":[{"id":"high","body":{"reasoning_effort":"high"}},{"id":"max"}]},
+            {"providerID":"p","id":"plain","enabled":true,"variants":[]},
+            {"providerID":"p","id":"disabled","enabled":false,"variants":[]}
+        ]}"#,
+        )
+        .expect("model catalogue");
+
+        assert!(catalogue.offers("p/thinking"));
+        assert!(!catalogue.offers("p/disabled"));
+        assert_eq!(
+            catalogue.effort("p/thinking", "medium").as_deref(),
+            Some("high")
         );
+        assert_eq!(catalogue.effort("p/plain", "high"), None);
+        Catalogue::read(r#"{"error":"unavailable"}"#).expect_err("invalid catalogue");
     }
 
     // The ladder a provider file climbs can start below the first model that reasons at all, so
     // fitting has to cover a model with every effort, a model with two, and a model with none.
     #[test]
     fn fits_a_members_score_to_what_its_own_model_takes() {
-        let catalogue = Catalogue::read(LISTING);
+        let catalogue = Catalogue::read(LISTING).expect("model catalogue");
 
         assert_eq!(
             catalogue.effort("openai/gpt-5.6-sol", "medium").as_deref(),
@@ -191,5 +224,56 @@ openai/gpt-5.6-sol
             "an effort nobody ranks cannot be fitted, and guessing would send an unknown one"
         );
         assert_eq!(catalogue.effort("elsewhere/absent", "high"), None);
+    }
+
+    #[test]
+    fn rejects_an_unavailable_model_at_startup() {
+        for listing in [LISTING, r#"{"output":[]}"#] {
+            assert!(matches!(
+                Catalogue::checked(&output(0, listing, ""), "p/missing"),
+                Err(Error::Model(model)) if model == "p/missing"
+            ));
+        }
+        let catalogue = Catalogue::checked(&output(0, LISTING, ""), "deepseek/deepseek-v4-pro")
+            .expect("an offered model can start");
+        assert_eq!(
+            catalogue
+                .effort("deepseek/deepseek-v4-pro", "high")
+                .as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_model_api_responses() {
+        for response in ["not JSON", "{}"] {
+            assert!(matches!(
+                Catalogue::checked(&output(0, response, ""), "p/model"),
+                Err(Error::Catalogue(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn preserves_the_cli_and_api_explanations_when_a_query_fails() {
+        let failure = output(
+            1,
+            r#"{"error":"provider unavailable"}"#,
+            " request failed\n",
+        );
+        assert!(matches!(
+            Catalogue::checked(&failure, "p/model"),
+            Err(Error::CatalogueUnavailable { status, detail })
+                if status.code() == Some(1)
+                    && detail == r#"request failed {"error":"provider unavailable"}"#
+        ));
+    }
+
+    fn output(code: i32, stdout: &str, stderr: &str) -> Output {
+        Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(code << 8),
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        }
     }
 }

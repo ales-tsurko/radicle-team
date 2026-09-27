@@ -532,19 +532,18 @@ mod tests {
             "one event from Claude Code's stream is the agent doing something"
         );
 
-        let written_at_the_end = Session::new(Role::Coder);
-        written_at_the_end
+        let reported_by_plugin = Session::new(Role::Coder);
+        reported_by_plugin
             .read::<Event>(
-                Some(&br#"{"type":"error","error":{"name":"Overloaded"}}"#[..]),
+                Some(&br#"{"type":"error","error":{"type":"api","message":"Overloaded"}}"#[..]),
                 Stream::Events,
             )
             .await
             .expect("events should be read");
         assert_eq!(
-            written_at_the_end.last_progress(),
+            reported_by_plugin.last_progress(),
             None,
-            "an OpenCode event arrives when it is over, so it is history rather than activity; \
-             its progress comes from the plugin's report instead"
+            "OpenCode progress comes from its live plugin stream, even when CLI output is buffered"
         );
     }
 
@@ -557,7 +556,7 @@ mod tests {
         let report = session
             .read::<Event>(
                 Some(
-                    &br#"{"type":"error","error":{"name":"APIError","data":{"message":"Authentication Fails"}}}"#
+                    &br#"{"type":"error","error":{"type":"api","message":"Authentication Fails"}}"#
                         [..],
                 ),
                 Stream::Events,
@@ -615,20 +614,13 @@ mod tests {
         );
     }
 
-    // OpenCode writes its events once a run is over rather than as it happens, so an error it
-    // reported is terminal however it exited: a delivery which exits zero having said its run
-    // failed publishes nothing while calling itself a success.
+    // OpenCode terminal errors must fail the delivery even if the CLI exits zero.
     #[tokio::test]
     async fn fails_an_opencode_run_which_reported_a_failure_and_exited_zero() {
+        let failure = r#"{"type":"error","error":{"type":"api","message":"Denied"}}"#;
         let session = Session::new(Role::Coder);
         let events = session
-            .read::<Event>(
-                Some(
-                    &br#"{"type":"error","error":{"name":"APIError","data":{"message":"Denied"}}}"#
-                        [..],
-                ),
-                Stream::Events,
-            )
+            .read::<Event>(Some(failure.as_bytes()), Stream::Events)
             .await
             .expect("events should be read");
         let diagnostics = session

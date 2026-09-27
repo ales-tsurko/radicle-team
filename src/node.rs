@@ -14,18 +14,28 @@
 
 use std::{
     fs, io,
+    os::unix::fs::FileTypeExt as _,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
-use radicle::node::{Handle as _, Node, NodeId};
+use radicle::{
+    identity::RepoId,
+    node::{
+        Command as NodeCommand, ConnectOptions, ConnectResult, Handle as _, Node, NodeId, Session,
+        State, Success, config::ConnectAddress,
+    },
+};
 use tokio::process::{Child, Command};
 
 use crate::{home::MemberHome, identity::Identity, shutdown::Shutdown};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Owns one supervised `radicle-node` child process.
@@ -33,6 +43,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub struct NodeManager {
     child: ChildHandle,
     node: Node,
+    socket: PathBuf,
     log: PathBuf,
 }
 
@@ -149,7 +160,8 @@ impl NodeManager {
 
     async fn spawn_manager(identity: &Identity, home: &MemberHome) -> Result<Self, Error> {
         let socket = identity.profile().home().socket_default();
-        let node = tokio::task::spawn_blocking(move || Self::available_node(socket))
+        let check_socket = socket.clone();
+        let node = tokio::task::spawn_blocking(move || Self::available_node(check_socket))
             .await
             .map_err(|error| Error::Task(error.to_string()))??;
         let log = home.node_log();
@@ -157,6 +169,7 @@ impl NodeManager {
         Ok(Self {
             child: ChildHandle::new(child),
             node,
+            socket,
             log,
         })
     }
@@ -190,7 +203,7 @@ impl NodeManager {
         let mut command = Command::new("radicle-node");
         command
             .arg("--log-level")
-            .arg("info")
+            .arg("warn")
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(error))
             .kill_on_drop(true);
@@ -204,6 +217,141 @@ impl NodeManager {
         &self.node
     }
 
+    /// Connects configured seeds and waits for their protocol handshakes before fetching.
+    pub(crate) async fn connect_seeds(
+        &self,
+        identity: &Identity,
+        repository: RepoId,
+        shutdown: &Shutdown,
+    ) -> Result<(), Error> {
+        let config = &identity.profile().config;
+        let mut seeds = config.preferred_seeds.clone();
+        for peer in &config.node.connect {
+            if !seeds.contains(peer) {
+                seeds.push(peer.clone());
+            }
+        }
+        if seeds.is_empty() {
+            return Ok(());
+        }
+
+        let connections = seeds.into_iter().map(|seed| {
+            Self::connect_seed(
+                self.node.clone(),
+                seed,
+                shutdown.clone(),
+                CONNECTION_TIMEOUT,
+            )
+        });
+        // A usable repository seed lets us proceed while other preferred seeds are unavailable.
+        // Private repositories may not advertise their inventory, so connected preferred seeds
+        // remain a fallback when their connection attempts finish.
+        let results = tokio::select! {
+            results = futures_util::future::join_all(connections) => results,
+            result = self.wait_for_repository_seed(repository, *identity.profile().id()) => {
+                return if shutdown.is_requested() { Ok(()) } else { result };
+            }
+        };
+        if shutdown.is_requested() || results.iter().any(Result::is_ok) {
+            return Ok(());
+        }
+        // A previously discovered peer can still serve the repository when preferred seeds fail.
+        let node = self.node.clone();
+        let sessions = tokio::task::spawn_blocking(move || node.sessions())
+            .await
+            .map_err(|error| Error::Task(error.to_string()))?
+            .map_err(Error::Control)?;
+        if sessions.iter().any(radicle::node::Session::is_connected) {
+            return Ok(());
+        }
+
+        Err(Error::SeedsUnavailable {
+            details: results
+                .into_iter()
+                .filter_map(Result::err)
+                .collect::<Vec<_>>()
+                .join("; "),
+            log: self.log.clone(),
+        })
+    }
+
+    async fn wait_for_repository_seed(&self, repository: RepoId, id: NodeId) -> Result<(), Error> {
+        loop {
+            let mut node = self.node.clone();
+            let seeds = tokio::task::spawn_blocking(move || node.seeds_for(repository, [id]))
+                .await
+                .map_err(|error| Error::Task(error.to_string()))?
+                .map_err(Error::Control)?;
+            if seeds.connected().next().is_some() {
+                return Ok(());
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    async fn connect_seed(
+        node: Node,
+        seed: ConnectAddress,
+        shutdown: Shutdown,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let peer = seed.to_string();
+        tokio::time::timeout(timeout, Self::connect_and_wait(node, seed, shutdown))
+            .await
+            .map_err(|_elapsed| format!("{peer}: connection timed out"))?
+            .map_err(|error| format!("{peer}: {error}"))
+    }
+
+    async fn connect_and_wait(
+        node: Node,
+        seed: ConnectAddress,
+        shutdown: Shutdown,
+    ) -> Result<(), String> {
+        let id = seed.id;
+        let session = Self::seed_session(node.clone(), id).await?;
+        if session.is_none_or(|session| matches!(session.state, State::Disconnected { .. })) {
+            let mut connection = node.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                connection.connect(
+                    id,
+                    seed.into(),
+                    ConnectOptions {
+                        persistent: true,
+                        // Session checks below handle handshakes that outlast this request.
+                        timeout: CONNECT_REQUEST_TIMEOUT,
+                    },
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            match result {
+                Ok(ConnectResult::Connected) | Err(radicle::node::Error::TimedOut) => {}
+                Ok(ConnectResult::Disconnected { reason }) => return Err(reason),
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+
+        // `connect` may succeed while the session is still `Attempted`. Fetching then fails with
+        // "peer is not connected" or "No addresses known", even for a configured seed.
+        loop {
+            if shutdown.is_requested() {
+                return Ok(());
+            }
+            let session = Self::seed_session(node.clone(), id).await?;
+            if session.is_some_and(|session| session.is_connected()) {
+                return Ok(());
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    async fn seed_session(node: Node, id: NodeId) -> Result<Option<Session>, String> {
+        tokio::task::spawn_blocking(move || node.session(id))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+    }
+
     /// Returns the managed child process handle.
     pub(crate) fn child_handle(&self) -> ChildHandle {
         self.child.clone()
@@ -214,37 +362,49 @@ impl NodeManager {
     /// # Errors
     ///
     /// Returns an error when the shutdown request or process wait fails.
-    pub async fn stop(mut self) -> Result<(), Error> {
-        Self::shutdown_node(self.node.clone()).await?;
-        self.reap_child().await
+    pub async fn stop(self) -> Result<(), Error> {
+        self.stop_supervised(&Shutdown::default()).await
     }
 
     pub(crate) async fn stop_supervised(mut self, shutdown: &Shutdown) -> Result<(), Error> {
         if shutdown.shutdown_started() {
-            return self.reap_child().await;
+            return self.reap_child(SHUTDOWN_TIMEOUT).await;
         }
         match Self::shutdown_node(self.node.clone()).await {
             Ok(()) => {
                 shutdown.mark_shutdown_started();
-                self.reap_child().await
+                self.reap_child(SHUTDOWN_TIMEOUT).await
             }
-            Err(_) if shutdown.shutdown_started() => self.reap_child().await,
-            Err(error) => Err(error),
+            Err(_) if shutdown.shutdown_started() => self.reap_child(SHUTDOWN_TIMEOUT).await,
+            Err(error) => {
+                self.terminate_and_reap().await?;
+                Err(error)
+            }
         }
     }
 
     pub(crate) async fn reap(mut self) -> Result<(), Error> {
-        self.reap_child().await
+        self.reap_child(SHUTDOWN_TIMEOUT).await
     }
 
-    async fn terminate_and_reap(self) -> Result<(), Error> {
+    async fn terminate_and_reap(&self) -> Result<(), Error> {
         self.child.kill().map_err(Error::Wait)?;
         let _status = self.child.wait().await.map_err(Error::Wait)?;
-        Ok(())
+        self.remove_owned_socket()
     }
 
-    async fn reap_child(&mut self) -> Result<(), Error> {
-        let status = self.child.wait().await.map_err(Error::Wait)?;
+    async fn reap_child(&mut self, timeout: Duration) -> Result<(), Error> {
+        let status = match tokio::time::timeout(timeout, self.child.wait()).await {
+            Ok(status) => status.map_err(Error::Wait)?,
+            Err(_elapsed) => {
+                self.terminate_and_reap().await?;
+                return Err(Error::ShutdownTimeout {
+                    timeout,
+                    log: self.log.clone(),
+                });
+            }
+        };
+        self.remove_owned_socket()?;
         if status.success() {
             Ok(())
         } else {
@@ -252,6 +412,24 @@ impl NodeManager {
                 status,
                 log: self.log.clone(),
             })
+        }
+    }
+
+    // Only called after our child has been reaped. A forced stop cannot unlink its own socket, and
+    // leaving it behind would prevent the next setup attempt from starting a node.
+    fn remove_owned_socket(&self) -> Result<(), Error> {
+        match fs::symlink_metadata(&self.socket) {
+            Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(&self.socket)
+                .map_err(|source| Error::Socket {
+                    path: self.socket.clone().into(),
+                    source,
+                }),
+            Ok(_) => Err(Error::SocketOccupied(self.socket.clone().into())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(Error::Socket {
+                path: self.socket.clone().into(),
+                source,
+            }),
         }
     }
 
@@ -295,10 +473,19 @@ impl NodeManager {
     }
 
     async fn shutdown_node(node: Node) -> Result<(), Error> {
-        tokio::task::spawn_blocking(move || node.shutdown())
+        tokio::task::spawn_blocking(move || Self::request_shutdown(&node))
             .await
             .map_err(|error| Error::Task(error.to_string()))?
             .map_err(Error::Control)
+    }
+
+    // `Node::shutdown` polls until the node stops, with no overall deadline. Only request shutdown
+    // here; the owned child is waited for separately and killed if it does not exit.
+    pub(crate) fn request_shutdown(node: &Node) -> Result<(), radicle::node::Error> {
+        node.call::<Success>(NodeCommand::Shutdown, CONNECT_REQUEST_TIMEOUT)?
+            .next()
+            .transpose()?;
+        Ok(())
     }
 
     fn ensure_socket_absent(socket: &Path) -> Result<(), Error> {
@@ -329,7 +516,7 @@ pub enum Error {
     #[error("a Radicle node is already running at '{0}'")]
     AlreadyRunning(Box<Path>),
     /// The control socket could not be inspected.
-    #[error("failed to inspect Radicle control socket '{path}': {source}")]
+    #[error("failed to access Radicle control socket '{path}': {source}")]
     Socket {
         /// Control socket path.
         path: Box<Path>,
@@ -375,6 +562,14 @@ pub enum Error {
         /// Node log path.
         log: PathBuf,
     },
+    /// The child did not stop after its grace period and was forcibly terminated.
+    #[error("radicle-node did not stop within {timeout:?} and was terminated; see '{log}'")]
+    ShutdownTimeout {
+        /// Time allowed for graceful shutdown.
+        timeout: Duration,
+        /// Node log path.
+        log: PathBuf,
+    },
     /// The node uses a different identity from the loaded profile.
     #[error("Radicle node identity {actual} does not match expected identity {expected}")]
     IdentityMismatch {
@@ -386,6 +581,17 @@ pub enum Error {
     /// A control-socket operation failed.
     #[error("Radicle node control error: {0}")]
     Control(radicle::node::Error),
+    /// No configured seed or previously discovered peer completed a connection.
+    #[error(
+        "could not connect to a Radicle seed: {details}. Check seed availability and network \
+         access (node log: {log})"
+    )]
+    SeedsUnavailable {
+        /// Connection failure for each configured seed.
+        details: String,
+        /// Log containing the node's diagnostics.
+        log: PathBuf,
+    },
 }
 
 #[cfg(all(test, unix, not(miri)))]
@@ -393,10 +599,311 @@ mod tests {
     use std::{fs, path::PathBuf, time::Duration};
 
     use radicle::node::{Node, NodeId};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-    use crate::node::{ChildHandle, Error, NodeManager};
+    use crate::{
+        node::{ChildHandle, Error, NodeManager},
+        shutdown::Shutdown,
+    };
 
     const NODE: &str = "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
+
+    #[tokio::test]
+    async fn shutdown_acknowledgment_does_not_wait_for_the_node_to_exit() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("socket should bind");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("client should connect");
+            let mut stream = BufReader::new(stream);
+            let mut request = String::new();
+            stream
+                .read_line(&mut request)
+                .await
+                .expect("request should arrive");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).expect("request should parse"),
+                serde_json::json!({"command": "shutdown"})
+            );
+            stream
+                .write_all(b"{}\n")
+                .await
+                .expect("response should be sent");
+            // Keep both the socket and node alive after acknowledging shutdown.
+            std::future::pending::<()>().await;
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            NodeManager::shutdown_node(Node::new(socket)),
+        )
+        .await;
+        server.abort();
+        assert!(server.await.expect_err("server should stop").is_cancelled());
+        result
+            .expect("shutdown acknowledgment must not wait for EOF or process exit")
+            .expect("shutdown should be acknowledged");
+    }
+
+    #[tokio::test]
+    async fn terminates_and_reaps_a_node_that_does_not_stop() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let socket = root.path().join("control.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).expect("socket should bind");
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("test child should start");
+        let handle = ChildHandle::new(child);
+        let mut manager = NodeManager {
+            child: handle.clone(),
+            node: Node::new("unused-control.sock"),
+            socket: socket.clone(),
+            log: PathBuf::from("node.log"),
+        };
+
+        assert!(matches!(
+            manager.reap_child(Duration::from_millis(50)).await,
+            Err(Error::ShutdownTimeout { .. })
+        ));
+        assert_eq!(
+            handle
+                .wait()
+                .await
+                .expect_err("child must have been reaped")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(
+            !socket.exists(),
+            "the next setup must not inherit an abandoned socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_a_node_that_stops_within_its_deadline() {
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("test child should start");
+        let mut manager = NodeManager {
+            child: ChildHandle::new(child),
+            node: Node::new("unused-control.sock"),
+            socket: PathBuf::from("unused-control.sock"),
+            log: PathBuf::from("node.log"),
+        };
+        manager
+            .reap_child(Duration::from_secs(1))
+            .await
+            .expect("node should stop normally");
+    }
+
+    #[tokio::test]
+    async fn reaps_the_child_when_the_shutdown_socket_is_unavailable() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let socket = root.path().join("missing.sock");
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("test child should start");
+        let handle = ChildHandle::new(child);
+        let manager = NodeManager {
+            child: handle.clone(),
+            node: Node::new(&socket),
+            socket,
+            log: root.path().join("node.log"),
+        };
+
+        assert!(matches!(manager.stop().await, Err(Error::Control(_))));
+        assert_eq!(
+            handle
+                .wait()
+                .await
+                .expect_err("failed shutdown must still reap the child")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repository_seed_does_not_wait_for_an_unavailable_preferred_seed() {
+        use crate::{
+            home::MemberHome,
+            identity::{KeyProtection, Manager, Provider},
+            member::Member,
+        };
+
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc"
+            .parse()
+            .expect("RID should parse");
+        let home = MemberHome::at(root.path());
+        home.record(Member::Nico, repository)
+            .expect("home should be created");
+        let identity = Manager::default()
+            .load(
+                Member::Nico,
+                &home,
+                &Provider::Managed {
+                    protection: KeyProtection::Unencrypted,
+                },
+            )
+            .expect("identity should be created");
+        assert!(identity.profile().config.preferred_seeds.len() > 1);
+
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("socket should bind");
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("client should connect");
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                stream
+                    .read_line(&mut request)
+                    .await
+                    .expect("request should arrive");
+                let request: serde_json::Value =
+                    serde_json::from_str(&request).expect("request should be JSON");
+                let response = if request.get("command").and_then(serde_json::Value::as_str)
+                    == Some("seedsFor")
+                {
+                    serde_json::json!([{
+                        "nid": NODE, "addrs": [], "state": {"connected": {"since": 0}},
+                    }])
+                } else {
+                    let id = request
+                        .get("nid")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("request should query a session");
+                    let state = if id == NODE {
+                        serde_json::json!({"connected": {"since": 0}})
+                    } else {
+                        serde_json::json!("attempted")
+                    };
+                    serde_json::json!({
+                        "nid": id, "link": "outbound", "addr": "127.0.0.1:8776", "state": state,
+                    })
+                };
+                stream
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .expect("response should be sent");
+            }
+        });
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .spawn()
+            .expect("test child should start");
+        let manager = NodeManager {
+            child: ChildHandle::new(child),
+            node: Node::new(&socket),
+            socket,
+            log: home.node_log(),
+        };
+        let connected = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.connect_seeds(&identity, repository, &Shutdown::default()),
+        )
+        .await;
+        manager
+            .terminate_and_reap()
+            .await
+            .expect("test child should stop");
+        server.abort();
+        assert!(server.await.expect_err("server should stop").is_cancelled());
+        connected
+            .expect("an offline seed must not delay a usable repository seed")
+            .expect("the repository seed should be ready");
+    }
+
+    // A successful connect response can precede the actual protocol handshake.
+    async fn seed_control(
+        connected_after: Option<usize>,
+    ) -> (tempfile::TempDir, Node, tokio::task::JoinHandle<usize>) {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("control socket should bind");
+        let server = tokio::spawn(async move {
+            let mut polls = 0;
+            let mut connecting = false;
+            loop {
+                let (stream, _) = listener.accept().await.expect("client should connect");
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                stream
+                    .read_line(&mut request)
+                    .await
+                    .expect("request should arrive");
+                let request: serde_json::Value =
+                    serde_json::from_str(&request).expect("request should be JSON");
+                let response = if request.get("command").and_then(serde_json::Value::as_str)
+                    == Some("connect")
+                {
+                    connecting = true;
+                    serde_json::json!({"status": "connected"})
+                } else if !connecting {
+                    serde_json::Value::Null
+                } else {
+                    polls += 1;
+                    let state = if connected_after.is_some_and(|count| polls >= count) {
+                        serde_json::json!({"connected": {"since": 0}})
+                    } else {
+                        serde_json::json!("attempted")
+                    };
+                    serde_json::json!({
+                        "nid": NODE,
+                        "link": "outbound",
+                        "addr": "127.0.0.1:8776",
+                        "state": state,
+                    })
+                };
+                stream
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .expect("response should be sent");
+                if connected_after.is_some_and(|count| polls >= count) {
+                    return polls;
+                }
+            }
+        });
+        (root, Node::new(socket), server)
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_seed_handshake_after_connect_succeeds() {
+        let (_root, node, server) = seed_control(Some(3)).await;
+        let seed = serde_json::from_value(serde_json::json!(format!("{NODE}@127.0.0.1:8776")))
+            .expect("seed should parse");
+
+        NodeManager::connect_seed(node, seed, Shutdown::default(), Duration::from_secs(1))
+            .await
+            .expect("seed should finish connecting");
+
+        let polls = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("handshake should be observed")
+            .expect("control server should complete");
+        assert_eq!(polls, 3, "an attempted connection must not permit a fetch");
+    }
+
+    #[tokio::test]
+    async fn reports_a_seed_that_never_finishes_connecting() {
+        let (_root, node, server) = seed_control(None).await;
+        let seed = serde_json::from_value(serde_json::json!(format!("{NODE}@127.0.0.1:8776")))
+            .expect("seed should parse");
+
+        let error =
+            NodeManager::connect_seed(node, seed, Shutdown::default(), Duration::from_millis(150))
+                .await
+                .expect_err("a pending connection must time out");
+
+        assert!(error.contains(NODE));
+        assert!(error.contains("connection timed out"));
+        server.abort();
+        assert!(server.await.expect_err("server should stop").is_cancelled());
+    }
 
     #[test]
     fn preserves_an_existing_unresponsive_socket() {
@@ -425,7 +932,8 @@ mod tests {
         ));
         let mut manager = NodeManager {
             child: ChildHandle::new(child),
-            node: Node::new(socket),
+            node: Node::new(&socket),
+            socket,
             log: PathBuf::from("node.log"),
         };
         let expected = NODE.parse::<NodeId>().expect("node ID should parse");
@@ -448,6 +956,7 @@ mod tests {
         let manager = NodeManager {
             child: handle.clone(),
             node: Node::new(std::env::temp_dir().join("radicle-team-unused-socket")),
+            socket: std::env::temp_dir().join("radicle-team-unused-socket"),
             log: PathBuf::from("node.log"),
         };
 

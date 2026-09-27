@@ -4,6 +4,7 @@ use std::{
     fmt, io,
     path::{Path, PathBuf},
     process::ExitStatus,
+    time::Duration,
 };
 
 use radicle::{
@@ -12,6 +13,7 @@ use radicle::{
     profile::Profile as RadicleProfile,
     storage::{ReadRepository as _, ReadStorage as _},
 };
+use tokio::sync::watch;
 
 use crate::{
     agent::{self, Chatter, Coder, Talker, adapter, documents},
@@ -29,6 +31,10 @@ use crate::{
     watcher,
 };
 
+const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
+const SYNC_ATTEMPTS: usize = 3;
+const SYNC_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// A single Radicle team member application.
 #[derive(Debug, Clone)]
 pub struct Application {
@@ -40,6 +46,7 @@ pub struct Application {
     provider: Option<String>,
     seeds: Vec<NodeId>,
     shutdown: Shutdown,
+    setup_progress: Option<watch::Sender<String>>,
 }
 
 impl Application {
@@ -57,12 +64,26 @@ impl Application {
             provider: None,
             seeds: Vec::new(),
             shutdown: Shutdown::default(),
+            setup_progress: None,
         }
     }
 
     pub(crate) fn with_shutdown(mut self, shutdown: Shutdown) -> Self {
         self.shutdown = shutdown;
         self
+    }
+
+    pub(crate) fn with_setup_progress(mut self, progress: watch::Sender<String>) -> Self {
+        self.setup_progress = Some(progress);
+        self
+    }
+
+    fn report_setup(&self, message: impl Into<String>) {
+        let message = message.into();
+        tracing::debug!(%message, "setup progress");
+        if let Some(progress) = &self.setup_progress {
+            progress.send_replace(message);
+        }
     }
 
     /// Uses an explicit application home directory.
@@ -168,6 +189,7 @@ impl Application {
     pub async fn setup(&self) -> Result<Setup, Error> {
         let runtime = Runtime::start(self, Ownership::Claim).await?;
         let setup = self.prepare_setup(&runtime).await;
+        self.report_setup("Stopping setup's Radicle node");
         let stopped = runtime.stop(&self.shutdown).await;
 
         Self::finish_after_stop(setup, stopped)
@@ -210,8 +232,10 @@ impl Application {
 
     async fn prepare_setup(&self, runtime: &Runtime) -> Result<Setup, Error> {
         self.synchronize(&runtime.identity).await?;
+        self.report_setup("Checking repository configuration");
         let (status, security) = self.setup_status(runtime).await?;
         let did = runtime.identity.did();
+        self.report_setup("Preparing chat identity");
         let chat_certificate = Self::initialize_chat_identity(&runtime.home, self.member)
             .await?
             .fingerprint();
@@ -499,35 +523,93 @@ impl Application {
         repository: RepoId,
     ) -> Result<(), Error> {
         self.ensure_running()?;
-        let output = self
-            .sync_command(identity, repository)
-            .output()
-            .await
-            .map_err(Error::SyncSpawn)?;
+        self.report_setup(format!("Synchronizing {repository}"));
+        // `rad clone --bare` still creates a Git checkout. Keep that bootstrap checkout temporary;
+        // the member's durable repository lives in its Radicle storage.
+        let temporary = tempfile::tempdir().map_err(Error::SyncSpawn)?;
+        let checkout = temporary.path().join("checkout.git");
+        let output = Self::sync_output(
+            || self.sync_command(identity, repository, &checkout),
+            repository,
+            identity.did(),
+            SYNC_TIMEOUT,
+        )
+        .await?;
         self.ensure_running()?;
         self.validate_sync_output(identity, repository, output)
+    }
+
+    // Radicle's --timeout applies to individual fetches, not the whole subprocess. Keep the overall
+    // wait bounded as well, and terminate the subprocess when that deadline expires.
+    async fn sync_output(
+        command: impl FnMut() -> Result<tokio::process::Command, Error>,
+        repository: RepoId,
+        did: Did,
+        timeout: Duration,
+    ) -> Result<std::process::Output, Error> {
+        tokio::time::timeout(timeout, Self::sync_attempts(command))
+            .await
+            .map_err(|_elapsed| Error::SyncTimeout {
+                repository,
+                did,
+                timeout,
+            })?
+    }
+
+    async fn sync_attempts(
+        mut command: impl FnMut() -> Result<tokio::process::Command, Error>,
+    ) -> Result<std::process::Output, Error> {
+        let mut attempts = 0;
+        loop {
+            let output = command()?
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(Error::SyncSpawn)?;
+            attempts += 1;
+            if attempts == SYNC_ATTEMPTS || !Self::sync_node_busy(&output) {
+                return Ok(output);
+            }
+            // A fresh node can spend longer than the control timeout validating the initial network
+            // announcements. Keep it running so the next fetch can use that work.
+            tracing::debug!(
+                attempts,
+                "Radicle control request timed out; retrying synchronization"
+            );
+            tokio::time::sleep(SYNC_RETRY_DELAY).await;
+        }
+    }
+
+    fn sync_node_busy(output: &std::process::Output) -> bool {
+        !output.status.success()
+            && String::from_utf8_lossy(&output.stderr)
+                .contains("timed out reading from control socket")
     }
 
     fn sync_command(
         &self,
         identity: &identity::Identity,
         repository: RepoId,
-    ) -> tokio::process::Command {
+        checkout: &Path,
+    ) -> Result<tokio::process::Command, Error> {
         let mut command = tokio::process::Command::new("rad");
-        command
-            .arg("sync")
-            .arg("--fetch")
-            .arg("--replicas")
-            .arg("1")
-            .arg("--timeout")
-            .arg("30s");
+        let stored = identity.profile().storage.contains(&repository)?;
+        if stored {
+            command.args(["sync", "--fetch", "--replicas", "1"]);
+        } else {
+            command.args(["clone", "--bare"]);
+        }
+        command.args(["--timeout", "30s"]);
         for seed in &self.seeds {
             command.arg("--seed").arg(seed.to_string());
         }
         command.arg(repository.to_string());
+        if !stored {
+            command.arg(checkout);
+        }
         identity.configure_radicle_command(command.as_std_mut());
 
-        command
+        Ok(command)
     }
 
     fn validate_sync_output(
@@ -536,14 +618,18 @@ impl Application {
         repository: RepoId,
         output: std::process::Output,
     ) -> Result<(), Error> {
-        if output.status.success() {
+        if output.status.success() && identity.profile().storage.contains(&repository)? {
             Ok(())
         } else {
-            let details = if output.stderr.is_empty() {
+            let mut details = if output.stderr.is_empty() {
                 String::from_utf8_lossy(&output.stdout).trim().to_owned()
             } else {
                 String::from_utf8_lossy(&output.stderr).trim().to_owned()
             };
+            if output.status.success() {
+                details =
+                    format!("repository was not fetched into the member's storage; {details}");
+            }
             Err(Error::Sync {
                 repository,
                 did: identity.did(),
@@ -793,6 +879,8 @@ impl Runtime {
         let (lock, identity) = tokio::task::spawn_blocking(move || {
             let lock = MemberLock::acquire(&worker_home)?;
             worker_application.take_home(&worker_home, ownership)?;
+            worker_application
+                .report_setup("Unlocking identity — approve keychain access if prompted");
             let identity = worker_application.load_identity(&worker_home)?;
             Ok::<_, Error>((lock, identity))
         })
@@ -813,10 +901,12 @@ impl Runtime {
         home: &MemberHome,
         identity: &identity::Identity,
     ) -> Result<NodeManager, Error> {
+        application.report_setup("Starting member's Radicle node");
         let node = NodeManager::start_supervised(identity, home, &application.shutdown).await?;
         match Self::prepare_node(application, identity, &node).await {
             Ok(()) => Ok(node),
             Err(error) => {
+                application.report_setup("Stopping setup's Radicle node");
                 Self::stop_after_start_error(node, &application.shutdown).await;
                 Err(error)
             }
@@ -829,7 +919,11 @@ impl Runtime {
         node: &NodeManager,
     ) -> Result<(), Error> {
         application.ensure_running()?;
-        application.seed_repository(identity, node.node()).await
+        application.seed_repository(identity, node.node()).await?;
+        application.report_setup("Connecting to repository seeds");
+        node.connect_seeds(identity, application.repository, &application.shutdown)
+            .await?;
+        application.ensure_running()
     }
 
     async fn stop_after_start_error(node: NodeManager, shutdown: &Shutdown) {
@@ -1625,9 +1719,19 @@ pub enum Error {
     /// Persisting repository seeding policy failed.
     #[error("failed to seed repository: {0}")]
     Seed(#[from] radicle::profile::Error),
-    /// The `rad sync` subprocess could not be started.
-    #[error("failed to start 'rad sync': {0}")]
+    /// The Radicle clone or sync subprocess could not be started.
+    #[error("failed to start Radicle repository synchronization: {0}")]
     SyncSpawn(io::Error),
+    /// The complete Radicle clone or sync subprocess exceeded its deadline.
+    #[error("synchronizing {repository} as {did} timed out after {timeout:?}; retry setup")]
+    SyncTimeout {
+        /// Repository being synchronized.
+        repository: RepoId,
+        /// Member identity used for synchronization.
+        did: Did,
+        /// Maximum duration of the complete subprocess.
+        timeout: Duration,
+    },
     /// Repository synchronization failed.
     #[error("failed to synchronize {repository} as {did} ({status}): {details}")]
     Sync {
@@ -1637,7 +1741,7 @@ pub enum Error {
         did: Did,
         /// Subprocess exit status.
         status: ExitStatus,
-        /// Diagnostic output from `rad sync`.
+        /// Diagnostic output from Radicle.
         details: String,
     },
     /// Opening or validating the Radicle repository failed.
@@ -1858,6 +1962,204 @@ mod tests {
         manifest::{Revision, ValidatedBinding},
     };
     use crate::{Application, Setup, SetupStatus, member::Member};
+
+    #[cfg(all(unix, not(miri)))]
+    #[tokio::test]
+    async fn terminates_a_sync_subprocess_that_exceeds_its_deadline() {
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let pid_file = root.path().join("sync.pid");
+        let command = || {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .args(["-c", "echo $$ > \"$SYNC_TEST_PID\"; exec sleep 60"])
+                .env("SYNC_TEST_PID", &pid_file);
+            Ok(command)
+        };
+        let (repository, did) = sync_target();
+        assert!(matches!(
+            Application::sync_output(command, repository, did, Duration::from_secs(1)).await,
+            Err(super::Error::SyncTimeout { repository: rid, did: signer, .. })
+                if rid == repository && signer == did
+        ));
+        let pid = fs::read_to_string(&pid_file)
+            .expect("subprocess should have started")
+            .trim()
+            .parse()
+            .expect("PID should parse");
+        let pid = rustix::process::Pid::from_raw(pid).expect("PID should be positive");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rustix::process::test_kill_process(pid) {
+                    Ok(()) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => {
+                        assert_eq!(error, rustix::io::Errno::SRCH);
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed-out sync must be killed and reaped");
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[tokio::test]
+    async fn preserves_sync_errors_and_output_within_the_deadline() {
+        use std::time::Duration;
+
+        let mut attempts = 0;
+        let command = || {
+            attempts += 1;
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", "echo unavailable >&2; exit 7"]);
+            Ok(command)
+        };
+        let (repository, did) = sync_target();
+        let output = Application::sync_output(command, repository, did, Duration::from_secs(1))
+            .await
+            .expect("command should start");
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stderr, b"unavailable\n");
+        assert_eq!(
+            attempts, 1,
+            "only control-socket timeouts should be retried"
+        );
+
+        let missing = || {
+            Ok(tokio::process::Command::new(
+                "/nonexistent/radicle-team-sync-test",
+            ))
+        };
+        assert!(matches!(
+            Application::sync_output(missing, repository, did, Duration::from_secs(1)).await,
+            Err(super::Error::SyncSpawn(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[tokio::test]
+    async fn retries_sync_while_a_new_node_processes_network_announcements() {
+        let (repository, did) = sync_target();
+        let mut attempts = 0;
+        let command = || {
+            attempts += 1;
+            let mut command = tokio::process::Command::new("/bin/sh");
+            let script = if attempts == 1 {
+                "echo 'node: timed out reading from control socket' >&2; exit 1"
+            } else {
+                "echo synchronized"
+            };
+            command.args(["-c", script]);
+            Ok(command)
+        };
+
+        let output =
+            Application::sync_output(command, repository, did, std::time::Duration::from_secs(5))
+                .await
+                .expect("sync should resume when the same node becomes responsive");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"synchronized\n");
+        assert_eq!(attempts, 2);
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[tokio::test]
+    async fn sync_retries_share_one_deadline() {
+        let (repository, did) = sync_target();
+        let mut attempts = 0;
+        let command = || {
+            attempts += 1;
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args([
+                "-c",
+                "echo 'node: timed out reading from control socket' >&2; exit 1",
+            ]);
+            Ok(command)
+        };
+
+        assert!(matches!(
+            Application::sync_output(
+                command,
+                repository,
+                did,
+                std::time::Duration::from_millis(250)
+            )
+            .await,
+            Err(super::Error::SyncTimeout { .. })
+        ));
+        assert_eq!(
+            attempts, 1,
+            "the total deadline must also cover the retry delay"
+        );
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    fn sync_target() -> (RepoId, radicle::identity::Did) {
+        (
+            "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc"
+                .parse()
+                .expect("RID should parse"),
+            "did:key:z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7"
+                .parse()
+                .expect("DID should parse"),
+        )
+    }
+
+    #[test]
+    #[cfg(all(unix, not(miri)))]
+    fn synchronization_requires_the_repository_to_be_fetched() {
+        use std::{os::unix::process::ExitStatusExt as _, process::Output};
+
+        use crate::identity::{KeyProtection, Manager, Provider};
+
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = RepoId::from_str("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc")
+            .expect("repository ID should be valid");
+        let home = MemberHome::at(root.path());
+        home.record(Member::Nico, repository)
+            .expect("member should be recorded");
+        let identity = Manager::default()
+            .load(
+                Member::Nico,
+                &home,
+                &Provider::Managed {
+                    protection: KeyProtection::Unencrypted,
+                },
+            )
+            .expect("fresh member identity should be created");
+        let application = Application::new(Member::Nico, repository);
+        let checkout = root.path().join("bootstrap.git");
+        let command = application
+            .sync_command(&identity, repository, &checkout)
+            .expect("first synchronization should be configured");
+        assert_eq!(
+            command.as_std().get_args().next(),
+            Some(std::ffi::OsStr::new("clone")),
+            "a fresh identity must clone before synchronizing an existing repository"
+        );
+        assert_eq!(
+            command.as_std().get_args().last(),
+            Some(checkout.as_os_str()),
+            "even --bare creates a checkout, so cloning must not use the caller's directory"
+        );
+
+        // `rad sync` can exit successfully without fetching anything on a fresh node.
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"No seeds found".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(matches!(
+            application.validate_sync_output(&identity, repository, output),
+            Err(super::Error::Sync { repository: actual, did, details, .. })
+                if actual == repository
+                    && did == identity.did()
+                    && details.contains("repository was not fetched")
+                    && details.contains("No seeds found")
+        ));
+    }
 
     #[test]
     fn application_retains_selection() {

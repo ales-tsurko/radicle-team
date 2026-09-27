@@ -7,7 +7,7 @@ pub(crate) struct Logging;
 impl Logging {
     pub(crate) fn init() -> Result<(), String> {
         let filter = EnvFilter::builder()
-            .with_default_directive(LevelFilter::INFO.into())
+            .with_default_directive(LevelFilter::WARN.into())
             .from_env_lossy();
 
         tracing_subscriber::fmt()

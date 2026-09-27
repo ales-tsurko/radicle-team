@@ -1,36 +1,59 @@
-// Tells the runtime what this member's agent is doing.
-//
-// The runtime stops an agent which has shown nothing for fifteen minutes, and from outside the
-// process a working agent and a stuck one look the same. OpenCode knows the difference, so this
-// plugin writes what it knows to a file the adapter reads. The path is written in when the adapter
-// installs this file, and every line is one event.
-//
-// The names below come from `@opencode-ai/plugin`: `event` carries everything OpenCode announces,
-// including `session.idle`, `session.error` and `message.part.updated`, while the tool hooks fire
-// around a tool call and `permission.ask` fires when a run wants an answer nobody is there to give.
-//
-// A member's own harness folder is the only thing this touches. It never fails a run: an agent
-// which cannot report is still an agent doing its work.
-
+// OpenCode 2 plugins export a definition and subscribe to live events during setup. The adapter
+// fills in the report path, which remains inside this role's harness.
 import { appendFileSync } from "node:fs"
 
 const REPORT = "__REPORT__"
 
-const note = (kind, detail) => {
+const note = (kind) => {
   try {
-    appendFileSync(REPORT, JSON.stringify({ kind, at: Date.now(), detail }) + "\n")
+    appendFileSync(REPORT, JSON.stringify({ kind, at: Date.now() }) + "\n")
   } catch {
-    // The runtime reads silence as a stall, which is the right answer when reporting is broken.
+    // Missing reports let the runtime detect a stalled or broken harness.
   }
 }
 
-export const Progress = async () => {
-  note("started")
+export default {
+  id: "radicle-team-progress",
+  setup: async ({ event, model, rpc }) => {
+    // RPC requests wait for all plugins to activate, so this sees the complete model registry.
+    // Return only the requested model and the fields Rust needs to keep CLI output bounded.
+    await rpc.register({
+      id: "radicle-team",
+      methods: {
+        models: {
+          input: {
+            type: "object",
+            properties: { model: { type: "string" } },
+            required: ["model"],
+          },
+          output: { type: "array", items: { type: "object" } },
+        },
+      },
+      events: {},
+    }, {
+      models: async (input) => {
+        const { data } = await model.list()
+        return data
+          .filter((item) => `${item.providerID}/${item.id}` === input.model)
+          .map(({ id, providerID, enabled, variants }) => ({
+            id, providerID, enabled, variants: variants.map(({ id }) => ({ id })),
+          }))
+      },
+    })
 
-  return {
-    event: async ({ event }) => note(event?.type),
-    "tool.execute.before": async (input) => note("tool.before", input?.tool),
-    "tool.execute.after": async (input) => note("tool.after", input?.tool),
-    "permission.ask": async (_input, output) => note("permission.ask", output?.status),
-  }
+    note("started")
+    const stop = new AbortController()
+    const reports = (async () => {
+      for await (const update of event.subscribe({ signal: stop.signal })) {
+        note(update.type)
+      }
+    })().catch(() => {
+      // Plugin shutdown or a broken stream must not fail the agent's delivery.
+    })
+
+    return async () => {
+      stop.abort()
+      await reports
+    }
+  },
 }

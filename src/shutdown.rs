@@ -2,19 +2,19 @@
 //!
 //! The CLI installs one handler for interruption and termination signals. The handler records the
 //! shutdown request and asks the currently supervised Radicle node to stop through its control
-//! socket. Application code then returns normally, allowing
-//! [`NodeManager`](crate::node::NodeManager) to reap the child. If no node can accept the request,
-//! the handler terminates the CLI instead of suppressing the operating-system signal indefinitely.
-//! This is necessary because operating-system termination does not run Rust destructors by itself.
+//! socket. Application code then returns normally, allowing [`NodeManager`] to reap the child. If
+//! no node can accept the request, the handler terminates the CLI instead of suppressing the
+//! operating-system signal indefinitely. This is necessary because operating-system termination
+//! does not run Rust destructors by itself.
 
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError,
     atomic::{AtomicBool, Ordering},
 };
 
-use radicle::node::{Handle as _, Node};
+use radicle::node::Node;
 
-use crate::node::ChildHandle;
+use crate::node::{ChildHandle, NodeManager};
 
 /// Coordinates one process-wide shutdown request with its managed node.
 #[derive(Debug, Clone, Default)]
@@ -128,7 +128,7 @@ impl Shutdown {
             return RequestResult::Failed;
         };
         runtime.spawn_blocking(move || {
-            if node.handle.clone().shutdown().is_err() {
+            if NodeManager::request_shutdown(&node.handle).is_err() {
                 let _result = child.kill();
             }
         });

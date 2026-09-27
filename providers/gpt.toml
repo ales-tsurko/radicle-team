@@ -27,11 +27,11 @@ env = ["OPENAI_API_KEY"]
 [INT]
 param = "model"
 values = [
-  "openai/gpt-5.6-luna",
-  "openai/gpt-5.6-luna",
-  "openai/gpt-5.6-terra",
-  "openai/gpt-5.6-sol",
-  "openai/gpt-5.6-sol",
+  "openai/gpt-6.0-luna",
+  "openai/gpt-6.0-luna",
+  "openai/gpt-6.0-terra",
+  "openai/gpt-6.0-sol",
+  "openai/gpt-6.0-astra",
 ]
 
 # How hard the model thinks before answering.
@@ -42,4 +42,3 @@ values = [
 [ACC]
 param = "reasoning_effort"
 values = ["none", "low", "medium", "high", "max"]
-
