@@ -3,7 +3,10 @@
 use std::{process::Command, str::FromStr as _};
 
 use age::{secrecy::ExposeSecret as _, x25519};
-use radicle::identity::{Did, RepoId};
+use radicle::{
+    identity::{Did, RepoId},
+    profile::Profile,
+};
 
 use crate::cli::setup::Error;
 
@@ -21,8 +24,9 @@ pub(crate) struct SecuritySetup {
 
 impl SecuritySetup {
     pub(super) fn provision(did: Did) -> Result<Self, Error> {
+        Self::authenticate()?;
         let repository = Self::create_repository()?;
-        Self::grant(repository, did)?;
+        Self::grant_access(repository, did)?;
         Ok(Self::generate(repository))
     }
 
@@ -75,13 +79,41 @@ impl SecuritySetup {
     }
 
     pub(super) fn grant(repository: RepoId, did: Did) -> Result<(), Error> {
+        Self::authenticate()?;
+        Self::grant_access(repository, did)
+    }
+
+    fn authenticate() -> Result<(), Error> {
+        let profile = Profile::load().map_err(Error::OperatorProfile)?;
+        match profile.signer() {
+            Ok(_) => return Ok(()),
+            Err(error) if error.prompt_for_passphrase() => {}
+            Err(error) => return Err(Error::OperatorSigner(error)),
+        }
+
+        // `rad init` can unlock a key just for itself, whereas `rad id update` needs the key
+        // registered with ssh-agent. Authenticate before creating anything, using the operator's
+        // profile inherited by both commands. The member's separate key cannot grant access.
+        Self::command(Command::new("rad").arg("auth"))?;
+        // `rad auth` may succeed without a running ssh-agent. Verify that later commands can sign.
+        profile.signer().map_err(Error::OperatorSigner)?;
+        Ok(())
+    }
+
+    fn grant_access(repository: RepoId, did: Did) -> Result<(), Error> {
         Self::command(
             Command::new("rad")
                 .args(["id", "update", "--repo"])
                 .arg(repository.to_string())
                 .args(["--allow"])
                 .arg(did.to_string())
-                .arg("--no-confirm"),
+                .args([
+                    "--title",
+                    "Grant security-report access",
+                    "--description",
+                    "Allow a radicle-team member to submit encrypted security reports.",
+                    "--no-confirm",
+                ]),
         )?;
         Self::command(
             Command::new("rad")
@@ -179,6 +211,104 @@ mod tests {
                 .message(),
             Some("Initialize security reports")
         );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(miri)))]
+    fn authenticates_before_creating_or_granting_access() {
+        use std::{fs, os::unix::fs::PermissionsExt as _, process::Command};
+
+        use radicle::{
+            crypto::Seed,
+            node::Alias,
+            profile::{Home, Profile},
+            storage::ReadStorage as _,
+        };
+
+        use crate::cli::setup::Error;
+
+        const CASE: &str = "RADICLE_TEAM_SECURITY_AUTH_CASE";
+        if let Ok(case) = std::env::var(CASE) {
+            let profile = Profile::load().expect("isolated operator profile should load");
+            if case == "unlocked" {
+                SecuritySetup::authenticate().expect("an unlocked key needs no authentication");
+                return;
+            }
+            let repository = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc"
+                .parse()
+                .expect("repository ID should parse");
+            for result in [
+                SecuritySetup::provision(profile.did()).map(|_| ()),
+                SecuritySetup::grant(repository, profile.did()),
+            ] {
+                if case == "auth-fails" {
+                    assert!(
+                        matches!(result, Err(Error::Command { status, .. }) if status.code() == Some(7))
+                    );
+                } else {
+                    assert!(matches!(result, Err(Error::OperatorSigner(_))));
+                }
+            }
+            assert!(
+                profile
+                    .storage
+                    .repositories()
+                    .expect("storage should open")
+                    .is_empty()
+            );
+            return;
+        }
+
+        for case in ["auth-fails", "agent-missing", "unlocked"] {
+            let root = tempfile::tempdir().expect("temporary directory should be created");
+            let home = Home::new(root.path().join("identity")).expect("profile home should exist");
+            let passphrase = (case != "unlocked").then(|| "test-passphrase".to_owned().into());
+            Profile::init(
+                home,
+                Alias::new("operator"),
+                passphrase,
+                Seed::new([41; 32]),
+            )
+            .expect("isolated operator identity should be created");
+            let rad = root.path().join("rad");
+            fs::write(
+                &rad,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$RADICLE_TEAM_SECURITY_AUTH_LOG\"\ntest \
+                 \"$*\" = auth || exit 9\ntest \"$RADICLE_TEAM_SECURITY_AUTH_CASE\" != auth-fails \
+                 || exit 7\n",
+            )
+            .expect("Radicle stub should be written");
+            fs::set_permissions(&rad, fs::Permissions::from_mode(0o700))
+                .expect("Radicle stub should be executable");
+            let log = root.path().join("commands");
+            let output = Command::new(std::env::current_exe().expect("test binary should exist"))
+                .args([
+                    "--exact",
+                    "cli::setup::security::tests::authenticates_before_creating_or_granting_access",
+                    "--nocapture",
+                ])
+                .env(CASE, case)
+                .env("RAD_HOME", root.path().join("identity"))
+                .env_remove("RAD_PASSPHRASE")
+                .env_remove("RAD_SOCKET")
+                .env("SSH_AUTH_SOCK", root.path().join("missing-agent.sock"))
+                .env("PATH", root.path())
+                .env("RADICLE_TEAM_SECURITY_AUTH_LOG", &log)
+                .output()
+                .expect("isolated authentication test should start");
+            assert!(output.status.success(), "{case}: {output:?}");
+            if case == "unlocked" {
+                assert!(
+                    !log.exists(),
+                    "an available signing key must not prompt again"
+                );
+            } else {
+                assert_eq!(
+                    fs::read_to_string(log).expect("commands should be logged"),
+                    "auth\nauth\n"
+                );
+            }
+        }
     }
 
     #[test]

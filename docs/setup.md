@@ -240,6 +240,12 @@ That repository must be private, the user's own Radicle node must be running,
 and the user's Radicle identity must be able to update its access list. A
 public repository is refused.
 
+Setup unlocks your personal Radicle identity before creating the repository or
+granting access. Your identity owns newly created repositories; the member DID
+receives access. The repository stays in your Radicle storage after its
+temporary initial checkout is removed. Use `rad checkout <RID>` to create a
+working copy.
+
 
 
 

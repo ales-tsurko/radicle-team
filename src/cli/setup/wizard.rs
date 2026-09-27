@@ -770,6 +770,15 @@ pub enum Error {
     /// A setup filesystem or subprocess operation failed.
     #[error("setup I/O failed: {0}")]
     Io(#[from] io::Error),
+    /// The operator's personal Radicle profile could not be loaded.
+    #[error("could not load your Radicle identity: {0}")]
+    OperatorProfile(radicle::profile::Error),
+    /// The operator's signing key is unavailable after authentication.
+    #[error(
+        "could not unlock your Radicle signing key: {0}; ensure ssh-agent is running and run `rad \
+         auth`"
+    )]
+    OperatorSigner(radicle::profile::SignerError),
     /// `rad inspect` returned malformed output.
     #[error("the current Radicle checkout returned an invalid repository ID: {0}")]
     CheckoutIdentity(radicle::identity::IdError),
