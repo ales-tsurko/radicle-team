@@ -9,7 +9,7 @@ use std::{
 
 use radicle::{
     identity::{Did, RepoId},
-    node::{Node, NodeId, policy::Scope},
+    node::{Handle as _, Node, NodeId, policy::Scope},
     profile::Profile as RadicleProfile,
     storage::{ReadRepository as _, ReadStorage as _},
 };
@@ -34,6 +34,7 @@ use crate::{
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 const SYNC_ATTEMPTS: usize = 3;
 const SYNC_RETRY_DELAY: Duration = Duration::from_secs(1);
+const ACTIVATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A single Radicle team member application.
 #[derive(Debug, Clone)]
@@ -328,6 +329,9 @@ impl Application {
 
     /// Runs the team member.
     ///
+    /// Waits for the canonical manifest to authorize this identity before starting agents when the
+    /// repository manifest or member binding is still missing.
+    ///
     /// Each of the member's three roles is started as its own agent on the provider this member
     /// runs on: the runtime holds each one's process, so it can stop an agent which has gone silent
     /// or refused to stop.
@@ -486,7 +490,7 @@ impl Application {
     async fn prepare_run(&self, runtime: &Runtime) -> Result<manifest::ValidatedBinding, Error> {
         self.synchronize(&runtime.identity).await?;
         let binding = self
-            .validate_binding(&runtime.home, &runtime.identity)
+            .wait_for_binding(&runtime.home, &runtime.identity)
             .await?;
         self.prepare_security_repository(runtime, binding.security())
             .await?;
@@ -494,8 +498,60 @@ impl Application {
         Ok(binding)
     }
 
+    // The proposed manifest is local setup state. Only canonical (or explicitly selected
+    // administrator-owned) policy may authorize agents to start.
+    async fn wait_for_binding(
+        &self,
+        home: &MemberHome,
+        identity: &identity::Identity,
+    ) -> Result<manifest::ValidatedBinding, Error> {
+        if self.manifest_file.is_some() {
+            return self
+                .validate_profile_binding(home, identity.profile(), identity.did())
+                .await;
+        }
+        let mut waiting = false;
+        loop {
+            self.ensure_running()?;
+            if let SetupValidation::Ready(binding) = self.load_setup_validation(identity).await? {
+                self.record_binding(home, (*binding).clone()).await?;
+                return Ok(*binding);
+            }
+            if !waiting {
+                tracing::warn!(member = %self.member, repository = %self.repository,
+                    "awaiting manifest approval on the canonical branch; agents have not started");
+                waiting = true;
+            }
+            tokio::time::sleep(ACTIVATION_POLL_INTERVAL).await;
+            self.ensure_running()?;
+            match self.synchronize(identity).await {
+                Ok(()) => {}
+                Err(error @ (Error::Sync { .. } | Error::SyncTimeout { .. })) => {
+                    tracing::warn!(%error, "synchronization failed while waiting for manifest approval");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub(crate) async fn announce_setup_patch(&self) -> Result<(), Error> {
+        let runtime = Runtime::start(self, Ownership::Verify).await?;
+        let mut node = runtime.node.node().clone();
+        let repository = self.repository;
+        let namespace = *runtime.identity.profile().id();
+        let result = tokio::task::spawn_blocking(move || {
+            node.announce_refs_for(repository, [namespace])
+                .map(|_| ())
+                .map_err(|error| Error::Node(node::Error::Control(error)))
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()));
+        let result = result.and_then(std::convert::identity);
+        Self::finish_after_stop(result, runtime.stop(&self.shutdown).await)
+    }
+
     // Resolves this member's directory.
-    fn member_home(&self) -> Result<MemberHome, home::Error> {
+    pub(crate) fn member_home(&self) -> Result<MemberHome, home::Error> {
         match &self.home {
             // Canonicalised because Git resolves a worktree destination against the object store
             // rather than the working directory, so a relative path would create it elsewhere.
@@ -507,7 +563,7 @@ impl Application {
     }
 
     // Confirms the member directory belongs to the member and repository being run.
-    fn validate_member_home(&self, home: &MemberHome) -> Result<(), Error> {
+    pub(crate) fn validate_member_home(&self, home: &MemberHome) -> Result<(), Error> {
         Self::validate_home_owner(home, self.member, Some(self.repository))?.ok_or_else(|| {
             Error::MemberDirectory {
                 path: home.path().into(),
@@ -800,15 +856,6 @@ impl Application {
             .next_generation(self.repository, self.member)
             .await
             .map_err(Error::from)
-    }
-
-    async fn validate_binding(
-        &self,
-        home: &MemberHome,
-        identity: &identity::Identity,
-    ) -> Result<manifest::ValidatedBinding, Error> {
-        self.validate_profile_binding(home, identity.profile(), identity.did())
-            .await
     }
 
     async fn validate_profile_binding(
@@ -2418,6 +2465,173 @@ mod tests {
         assert!(output.contains("nico IRC certificate: cert-sha256:"));
         assert!(output.contains("run interactive setup"));
         assert!(output.contains("generation 1"));
+    }
+
+    #[tokio::test]
+    async fn activation_waits_for_canonical_approval_and_rejects_an_invalid_binding() {
+        use radicle::{
+            node::device::Device,
+            storage::{ReadRepository as _, SignRepository as _, WriteRepository as _},
+        };
+
+        use crate::identity::{KeyProtection, Manager, Provider};
+
+        let root = tempfile::tempdir().expect("fixture directory should exist");
+        let home = MemberHome::at(root.path().join("maya"));
+        home.create().expect("member home should create");
+        home.record_identity(Member::Maya)
+            .expect("identity owner should be recorded");
+        let identity = Manager::default()
+            .load(
+                Member::Maya,
+                &home,
+                &Provider::Managed {
+                    protection: KeyProtection::Unencrypted,
+                },
+            )
+            .expect("member identity should create");
+        let signer = Device::from(identity.memory_signer().expect("signer should load")).boxed();
+        let source =
+            git2::Repository::init(root.path().join("source")).expect("source should initialize");
+        source
+            .set_head("refs/heads/main")
+            .expect("main should be selected");
+        let empty = source
+            .treebuilder(None)
+            .expect("tree builder should create")
+            .write()
+            .expect("tree should write");
+        let tree = source.find_tree(empty).expect("tree should read");
+        let signature =
+            git2::Signature::now("Test", "test@example.com").expect("signature should create");
+        source
+            .commit(Some("HEAD"), &signature, &signature, "Initial", &tree, &[])
+            .expect("commit should create");
+        let (rid, _, _) = radicle::rad::init(
+            &source,
+            "activation-test".try_into().expect("name should parse"),
+            "Activation test",
+            "main".try_into().expect("branch should parse"),
+            Visibility::Public,
+            &signer,
+            &identity.profile().storage,
+        )
+        .expect("Radicle repository should create");
+        let application = Application::new(Member::Maya, rid).with_home(home.path());
+        let manifest = format!(
+            r#"version = 1
+[security]
+repository = "{rid}"
+recipients = ["age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa"]
+[members.maya]
+signing_did = "{}"
+generation = 1
+state = "active"
+mcp_allow = ["read"]
+"#,
+            identity.did()
+        );
+        let coder = home.worktree(crate::agent::Role::Coder);
+        fs::create_dir_all(&coder).expect("coder directory should create");
+        fs::write(coder.join(crate::manifest::FILE_NAME), &manifest)
+            .expect("proposed manifest should write");
+
+        // The pending local proposal never authorizes the member. Waiting succeeds only once
+        // the repository delegates' canonical branch contains a valid binding.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            application.wait_for_binding(&home, &identity),
+        )
+        .await
+        .expect_err("an unapproved local proposal must keep waiting");
+        let stored = identity
+            .profile()
+            .storage
+            .repository(rid)
+            .expect("storage should open");
+        let base = stored
+            .canonical_head()
+            .expect("canonical head should read")
+            .1;
+        let parent = stored
+            .raw()
+            .find_commit(base.into())
+            .expect("base commit should read");
+        let mut builder = stored
+            .raw()
+            .treebuilder(Some(&parent.tree().expect("base tree should read")))
+            .expect("tree builder should create");
+        let blob = stored
+            .raw()
+            .blob(manifest.as_bytes())
+            .expect("manifest blob should write");
+        builder
+            .insert(crate::manifest::FILE_NAME, blob, 0o100644)
+            .expect("manifest should enter tree");
+        let tree = stored
+            .raw()
+            .find_tree(builder.write().expect("tree should write"))
+            .expect("tree should read");
+        let reference = format!(
+            "refs/namespaces/{}/refs/heads/main",
+            identity.profile().id()
+        );
+        stored
+            .raw()
+            .commit(
+                Some(&reference),
+                &signature,
+                &signature,
+                "Approve member",
+                &tree,
+                &[&parent],
+            )
+            .expect("canonical merge should create");
+        stored
+            .sign_refs(&signer)
+            .expect("delegate references should sign");
+        let binding = application
+            .wait_for_binding(&home, &identity)
+            .await
+            .expect("approved member should activate");
+        assert_eq!(binding.generation(), 1);
+
+        let invalid = manifest.replace("state = \"active\"", "state = \"inactive\"");
+        let blob = stored
+            .raw()
+            .blob(invalid.as_bytes())
+            .expect("revoked manifest should write");
+        builder
+            .insert(crate::manifest::FILE_NAME, blob, 0o100644)
+            .expect("revocation should enter tree");
+        let tree = stored
+            .raw()
+            .find_tree(builder.write().expect("tree should write"))
+            .expect("tree should read");
+        let current = stored
+            .raw()
+            .find_reference(&reference)
+            .expect("canonical reference should read")
+            .peel_to_commit()
+            .expect("canonical commit should read");
+        stored
+            .raw()
+            .commit(
+                Some(&reference),
+                &signature,
+                &signature,
+                "Revoke member",
+                &tree,
+                &[&current],
+            )
+            .expect("revocation should commit");
+        stored.sign_refs(&signer).expect("references should sign");
+        assert!(matches!(
+            application.wait_for_binding(&home, &identity).await,
+            Err(super::Error::Manifest(crate::manifest::Error::Inactive(
+                Member::Maya
+            )))
+        ));
     }
 
     #[tokio::test]

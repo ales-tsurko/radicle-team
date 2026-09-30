@@ -81,7 +81,10 @@
 //! validates this binding after synchronization, before watching activity, and again immediately
 //! before every agent-requested write.
 
-pub use crate::application::{Application, Error, Setup, SetupStatus};
+pub use crate::{
+    application::{Application, Error, Setup, SetupStatus},
+    workspace::Error as WorkspaceError,
+};
 
 pub mod agent;
 mod application;

@@ -1,7 +1,11 @@
 //! Setup wizard orchestration.
 
 use std::{
-    collections::BTreeSet, io, io::IsTerminal as _, path::Path, process::ExitStatus,
+    collections::BTreeSet,
+    io,
+    io::IsTerminal as _,
+    path::{Path, PathBuf},
+    process::ExitStatus,
     str::FromStr as _,
 };
 
@@ -173,13 +177,25 @@ impl SetupWizard {
 
     async fn handle_setup(&self, setup: Setup, decided: &mut Decisions) -> Result<Step, Error> {
         if matches!(setup.status(), SetupStatus::Ready { .. }) {
-            self.configure_sandbox()?;
-            cliclack::outro(setup)?;
-            Ok(Step::Complete)
+            self.finish_setup(setup)
+        } else if let Some(path) = self.application.manifest_file() {
+            let update = self.manifest_update(&setup, decided).await?;
+            self.prepare_explicit_manifest(path, update)
+                .await
+                .map(|()| Step::Retry)
         } else {
-            self.prepare_manifest(setup, decided).await?;
-            Ok(Step::Retry)
+            self.prepare_repository_manifest(&setup, decided).await?;
+            self.finish_setup(
+                "Setup complete; awaiting manifest approval. Run the member to wait for \
+                 activation.",
+            )
         }
+    }
+
+    fn finish_setup(&self, message: impl std::fmt::Display) -> Result<Step, Error> {
+        self.configure_sandbox()?;
+        cliclack::outro(message)?;
+        Ok(Step::Complete)
     }
 
     fn handle_error(&self, error: crate::Error) -> Result<Step, Error> {
@@ -209,16 +225,6 @@ impl SetupWizard {
         result
             .inspect(|_| spinner.stop("Repository synchronized"))
             .inspect_err(|_| spinner.error("Setup needs attention"))
-    }
-
-    async fn prepare_manifest(&self, setup: Setup, decided: &mut Decisions) -> Result<(), Error> {
-        let update = self.manifest_update(&setup, decided).await?;
-        self.show_manifest(update.entry())?;
-        if let Some(path) = self.application.manifest_file() {
-            return self.prepare_explicit_manifest(path, update).await;
-        }
-
-        self.prepare_repository_manifest(update).await
     }
 
     async fn manifest_update(
@@ -466,9 +472,7 @@ impl SetupWizard {
     }
 
     async fn provision_security_repository(&self, did: Did) -> Result<SecuritySetup, Error> {
-        tokio::task::spawn_blocking(move || SecuritySetup::provision(did))
-            .await
-            .map_err(|error| Error::Task(error.to_string()))?
+        tokio::task::spawn_blocking(move || SecuritySetup::provision(did)).await?
     }
 
     async fn select_security_repository(&self, did: Did) -> Result<SecuritySetup, Error> {
@@ -476,9 +480,7 @@ impl SetupWizard {
             cliclack::input("Existing security repository RID")
                 .placeholder("rad:...")
                 .interact()?;
-        tokio::task::spawn_blocking(move || SecuritySetup::existing(repository, did))
-            .await
-            .map_err(|error| Error::Task(error.to_string()))?
+        tokio::task::spawn_blocking(move || SecuritySetup::existing(repository, did)).await?
     }
 
     fn show_security_recovery_key(&self, setup: &SecuritySetup) -> Result<(), Error> {
@@ -504,22 +506,71 @@ impl SetupWizard {
         if !granted {
             return Err(Error::Cancelled);
         }
-        tokio::task::spawn_blocking(move || SecuritySetup::grant(repository, did))
-            .await
-            .map_err(|error| Error::Task(error.to_string()))??;
+        tokio::task::spawn_blocking(move || SecuritySetup::grant(repository, did)).await??;
 
         Ok(())
     }
 
-    async fn prepare_repository_manifest(&self, update: ManifestUpdate) -> Result<(), Error> {
-        let repository = self.application.repository();
-        let checkout = tokio::task::spawn_blocking(move || RepositoryCheckout::current(repository))
-            .await
-            .map_err(|error| Error::Task(error.to_string()))??;
-        match checkout {
-            Some(checkout) => self.prepare_checkout(checkout, update).await,
-            None => self.missing_checkout(),
+    async fn prepare_repository_manifest(
+        &self,
+        setup: &Setup,
+        decided: &mut Decisions,
+    ) -> Result<(), Error> {
+        let generation = setup.status().generation();
+        let (checkout, preview) = self.inspect_manifest(generation).await?;
+        let (checkout, (preview, published)) = if let Some(preview) = preview {
+            (checkout, preview)
+        } else {
+            self.draft_manifest(checkout, setup, decided).await?
+        };
+        Self::confirm_patch(preview, published)?;
+        self.publish_manifest(checkout, setup.clone()).await
+    }
+
+    async fn inspect_manifest(
+        &self,
+        generation: u64,
+    ) -> Result<(RepositoryCheckout, Option<(String, bool)>), Error> {
+        let checkout = RepositoryCheckout::open(&self.application).await?;
+        tokio::task::spawn_blocking(move || {
+            let preview = checkout.preview(generation)?;
+            Ok::<_, Error>((checkout, preview))
+        })
+        .await?
+    }
+
+    async fn draft_manifest(
+        &self,
+        checkout: RepositoryCheckout,
+        setup: &Setup,
+        decided: &mut Decisions,
+    ) -> Result<(RepositoryCheckout, (String, bool)), Error> {
+        let update = self.manifest_update(setup, decided).await?;
+        self.show_manifest(update.entry())?;
+        let generation = setup.status().generation();
+        tokio::task::spawn_blocking(move || {
+            checkout.prepare(update)?;
+            let preview = checkout
+                .preview(generation)?
+                .ok_or(Error::MissingProposal)?;
+            Ok((checkout, preview))
+        })
+        .await?
+    }
+
+    fn confirm_patch(preview: String, published: bool) -> Result<(), Error> {
+        if !published {
+            cliclack::note("Proposed manifest", preview)?;
+            if !cliclack::confirm(
+                "Publish this manifest as a Radicle patch under the member identity?",
+            )
+            .initial_value(true)
+            .interact()?
+            {
+                return Err(Error::Cancelled);
+            }
         }
+        Ok(())
     }
 
     async fn prepare_explicit_manifest(
@@ -527,10 +578,11 @@ impl SetupWizard {
         path: &Path,
         update: ManifestUpdate,
     ) -> Result<(), Error> {
+        self.show_manifest(update.entry())?;
         if self.confirm_explicit_manifest(path)? {
             Self::update_explicit_manifest(path, update).await
         } else {
-            self.wait_for_manifest()
+            Err(Error::Cancelled)
         }
     }
 
@@ -544,9 +596,7 @@ impl SetupWizard {
 
     async fn update_explicit_manifest(path: &Path, update: ManifestUpdate) -> Result<(), Error> {
         let path = path.to_owned();
-        let changed = tokio::task::spawn_blocking(move || update.prepare(&path))
-            .await
-            .map_err(|error| Error::Task(error.to_string()))??;
+        let changed = tokio::task::spawn_blocking(move || update.prepare(&path)).await??;
         if changed {
             cliclack::log::success("Explicit manifest updated")?;
         }
@@ -558,56 +608,18 @@ impl SetupWizard {
         cliclack::note("Required manifest entry", entry).map_err(Error::from)
     }
 
-    async fn prepare_checkout(
+    async fn publish_manifest(
         &self,
         checkout: RepositoryCheckout,
-        update: ManifestUpdate,
+        setup: Setup,
     ) -> Result<(), Error> {
-        if self.confirm_publish(&checkout).await? {
-            Self::publish_manifest(checkout, update).await?;
-        }
-        self.wait_for_manifest()
-    }
-
-    async fn confirm_publish(&self, checkout: &RepositoryCheckout) -> Result<bool, Error> {
-        let checkout = checkout.clone();
-        let member = self.application.member();
-        let commands = tokio::task::spawn_blocking(move || checkout.commands(member))
-            .await
-            .map_err(|error| Error::Task(error.to_string()))??;
-        cliclack::note("Commands", commands)?;
-        cliclack::confirm("Create the manifest commit and open a Radicle patch?")
-            .initial_value(true)
-            .interact()
-            .map_err(Error::from)
-    }
-
-    async fn publish_manifest(
-        checkout: RepositoryCheckout,
-        update: ManifestUpdate,
-    ) -> Result<(), Error> {
-        let published = tokio::task::spawn_blocking(move || checkout.publish(update))
-            .await
-            .map_err(|error| Error::Task(error.to_string()))??;
-        if published {
-            cliclack::log::success("Manifest patch published")?;
-        }
-
+        let patch =
+            tokio::task::spawn_blocking(move || checkout.publish(setup.status().generation()))
+                .await??;
+        // Publication releases the home lock before starting the member's node to announce it.
+        cliclack::log::success(format!("Manifest patch: {patch}"))?;
+        self.application.announce_setup_patch().await?;
         Ok(())
-    }
-
-    fn missing_checkout(&self) -> Result<(), Error> {
-        cliclack::log::warning("The current directory is not this repository's Radicle checkout.")?;
-        self.wait_for_manifest()
-    }
-
-    fn wait_for_manifest(&self) -> Result<(), Error> {
-        let ready = cliclack::confirm(
-            "Continue after the manifest change has reached the canonical branch?",
-        )
-        .initial_value(true)
-        .interact()?;
-        if ready { Ok(()) } else { Err(Error::Cancelled) }
     }
 
     fn retry_access(&self, error: crate::Error) -> Result<(), Error> {
@@ -717,8 +729,7 @@ impl From<crate::provider::CredentialsError> for Error {
 
 // What the operator has already been asked, so a retry does not ask it again.
 //
-// The wizard loops until the manifest reaches the canonical branch, which on a fresh repository
-// takes several passes. Every question the operator answers belongs here.
+// Synchronization failures can be retried without asking the same questions again.
 #[derive(Debug, Default)]
 struct Decisions {
     policy: Option<NewManifestPolicy>,
@@ -779,33 +790,86 @@ pub enum Error {
          auth`"
     )]
     OperatorSigner(radicle::profile::SignerError),
-    /// `rad inspect` returned malformed output.
-    #[error("the current Radicle checkout returned an invalid repository ID: {0}")]
+    /// Creating the member's working copies failed.
+    #[error(transparent)]
+    Workspace(#[from] crate::WorkspaceError),
+    /// Opening or validating the member's Radicle repository failed.
+    #[error("member repository operation failed: {0}")]
+    Repository(#[from] radicle::storage::RepositoryError),
+    /// Reading the repository's collaborative objects failed.
+    #[error("member collaborative object operation failed: {0}")]
+    Cob(#[from] radicle::cob::store::Error),
+    /// Creating the manifest patch failed.
+    #[error("manifest patch creation failed: {0}")]
+    Patch(#[from] radicle::cob::patch::Error),
+    /// Opening the member's patch cache failed.
+    #[error("member profile operation failed: {0}")]
+    Profile(#[from] radicle::profile::Error),
+    /// The member's signing key is unavailable.
+    #[error("could not load the member's signing key: {0}")]
+    Signer(#[from] radicle::profile::SignerError),
+    /// The generated patch title is invalid.
+    #[error("invalid manifest patch title: {0}")]
+    PatchTitle(#[from] radicle::cob::TitleError),
+    /// A Radicle command returned a malformed repository identifier.
+    #[error("Radicle returned an invalid repository ID: {0}")]
     CheckoutIdentity(radicle::identity::IdError),
-    /// The selected Git repository has no working tree.
-    #[error("the current Radicle repository is bare and cannot be used as a checkout")]
-    BareCheckout,
-    /// A local Git repository operation failed.
+    /// A local Git operation failed.
     #[error("local Git operation failed: {0}")]
     Git(#[from] git2::Error),
-    /// The working manifest has changes that the wizard must not overwrite.
-    #[error("'{FILE_NAME}' has uncommitted changes; review them before continuing")]
-    DirtyManifest,
-    /// Git ignores the repository manifest, so it cannot be published.
-    #[error("'{FILE_NAME}' is ignored by Git; remove its ignore rule before continuing")]
-    IgnoredManifest,
-    /// The index contains changes that must not be included in the generated commit.
-    #[error("the Git index has staged changes; commit or unstage them before continuing")]
-    StagedChanges,
-    /// The current branch already belongs to another Radicle patch.
-    #[error("the current branch already tracks a Radicle patch; switch to the canonical branch")]
-    ExistingPatch,
-    /// The current checkout is not exactly at its canonical Radicle upstream.
+    /// The coder checkout is outside the expected member directory.
+    #[error("setup checkout is outside the member home")]
+    CheckoutLocation,
+    /// The coder checkout does not share the member's Git object store.
+    #[error("coder worktree does not use the member's shared Git store")]
+    CheckoutStorage,
+    /// The coder checkout's Radicle remote points to another repository.
+    #[error("setup checkout belongs to another repository")]
+    CheckoutRepository,
+    /// Git cannot address a checkout or storage path as UTF-8.
+    #[error("path is not UTF-8: '{}'", .0.display())]
+    NonUtf8Path(PathBuf),
+    /// The checkout's proposal does not descend from canonical history.
     #[error(
-        "the current branch is not at the canonical Radicle head; switch to an up-to-date \
-         canonical branch"
+        "setup checkout contains commits outside the canonical history; review {} before retrying",
+        .0.display()
     )]
-    NonCanonicalCheckout,
+    NonCanonicalCheckout(PathBuf),
+    /// Preparing a proposal would overwrite uncommitted work.
+    #[error("coder worktree has uncommitted changes; review {} before retrying", .0.display())]
+    DirtyCheckout(PathBuf),
+    /// The canonical head changed after the checkout was prepared.
+    #[error("canonical branch changed during setup; retry setup")]
+    CanonicalChanged,
+    /// The proposed binding uses a different identity generation.
+    #[error("setup manifest binding generation is {actual}, expected {expected}")]
+    BindingGeneration {
+        /// Generation required by the provisioned identity.
+        expected: u64,
+        /// Generation found in the proposed manifest.
+        actual: u64,
+    },
+    /// A proposed manifest is a symlink or another nonregular file.
+    #[error("setup manifest must be a regular file: '{}'", .0.display())]
+    IrregularManifest(PathBuf),
+    /// The working manifest differs from the committed proposal.
+    #[error("setup manifest has changed since its commit; review it before retrying")]
+    ChangedManifest,
+    /// The working copy deletes the manifest instead of proposing a binding.
+    #[error("setup manifest was removed; restore it before retrying")]
+    RemovedManifest,
+    /// A proposal commit has an unsupported number of parents.
+    #[error("setup proposal must contain a single manifest commit")]
+    InvalidProposalHistory,
+    /// The proposal commit includes changes outside the manifest.
+    #[error("setup commit includes changes outside the manifest")]
+    NonManifestChanges,
+    /// Publication was requested without a proposed manifest change.
+    #[error("coder worktree has no proposed manifest change")]
+    MissingProposal,
+    /// Publication would include unrelated staged work.
+    #[error("setup checkout has unrelated staged changes")]
+    StagedChanges,
     /// The working manifest binds the member differently.
     #[error("'{FILE_NAME}' already contains a different binding for {0}")]
     ConflictingBinding(Member),
@@ -824,20 +888,6 @@ pub enum Error {
     /// The wizard was asked to modify an already valid manifest.
     #[error("the repository manifest is already ready")]
     ReadyManifest,
-    /// The checkout changed after the generated commit and cannot be restored safely.
-    #[error("the checkout changed while publishing the generated manifest commit")]
-    CheckoutChangedDuringPublish,
-    /// Publishing and restoring the generated change both failed.
-    #[error(
-        "manifest patch operation failed ({operation}); restoring the checkout also failed \
-         ({recovery})"
-    )]
-    PatchRecovery {
-        /// Original add, commit, or push failure.
-        operation: Box<Error>,
-        /// Checkout recovery failure.
-        recovery: Box<Error>,
-    },
     /// A Git command failed.
     #[error("command '{command}' exited with {status}")]
     Command {
@@ -848,7 +898,7 @@ pub enum Error {
     },
     /// A blocking setup task failed.
     #[error("setup task failed: {0}")]
-    Task(String),
+    Task(#[from] tokio::task::JoinError),
 }
 
 impl From<crate::Error> for Error {

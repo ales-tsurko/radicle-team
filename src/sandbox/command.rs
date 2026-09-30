@@ -759,7 +759,18 @@ pub enum Error {
     /// Zerobox could not transform the command for the platform sandbox.
     #[error("failed to transform agent command: {0}")]
     SandboxTransform(#[from] zerobox_sandboxing::SandboxTransformError),
+    /// Binding or inspecting the managed network proxy's sockets failed.
+    #[error("sandbox network I/O failed: {0}")]
+    NetworkIo(#[from] io::Error),
+    /// A sandbox domain pattern is invalid.
+    #[error("invalid sandbox network domain pattern: {0}")]
+    NetworkPattern(#[from] globset::Error),
+    /// Zerobox requested a reload of application-owned immutable policy.
+    #[error("immutable sandbox policy cannot be reloaded")]
+    ImmutableNetworkPolicy,
     /// Zerobox failed to establish or supervise the sandbox.
+    ///
+    /// Its upstream API returns `anyhow::Error`; local failures have typed variants above.
     #[error("agent sandbox failed: {0}")]
     Zerobox(#[from] anyhow::Error),
 }

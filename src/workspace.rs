@@ -157,10 +157,18 @@ impl Workspaces {
         ))
     }
 
-    /// Creates the shared object store and every role's working copy.
-    ///
-    /// Safe to call again on an existing member directory, which is what happens on every start.
+    /// Creates the working copies and releases branches held by the previous run.
     pub(crate) async fn initialize(&self) -> Result<(), Error> {
+        self.create().await?;
+        self.detach_copies().await?;
+
+        self.sweep().await
+    }
+
+    /// Creates the shared store and role copies without moving existing working copies.
+    ///
+    /// Setup uses this before preparing the manifest in the coder's copy.
+    pub(crate) async fn create(&self) -> Result<(), Error> {
         self.require_relative_worktrees().await?;
         let common = self.home.git_common();
         if !common.join("HEAD").is_file() {
@@ -189,9 +197,7 @@ impl Workspaces {
                 .await?;
             }
         }
-        self.detach_copies().await?;
-
-        self.sweep().await
+        Ok(())
     }
 
     // Takes every working copy off the branch it was left standing on.
@@ -661,35 +667,54 @@ impl Workspaces {
     }
 }
 
+/// Error preparing or using a member's working copies.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum Error {
+pub enum Error {
+    /// A workspace filesystem or subprocess operation failed.
     #[error("workspace I/O failed: {0}")]
     Io(#[source] std::io::Error),
+    /// Preparing a sandboxed Git command failed.
     #[error("workspace sandbox failed: {0}")]
     Sandbox(String),
+    /// A Git subprocess failed.
     #[error("git {command} failed: {message}")]
-    Git { command: String, message: String },
+    Git {
+        /// Git arguments for the failed command.
+        command: String,
+        /// Diagnostic output from Git.
+        message: String,
+    },
+    /// Creating a Radicle checkout failed.
     #[error("workspace checkout failed: {0}")]
     Checkout(#[from] radicle::rad::CheckoutError),
+    /// A Git library operation failed.
     #[error("workspace Git library call failed: {0}")]
     LibGit(#[from] git2::Error),
+    /// Opening or validating the stored Radicle repository failed.
     #[error("workspace repository failed: {0}")]
     Repository(#[from] radicle::storage::RepositoryError),
+    /// No delegate namespace provides the canonical branch.
     #[error("canonical branch is not available from a delegate namespace")]
     CanonicalBranchRemote,
+    /// Reading a collaborative object failed.
     #[error("workspace collaborative object failed: {0}")]
     Cob(#[from] radicle::cob::store::Error),
+    /// The requested patch does not exist.
     #[error("patch {0} was not found")]
     PatchNotFound(radicle::cob::ObjectId),
+    /// A blocking workspace task failed.
     #[error("workspace task failed: {0}")]
     Task(String),
+    /// Reading the member's work queue failed.
     #[error("workspace could not read the work queue: {0}")]
     Queue(String),
+    /// Git is too old to create relocatable working copies.
     #[error(
         "Git 2.48 or newer is required so working copies survive moving the member directory, \
          found '{0}'"
     )]
     GitTooOld(String),
+    /// No unused branch was available for preserving interrupted work.
     #[error("could not find an unused salvage branch under '{0}'")]
     SalvageExhausted(String),
 }

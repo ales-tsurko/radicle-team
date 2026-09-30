@@ -80,7 +80,7 @@ Nico needs goes inside it:
 ├── cache/               build output, shared by nico's three roles
 ├── harness/             agent state, one folder per role
 └── code/
-    ├── .git-common      the commits, stored once
+    ├── .git-common      commits shared by setup and all three roles
     ├── talker/          issues and patches
     ├── chatter/         chat
     └── coder/           writing code
@@ -88,7 +88,7 @@ Nico needs goes inside it:
 
 `talker/`, `chatter/` and `coder/` each behave like a normal Git clone. They
 share `.git-common`, so the history is stored once rather than three times, and
-each keeps its own branch.
+each has its own `HEAD` and index.
 
 Before every delivery the runtime resets that role's copy to whatever it is
 about to work on.
@@ -99,18 +99,17 @@ answering copies are simply cleaned: what they hold is what they looked at on
 the way to an answer, and the answer itself is already in the issue or the
 channel.
 
-Only the building role has branches. Each one belongs to one job and is named
-after it:
+The building role uses one branch per job, named after that job:
 
 ```text
 nico-rt/job-17
 ```
 
-A branch is removed once its job is over. The queue is what says so: a job which
-was carried out has had its row removed, and a job which stalled, failed, or was
-interrupted still has one, along with whatever it committed. A branch the agent
-is still standing on is left alone and removed when it next moves to other work,
-so tidying up never pulls the ground out from under a job which is still
+A job branch is removed once its job is over. The queue is what says so: a job
+which was carried out has had its row removed, and a job which stalled, failed,
+or was interrupted still has one, along with whatever it committed. A branch the
+agent is still standing on is left alone and removed when it next moves to other
+work, so tidying up never pulls the ground out from under a job which is still
 running.
 
 Setup also asks which models the member runs on, and signs you in if that
@@ -253,27 +252,44 @@ Setup creates or loads Nico's identity, starts Nico's node, waits for seed
 connections, synchronizes the repository, and prints the DID. That DID is Nico's
 own, not the operator's, so a private repository has to grant it access before
 synchronization can succeed — the wizard waits and retries while that happens.
-It finishes with:
+When the canonical manifest already authorizes the member, setup reports that
+the member is ready. Otherwise, interactive setup publishes a manifest patch and
+finishes with:
 
 ```text
-nico is ready for rad:... with binding generation 1
+Setup complete; awaiting manifest approval.
 ```
 
-When standard input or output is not a terminal, setup never prompts or modifies
-the checkout. It prints the required action and exits.
+When standard input or output is not a terminal, setup never prompts or
+publishes a patch. It prints the required action and exits.
 
 
 ### Adding the member to the manifest
 
-If the repository manifest or member binding is missing, run setup from the
-repository checkout. It shows the exact Git commands and asks before writing
-`radicle-team.toml`, committing, and opening a Radicle patch under the user's
-identity.
+Setup works from any directory, including on a separate server. It initializes
+the member's three role worktrees and uses `code/coder/` to propose the
+manifest. The worktrees share `code/.git-common`. Setup keeps the coder worktree
+on a detached `HEAD`, commits after confirmation, and publishes a patch under
+the member's signing identity. The operator's checkout and canonical branch are
+untouched.
 
-It publishes only when `HEAD` exactly matches the live canonical `rad` tip, so
-switch to an up-to-date canonical branch first and unrelated commits can never
-be swept in. Once the patch reaches the canonical branch, the wizard validates
-it.
+The wizard saves the proposed `radicle-team.toml` in the coder worktree and asks
+before committing and publishing. Rerunning an interrupted setup resumes from
+the working manifest or detached commit and reuses an existing Radicle patch.
+The member lock prevents the runtime from using the worktree during setup. Once
+published, the patch preserves the commit when the coder moves to job branches.
+Setup refuses to replace unrelated uncommitted work.
+
+Setup finishes once the patch is published and local configuration is ready. A
+repository delegate reviews and merges the patch into the canonical branch. You
+can start `run` before the merge: it waits for the approved manifest before
+starting agents or processing repository work. A proposed manifest never
+authorizes the member. An invalid binding or a binding for another DID is
+reported as an error.
+
+With `--manifest PATH`, setup updates the explicitly selected local manifest
+instead, then validates it. This mode uses administrator-owned local policy and
+does not require a canonical merge.
 
 
 ### Creating a manifest from scratch
@@ -302,16 +318,18 @@ working copy.
 
 ## Run a member
 
-After setup reports that the member is ready, start the watcher:
+After setup finishes, start the watcher:
 
 ```sh
 radicle-team run nico --repo rad:...
 ```
 
-The process owns the member's node for its lifetime. It classifies relevant
-assignments, mentions, replies, comments, reviews, revisions, reactions,
-resolutions, lifecycle changes, and merges until stopped. `SIGINT` and `SIGTERM`
-trigger graceful node shutdown before the child is reaped.
+The process owns the member's node for its lifetime. If manifest approval is
+pending, it keeps synchronizing and waits for the canonical binding. Once
+approved, it classifies relevant assignments, mentions, replies, comments,
+reviews, revisions, reactions, resolutions, lifecycle changes, and merges until
+stopped. `SIGINT` and `SIGTERM` trigger graceful node shutdown before the child
+is reaped.
 
 Operational events are emitted as structured records through `tracing`, so the
 destination and verbosity are chosen by the process rather than fixed in the

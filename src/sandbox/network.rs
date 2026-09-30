@@ -43,14 +43,10 @@ impl ManagedNetwork {
             return Ok(None);
         }
         let route = Arc::new(Route::new(&policy)?);
-        let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .map_err(anyhow::Error::from)?;
-        let socks = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .map_err(anyhow::Error::from)?;
-        let http_address = http.local_addr().map_err(anyhow::Error::from)?;
-        let socks_address = socks.local_addr().map_err(anyhow::Error::from)?;
+        let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let socks = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let http_address = http.local_addr()?;
+        let socks_address = socks.local_addr()?;
         let proxy = Self::metadata(http_address, socks_address).await?;
         let runtime = ProxyRuntime::start(http, socks, route);
 
@@ -424,16 +420,11 @@ impl Route {
         let mut builder = GlobSetBuilder::new();
         for pattern in policy.domains() {
             for pattern in Self::expand_pattern(pattern) {
-                builder.add(
-                    GlobBuilder::new(&pattern)
-                        .case_insensitive(true)
-                        .build()
-                        .map_err(anyhow::Error::from)?,
-                );
+                builder.add(GlobBuilder::new(&pattern).case_insensitive(true).build()?);
             }
         }
         Ok(Self {
-            domains: builder.build().map_err(anyhow::Error::from)?,
+            domains: builder.build()?,
             mcp: policy
                 .mcp_address()
                 .map(|(host, port)| (normalize_host(host), port)),
@@ -588,9 +579,7 @@ impl ConfigReloader for StaticReloader {
     }
 
     async fn reload_now(&self) -> anyhow::Result<ConfigState> {
-        Err(anyhow::anyhow!(
-            "immutable sandbox policy cannot be reloaded"
-        ))
+        Err(Error::ImmutableNetworkPolicy.into())
     }
 }
 
@@ -612,13 +601,32 @@ impl std::fmt::Debug for ProxyRuntime {
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
+    use std::error::Error as _;
+
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use crate::sandbox::{
         NetworkAccess,
+        command::Error,
         network::{ManagedNetwork, Route},
         policy::NetworkPolicy,
     };
+
+    #[tokio::test]
+    async fn rejects_invalid_domain_patterns_with_their_original_error_source() {
+        let policy = NetworkPolicy::new(NetworkAccess::Domains(vec!["[".to_owned()]), None);
+        let error = ManagedNetwork::start(policy)
+            .await
+            .expect_err("invalid domain patterns should prevent the proxy from starting");
+        assert!(matches!(&error, Error::NetworkPattern(_)));
+        assert!(
+            error
+                .source()
+                .expect("pattern failure should retain its source")
+                .downcast_ref::<globset::Error>()
+                .is_some()
+        );
+    }
 
     #[tokio::test]
     async fn restricted_proxy_reaches_only_the_mcp_port_on_loopback() {
