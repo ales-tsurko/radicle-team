@@ -55,7 +55,11 @@ impl Cli {
     /// Returns the repository to use, for the commands which need one.
     #[must_use]
     pub fn repository(&self) -> Option<RepoId> {
-        self.options().map(|options| options.repo)
+        match &self.command {
+            Command::Setup(options) => options.repo,
+            Command::Run(options) => Some(options.repo),
+            Command::Providers(_) | Command::Login(_) => None,
+        }
     }
 
     /// Returns the explicit application home, if configured.
@@ -81,20 +85,22 @@ impl Cli {
     /// # Errors
     ///
     /// Returns an error when `setup` was given no directory and the working directory cannot be
-    /// read.
+    /// read, or identity-only setup has no repository to build an application for.
     pub fn application(self) -> Result<Application, Error> {
         let mode = self.mode();
+        let repository = self.repository();
         let options = self
             .command
             .into_options()
             .ok_or(Error::NotAMemberCommand)?;
-        let mut application = Application::new(options.member, options.repo)
+        let repository = repository.ok_or(Error::RepositoryRequired)?;
+        let mut application = Application::new(options.member, repository)
             .with_identity_provider(options.identity_provider());
         match (options.home, mode) {
             (Some(home), _) => application = application.with_home(home),
             (None, Mode::Setup) => {
                 application = application.with_home(
-                    Application::default_setup_home(options.member, options.repo)?.path(),
+                    Application::default_setup_home(options.member, Some(repository))?.path(),
                 );
             }
             (None, _) => {}
@@ -136,6 +142,24 @@ impl Cli {
     async fn run_member(self) -> Result<(), Error> {
         let prepare = self.mode() == Mode::Setup;
         let shutdown = Shutdown::install()?;
+        if let Command::Setup(options) = &self.command
+            && options.identity_only
+        {
+            let member = options.member.member;
+            let home = match &options.member.home {
+                Some(home) => crate::home::MemberHome::at(home),
+                None => Application::default_setup_home(member, options.repo)?,
+            };
+            let did = Application::provision_identity(
+                member,
+                options.repo,
+                home,
+                options.member.identity_provider(),
+            )
+            .await?;
+            println!("{member} identity: {did}");
+            return Ok(());
+        }
         let application = self.application()?.with_shutdown(shutdown);
         if prepare {
             return SetupWizard::new(application)
@@ -173,6 +197,9 @@ pub enum Error {
     /// A command which runs no member was asked for one.
     #[error("this command does not run a team member")]
     NotAMemberCommand,
+    /// A repository operation was requested without selecting a repository.
+    #[error("--repo is required for full setup or run")]
+    RepositoryRequired,
 }
 
 impl From<provider_command::Error> for Error {
@@ -209,9 +236,9 @@ pub enum Mode {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Prepare a member identity and repository.
-    Setup(Options),
+    Setup(SetupOptions),
     /// Run a member.
-    Run(Options),
+    Run(RunOptions),
     /// List the model providers this machine can run members on.
     Providers(ProvidersOptions),
     /// Authorize a model provider.
@@ -221,17 +248,40 @@ enum Command {
 impl Command {
     const fn options(&self) -> Option<&Options> {
         match self {
-            Self::Setup(options) | Self::Run(options) => Some(options),
+            Self::Setup(options) => Some(&options.member),
+            Self::Run(options) => Some(&options.member),
             Self::Providers(_) | Self::Login(_) => None,
         }
     }
 
     fn into_options(self) -> Option<Options> {
         match self {
-            Self::Setup(options) | Self::Run(options) => Some(options),
+            Self::Setup(options) => Some(options.member),
+            Self::Run(options) => Some(options.member),
             Self::Providers(_) | Self::Login(_) => None,
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct SetupOptions {
+    #[command(flatten)]
+    member: Options,
+    /// Repository to prepare; optional when only provisioning an identity.
+    #[arg(short, long, required_unless_present = "identity_only")]
+    repo: Option<RepoId>,
+    /// Save the member identity and print its DID without starting a node or fetching.
+    #[arg(long)]
+    identity_only: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunOptions {
+    #[command(flatten)]
+    member: Options,
+    /// Radicle repository to watch.
+    #[arg(short, long)]
+    repo: RepoId,
 }
 
 #[derive(Debug, Args)]
@@ -261,9 +311,6 @@ struct LoginOptions {
 struct Options {
     // Team member to select: nico, maya, leon, vera, nora, or theo.
     member: Member,
-    // Radicle repository to prepare or watch.
-    #[arg(short, long)]
-    repo: RepoId,
     // Application home containing isolated member data.
     #[arg(long, env = ENVIRONMENT_VARIABLE, value_name = "PATH")]
     home: Option<PathBuf>,
@@ -478,5 +525,53 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn identity_only_is_available_only_for_setup() {
+        let _cli = Cli::try_parse_from([
+            "radicle-team",
+            "setup",
+            "maya",
+            "--repo",
+            REPOSITORY,
+            "--identity-only",
+        ])
+        .expect("setup should accept identity-only provisioning");
+        assert!(matches!(
+            Cli::try_parse_from([
+                "radicle-team",
+                "run",
+                "maya",
+                "--repo",
+                REPOSITORY,
+                "--identity-only",
+            ]),
+            Err(error) if error.kind() == ErrorKind::UnknownArgument
+        ));
+    }
+
+    #[test]
+    fn provisions_without_a_repository_but_full_setup_and_run_require_one() {
+        let cli = Cli::try_parse_from(["radicle-team", "setup", "maya", "--identity-only"])
+            .expect("identity provisioning should not require a home or repository");
+        assert_eq!(cli.repository(), None);
+        let cli = Cli::try_parse_from([
+            "radicle-team",
+            "setup",
+            "maya",
+            "--identity-only",
+            "--home",
+            "/team/maya",
+        ])
+        .expect("identity provisioning should not need a repository");
+        assert_eq!(cli.repository(), None);
+        assert_eq!(cli.home(), Some(std::path::Path::new("/team/maya")));
+        for command in ["setup", "run"] {
+            assert!(matches!(
+                Cli::try_parse_from(["radicle-team", command, "maya", "--home", "/team/maya"]),
+                Err(error) if error.kind() == ErrorKind::MissingRequiredArgument
+            ));
+        }
     }
 }

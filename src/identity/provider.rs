@@ -23,7 +23,7 @@ use std::{
 
 use radicle::{
     crypto::{
-        Seed,
+        KeyPair, PublicKey, Seed,
         ssh::{
             Keystore, Passphrase,
             keystore::{MemorySigner, MemorySignerError},
@@ -181,7 +181,7 @@ where
     fn load_managed(
         &self,
         member: Member,
-        repository: RepoId,
+        repository: Option<RepoId>,
         member_home: &MemberHome,
         protection: KeyProtection,
     ) -> Result<Identity, Error> {
@@ -192,14 +192,17 @@ where
 
         let (profile, passphrase) = match initialized {
             ProfileFiles::Complete => {
-                let passphrase = self.existing_passphrase(member, repository, &keystore)?;
-                (Self::load_profile(home)?, passphrase)
+                let profile = Self::load_profile(home)?;
+                let passphrase =
+                    self.existing_passphrase(member, repository, &keystore, profile.did())?;
+                (profile, passphrase)
             }
             ProfileFiles::Empty => {
-                let passphrase = self.new_passphrase(member, repository, protection)?;
+                let seed = Seed::generate();
+                let key = PublicKey::from(KeyPair::from_seed(seed).pk);
+                let passphrase = self.new_passphrase(member, Did::from(key), protection)?;
                 let alias = Alias::from_str(member.id())?;
-                let profile =
-                    RadicleProfile::init(home, alias, passphrase.clone(), Seed::generate())?;
+                let profile = RadicleProfile::init(home, alias, passphrase.clone(), seed)?;
                 (profile, passphrase)
             }
             ProfileFiles::Partial => {
@@ -213,14 +216,14 @@ where
     fn load_existing(
         &self,
         member: Member,
-        repository: RepoId,
+        repository: Option<RepoId>,
         path: &Path,
         expected_did: Option<Did>,
     ) -> Result<Identity, Error> {
         let home = RadicleHome::load(path)?;
         let keystore = Keystore::new(&home.keys());
-        let passphrase = self.existing_passphrase(member, repository, &keystore)?;
         let profile = Self::load_profile(home)?;
+        let passphrase = self.existing_passphrase(member, repository, &keystore, profile.did())?;
         let identity = Identity::from_profile(profile, passphrase)?;
 
         if let Some(expected) = expected_did
@@ -262,8 +265,9 @@ where
     fn existing_passphrase(
         &self,
         member: Member,
-        repository: RepoId,
+        repository: Option<RepoId>,
         keystore: &Keystore,
+        did: Did,
     ) -> Result<Option<Passphrase>, Error> {
         if !keystore.is_encrypted()? {
             return Ok(None);
@@ -272,16 +276,26 @@ where
             return Ok(Some(passphrase));
         }
 
-        self.credentials
-            .load(&CredentialId::new(member, repository))?
-            .ok_or(Error::MissingPassphrase)
-            .map(Some)
+        if let Some(passphrase) = self
+            .credentials
+            .load(&CredentialId::for_identity(member, did))?
+        {
+            return Ok(Some(passphrase));
+        }
+        if let Some(repository) = repository
+            && let Some(passphrase) = self
+                .credentials
+                .load(&CredentialId::new(member, repository))?
+        {
+            return Ok(Some(passphrase));
+        }
+        Err(Error::MissingPassphrase)
     }
 
     fn new_passphrase(
         &self,
         member: Member,
-        repository: RepoId,
+        did: Did,
         protection: KeyProtection,
     ) -> Result<Option<Passphrase>, Error> {
         if protection == KeyProtection::Unencrypted {
@@ -291,7 +305,7 @@ where
             return Ok(Some(passphrase));
         }
 
-        let id = CredentialId::new(member, repository);
+        let id = CredentialId::for_identity(member, did);
         if let Some(passphrase) = self.credentials.load(&id)? {
             return Ok(Some(passphrase));
         }
@@ -415,6 +429,7 @@ pub enum Error {
 mod tests {
     use std::{
         cell::RefCell,
+        collections::BTreeMap,
         fs,
         process::Command,
         sync::atomic::{AtomicU64, Ordering},
@@ -436,24 +451,22 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MemoryCredentials {
-        passphrase: RefCell<Option<String>>,
+        passphrases: RefCell<BTreeMap<String, String>>,
     }
 
     impl CredentialStore for MemoryCredentials {
-        fn load(&self, _id: &CredentialId) -> Result<Option<Passphrase>, CredentialError> {
+        fn load(&self, id: &CredentialId) -> Result<Option<Passphrase>, CredentialError> {
             Ok(self
-                .passphrase
+                .passphrases
                 .borrow()
-                .as_ref()
+                .get(id.account())
                 .map(|passphrase| Passphrase::from(passphrase.clone())))
         }
 
-        fn store(
-            &self,
-            _id: &CredentialId,
-            passphrase: &Passphrase,
-        ) -> Result<(), CredentialError> {
-            self.passphrase.replace(Some(passphrase.to_string()));
+        fn store(&self, id: &CredentialId, passphrase: &Passphrase) -> Result<(), CredentialError> {
+            self.passphrases
+                .borrow_mut()
+                .insert(id.account().to_owned(), passphrase.to_string());
             Ok(())
         }
     }
@@ -511,6 +524,74 @@ mod tests {
 
         assert_eq!(reloaded.did(), did);
         assert!(reloaded.memory_signer().is_some());
+    }
+
+    #[test]
+    fn encrypted_identity_survives_repository_binding_and_relocation() {
+        let directory = TestDirectory::new();
+        let home = directory.member_home();
+        home.record_identity(Member::Nico)
+            .expect("identity owner should be recorded");
+        let manager = Manager::new(MemoryCredentials::default());
+        let did = manager
+            .load(Member::Nico, &home, &Provider::default())
+            .expect("encrypted identity should be created without a repository")
+            .did();
+        home.record(Member::Nico, REPOSITORY.parse().expect("RID should parse"))
+            .expect("repository should be bound");
+
+        let destination = TestDirectory::new();
+        let moved = MemberHome::at(destination.0.join("moved"));
+        fs::rename(home.path(), moved.path()).expect("identity folder should move");
+        let reloaded = manager
+            .load(Member::Nico, &moved, &Provider::default())
+            .expect("the same credential should unlock the bound and relocated key");
+        assert_eq!(reloaded.did(), did);
+        assert!(reloaded.memory_signer().is_some());
+
+        let other_directory = TestDirectory::new();
+        let other = other_directory.member_home();
+        other
+            .record_identity(Member::Nico)
+            .expect("other identity owner should be recorded");
+        let another = manager
+            .load(Member::Nico, &other, &Provider::default())
+            .expect("another unbound identity should have its own credential");
+        assert_ne!(another.did(), did);
+        assert_eq!(manager.credentials.passphrases.borrow().len(), 2);
+        assert_eq!(
+            manager
+                .load(Member::Nico, &moved, &Provider::default())
+                .expect("creating another identity must not overwrite the original credential")
+                .did(),
+            did
+        );
+    }
+
+    #[test]
+    fn loads_an_existing_repository_scoped_passphrase() {
+        let directory = TestDirectory::new();
+        let home = directory.member_home();
+        let passphrase = Passphrase::from("legacy-test-passphrase".to_owned());
+        let profile = radicle::profile::Profile::init(
+            radicle::profile::Home::new(home.identity()).expect("identity home should initialize"),
+            "nico".parse().expect("alias should parse"),
+            Some(passphrase.clone()),
+            radicle::crypto::Seed::generate(),
+        )
+        .expect("legacy encrypted profile should initialize");
+        let credentials = MemoryCredentials::default();
+        credentials
+            .store(
+                &CredentialId::new(Member::Nico, REPOSITORY.parse().expect("RID should parse")),
+                &passphrase,
+            )
+            .expect("legacy credential should be stored");
+        let identity = Manager::new(credentials)
+            .load(Member::Nico, &home, &Provider::default())
+            .expect("existing repository-scoped credentials must remain supported");
+        assert_eq!(identity.did(), profile.did());
+        assert!(identity.memory_signer().is_some());
     }
 
     #[test]

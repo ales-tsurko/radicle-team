@@ -134,7 +134,16 @@ impl MemberHome {
     ///
     /// Returns an error when the marker cannot be written.
     pub fn record(&self, member: Member, repository: RepoId) -> Result<(), Error> {
-        self.write_marker(member, repository)
+        self.write_marker(member, Some(repository))
+    }
+
+    /// Records an identity's owner before a repository is selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the marker cannot be written.
+    pub fn record_identity(&self, member: Member) -> Result<(), Error> {
+        self.write_marker(member, None)
     }
 
     /// Reads the marker recorded when this directory was created.
@@ -149,10 +158,18 @@ impl MemberHome {
             source,
         })?;
 
-        toml_edit::de::from_str(&body).map_err(|error| Error::MarkerMalformed {
-            path,
-            reason: error.to_string(),
-        })
+        let marker: Marker =
+            toml_edit::de::from_str(&body).map_err(|error| Error::MarkerMalformed {
+                path: path.clone(),
+                reason: error.to_string(),
+            })?;
+        if marker.repository.is_none() && !marker.identity_only {
+            return Err(Error::MarkerMalformed {
+                path,
+                reason: "an unbound member marker must declare identity_only = true".to_owned(),
+            });
+        }
+        Ok(marker)
     }
 
     /// Returns the member's Radicle home directory.
@@ -245,10 +262,11 @@ impl MemberHome {
         self.path.join(MARKER)
     }
 
-    fn write_marker(&self, member: Member, repository: RepoId) -> Result<(), Error> {
+    fn write_marker(&self, member: Member, repository: Option<RepoId>) -> Result<(), Error> {
         let marker = Marker {
             member: member.id().to_owned(),
-            repository: repository.urn(),
+            identity_only: repository.is_none(),
+            repository: repository.map(|repository| repository.urn()),
         };
         let body = toml_edit::ser::to_string_pretty(&marker)
             .map_err(|source| Error::MarkerUnwritable(source.to_string()))?;
@@ -266,8 +284,12 @@ impl MemberHome {
 pub struct Marker {
     /// Fixed name of the member owning the directory.
     pub member: String,
-    /// Repository the member works in.
-    pub repository: String,
+    /// Repository the member works in, absent until full setup binds the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// Marks an intentionally prepared identity whose repository has not yet been selected.
+    #[serde(default)]
+    pub identity_only: bool,
 }
 
 impl Marker {
@@ -280,13 +302,13 @@ impl Marker {
         Member::from_str(&self.member)
     }
 
-    /// Returns the repository this directory belongs to.
+    /// Returns the repository this directory belongs to, if full setup has selected one.
     ///
     /// # Errors
     ///
     /// Returns an error when the recorded identifier is not a valid repository.
-    pub fn repository(&self) -> Result<RepoId, radicle::identity::IdError> {
-        RepoId::from_urn(&self.repository)
+    pub fn repository(&self) -> Result<Option<RepoId>, radicle::identity::IdError> {
+        self.repository.as_deref().map(RepoId::from_urn).transpose()
     }
 }
 
@@ -424,7 +446,7 @@ mod tests {
         assert_eq!(marker.member().expect("member should parse"), Member::Nico);
         assert_eq!(
             marker.repository().expect("repository should parse"),
-            repository
+            Some(repository)
         );
     }
 

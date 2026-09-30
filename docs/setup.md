@@ -118,6 +118,53 @@ provider needs it. Answer "decide later" to leave it unset.
 Pass `--home PATH` to name the folder yourself.
 
 
+### Preparing access to a private repository
+
+Create the identity before granting repository access:
+
+```sh
+radicle-team setup nico --identity-only
+```
+
+This succeeds without starting a node, connecting to seeds, fetching the
+repository, or configuring agents. It saves the identity in the member folder
+and prints `nico identity: did:key:...`. Rerunning it prints the same DID.
+`--repo` and `--home` are optional in this mode. Without a repository, setup
+creates `./nico` in the current directory, and the identity is not yet bound to
+a repository. `--home` (or `RADICLE_TEAM_HOME`) overrides the folder. Providing
+`--repo` keeps the usual default folder naming.
+
+As a repository delegate, grant that DID access using your own Radicle identity:
+
+```sh
+rad id update --repo rad:z3cyot... --title "Allow Nico" --allow did:key:...
+```
+
+The private repository also needs a reachable, authorized seed holding a copy.
+Grant the trusted seed access and arrange replication as described in the
+[Radicle private repository guide](https://radicle.dev/guides/user#curating-the-allow-list). Then run full
+setup with that seed's NID:
+
+```sh
+radicle-team setup nico --home ./nico --repo rad:z3cyot... --seed z6Mk...
+```
+
+For full setup, point `--home` at the folder created in the first stage. Full
+setup requires `--repo` and binds that folder to the selected repository while
+reusing the authorized key.
+An already bound folder cannot be reassigned to another member or repository.
+
+The DID derives from the saved key. Restarts, application updates, and moving
+the member folder preserve it. Deleting and recreating the identity generates a
+new DID, requiring new access grants and a new manifest binding. Separate member
+folders have separate identities by default; there is no universal DID for a
+member name. Retrieve a saved DID without synchronizing:
+
+```sh
+RAD_HOME=./nico/identity rad self --did
+```
+
+
 ### Choosing models
 
 ```sh
@@ -344,6 +391,10 @@ values:
   upward search
 - `--seed NID` adds a preferred synchronization seed and may be repeated, on
   `setup` and on `run`, which synchronizes before it starts watching
+- `setup --identity-only` saves the identity and prints its DID before repository
+  access is granted; `--repo` and `--home` are optional. Without either, it creates
+  a folder named after the member in the current directory. It does not fetch or
+  run the remaining setup steps
 - `--identity-home PATH` uses an existing dedicated Radicle identity
 - `--expected-did DID` verifies that existing identity
 - `--unencrypted-identity` creates a managed key protected only by filesystem
@@ -360,8 +411,9 @@ alone cannot unlock the managed `radicle-node` process.
 
 Everything is inside the member folder, so it can be moved, backed up, or
 deleted as a unit. There is no global directory. Working copies record their
-paths relatively and the stored passphrase is keyed on the member and
-repository, so renaming or relocating the folder keeps working. This needs Git
+paths relatively and new stored passphrases are keyed on the member and DID,
+so renaming or relocating the folder keeps working. Existing passphrases keyed
+on the member and repository remain supported. This needs Git
 2.48 or newer, and setup refuses an older one rather than failing obscurely
 later.
 
@@ -390,6 +442,7 @@ uses the control socket inside its own `identity/`.
 
 ## Troubleshooting
 
-If setup fails because a repository is private, use the DID shown in the error
-or identity log message to grant access, then rerun setup. Node startup failures
-include the log path in their diagnostic.
+For a private repository, run `setup --identity-only` first to obtain the DID,
+grant it access, and provide a reachable authorized seed with `--seed`. If a
+previous full setup attempt failed, identity-only setup reuses its saved key.
+Node startup failures include the log path in their diagnostic.

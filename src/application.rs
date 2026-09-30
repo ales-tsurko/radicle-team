@@ -177,6 +177,41 @@ impl Application {
         &self.seeds
     }
 
+    /// Creates or loads the member identity without starting a node or fetching a repository.
+    ///
+    /// The saved identity is reused by subsequent setup, so its DID can be granted access to a
+    /// private repository before synchronization is attempted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the member directory, process lock, or identity cannot be prepared.
+    pub async fn setup_identity(&self) -> Result<Did, Error> {
+        let home = self.member_home()?;
+        Self::provision_identity(
+            self.member,
+            Some(self.repository),
+            home,
+            self.identity_provider.clone(),
+        )
+        .await
+    }
+
+    pub(crate) async fn provision_identity(
+        member: Member,
+        repository: Option<RepoId>,
+        home: MemberHome,
+        provider: Provider,
+    ) -> Result<Did, Error> {
+        tokio::task::spawn_blocking(move || {
+            let _lock = MemberLock::acquire(&home)?;
+            Self::claim_identity_home(&home, member, repository)?;
+            let identity = Manager::default().load(member, &home, &provider)?;
+            Ok(identity.did())
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))?
+    }
+
     /// Prepares the selected member to work in the repository.
     ///
     /// This provisions the identity, starts its node, synchronizes the repository, and validates
@@ -198,7 +233,7 @@ impl Application {
     /// Takes the member directory the way `ownership` asks for, under the process lock.
     fn take_home(&self, home: &MemberHome, ownership: Ownership) -> Result<(), Error> {
         match ownership {
-            Ownership::Claim => self.claim_home(home),
+            Ownership::Claim => Self::claim_identity_home(home, self.member, Some(self.repository)),
             Ownership::Verify => self.validate_member_home(home),
         }
     }
@@ -212,9 +247,16 @@ impl Application {
     /// A directory holding an identity but no marker is refused rather than claimed. The marker
     /// is written before the identity is created, so the pair can only be missing the first if
     /// something removed it, and guessing whose key is in there is exactly the mistake above.
-    fn claim_home(&self, home: &MemberHome) -> Result<(), Error> {
+    fn claim_identity_home(
+        home: &MemberHome,
+        member: Member,
+        repository: Option<RepoId>,
+    ) -> Result<(), Error> {
         if home.path().join(crate::home::MARKER).is_file() {
-            self.validate_member_home(home)?;
+            Self::validate_home_owner(home, member, repository)?;
+            if repository.is_none() {
+                return Ok(());
+            }
         } else if home.holds_identity() {
             return Err(Error::MemberDirectory {
                 path: home.path().into(),
@@ -226,8 +268,11 @@ impl Application {
             });
         }
 
-        home.record(self.member, self.repository)
-            .map_err(Error::from)
+        match repository {
+            Some(repository) => home.record(member, repository),
+            None => home.record_identity(member),
+        }
+        .map_err(Error::from)
     }
 
     async fn prepare_setup(&self, runtime: &Runtime) -> Result<Setup, Error> {
@@ -463,6 +508,21 @@ impl Application {
 
     // Confirms the member directory belongs to the member and repository being run.
     fn validate_member_home(&self, home: &MemberHome) -> Result<(), Error> {
+        Self::validate_home_owner(home, self.member, Some(self.repository))?.ok_or_else(|| {
+            Error::MemberDirectory {
+                path: home.path().into(),
+                reason: "its identity is not yet bound to a repository; complete setup with --repo"
+                    .to_owned(),
+            }
+        })?;
+        Ok(())
+    }
+
+    fn validate_home_owner(
+        home: &MemberHome,
+        expected_member: Member,
+        expected_repository: Option<RepoId>,
+    ) -> Result<Option<RepoId>, Error> {
         let marker = home.marker()?;
         let member = marker.member().map_err(|error| Error::MemberDirectory {
             path: home.path().into(),
@@ -474,33 +534,45 @@ impl Application {
                 path: home.path().into(),
                 reason: error.to_string(),
             })?;
-        if member != self.member || repository != self.repository {
+        if member != expected_member
+            || repository
+                .zip(expected_repository)
+                .is_some_and(|(actual, expected)| actual != expected)
+        {
             return Err(Error::MemberDirectory {
                 path: home.path().into(),
-                reason: format!("it belongs to {member} in {repository}"),
+                reason: match repository {
+                    Some(repository) => format!("it belongs to {member} in {repository}"),
+                    None => format!("it belongs to {member}"),
+                },
             });
         }
 
-        Ok(())
+        Ok(repository)
     }
 
-    /// Returns the directory `setup` creates when none was given.
+    /// Returns the directory `setup` creates when none was given: member and repository when
+    /// selected, or just the member when preparing an identity without a repository.
     pub(crate) fn default_setup_home(
         member: Member,
-        repository: RepoId,
+        repository: Option<RepoId>,
     ) -> Result<MemberHome, home::Error> {
         let working = std::env::current_dir().map_err(home::Error::WorkingDirectory)?;
-        let urn = repository.urn();
-        let short: String = urn
-            .strip_prefix("rad:")
-            .unwrap_or(&urn)
-            .chars()
-            .take(8)
-            .collect();
+        let name = match repository {
+            Some(repository) => {
+                let urn = repository.urn();
+                let short: String = urn
+                    .strip_prefix("rad:")
+                    .unwrap_or(&urn)
+                    .chars()
+                    .take(8)
+                    .collect();
+                format!("{}-{short}", member.id())
+            }
+            None => member.id().to_owned(),
+        };
 
-        Ok(MemberHome::at(
-            working.join(format!("{}-{short}", member.id())),
-        ))
+        Ok(MemberHome::at(working.join(name)))
     }
 
     pub(crate) fn sandbox_config_path(&self) -> Result<PathBuf, Error> {
@@ -872,8 +944,17 @@ impl Runtime {
         home: &MemberHome,
         ownership: Ownership,
     ) -> Result<(MemberLock, identity::Identity, NodeManager), Error> {
-        let home = home.clone();
-        let application = application.clone();
+        let (lock, identity) = Self::prepare_identity(application, home, ownership).await?;
+        let node = Self::start_node(application, home, &identity).await?;
+
+        Ok((lock, identity, node))
+    }
+
+    async fn prepare_identity(
+        application: &Application,
+        home: &MemberHome,
+        ownership: Ownership,
+    ) -> Result<(MemberLock, identity::Identity), Error> {
         let worker_home = home.clone();
         let worker_application = application.clone();
         let (lock, identity) = tokio::task::spawn_blocking(move || {
@@ -891,9 +972,7 @@ impl Runtime {
             did = %identity.did(),
             "member identity loaded"
         );
-        let node = Self::start_node(&application, &home, &identity).await?;
-
-        Ok((lock, identity, node))
+        Ok((lock, identity))
     }
 
     async fn start_node(
@@ -1870,6 +1949,67 @@ mod tests {
         );
     }
 
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn full_setup_binds_a_prepared_identity_without_replacing_it() {
+        use super::{Ownership, Runtime};
+        use crate::identity::{KeyProtection, Provider};
+
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let home = MemberHome::at(root.path().join("maya"));
+        let provider = Provider::Managed {
+            protection: KeyProtection::Unencrypted,
+        };
+        let did =
+            Application::provision_identity(Member::Maya, None, home.clone(), provider.clone())
+                .await
+                .expect("identity should be provisioned without a repository");
+        let repository = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc"
+            .parse()
+            .expect("RID should parse");
+        let application = Application::new(Member::Maya, repository)
+            .with_home(home.path())
+            .with_identity_provider(provider);
+        assert!(
+            matches!(
+                application.validate_member_home(&home),
+                Err(super::Error::MemberDirectory { .. })
+            ),
+            "run must refuse an identity without a repository binding"
+        );
+
+        let (lock, identity) = Runtime::prepare_identity(&application, &home, Ownership::Claim)
+            .await
+            .expect("full setup's first stage should bind the prepared identity");
+        assert_eq!(identity.did(), did);
+        assert_eq!(
+            home.marker()
+                .expect("marker should exist")
+                .repository()
+                .expect("repository should parse"),
+            Some(repository)
+        );
+        application
+            .validate_member_home(&home)
+            .expect("the bound identity should be usable by run");
+        assert!(
+            !home.node_log().exists(),
+            "binding should precede node startup"
+        );
+        drop(lock);
+
+        let other = "rad:z42hL2jL4Tn8K5qgKbQ3xYrxLX9rU"
+            .parse()
+            .expect("other RID should parse");
+        assert!(
+            matches!(
+                Application::new(Member::Maya, other).take_home(&home, Ownership::Claim),
+                Err(super::Error::MemberDirectory { .. })
+            ),
+            "an existing binding must not be overwritten by another repository"
+        );
+    }
+
     // The manifest records what the team agreed; the operator running the member pays for it and
     // holds the credentials. So a command-line choice wins, and neither being set is normal.
     #[cfg(not(miri))]
@@ -1928,8 +2068,8 @@ mod tests {
         home.create().expect("member directory should be created");
         fs::create_dir_all(home.identity()).expect("identity directory should be created");
 
-        let claimed =
-            super::Application::new(crate::member::Member::Nico, repository).claim_home(&home);
+        let claimed = super::Application::new(crate::member::Member::Nico, repository)
+            .take_home(&home, super::Ownership::Claim);
 
         assert!(
             matches!(claimed, Err(super::Error::MemberDirectory { .. })),

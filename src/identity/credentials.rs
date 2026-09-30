@@ -2,8 +2,8 @@
 //!
 //! [`CredentialStore`] is the small boundary used by the identity provider to load and save
 //! key-encryption passphrases. [`SystemCredentialStore`] maps it to the operating system's
-//! credential service through `keyring`, with each entry scoped by the fixed member and the
-//! repository it works in.
+//! credential service through `keyring`, with each new entry scoped by the member and signing
+//! DID. Existing entries scoped by member and repository remain readable.
 //!
 //! This module never stores or reads the Radicle private key itself. It only supplies the
 //! passphrase needed by the provider to create or unlock that key. Service-provided
@@ -12,7 +12,10 @@
 
 use std::fmt;
 
-use radicle::{crypto::ssh::Passphrase, identity::RepoId};
+use radicle::{
+    crypto::ssh::Passphrase,
+    identity::{Did, RepoId},
+};
 use keyring::{Entry, Error as KeyringError};
 
 use crate::member::Member;
@@ -43,13 +46,17 @@ pub struct CredentialId {
 }
 
 impl CredentialId {
-    /// Names the credential after the member and repository it belongs to.
-    ///
-    /// Keyed on identity rather than on where the member directory happens to sit, so moving that
-    /// directory does not lose the stored passphrase.
+    /// Names a legacy credential after the member and repository it belongs to.
     pub(super) fn new(member: Member, repository: RepoId) -> Self {
         Self {
             account: format!("{}:{repository}", member.id()),
+        }
+    }
+
+    /// Names a credential after the signing identity, independent of its path or repository.
+    pub(super) fn for_identity(member: Member, did: Did) -> Self {
+        Self {
+            account: format!("{}:{did}", member.id()),
         }
     }
 
