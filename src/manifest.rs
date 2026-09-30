@@ -319,7 +319,7 @@ impl Binding {
     }
 
     /// Returns a binding for tests which need one without parsing a manifest.
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) fn test(signing_did: Did, generation: u64) -> Self {
         Self {
             signing_did,
@@ -331,7 +331,7 @@ impl Binding {
     }
 
     /// Uses `provider` as the model provider this binding names.
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_provider(mut self, provider: Option<&str>) -> Self {
         self.provider = provider.map(str::to_owned);
@@ -378,7 +378,7 @@ impl McpAllowlist {
     }
 
     /// Allows every method the manifest is able to grant.
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) fn everything() -> Self {
         let mut allowlist = Self::default();
         for method in crate::mcp::ToolService::registered_tools() {
@@ -568,7 +568,7 @@ impl RepositoryPolicy {
         self
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) fn with_chat_for_test(mut self, chat: ChatConfig) -> Self {
         self.chat = Some(Arc::new(chat));
         self
@@ -811,7 +811,7 @@ impl SecurityPolicy {
         &self.recipients
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) fn test(repository: RepoId) -> Self {
         Self::test_with_recipients(
             repository,
@@ -819,7 +819,7 @@ impl SecurityPolicy {
         )
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) fn test_with_recipients(repository: RepoId, recipients: Vec<String>) -> Self {
         Self {
             repository,
@@ -963,9 +963,10 @@ pub enum Error {
 mod tests {
     use std::{collections::BTreeSet, fs, path::PathBuf};
 
-    use radicle::identity::Did;
-    #[cfg(not(miri))]
-    use radicle::{git::Oid, identity::RepoId};
+    use radicle::{
+        git::Oid,
+        identity::{Did, RepoId},
+    };
 
     use crate::{
         manifest::{Error, Manifest, McpAllowlist, QueuePosition, Revision, TriggerAccess},
@@ -1019,7 +1020,6 @@ mod tests {
         assert!(!binding.mcp_allow().allows("create_comment"));
     }
 
-    #[cfg(not(miri))]
     #[test]
     fn validates_chat_configuration_and_authenticates_only_the_pinned_account() {
         use radicle::crypto::{Signature, signature::Signer as _, ssh::keystore::MemorySigner};

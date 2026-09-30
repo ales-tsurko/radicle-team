@@ -704,8 +704,6 @@ mod tests {
         path.display().to_string()
     }
 
-    // Preparing a role touches real directories and builds a real sandbox, which Miri cannot do.
-    #[cfg(not(miri))]
     mod preparing {
         use url::Url;
 

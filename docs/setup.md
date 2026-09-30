@@ -31,8 +31,9 @@ sudo apt-get install bubblewrap   # or the equivalent for your distribution
 ```
 
 Bubblewrap also needs an unprivileged user namespace. Ubuntu 23.10 and later
-confine those by default, which makes `bwrap` fail with `setting up uid map:
-Permission denied`. Confirm it works, and lift the restriction if it does not:
+confine those by default, which makes `bwrap` fail with
+`setting up uid map: Permission denied`. Confirm it works, and lift the
+restriction if it does not:
 
 ```sh
 bwrap --dev-bind / / --unshare-user true
@@ -142,7 +143,7 @@ rad id update --repo rad:z3cyot... --title "Allow Nico" --allow did:key:...
 
 The private repository also needs a reachable, authorized seed holding a copy.
 Grant the trusted seed access and arrange replication as described in the
-[Radicle private repository guide](https://radicle.dev/guides/user#curating-the-allow-list). Then run full
+[Radicle private repository guide][private-repository-guide]. Then run full
 setup with that seed's NID:
 
 ```sh
@@ -151,8 +152,8 @@ radicle-team setup nico --home ./nico --repo rad:z3cyot... --seed z6Mk...
 
 For full setup, point `--home` at the folder created in the first stage. Full
 setup requires `--repo` and binds that folder to the selected repository while
-reusing the authorized key.
-An already bound folder cannot be reassigned to another member or repository.
+reusing the authorized key. An already bound folder cannot be reassigned to
+another member or repository.
 
 The DID derives from the saved key. Restarts, application updates, and moving
 the member folder preserve it. Deleting and recreating the identity generates a
@@ -189,8 +190,8 @@ prints the directory, so there is no need to guess.
 
 One file per provider, named after it. The file says which agent application
 reaches that provider's models, how a member's scores become that provider's
-settings, and how it accepts being authorized. Adding a model, a
-setting, or a whole provider is an edited file rather than a new release.
+settings, and how it accepts being authorized. Adding a model, a setting, or a
+whole provider is an edited file rather than a new release.
 
 ```sh
 radicle-team login gpt
@@ -283,9 +284,12 @@ grants the member DID access, generates an age encryption identity, and shows
 its recovery key once — save that key outside every agent environment. Later
 members are granted access through the same repository authority.
 
+Each newly created security repository has a unique name and RID, so another
+team or a repeated setup attempt does not collide with an earlier creation.
+
 That repository must be private, the user's own Radicle node must be running,
-and the user's Radicle identity must be able to update its access list. A
-public repository is refused.
+and the user's Radicle identity must be able to update its access list. A public
+repository is refused.
 
 Setup unlocks your personal Radicle identity before creating the repository or
 granting access. Your identity owns newly created repositories; the member DID
@@ -306,8 +310,8 @@ radicle-team run nico --repo rad:...
 
 The process owns the member's node for its lifetime. It classifies relevant
 assignments, mentions, replies, comments, reviews, revisions, reactions,
-resolutions, lifecycle changes, and merges until stopped. `SIGINT` and
-`SIGTERM` trigger graceful node shutdown before the child is reaped.
+resolutions, lifecycle changes, and merges until stopped. `SIGINT` and `SIGTERM`
+trigger graceful node shutdown before the child is reaped.
 
 Operational events are emitted as structured records through `tracing`, so the
 destination and verbosity are chosen by the process rather than fixed in the
@@ -371,9 +375,9 @@ Each gets its own folder, side by side:
 
 Run `radicle-team run` from inside one of them, or from anywhere with `--home`.
 Commands search the current directory and its parents for
-`radicle-team-member.toml`, the way `git` finds a repository. A file of that name
-which does not read back as a marker does not end the search, since everything
-below a member's folder is repository content.
+`radicle-team-member.toml`, the way `git` finds a repository. A file of that
+name which does not read back as a marker does not end the search, since
+everything below a member's folder is repository content.
 
 Two processes cannot use one member folder at the same time. The same member can
 run for different repositories, in different folders, without sharing identity
@@ -391,10 +395,10 @@ values:
   upward search
 - `--seed NID` adds a preferred synchronization seed and may be repeated, on
   `setup` and on `run`, which synchronizes before it starts watching
-- `setup --identity-only` saves the identity and prints its DID before repository
-  access is granted; `--repo` and `--home` are optional. Without either, it creates
-  a folder named after the member in the current directory. It does not fetch or
-  run the remaining setup steps
+- `setup --identity-only` saves the identity and prints its DID before
+  repository access is granted; `--repo` and `--home` are optional. Without
+  either, it creates a folder named after the member in the current directory.
+  It does not fetch or run the remaining setup steps
 - `--identity-home PATH` uses an existing dedicated Radicle identity
 - `--expected-did DID` verifies that existing identity
 - `--unencrypted-identity` creates a managed key protected only by filesystem
@@ -411,11 +415,10 @@ alone cannot unlock the managed `radicle-node` process.
 
 Everything is inside the member folder, so it can be moved, backed up, or
 deleted as a unit. There is no global directory. Working copies record their
-paths relatively and new stored passphrases are keyed on the member and DID,
-so renaming or relocating the folder keeps working. Existing passphrases keyed
-on the member and repository remain supported. This needs Git
-2.48 or newer, and setup refuses an older one rather than failing obscurely
-later.
+paths relatively and new stored passphrases are keyed on the member and DID, so
+renaming or relocating the folder keeps working. Existing passphrases keyed on
+the member and repository remain supported. This needs Git 2.48 or newer, and
+setup refuses an older one rather than failing obscurely later.
 
 Managed private keys live in `identity/`. Encrypted-key passphrases live in the
 operating-system credential store, never in the manifest. Node output goes to
@@ -446,3 +449,5 @@ For a private repository, run `setup --identity-only` first to obtain the DID,
 grant it access, and provide a reachable authorized seed with `--seed`. If a
 previous full setup attempt failed, identity-only setup reuses its saved key.
 Node startup failures include the log path in their diagnostic.
+
+[private-repository-guide]: https://radicle.dev/guides/user#curating-the-allow-list

@@ -1907,7 +1907,6 @@ pub enum Error {
 #[cfg(test)]
 mod tests {
 
-    #[cfg(not(miri))]
     #[test]
     fn refuses_a_directory_belonging_to_another_member_or_repository() {
         let root = tempfile::tempdir().expect("temporary directory should be created");
@@ -1949,7 +1948,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(miri))]
     #[tokio::test]
     async fn full_setup_binds_a_prepared_identity_without_replacing_it() {
         use super::{Ownership, Runtime};
@@ -2012,7 +2010,6 @@ mod tests {
 
     // The manifest records what the team agreed; the operator running the member pays for it and
     // holds the credentials. So a command-line choice wins, and neither being set is normal.
-    #[cfg(not(miri))]
     #[test]
     fn prefers_the_command_lines_provider_over_the_manifests() {
         let repository =
@@ -2058,7 +2055,6 @@ mod tests {
     // The marker is written before the identity is created, so a directory holding one without the
     // other is a member's whose marker was lost. Claiming it writes this member's name over it, and
     // the identity loaded a moment later is then somebody else's key under this member's name.
-    #[cfg(not(miri))]
     #[test]
     fn refuses_to_claim_a_directory_which_already_holds_an_identity() {
         let root = tempfile::tempdir().expect("temporary directory should be created");
@@ -2080,30 +2076,26 @@ mod tests {
             "and nothing may be written into it"
         );
     }
-    #[cfg(not(miri))]
-    use std::{fs, path::PathBuf};
-    use std::str::FromStr as _;
+    use std::{fs, path::PathBuf, str::FromStr as _};
 
-    #[cfg(not(miri))]
     use radicle::{
         crypto::Seed,
         git::Oid,
-        identity::doc::Visibility,
+        identity::{RepoId, doc::Visibility},
         node::Alias,
         profile::{Home, Profile},
         storage::ReadStorage as _,
     };
-    use radicle::identity::RepoId;
 
-    #[cfg(not(miri))]
     use crate::{
+        Application, Setup, SetupStatus,
         application::SetupValidation,
         home::MemberHome,
         manifest::{Revision, ValidatedBinding},
+        member::Member,
     };
-    use crate::{Application, Setup, SetupStatus, member::Member};
 
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(unix)]
     #[tokio::test]
     async fn terminates_a_sync_subprocess_that_exceeds_its_deadline() {
         use std::time::Duration;
@@ -2144,7 +2136,7 @@ mod tests {
         .expect("timed-out sync must be killed and reaped");
     }
 
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(unix)]
     #[tokio::test]
     async fn preserves_sync_errors_and_output_within_the_deadline() {
         use std::time::Duration;
@@ -2178,7 +2170,7 @@ mod tests {
         ));
     }
 
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(unix)]
     #[tokio::test]
     async fn retries_sync_while_a_new_node_processes_network_announcements() {
         let (repository, did) = sync_target();
@@ -2204,7 +2196,7 @@ mod tests {
         assert_eq!(attempts, 2);
     }
 
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(unix)]
     #[tokio::test]
     async fn sync_retries_share_one_deadline() {
         let (repository, did) = sync_target();
@@ -2235,7 +2227,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(unix)]
     fn sync_target() -> (RepoId, radicle::identity::Did) {
         (
             "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc"
@@ -2248,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(unix)]
     fn synchronization_requires_the_repository_to_be_fetched() {
         use std::{os::unix::process::ExitStatusExt as _, process::Output};
 
@@ -2347,7 +2339,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(miri))]
     fn rejects_a_public_security_repository() {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let home = Home::new(root.path().join("home")).expect("Radicle home should be created");
@@ -2430,7 +2421,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(miri))]
     async fn accepts_a_ready_binding_at_the_maximum_generation() {
         let root = PathBuf::from("target/tests/application/max-ready-generation");
         let _result = fs::remove_dir_all(&root);

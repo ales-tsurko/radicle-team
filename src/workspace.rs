@@ -121,7 +121,7 @@ impl Workspaces {
     }
 
     /// Returns the shared object store every working copy reads from.
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) fn store(&self) -> PathBuf {
         self.home.git_common()
     }
@@ -131,7 +131,7 @@ impl Workspaces {
     /// Not initialized: a test which needs the copies to exist calls [`Self::initialize`] itself.
     /// `name` separates one test's directory from another's, because the harness runs them at the
     /// same time and one clearing another's would fail whichever lost the race.
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) fn memory(
         name: &str,
         storage: Storage,
@@ -694,7 +694,7 @@ pub(crate) enum Error {
     SalvageExhausted(String),
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{
         fs,

@@ -89,13 +89,13 @@ impl Publisher {
         publisher
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) async fn with_memory_journal(mut self) -> Result<Self, Error> {
         self.journal = Some(MutationJournal::memory().await?);
         Ok(self)
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) async fn forget_completion(&self, key: &MutationKey) -> Result<(), Error> {
         self.journal
             .as_ref()
@@ -498,7 +498,7 @@ impl MutationJournal {
         Self::from_database(Database::open(path).await?).await
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     async fn memory() -> Result<Self, Error> {
         Self::from_database(Database::memory().await?).await
     }
@@ -668,7 +668,7 @@ impl MutationJournal {
         .await
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     async fn forget_completion(&self, repository: RepoId, key: &MutationKey) -> Result<(), Error> {
         self.update_entry(
             repository,
@@ -821,7 +821,7 @@ pub(crate) enum Error {
     #[error("mutation disappeared from the journal")]
     MutationMissing,
     /// A journal operation was requested while journalling is disabled.
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     #[error("mutation journal is disabled")]
     JournalDisabled,
     /// Reading or writing the mutation journal failed.

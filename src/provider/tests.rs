@@ -179,10 +179,6 @@ fn reports_no_providers_before_any_are_installed() {
 
 // One account per person and provider, until a project has to be billed separately. The member's
 // file replaces the global one rather than merging, so a split bill cannot half-inherit.
-//
-// Not under Miri: reading a credentials file checks the owner, and Miri reports a user ID of its
-// own which never matches the one that wrote the file.
-#[cfg(not(miri))]
 #[test]
 fn prefers_a_members_credentials_over_the_global_ones() {
     let root = clear("provider-credentials");
@@ -420,10 +416,7 @@ fn narrows_a_credentials_file_which_was_already_loose() {
 
 // A key loosened by hand or restored from a backup is refused rather than used, the same way every
 // other secret this application reads is gated.
-//
-// Not under Miri: its own user ID would fail the owner check first, and this would pass on the
-// wrong error.
-#[cfg(all(unix, not(miri)))]
+#[cfg(unix)]
 #[test]
 fn refuses_credentials_anybody_can_read() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -496,7 +489,7 @@ fn refuses_a_provider_name_which_is_a_path() {
 // Installing runs on every listing, every login, and every setup. A plain write follows a symbolic
 // link and overwrites whatever it points at, so a link left in the provider directory would make a
 // read-only-looking command destroy an unrelated file.
-#[cfg(all(unix, not(miri)))]
+#[cfg(unix)]
 #[test]
 fn replaces_a_linked_provider_rather_than_what_it_points_at() {
     let root = clear("provider-install-symlink");

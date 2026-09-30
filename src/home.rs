@@ -356,15 +356,14 @@ pub enum Error {
 mod tests {
     use std::path::Path;
 
-    // Only the tests which touch the filesystem need these, and Miri runs none of them.
-    #[cfg(not(miri))]
     use radicle::identity::RepoId;
 
-    #[cfg(not(miri))]
-    use crate::home::MARKER;
-    use crate::{agent::Role, home::MemberHome, member::Member};
+    use crate::{
+        agent::Role,
+        home::{MARKER, MemberHome},
+        member::Member,
+    };
 
-    #[cfg(not(miri))]
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 
     #[test]
@@ -430,7 +429,6 @@ mod tests {
         assert_ne!(nico.cache(), maya.cache());
     }
 
-    #[cfg(not(miri))]
     #[test]
     fn records_and_reads_back_the_directory_it_created() {
         let root = tempfile::tempdir().expect("temporary directory should be created");
@@ -450,7 +448,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(miri))]
     #[test]
     fn finds_the_member_directory_from_a_subdirectory() {
         let root = tempfile::tempdir().expect("temporary directory should be created");
@@ -473,7 +470,6 @@ mod tests {
     // A member's working copies live inside its home, so everything below it is repository
     // content. A file which happens to carry the marker's name there would otherwise end the
     // search one directory short of the home it was looking for.
-    #[cfg(not(miri))]
     #[test]
     fn walks_past_a_repository_file_wearing_the_marker_name() {
         let root = tempfile::tempdir().expect("temporary directory should be created");
@@ -496,7 +492,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(miri))]
     #[test]
     fn refuses_a_marker_it_cannot_read() {
         let root = tempfile::tempdir().expect("temporary directory should be created");

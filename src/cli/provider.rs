@@ -299,10 +299,6 @@ mod tests {
     // A member-scoped login the listing cannot see reads as never having happened. The operator
     // then logs in again without the flag, putting the project's key in the shared store -- the
     // opposite of what `--home` exists for.
-    //
-    // Not under Miri: reading a credentials file checks the owner, and Miri reports a user ID of
-    // its own which never matches the one that wrote the file.
-    #[cfg(not(miri))]
     #[test]
     fn reports_a_login_recorded_against_one_member() {
         let configuration = clear("cli-provider-list-home");

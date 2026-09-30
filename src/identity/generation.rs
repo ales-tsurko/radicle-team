@@ -195,7 +195,7 @@ impl GenerationStore {
             .transpose()
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     async fn memory() -> Result<Self, Error> {
         Self::from_database(Database::memory().await?).await
     }
@@ -270,7 +270,7 @@ impl From<crate::database::Error> for Error {
     }
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::str::FromStr as _;
 

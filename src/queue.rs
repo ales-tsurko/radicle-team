@@ -88,7 +88,7 @@ impl WorkQueue {
     }
 
     // Opens a queue that lives only as long as the process, for tests.
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) async fn memory(repository: RepoId, member: Member) -> Result<Self, Error> {
         let database = Database::memory().await?;
         database.execute(SCHEMA).await?;
@@ -100,7 +100,7 @@ impl WorkQueue {
     ///
     /// Whether a write reached durable storage decides what a restart does, and a failure there
     /// has to be provable rather than reasoned about.
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) const fn database(&self) -> &Database {
         &self.database
     }
@@ -478,7 +478,7 @@ impl From<crate::database::Error> for Error {
     }
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{str::FromStr as _, time::Duration};
 

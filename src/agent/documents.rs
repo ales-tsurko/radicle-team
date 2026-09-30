@@ -185,7 +185,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(miri))]
     #[test]
     fn writes_a_fresh_set_over_a_stale_one() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

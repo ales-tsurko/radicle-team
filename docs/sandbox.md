@@ -89,8 +89,8 @@ configuration and hooks name, and the runtime's own Git reads them too:
 
 Fencing paths off only covers what the runtime *reads*. The runtime also writes
 references there, and a name the building agent can write may be made to stand
-for another reference entirely. So every reference the runtime writes is one it 
-named itself, addressed in full and set without following it. An agent can do 
+for another reference entirely. So every reference the runtime writes is one it
+named itself, addressed in full and set without following it. An agent can do
 what it likes inside `<member>-rt/`; it cannot reach outside it.
 
 Neither of those is the boundary. They narrow what an agent can put in a Git
@@ -161,10 +161,10 @@ loopback is unreachable and only the managed proxy bridges out. Zerobox creates
 that namespace per command, so a server one command starts is not reachable from
 the next one. A workflow that runs a local development server and then connects
 to it therefore needs `network = "all"` on Linux. Domains do not help, because
-that is still a restricted sandbox. A restricted sandbox on Linux also
-blocks the command from creating new Unix domain sockets, so local services
-reached that way, such as a container daemon or a database socket, are
-unavailable there as well.
+that is still a restricted sandbox. A restricted sandbox on Linux also blocks
+the command from creating new Unix domain sockets, so local services reached
+that way, such as a container daemon or a database socket, are unavailable there
+as well.
 
 If you need both an isolated internet and a working local server on Linux, run
 the whole member inside a container with `network = "all"` and filter egress at

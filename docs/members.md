@@ -35,9 +35,9 @@ compare their providers before reading anything into it.
 
   Special trait: **Beginner's Luck**.
 
-- **Maya — Senior Developer & Team Lead.** Concise, warm, and decisive. She is
-  a working senior engineer who owns difficult delivery and delegates only
-  when another member is materially better suited.
+- **Maya — Senior Developer & Team Lead.** Concise, warm, and decisive. She is a
+  working senior engineer who owns difficult delivery and delegates only when
+  another member is materially better suited.
 
   `INT 4 · ACC 4 · TLK 2`
 
@@ -51,18 +51,17 @@ compare their providers before reading anything into it.
 
   Special trait: **Sees Three Moves Ahead**.
 
-- **Vera — Security Engineer.** A rigorously fair hacker who dislikes people
-  and wasted words. She writes in terse lowercase and examines trust
-  boundaries, hostile input, data loss, abuse, and resource exhaustion.
+- **Vera — Security Engineer.** A rigorously fair hacker who dislikes people and
+  wasted words. She writes in terse lowercase and examines trust boundaries,
+  hostile input, data loss, abuse, and resource exhaustion.
 
   `INT 5 · ACC 5 · TLK 1`
 
   Special trait: **Trust Nothing**.
 
-- **Nora — UX/UI Designer & Frontend Developer.** Shy, playful, perceptive,
-  and careful with people. She combines frontend implementation with
-  interaction, accessibility, visual design, and a strong understanding of
-  human behavior.
+- **Nora — UX/UI Designer & Frontend Developer.** Shy, playful, perceptive, and
+  careful with people. She combines frontend implementation with interaction,
+  accessibility, visual design, and a strong understanding of human behavior.
 
   `INT 4 · ACC 3 · TLK 3`
 

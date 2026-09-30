@@ -610,7 +610,7 @@ impl std::fmt::Debug for ProxyRuntime {
     }
 }
 
-#[cfg(all(test, not(miri), any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 

@@ -38,8 +38,8 @@ provider = "gpt"                         # optional, a name from `radicle-team p
 `provider` names which models a member runs on, never a model itself: which
 model of that provider it gets is decided from the member's character sheet by
 that provider's own configuration, which is machine-local. Whoever runs the
-member holds its credentials and pays for it, so `radicle-team run --provider
-NAME` overrides what the manifest says.
+member holds its credentials and pays for it, so
+`radicle-team run --provider NAME` overrides what the manifest says.
 
 Every value here is read once at startup, so changing one needs a restart. The
 single exception is the delegate set, which is re-read on every scan: granting
@@ -183,8 +183,8 @@ server can create authenticated chat work.
 
 `spki-sha256:` is followed by exactly 64 lowercase hexadecimal digits: SHA-256
 of the server certificate's DER-encoded SubjectPublicKeyInfo. This survives a
-certificate renewal that keeps the key. `cert-sha256:` has the same encoding
-but hashes the complete DER-encoded client certificate. The latter is enrollment
+certificate renewal that keeps the key. `cert-sha256:` has the same encoding but
+hashes the complete DER-encoded client certificate. The latter is enrollment
 evidence, not something IRC peers inspect at runtime.
 
 
@@ -209,10 +209,10 @@ account and certificate. A rogue or compromised delegate therefore cannot bind
 Mallory's IRC account to Alice's DID and inherit Alice's permissions merely by
 editing the manifest.
 
-Parsing verifies every signature, rejects duplicate accounts, DIDs,
-certificates and IRC channel targets, and requires an attestation for every
-active member. Runtime authentication additionally requires the active RID and
-observed server pin to match before an `account-tag` can produce a sender DID.
+Parsing verifies every signature, rejects duplicate accounts, DIDs, certificates
+and IRC channel targets, and requires an attestation for every active member.
+Runtime authentication additionally requires the active RID and observed server
+pin to match before an `account-tag` can produce a sender DID.
 
 
 
@@ -251,5 +251,4 @@ issue permission at all. A member that finds something dangerous must always be
 able to report it, so this is not left to configuration.
 
 Agent adapters receive only the scoped MCP endpoint. Trusted adapter code must
-also keep the host Radicle profile and recovery keys outside model
-subprocesses.
+also keep the host Radicle profile and recovery keys outside model subprocesses.

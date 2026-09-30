@@ -280,7 +280,7 @@ impl Change {
     }
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{path::Path, str::FromStr as _};
 

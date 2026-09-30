@@ -594,7 +594,7 @@ pub enum Error {
     },
 }
 
-#[cfg(all(test, unix, not(miri)))]
+#[cfg(all(test, unix))]
 mod tests {
     use std::{fs, path::PathBuf, time::Duration};
 

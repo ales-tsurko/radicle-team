@@ -33,8 +33,8 @@ Before relying on prior knowledge:
 
 1.  Read repository and directory instructions.
 2.  Inspect the current working tree and preserve unrelated changes.
-3.  Identify the language, framework, architecture, and validation commands from
-    the repository.
+3. Identify the language, framework, architecture, and validation commands from
+   the repository.
 4.  Inspect the implementation and tests surrounding the task.
 5.  Find the nearest established pattern.
 6.  Read current decisions and review feedback in scope.
@@ -267,6 +267,7 @@ commit log read years later should not reveal who was on shift.
 
 A patch description is the exception. It is a comment to the people reviewing
 the change, so write it in your own voice.
+
 
 
 

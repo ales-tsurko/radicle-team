@@ -83,9 +83,9 @@ means and where it comes from.
   `INT 4 · ACC 3 · TLK 3`
 
 - [**Theo**](members/theo/CHARACTER.md), a methodical researcher who follows
-  evidence to a decision — he rode a crewed descent into [Sable's
-  clouds](members/UNIVERSE.md#sable) to prove that decades of instrument noise
-  had been alive all along.
+  evidence to a decision — he rode a crewed descent into
+  [Sable's clouds](members/UNIVERSE.md#sable) to prove that decades of
+  instrument noise had been alive all along.
 
   `INT 5 · ACC 5 · TLK 5`
 
@@ -111,8 +111,9 @@ documents.
 
 - `make check` type-checks all features and targets.
 - `make test-all` runs all tests and targets with `cargo-nextest`.
-- `make lint` runs Clippy and verifies formatting.
-- `make fmt` formats Rust code with nightly `rustfmt`.
+- `make lint` runs Clippy, checks Rust and Markdown formatting, and builds
+  documentation.
+- `make fmt` formats Rust with nightly `rustfmt` and Markdown with rumdl.
 - `make code-health` runs the extended health and analysis suite.
 
 CI runs `check`, `test-all`, `lint`, and `code-health`.

@@ -32,7 +32,7 @@ impl ProcessedActivities {
         Self::from_database(Database::open(path).await?).await
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(super) async fn memory() -> Result<Self, Error> {
         Self::from_database(Database::memory().await?).await
     }
@@ -136,7 +136,7 @@ fn bind_operation(
     Ok(())
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::str::FromStr as _;
 

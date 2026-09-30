@@ -232,7 +232,6 @@ fn combines_the_documents_in_the_order_they_establish() {
 // Every provider this build ships for Claude Code has to map onto controls it carries, for every
 // member. A file which does not is one an operator meets as a failed run, on a file they did not
 // write.
-#[cfg(not(miri))]
 #[test]
 fn runs_every_provider_this_build_ships_for_it() {
     let root = clear("claude-shipped");

@@ -1,8 +1,8 @@
 # The `claude-code` adapter
 
-What is specific to running a member through [Claude
-Code](https://code.claude.com/docs). What every adapter does, and what the
-runtime does around one, is in
+What is specific to running a member through
+[Claude Code](https://code.claude.com/docs). What every adapter does, and what
+the runtime does around one, is in
 [architecture](../architecture.md#runtime-and-agent-roles). The OpenCode
 counterpart is [here](opencode.md), and where the two differ this page says so.
 

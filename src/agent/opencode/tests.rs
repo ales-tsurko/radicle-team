@@ -171,7 +171,6 @@ fn keeps_a_headless_run_headless() {
 
 // The runtime cannot see what an agent is doing, so the plugin is what tells it. A plugin which was
 // never installed, or which still carries the placeholder path, reports nothing at all.
-#[cfg(not(miri))]
 #[test]
 fn installs_a_plugin_which_reports_where_the_adapter_reads() {
     let harness = clear("opencode-plugin");
@@ -208,7 +207,7 @@ fn installs_a_plugin_which_reports_where_the_adapter_reads() {
 
 // This exercises version detection, the real sandbox, plugin activation, catalogue RPC and
 // configuration together. The fake provider lists a model but no model request is made.
-#[cfg(all(target_os = "macos", not(miri)))]
+#[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires OpenCode 2 on PATH and permission to start sandboxed processes"]
 async fn starts_with_installed_opencode_v2() {
@@ -322,7 +321,6 @@ values = ["low", "low", "medium", "high", "max"]
 // Every provider this build ships for OpenCode has to map onto controls OpenCode has, for every
 // member. A file which does not is one an operator meets as a failed run, on a file they did not
 // write.
-#[cfg(not(miri))]
 #[test]
 fn runs_every_provider_this_build_ships_for_it() {
     let root = clear("opencode-shipped");

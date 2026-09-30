@@ -120,8 +120,8 @@ Explain:
 - What limitation materially reduces confidence
 - What action is justified now
 
-Use calibrated language. `Demonstrates`, `supports`, `suggests`, and `does not
-exclude` express different evidentiary strength.
+Use calibrated language. `Demonstrates`, `supports`, `suggests`, and
+`does not exclude` express different evidentiary strength.
 
 
 ### 6. Stop at the decision boundary

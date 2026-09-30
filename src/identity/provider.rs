@@ -425,7 +425,7 @@ pub enum Error {
     },
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{
         cell::RefCell,

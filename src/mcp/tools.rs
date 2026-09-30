@@ -178,7 +178,7 @@ impl ToolService {
     }
 
     /// Returns whether this server exposes `method` at all.
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(super) fn offers(&self, method: &str) -> bool {
         self.tool_router.has_route(method)
     }

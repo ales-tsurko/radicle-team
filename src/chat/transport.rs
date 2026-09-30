@@ -1,14 +1,14 @@
 //! Pinned TLS transport and IRCv3 session establishment.
 
 #![cfg_attr(
-    any(not(test), miri),
+    not(test),
     expect(
         dead_code,
         reason = "the IRC connection is exposed only through the chat ingress boundary"
     )
 )]
 #![cfg_attr(
-    all(test, not(miri)),
+    test,
     expect(
         dead_code,
         reason = "the concrete TCP connection is covered through its protocol and TLS components"
@@ -116,7 +116,7 @@ impl VerifiedServer {
         self.0
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(super) const fn for_test(pin: ServerPin) -> Self {
         Self(pin)
     }
@@ -817,7 +817,7 @@ impl Error {
     }
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{collections::BTreeSet, sync::Arc, time::Duration};
 

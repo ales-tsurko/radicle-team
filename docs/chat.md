@@ -3,10 +3,10 @@
 People working with a team need a way to reach its members quickly, without
 opening an issue for every question. Chat is that channel.
 
-`radicle-team` speaks IRC. A member joins its team's channels as an ordinary
-IRC client under its own nick, and the people it works with join as ordinary
-users. There is no bot, no gateway, and no platform integration. The team runs
-its own server.
+`radicle-team` speaks IRC. A member joins its team's channels as an ordinary IRC
+client under its own nick, and the people it works with join as ordinary users.
+There is no bot, no gateway, and no platform integration. The team runs its own
+server.
 
 This document covers what a server must provide, how identity works, and how to
 deploy one. The `[chat]` schema is in
@@ -69,9 +69,9 @@ fingerprint is enrollment evidence held by the server, not runtime identity.
 Peers never see another client's fingerprint.
 
 IRC client certificates are generated separately and never derived from the
-Radicle key. The same key material should not serve two protocols with
-different security arguments. The Radicle key signs the attestation instead,
-which gives the binding without the reuse.
+Radicle key. The same key material should not serve two protocols with different
+security arguments. The Radicle key signs the attestation instead, which gives
+the binding without the reuse.
 
 Every repository member has a separate certificate and SASL account. When one
 IRC server hosts multiple repositories, those accounts remain distinct and are
@@ -86,10 +86,10 @@ asks and the agent decides.
 
 ## Channels
 
-A channel binds to one repository, and one repository only. The binding lives
-in the manifest as a logical channel identifier mapped to a pinned server and
-IRC channel, so it is authorized by the same reviewed, signed file as
-everything else. No separate linking or approval exchange is needed.
+A channel binds to one repository, and one repository only. The binding lives in
+the manifest as a logical channel identifier mapped to a pinned server and IRC
+channel, so it is authorized by the same reviewed, signed file as everything
+else. No separate linking or approval exchange is needed.
 
 The channel topic carries the full RID. This catches a channel accidentally
 reused across repositories. Topics are mutable by channel operators, so it is a

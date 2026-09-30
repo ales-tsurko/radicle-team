@@ -15,5 +15,5 @@ mod sandbox;
 mod security;
 mod wizard;
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests;

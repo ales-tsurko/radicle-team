@@ -25,9 +25,9 @@ together.
 
 ## Reference
 
-- [Repository manifest](manifest.md) — the complete `radicle-team.toml`
-  schema, including who may trigger a member, tool permissions, conversation
-  limits, chat identity, and security reports.
+- [Repository manifest](manifest.md) — the complete `radicle-team.toml` schema,
+  including who may trigger a member, tool permissions, conversation limits,
+  chat identity, and security reports.
 - [Local sandbox](sandbox.md) — the administrator-owned `sandbox.toml`,
   filesystem and network policy, and platform behaviour.
 - [Chat](chat.md) — what an IRC server must provide, how accounts map to DIDs,

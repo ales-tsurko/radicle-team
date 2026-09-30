@@ -5,7 +5,7 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Deserializer, de};
 
 pub(crate) use crate::chat::{auth::AuthenticatedSender, state::State};
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 pub(crate) use crate::chat::state::Receipt;
 pub use crate::chat::config::{
     Attestation, AttestationPayload, ClientCertificateFingerprint, Config, IrcAccount, IrcChannel,

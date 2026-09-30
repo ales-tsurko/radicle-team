@@ -49,8 +49,8 @@ Some models are hosted in China, which recent OpenCode asks you to opt in to
 before it will offer them. That opt-in is in OpenCode, not here. Without it the
 model reads as one OpenCode does not have.
 
-The adapter queries models through its plugin RPC, which waits for providers
-to finish loading.
+The adapter queries models through its plugin RPC, which waits for providers to
+finish loading.
 
 
 

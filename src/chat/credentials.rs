@@ -156,7 +156,7 @@ pub(crate) enum Error {
     Transport(#[from] crate::chat::transport::Error),
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{
         fs,

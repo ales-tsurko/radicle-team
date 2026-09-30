@@ -445,9 +445,7 @@ pub(crate) fn shorten(line: &str) -> String {
     }
 }
 
-// Excluded from Miri: every test here builds a Tokio runtime, and Miri cannot make the `kqueue`
-// call its IO driver starts with.
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use crate::agent::{
         Role,

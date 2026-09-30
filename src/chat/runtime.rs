@@ -69,7 +69,7 @@ impl<D> Ingress<D> {
         )
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "the test constructor mirrors independently validated runtime capabilities"
@@ -401,7 +401,7 @@ struct PendingDelivery {
 #[derive(Debug)]
 enum DelegateSource {
     Repository(Storage),
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     Fixed(Vec<Did>),
 }
 
@@ -420,7 +420,7 @@ impl DelegateSource {
                 .map_err(|error| Error::Delegates(error.to_string()))?
                 .map_err(|error| Error::Delegates(error.to_string()))
             }
-            #[cfg(all(test, not(miri)))]
+            #[cfg(test)]
             Self::Fixed(delegates) => Ok(delegates.clone()),
         }
     }
@@ -489,7 +489,7 @@ pub(crate) enum Error {
     UnboundOutbox(crate::chat::ChannelId),
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{
         str::FromStr as _,

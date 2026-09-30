@@ -200,7 +200,7 @@ mod tests {
         assert!(!shutdown.shutdown_started());
     }
 
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(unix)]
     fn supervised_test_child() -> (Shutdown, crate::node::ChildHandle) {
         use radicle::node::Node;
 
@@ -226,7 +226,7 @@ mod tests {
         (shutdown, handle)
     }
 
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(unix)]
     #[tokio::test]
     async fn kills_a_child_when_control_shutdown_fails() {
         let (shutdown, handle) = supervised_test_child();
@@ -241,7 +241,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_signal_forces_a_child_that_acknowledged_shutdown() {
         let (shutdown, handle) = supervised_test_child();

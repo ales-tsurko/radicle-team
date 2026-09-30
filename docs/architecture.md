@@ -28,8 +28,8 @@ A member answers, chats, and builds at the same time, which one conversation
 cannot do. A half-written patch has no safe point to pause at, and an agent turn
 cannot be interrupted once it begins, so sharing one would put a question behind
 a twenty-minute job. Each member therefore runs three agents under one identity,
-one per role, with one MCP server each. To everybody reading the repository it is
-one person.
+one per role, with one MCP server each. To everybody reading the repository it
+is one person.
 
 `Talker` answers repository activity, `Chatter` answers chat, and `Coder`
 carries out queued work. The chatting role is started only when the manifest has
@@ -40,8 +40,8 @@ agent events:
 
 - a mention, reply, or relevant change in a Radicle issue or patch goes to the
   member's talking agent;
-- an assignment goes to the member's work queue, which the building agent
-  takes jobs from;
+- an assignment goes to the member's work queue, which the building agent takes
+  jobs from;
 - an authenticated chat message goes to the member's chatting agent, which may
   in turn record work in the queue when it decides work is needed;
 - each agent runs inside a work-scoped workspace with a scoped MCP server, and
@@ -102,18 +102,18 @@ A job which was running when the process died is still marked taken in the
 queue, so it is put back at the front on the next start rather than left
 silently lost.
 
-Each member opens one outbound TLS connection to the team's IRC server and
-joins the channels bound to its repository. Members run on separate machines,
-so each connects on its own. Nothing listens for inbound connections and no
-member needs a public address.
+Each member opens one outbound TLS connection to the team's IRC server and joins
+the channels bound to its repository. Members run on separate machines, so each
+connects on its own. Nothing listens for inbound connections and no member needs
+a public address.
 
-To everyone in the channel a member looks like any other user. Addressing one
-by nick reaches it. Two members in the same channel are two users, the same way
-two people are.
+To everyone in the channel a member looks like any other user. Addressing one by
+nick reaches it. Two members in the same channel are two users, the same way two
+people are.
 
-Nothing about the chosen server appears in the source. `radicle-team` speaks
-IRC and IRCv3, so any conforming server works. See [chat](chat.md) for what a
-server must provide and how to deploy one.
+Nothing about the chosen server appears in the source. `radicle-team` speaks IRC
+and IRCv3, so any conforming server works. See [chat](chat.md) for what a server
+must provide and how to deploy one.
 
 
 
@@ -158,9 +158,9 @@ the room.
 Running one bot per member instead of a gateway does not survive contact with
 the platforms. Telegram caps an account at twenty bots, which members times
 repositories reaches at five members and four repositories. Telegram usernames
-share one global namespace with all users and channels. Telegram bots cannot
-see other bots' messages at all, so members could not share channel context.
-None of it removes the platform from the trust path.
+share one global namespace with all users and channels. Telegram bots cannot see
+other bots' messages at all, so members could not share channel context. None of
+it removes the platform from the trust path.
 
 Building a chat application is out of scope. Real people talk in these channels
 alongside the members and are the same kind of participant, which makes this
@@ -178,8 +178,8 @@ client library both exist, but state resolution, device management, and
 encryption key handling are far more protocol than this needs.
 
 Nostr remains rejected. Relay-based groups and MLS encrypted messaging are both
-draft specifications, private group clients are few, and its keys are a
-separate identity from the Radicle one in any case.
+draft specifications, private group clients are few, and its keys are a separate
+identity from the Radicle one in any case.
 
 XMPP was never considered in the original design and is a real alternative. It
 is lighter than Matrix with better mobile support than IRC, and its Rust
@@ -217,11 +217,13 @@ reasons given when they were first considered.
 
 A spike proved that `irc::Client` exposes the required IRCv3 commands and tags
 but cannot enforce the manifest's exact SPKI pin. In `irc` 1.1.0
-[`src/client/conn.rs:336-381`](https://docs.rs/crate/irc/1.1.0/source/src/client/conn.rs),
-the crate privately constructs its TLS configuration with WebPKI and native
-roots, optionally adds another root, and exposes only an accept-all alternative.
-There is no custom verifier or transport injection point.
+[`src/client/conn.rs:336-381`][irc-connection], the crate privately constructs
+its TLS configuration with WebPKI and native roots, optionally adds another
+root, and exposes only an accept-all alternative. There is no custom verifier or
+transport injection point.
 
 `irc-proto::IrcCodec` preserves `account` and `msgid` tags over a caller-owned
 stream, leaving DNS, TCP, client certificates, and strict SPKI verification
 under this application's control.
+
+[irc-connection]: https://docs.rs/crate/irc/1.1.0/source/src/client/conn.rs

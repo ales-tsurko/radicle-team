@@ -84,7 +84,6 @@ mod tests {
 
     // The name in a provider file is matched against what this build has, so the two lists cannot
     // drift apart without a member failing to start on a provider which reads perfectly well.
-    #[cfg(not(miri))]
     #[test]
     fn builds_roles_for_every_adapter_it_lists() {
         let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

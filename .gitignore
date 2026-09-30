@@ -1,3 +1,4 @@
 .DS_Store
 /target
+.rumdl_cache/
 /RADICLE_INTEGRATION_SPEC.md

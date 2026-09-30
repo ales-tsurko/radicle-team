@@ -20,7 +20,7 @@ impl Database {
         Self::blocking(move || Self::open_connection(path)).await
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) async fn memory() -> Result<Self, Error> {
         Self::blocking(|| Self::open_connection(":memory:")).await
     }

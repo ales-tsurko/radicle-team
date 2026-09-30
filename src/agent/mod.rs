@@ -22,7 +22,7 @@ pub(crate) use crate::agent::{
     publisher::{Authorizer, Error as PublishError, MutationKey, MutationValidation, Publisher},
     session::Session,
 };
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 pub(crate) use crate::agent::publisher::Announcer;
 
 pub(crate) mod adapter;

@@ -1,10 +1,9 @@
 //! MCP integration and repository-service tests.
 
-use std::str::FromStr as _;
-#[cfg(not(miri))]
 use std::{
     fs,
     path::Path,
+    str::FromStr as _,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -13,68 +12,54 @@ use std::{
 
 use radicle::{
     cob::{
-        EntryId, Manifest, Op, Timestamp, Version,
-        patch::{Action as PatchAction, TYPENAME},
-    },
-    crypto::PublicKey,
-    git::Oid,
-};
-#[cfg(not(miri))]
-use radicle::{
-    cob::{
-        Embed, ObjectId,
+        Embed, EntryId, Manifest, ObjectId, Op, Timestamp, Version,
         common::Uri,
         issue::{self, Issues},
-        patch::{self, Patches},
+        patch::{self, Action as PatchAction, Patches, TYPENAME},
         store::access::ReadOnly,
     },
-    crypto::Seed,
+    crypto::{PublicKey, Seed},
+    git::Oid,
     identity::{RepoId, doc::Visibility},
     node::Alias,
     profile::{Home, Profile},
     storage::{ReadRepository as _, ReadStorage as _},
 };
 
-#[cfg(not(miri))]
-use crate::mcp::{
-    protocol::{
-        CommentIssueRequest, CommentOperation, CommentTargetKind, CommentWriteRequest,
-        CreateIssueRequest, CreatePatchRequest, DiffRequest, Document, EditIssueRequest,
-        EditPatchRequest, EmbedReadRequest, EmbedWriteRequest, IssueRequest, IssueStateFilter,
-        ListIssuesRequest, LocationRequest, MAX_EMBED_BYTES, MergePatchRequest, PreparedEmbed,
-        ReactionWriteRequest, ResolveCommentRequest, ReviewCommentRequest, ReviewWriteRequest,
-        SecurityIssueRequest, SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind,
-        SubjectRequest, mutation_identity, parse_location, parse_object, validate_code_location,
-    },
-    read::MAX_DIFF_BYTES,
-    recovery::{ReactionRecovery, find_review, review_mutation_operation},
-    security::SecurityReporting,
-    server::Server,
-};
-#[cfg(not(miri))]
-use crate::mcp::server::ServiceError;
-use crate::mcp::{
-    read::{paginate_operations, revision_action},
-    tools::ToolService,
-};
-#[cfg(not(miri))]
 use crate::{
-    agent::Role, manifest::QueuePosition, mcp::tools::ToolState, member::Member, queue::WorkQueue,
+    agent::Role,
+    manifest::QueuePosition,
+    mcp::{
+        protocol::{
+            CommentIssueRequest, CommentOperation, CommentTargetKind, CommentWriteRequest,
+            CreateIssueRequest, CreatePatchRequest, DiffRequest, Document, EditIssueRequest,
+            EditPatchRequest, EmbedReadRequest, EmbedWriteRequest, IssueRequest, IssueStateFilter,
+            ListIssuesRequest, LocationRequest, MAX_EMBED_BYTES, MergePatchRequest, PreparedEmbed,
+            ReactionWriteRequest, ResolveCommentRequest, ReviewCommentRequest, ReviewWriteRequest,
+            SecurityIssueRequest, SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind,
+            SubjectRequest, mutation_identity, parse_location, parse_object,
+            validate_code_location,
+        },
+        read::{MAX_DIFF_BYTES, paginate_operations, revision_action},
+        recovery::{ReactionRecovery, find_review, review_mutation_operation},
+        security::SecurityReporting,
+        server::{Server, ServiceError},
+        tools::{ToolService, ToolState},
+    },
+    member::Member,
+    queue::WorkQueue,
     watcher::Subject,
 };
 
-#[cfg(not(miri))]
 const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 const AUTHOR: &str = "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
 
-#[cfg(not(miri))]
 async fn chat_state() -> crate::chat::State {
     crate::chat::State::memory()
         .await
         .expect("chat state should open")
 }
 
-#[cfg(not(miri))]
 struct RepositoryFixture {
     _root: tempfile::TempDir,
     profile: Profile,
@@ -84,7 +69,6 @@ struct RepositoryFixture {
     head: git2::Oid,
 }
 
-#[cfg(not(miri))]
 impl RepositoryFixture {
     fn new() -> Self {
         let root = tempfile::tempdir().expect("temporary directory should be created");
@@ -269,7 +253,6 @@ impl RepositoryFixture {
     }
 }
 
-#[cfg(not(miri))]
 fn commit(
     repository: &git2::Repository,
     signature: &git2::Signature<'_>,
@@ -294,7 +277,6 @@ fn commit(
         .expect("commit should be created")
 }
 
-#[cfg(not(miri))]
 fn result_id(result: rmcp::Json<Document>) -> String {
     result
         .0
@@ -305,7 +287,6 @@ fn result_id(result: rmcp::Json<Document>) -> String {
         .to_owned()
 }
 
-#[cfg(not(miri))]
 fn object_count(repository: &git2::Repository) -> usize {
     let mut count = 0;
     repository
@@ -320,7 +301,6 @@ fn object_count(repository: &git2::Repository) -> usize {
 }
 
 #[test]
-#[cfg(not(miri))]
 fn mutation_identity_is_stable_and_payload_sensitive() {
     let request = CreateIssueRequest {
         title: "Bug".to_owned(),
@@ -352,7 +332,6 @@ fn mutation_identity_is_stable_and_payload_sensitive() {
 }
 
 #[test]
-#[cfg(not(miri))]
 fn rejects_duplicate_embed_names() {
     PreparedEmbed::prepare(vec![
         EmbedWriteRequest {
@@ -368,7 +347,6 @@ fn rejects_duplicate_embed_names() {
 }
 
 #[test]
-#[cfg(not(miri))]
 fn rejects_oversized_embed_before_base64_decoding() {
     let error = PreparedEmbed::prepare(vec![EmbedWriteRequest {
         name: "oversized.bin".to_owned(),
@@ -388,7 +366,6 @@ fn exposes_the_complete_mcp_tool_set() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn starts_on_a_loopback_capability_url_and_stops() {
     let root = tempfile::tempdir().expect("temporary directory should be created");
     let home = Home::new(root.path()).expect("Radicle home should be created");
@@ -434,7 +411,6 @@ async fn starts_on_a_loopback_capability_url_and_stops() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn limits_tools_to_the_active_delivery_subject() {
     let scope = super::WorkScope::default();
     let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
@@ -485,7 +461,6 @@ async fn limits_tools_to_the_active_delivery_subject() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn authenticated_chat_can_address_the_active_repository() {
     let scope = super::WorkScope::default();
     let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
@@ -515,7 +490,6 @@ async fn authenticated_chat_can_address_the_active_repository() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn chat_reply_targets_only_the_active_channel_and_message() {
     let fixture = RepositoryFixture::new();
     let chat = chat_state().await;
@@ -602,11 +576,9 @@ async fn chat_reply_targets_only_the_active_channel_and_message() {
         .expect_err("repository activity must not gain a chat target");
 }
 
-#[cfg(not(miri))]
 #[derive(Debug, Clone, Copy)]
 struct TestAnnouncer;
 
-#[cfg(not(miri))]
 impl crate::agent::Announcer for TestAnnouncer {
     fn announce(
         &self,
@@ -617,11 +589,9 @@ impl crate::agent::Announcer for TestAnnouncer {
     }
 }
 
-#[cfg(not(miri))]
 #[derive(Debug, Clone, Copy)]
 struct TestAuthorizer(RepoId);
 
-#[cfg(not(miri))]
 #[async_trait::async_trait]
 impl crate::agent::Authorizer for TestAuthorizer {
     async fn authorize(&self, _method: &str) -> Result<(), crate::agent::PublishError> {
@@ -635,11 +605,9 @@ impl crate::agent::Authorizer for TestAuthorizer {
     }
 }
 
-#[cfg(not(miri))]
 #[derive(Debug, Clone)]
 struct RotatingAuthorizer(Arc<tokio::sync::RwLock<crate::manifest::SecurityPolicy>>);
 
-#[cfg(not(miri))]
 #[async_trait::async_trait]
 impl crate::agent::Authorizer for RotatingAuthorizer {
     async fn authorize(&self, _method: &str) -> Result<(), crate::agent::PublishError> {
@@ -653,11 +621,9 @@ impl crate::agent::Authorizer for RotatingAuthorizer {
     }
 }
 
-#[cfg(not(miri))]
 #[derive(Debug, Clone)]
 struct FlakyAnnouncer(Arc<AtomicUsize>);
 
-#[cfg(not(miri))]
 impl crate::agent::Announcer for FlakyAnnouncer {
     fn announce(
         &self,
@@ -675,7 +641,6 @@ impl crate::agent::Announcer for FlakyAnnouncer {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn recovers_a_completed_write_when_the_delivery_is_replayed() {
     let fixture = RepositoryFixture::new();
     let scope = super::WorkScope::default();
@@ -772,7 +737,6 @@ async fn recovers_a_completed_write_when_the_delivery_is_replayed() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn reconciles_security_writes_from_the_delivery_journal() {
     let fixture = RepositoryFixture::new();
     let security_repository = fixture.additional_repository("security-recovery");
@@ -854,7 +818,6 @@ async fn reconciles_security_writes_from_the_delivery_journal() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn recovers_an_unsigned_local_write_without_duplication() {
     let fixture = RepositoryFixture::new();
     let scope = super::WorkScope::default();
@@ -959,7 +922,6 @@ async fn recovers_an_unsigned_local_write_without_duplication() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn recovers_created_comments_and_reviews_by_operation_id() {
     let fixture = RepositoryFixture::new();
     let scope = super::WorkScope::default();
@@ -1165,7 +1127,6 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn replays_stale_mutations_and_distinguishes_repeated_invocations() {
     let fixture = RepositoryFixture::new();
     let scope = super::WorkScope::default();
@@ -1301,7 +1262,6 @@ async fn replays_stale_mutations_and_distinguishes_repeated_invocations() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn distinguishes_identical_mutations_and_replays_concurrent_writes() {
     let fixture = RepositoryFixture::new();
     let scope = super::WorkScope::default();
@@ -1430,7 +1390,6 @@ async fn distinguishes_identical_mutations_and_replays_concurrent_writes() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn preserves_and_signs_workspace_only_patch_commits() {
     use radicle::storage::refs::SignedRefs;
 
@@ -1489,7 +1448,6 @@ async fn preserves_and_signs_workspace_only_patch_commits() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn filters_listed_issues_by_state_and_query() {
     let fixture = RepositoryFixture::new();
     let service = fixture.service().await;
@@ -1568,7 +1526,6 @@ async fn filters_listed_issues_by_state_and_query() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn manages_issues_and_their_comments() {
     let fixture = RepositoryFixture::new();
     let service = fixture.service().await;
@@ -1885,7 +1842,6 @@ async fn manages_issues_and_their_comments() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn reports_security_issues_independently_of_the_issue_allowlist() {
     let fixture = RepositoryFixture::new();
     let service = fixture.service().await;
@@ -1916,7 +1872,6 @@ async fn reports_security_issues_independently_of_the_issue_allowlist() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn reloads_the_security_policy_before_reporting() {
     let fixture = RepositoryFixture::new();
     let old_identity = age::x25519::Identity::generate();
@@ -1979,7 +1934,6 @@ async fn reloads_the_security_policy_before_reporting() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn manages_patch_reviews_and_inline_comments() {
     let fixture = RepositoryFixture::new();
     let service = fixture.service().await;
@@ -2485,7 +2439,6 @@ async fn manages_patch_reviews_and_inline_comments() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn rejects_a_diff_with_a_single_oversized_line() {
     let fixture = RepositoryFixture::new();
     let checkout = git2::Repository::open(&fixture.working).expect("checkout should open");
@@ -2533,7 +2486,7 @@ async fn rejects_a_diff_with_a_single_oversized_line() {
 }
 
 #[tokio::test]
-#[cfg(all(not(miri), unix))]
+#[cfg(unix)]
 async fn groups_diff_lines_by_raw_non_utf8_paths() {
     let fixture = RepositoryFixture::new();
     let checkout = git2::Repository::open(&fixture.working).expect("checkout should open");
@@ -2687,7 +2640,6 @@ fn includes_merges_in_revision_history() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn each_role_offers_only_the_tools_it_can_use() {
     let fixture = RepositoryFixture::new();
     let queue = fixture.queue().await;
@@ -2738,7 +2690,6 @@ async fn each_role_offers_only_the_tools_it_can_use() {
 }
 
 #[tokio::test]
-#[cfg(not(miri))]
 async fn carries_a_note_on_the_next_result_the_building_half_receives() {
     let fixture = RepositoryFixture::new();
     let queue = fixture.queue().await;
@@ -2776,7 +2727,6 @@ async fn carries_a_note_on_the_next_result_the_building_half_receives() {
 // queue only learned about it when the job ended, a run picking that job up again would start
 // over on the issue it came from and leave the patch behind.
 #[tokio::test]
-#[cfg(not(miri))]
 async fn records_the_patch_a_job_produced_before_the_job_can_fail() {
     let fixture = RepositoryFixture::new();
     let queue = fixture.queue().await;
@@ -2868,7 +2818,6 @@ async fn records_the_patch_a_job_produced_before_the_job_can_fail() {
 }
 
 // Returns the branches the runtime made, in order.
-#[cfg(not(miri))]
 fn branches(workspaces: &crate::workspace::Workspaces) -> Vec<String> {
     let output = std::process::Command::new("git")
         .args(["branch", "--list", "--format=%(refname:short)", "nico-rt/*"])
@@ -2885,7 +2834,6 @@ fn branches(workspaces: &crate::workspace::Workspaces) -> Vec<String> {
 // A patch the runtime could not write down must not be reported as a success. The agent would
 // carry on believing the job had become that patch, while a restart would begin the issue again.
 #[tokio::test]
-#[cfg(not(miri))]
 async fn refuses_to_report_a_patch_it_could_not_record() {
     let fixture = RepositoryFixture::new();
     let queue = fixture.queue().await;

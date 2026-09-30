@@ -39,12 +39,13 @@ impl SecuritySetup {
     fn create_repository() -> Result<RepoId, Error> {
         let directory = tempfile::tempdir()?;
         Self::initialize_git(directory.path())?;
+        let name = Self::repository_name();
         Self::command(
             Command::new("rad")
                 .args([
                     "init",
                     "--name",
-                    "radicle-team-security",
+                    &name,
                     "--description",
                     "Encrypted radicle-team security reports",
                     "--private",
@@ -55,6 +56,12 @@ impl SecuritySetup {
         let repository = Self::repository(directory.path())?;
 
         Ok(repository)
+    }
+
+    fn repository_name() -> String {
+        // The RID hashes the initial identity document, not the Git history. A fixed name and
+        // description under the same delegate would try to initialize the same repository again.
+        format!("radicle-team-security-{:032x}", rand::random::<u128>())
     }
 
     fn generate(repository: RepoId) -> Self {
@@ -194,7 +201,6 @@ mod tests {
     use crate::cli::setup::SecuritySetup;
 
     #[test]
-    #[cfg(not(miri))]
     fn initializes_the_security_repository_source() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
 
@@ -214,7 +220,56 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(unix, not(miri)))]
+    fn creates_distinct_security_repositories_for_the_same_operator() {
+        use radicle::{
+            crypto::Seed,
+            identity::Visibility,
+            node::Alias,
+            profile::{Home, Profile},
+            storage::ReadStorage as _,
+        };
+
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let profile = Profile::init(
+            Home::new(root.path().join("identity")).expect("profile home should exist"),
+            Alias::new("operator"),
+            None,
+            Seed::new([41; 32]),
+        )
+        .expect("isolated operator identity should be created");
+        let signer = profile.signer().expect("operator key should be available");
+        let mut repositories = Vec::new();
+        for _ in 0..2 {
+            let source = tempfile::tempdir().expect("source directory should be created");
+            SecuritySetup::initialize_git(source.path()).expect("source should initialize");
+            let git = git2::Repository::open(source.path()).expect("Git repository should open");
+            let (repository, _, _) = radicle::rad::init(
+                &git,
+                SecuritySetup::repository_name()
+                    .parse()
+                    .expect("generated name should be valid"),
+                "Encrypted radicle-team security reports",
+                "main".try_into().expect("branch name should parse"),
+                Visibility::private([]),
+                &signer,
+                &profile.storage,
+            )
+            .expect("another security repository must initialize under the same operator");
+            repositories.push(repository);
+        }
+        assert_ne!(repositories.first(), repositories.last());
+        assert_eq!(
+            profile
+                .storage
+                .repositories()
+                .expect("storage should open")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn authenticates_before_creating_or_granting_access() {
         use std::{fs, os::unix::fs::PermissionsExt as _, process::Command};
 

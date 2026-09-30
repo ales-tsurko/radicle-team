@@ -255,7 +255,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(miri))]
     #[test]
     fn tells_the_chatting_role_who_is_waiting_for_it() {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/prompt-chat");

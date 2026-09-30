@@ -764,10 +764,7 @@ pub enum Error {
     Zerobox(#[from] anyhow::Error),
 }
 
-// Excluded from Miri: every test here loads a real sandbox, which writes a configuration file
-// that Miri's synthetic user ID cannot own, and on Linux resolves bubblewrap through a foreign
-// `access` call that Miri cannot execute.
-#[cfg(all(test, not(miri), any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use url::Url;
 

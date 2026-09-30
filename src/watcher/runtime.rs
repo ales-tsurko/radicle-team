@@ -851,7 +851,7 @@ impl From<conversation::Error> for Error {
     }
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::str::FromStr as _;
 

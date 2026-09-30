@@ -622,7 +622,7 @@ pub(crate) enum AuthenticationError {
     Account,
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use radicle::{
         crypto::{Signature, signature::Signer as _, ssh::keystore::MemorySigner},

@@ -184,7 +184,6 @@ fn shows_the_chosen_provider_in_the_binding_it_tells_you_to_paste() {
 // The binding a non-interactive run prints is pasted into the shared manifest by hand, so the name
 // in it gets the same check the interactive run applies. A typo accepted here is accepted by every
 // reader forever, while the member it names has no credentials and no models.
-#[cfg(not(miri))]
 #[test]
 fn refuses_a_provider_name_nobody_installed_without_a_terminal() {
     let wizard = SetupWizard::new(
@@ -676,7 +675,6 @@ fn accepts_any_checkout_at_the_live_canonical_head() {
 
 // Setup finishing without credentials would leave a member which fails at its first delivery, so
 // the wizard authorizes as part of choosing. A provider needing nothing must not be asked about.
-#[cfg(not(miri))]
 #[test]
 fn authorizes_only_a_chosen_provider_which_needs_it() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -720,7 +718,6 @@ fn authorizes_only_a_chosen_provider_which_needs_it() {
 // A subscription is the whole reason the Claude Code adapter exists, so setup has to be able to
 // record one. Forcing an API key on somebody who holds a subscription makes them buy credit they
 // do not need, or abandon setup.
-#[cfg(not(miri))]
 #[test]
 fn records_a_subscription_without_demanding_an_api_key() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -764,7 +761,6 @@ fn records_a_subscription_without_demanding_an_api_key() {
 
 // A name nobody installed would be written into the shared manifest and accepted there forever,
 // while the member it names has no credentials and no models.
-#[cfg(not(miri))]
 #[test]
 fn refuses_a_provider_name_nobody_installed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -20,7 +20,7 @@ impl AuthenticatedSender {
         self.did
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) const fn for_test(did: Did) -> Self {
         Self { did }
     }

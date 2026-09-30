@@ -74,7 +74,7 @@ jobs:
           bwrap --dev-bind / / --unshare-user true
 
       - name: Install Rust nightly tools
-        run: rustup toolchain install nightly --component miri --component rust-src --component rustfmt
+        run: rustup toolchain install nightly --component rustfmt
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -87,7 +87,8 @@ jobs:
       - name: Install quality tools
         run: |
           cargo binstall --no-confirm --force cargo-nextest cargo-llvm-cov cargo-crap similarity-rs cargo-machete
-          command -v cargo-nextest cargo-llvm-cov cargo-crap similarity-rs cargo-machete
+          cargo binstall --no-confirm --force rumdl@0.2.75
+          command -v cargo-nextest cargo-llvm-cov cargo-crap similarity-rs cargo-machete rumdl
 
       - name: Lint
         run: make lint

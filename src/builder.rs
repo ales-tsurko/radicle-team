@@ -166,7 +166,7 @@ pub enum Error {
     Abandoned(i64),
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{path::PathBuf, str::FromStr as _, sync::Arc};
 

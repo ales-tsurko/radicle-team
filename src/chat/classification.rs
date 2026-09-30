@@ -1,7 +1,7 @@
 //! Fail-closed reduction of IRC messages into authenticated chat work.
 
 #![cfg_attr(
-    any(not(test), miri),
+    not(test),
     expect(
         dead_code,
         reason = "the IRC ingress is isolated behind its transport and classifier boundary"
@@ -289,7 +289,7 @@ pub(crate) enum Error {
     Member,
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::str::FromStr as _;
 

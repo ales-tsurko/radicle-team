@@ -1,7 +1,5 @@
 //! Identity provisioning must succeed before any repository access is available.
 
-#![cfg(not(miri))]
-
 use std::{path::Path, process::Command};
 
 use radicle::{identity::Did, storage::ReadStorage as _};

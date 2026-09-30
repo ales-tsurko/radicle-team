@@ -1,7 +1,7 @@
 //! Persistent identities for received IRC messages.
 
 #![cfg_attr(
-    any(not(test), miri),
+    not(test),
     expect(
         dead_code,
         reason = "chat persistence is isolated behind one complete crate-private boundary"
@@ -110,7 +110,7 @@ impl State {
         Ok(Self { database })
     }
 
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     pub(crate) async fn memory() -> Result<Self, Error> {
         let database = Database::memory().await?;
         database.execute(SCHEMA).await?;
@@ -342,7 +342,7 @@ pub(crate) enum Error {
     OutboxMessageNotFound(OutboxId),
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{fs, path::Path, str::FromStr as _};
 

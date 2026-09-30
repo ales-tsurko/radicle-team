@@ -64,11 +64,6 @@ fn main() {
         .find(|argument| !argument.starts_with('-'))
         .map(String::as_str);
 
-    // Miri implements neither the polling syscalls a Tokio IO runtime needs nor process spawning,
-    // so these checks cannot run under it.
-    if cfg!(miri) {
-        return;
-    }
     // Agent sandboxing fails closed where Zerobox has no enforcing backend, so there is nothing to
     // observe on those platforms.
     if !cfg!(any(target_os = "macos", target_os = "linux")) {

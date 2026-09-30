@@ -123,7 +123,7 @@ struct Request {
     completion: oneshot::Sender<Result<(), Error>>,
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{path::PathBuf, str::FromStr as _, time::Duration};
 

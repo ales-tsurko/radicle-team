@@ -391,17 +391,14 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
-    #[cfg(not(miri))]
     use std::{fs, path::Path};
 
     use crate::{
         home::MemberHome,
-        sandbox::{Config, NetworkAccess},
+        sandbox::{Config, ConfigError, NetworkAccess},
     };
-    #[cfg(not(miri))]
-    use crate::sandbox::ConfigError;
 
     fn member_home(root: impl Into<std::path::PathBuf>) -> MemberHome {
         MemberHome::at(root)
@@ -419,7 +416,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(miri))]
     fn round_trips_every_policy_value() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let home = member_home(directory.path());
@@ -468,7 +464,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(miri))]
     fn accepts_disabled_network_and_rejects_relative_paths() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let home = member_home(directory.path());

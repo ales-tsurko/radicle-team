@@ -70,7 +70,7 @@ pub enum Error {
     AlreadyRunning(Box<Path>),
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{
         fs,
