@@ -280,7 +280,12 @@ The member lock prevents the runtime from using the worktree during setup. Once
 published, the patch preserves the commit when the coder moves to job branches.
 Setup refuses to replace unrelated uncommitted work.
 
-Setup finishes once the patch is published and local configuration is ready. A
+Setup keeps the member's node running until at least one repository seed
+confirms fetching the published patch. If replication fails or times out, setup
+reports the error and retains the patch so rerunning setup can retry its
+replication.
+
+Setup finishes once the patch is replicated and local configuration is ready. A
 repository delegate reviews and merges the patch into the canonical branch. You
 can start `run` before the merge: it waits for the approved manifest before
 starting agents or processing repository work. A proposed manifest never

@@ -9,7 +9,7 @@ use std::{
 
 use radicle::{
     identity::{Did, RepoId},
-    node::{Handle as _, Node, NodeId, policy::Scope},
+    node::{Node, NodeId, policy::Scope, seed::Store as _},
     profile::Profile as RadicleProfile,
     storage::{ReadRepository as _, ReadStorage as _},
 };
@@ -536,18 +536,55 @@ impl Application {
 
     pub(crate) async fn announce_setup_patch(&self) -> Result<(), Error> {
         let runtime = Runtime::start(self, Ownership::Verify).await?;
-        let mut node = runtime.node.node().clone();
-        let repository = self.repository;
-        let namespace = *runtime.identity.profile().id();
-        let result = tokio::task::spawn_blocking(move || {
-            node.announce_refs_for(repository, [namespace])
-                .map(|_| ())
-                .map_err(|error| Error::Node(node::Error::Control(error)))
-        })
-        .await
-        .map_err(|error| Error::Task(error.to_string()));
-        let result = result.and_then(std::convert::identity);
+        self.report_setup("Replicating manifest patch to a repository seed");
+        // `announce_refs_for` only queues an announcement. Keep the node alive while the CLI
+        // waits, then verify its acknowledgement: `rad sync` can succeed with no seeds.
+        let result = async {
+            let output = Self::sync_output(
+                || Ok(self.announce_command(&runtime.identity)),
+                self.repository,
+                runtime.identity.did(),
+                SYNC_TIMEOUT,
+            )
+            .await?;
+            self.ensure_running()?;
+            self.validate_sync_output(&runtime.identity, self.repository, output)?;
+            let profile = runtime.identity.profile().clone();
+            let repository = self.repository;
+            tokio::task::spawn_blocking(move || Self::confirm_replication(&profile, repository))
+                .await
+                .map_err(|error| Error::Task(error.to_string()))
+                .flatten()
+        }
+        .await;
         Self::finish_after_stop(result, runtime.stop(&self.shutdown).await)
+    }
+
+    fn announce_command(&self, identity: &identity::Identity) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("rad");
+        command.args(["sync", "--announce", "--replicas", "1", "--timeout", "30s"]);
+        for seed in &self.seeds {
+            command.arg("--seed").arg(seed.to_string());
+        }
+        command.arg(self.repository.to_string());
+        identity.configure_radicle_command(command.as_std_mut());
+        command
+    }
+
+    fn confirm_replication(profile: &RadicleProfile, repository: RepoId) -> Result<(), Error> {
+        let stored = profile.storage.repository(repository)?;
+        let refs = radicle::storage::refs::RefsAt::new(&stored, *profile.id())?;
+        let database = profile.database()?;
+        for seed in database.seeds_for(&repository)? {
+            let seed = seed?;
+            if seed.nid != *profile.id() && seed.synced_at.oid == refs.at {
+                return Ok(());
+            }
+        }
+        Err(Error::ReplicationUnconfirmed {
+            repository,
+            did: profile.did(),
+        })
     }
 
     // Resolves this member's directory.
@@ -1870,6 +1907,23 @@ pub enum Error {
         /// Diagnostic output from Radicle.
         details: String,
     },
+    /// No remote seed acknowledged the member's current signed references.
+    #[error("no seed confirmed replication of {repository} as {did}; retry setup")]
+    ReplicationUnconfirmed {
+        /// Repository whose patch must be replicated.
+        repository: RepoId,
+        /// Member whose signed references must be fetched.
+        did: Did,
+    },
+    /// Reading the member's current signed references failed.
+    #[error("failed to read signed references: {0}")]
+    SignedReferences(#[from] radicle::storage::refs::sigrefs::read::error::Read),
+    /// Opening the node's replication database failed.
+    #[error("failed to open node replication database: {0}")]
+    NodeDatabase(#[from] radicle::node::db::Error),
+    /// Reading seed replication acknowledgements failed.
+    #[error("failed to read seed replication acknowledgements: {0}")]
+    SeedReplication(#[from] radicle::node::seed::Error),
     /// Opening or validating the Radicle repository failed.
     #[error("failed to access Radicle repository: {0}")]
     Repository(#[from] radicle::storage::RepositoryError),
@@ -2129,7 +2183,7 @@ mod tests {
         crypto::Seed,
         git::Oid,
         identity::{RepoId, doc::Visibility},
-        node::Alias,
+        node::{Alias, Timestamp, seed::Store as _},
         profile::{Home, Profile},
         storage::ReadStorage as _,
     };
@@ -2141,6 +2195,90 @@ mod tests {
         manifest::{Revision, ValidatedBinding},
         member::Member,
     };
+
+    #[test]
+    fn requires_a_remote_acknowledgement_of_the_current_signed_references() {
+        let root = tempfile::tempdir().expect("fixture directory should exist");
+        let profile = Profile::init(
+            Home::new(root.path().join("identity")).expect("identity home should create"),
+            Alias::new("replication-test"),
+            None,
+            Seed::generate(),
+        )
+        .expect("identity should create");
+        let checkout = git2::Repository::init(root.path().join("checkout"))
+            .expect("checkout should initialize");
+        checkout
+            .set_head("refs/heads/main")
+            .expect("main should select");
+        let tree = checkout
+            .treebuilder(None)
+            .expect("tree builder should create")
+            .write()
+            .expect("tree should write");
+        let tree = checkout.find_tree(tree).expect("tree should read");
+        let signature =
+            git2::Signature::now("Test", "test@example.com").expect("signature should create");
+        checkout
+            .commit(Some("HEAD"), &signature, &signature, "Initial", &tree, &[])
+            .expect("commit should create");
+        let (repository, _, _) = radicle::rad::init(
+            &checkout,
+            "replication-test".try_into().expect("name should parse"),
+            "Replication test",
+            "main".try_into().expect("branch should parse"),
+            Visibility::Public,
+            &profile.signer().expect("signer should load"),
+            &profile.storage,
+        )
+        .expect("repository should initialize");
+        let stored = profile
+            .storage
+            .repository(repository)
+            .expect("storage should open");
+        let refs = radicle::storage::refs::RefsAt::new(&stored, *profile.id())
+            .expect("signed references should read");
+        let unconfirmed = || {
+            assert!(matches!(
+                Application::confirm_replication(&profile, repository),
+                Err(super::Error::ReplicationUnconfirmed { repository: rid, did })
+                    if rid == repository && did == profile.did()
+            ));
+        };
+        unconfirmed();
+        let mut database = profile.database_mut().expect("database should open");
+        database
+            .synced(&repository, profile.id(), refs.at, Timestamp::EPOCH + 1)
+            .expect("local record should write");
+        unconfirmed();
+        let remote = "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7"
+            .parse()
+            .expect("remote node should parse");
+        database = database
+            .init(
+                &remote,
+                radicle::node::Features::SEED,
+                &Alias::new("seed"),
+                &radicle::node::UserAgent::default(),
+                Timestamp::EPOCH,
+                [],
+            )
+            .expect("remote node should register");
+        database
+            .synced(
+                &repository,
+                &remote,
+                Oid::from_sha1([0; 20]),
+                Timestamp::EPOCH + 1,
+            )
+            .expect("stale acknowledgement should write");
+        unconfirmed();
+        database
+            .synced(&repository, &remote, refs.at, Timestamp::EPOCH + 2)
+            .expect("current acknowledgement should write");
+        Application::confirm_replication(&profile, repository)
+            .expect("current remote acknowledgement should satisfy replication");
+    }
 
     #[cfg(unix)]
     #[tokio::test]

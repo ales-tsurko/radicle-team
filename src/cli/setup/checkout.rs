@@ -379,7 +379,7 @@ mod tests {
     use radicle::{
         crypto::Seed,
         identity::Visibility,
-        node::Alias,
+        node::{Alias, Handle as _, config::PeerConfig, policy::Scope},
         profile::{Home, Profile},
         storage::{
             ReadRepository as _, ReadStorage as _, SignRepository as _, WriteRepository as _,
@@ -395,6 +395,7 @@ mod tests {
         identity::{KeyProtection, Manager, Provider},
         manifest::{FILE_NAME, Manifest, QueuePosition, TriggerAccess},
         member::Member,
+        node::NodeManager,
         queue::WorkQueue,
         watcher::Subject,
         workspace::Workspaces,
@@ -438,27 +439,29 @@ mod tests {
                 Seed::new([41; 32]),
             )
             .expect("operator identity should create");
-            let signer = operator.signer().expect("operator signer should load");
-            let (repository, _, _) = radicle::rad::init(
-                &git,
-                "setup-test".try_into().expect("name should parse"),
-                "Setup test",
-                "main".try_into().expect("branch should parse"),
-                Visibility::default(),
-                &signer,
-                &operator.storage,
-            )
-            .expect("Radicle repository should create");
             let home = MemberHome::at(root.path().join("maya"));
             home.create().expect("member home should create");
-            home.record(Member::Maya, repository)
-                .expect("member should bind to repository");
+            home.record_identity(Member::Maya)
+                .expect("identity owner should be recorded");
             let provider = Provider::Managed {
                 protection: KeyProtection::Unencrypted,
             };
             let identity = Manager::default()
                 .load(Member::Maya, &home, &provider)
                 .expect("member identity should create");
+            let signer = operator.signer().expect("operator signer should load");
+            let (repository, _, _) = radicle::rad::init(
+                &git,
+                "setup-test".try_into().expect("name should parse"),
+                "Setup test",
+                "main".try_into().expect("branch should parse"),
+                Visibility::private([identity.did()]),
+                &signer,
+                &operator.storage,
+            )
+            .expect("Radicle repository should create");
+            home.record(Member::Maya, repository)
+                .expect("member should bind to repository");
             // Replicate the operator's repository into isolated member storage without a network.
             let stored = operator
                 .storage
@@ -504,6 +507,152 @@ mod tests {
                 TriggerAccess::Delegates,
             )
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the rad and radicle-node binaries"]
+    async fn retains_the_patch_when_no_seed_can_replicate_it() {
+        let fixture = Fixture::new();
+        let checkout = RepositoryCheckout::open(&fixture.application)
+            .await
+            .expect("member checkout should open");
+        let mut config = checkout.identity.profile().config.clone();
+        config.preferred_seeds.clear();
+        config.node.peers = PeerConfig::Static;
+        config
+            .write(&checkout.identity.profile().home().config())
+            .expect("member configuration should write");
+        checkout
+            .prepare(fixture.proposal(&checkout))
+            .expect("manifest should prepare");
+        let id = checkout.publish(1).expect("patch should publish locally");
+        let socket = checkout.identity.profile().home().socket_default();
+        drop(checkout);
+
+        assert!(matches!(
+            fixture.application.announce_setup_patch().await,
+            Err(crate::application::Error::ReplicationUnconfirmed { .. })
+        ));
+        assert!(!socket.exists(), "failed setup must also stop its node");
+        let checkout = RepositoryCheckout::open(&fixture.application)
+            .await
+            .expect("failed setup should release the member lock");
+        assert_eq!(
+            checkout.publish(1).expect("retry should reuse the patch"),
+            id
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the rad and radicle-node binaries"]
+    async fn replicates_the_patch_before_stopping_the_member_node() {
+        let fixture = Fixture::new();
+        let repository = fixture.application.repository();
+        let mut config = fixture.operator.config.clone();
+        config.preferred_seeds.clear();
+        config.node.peers = PeerConfig::Static;
+        config.node.listen = vec!["127.0.0.1:0".parse().expect("address should parse")];
+        config
+            .write(&fixture.operator.home().config())
+            .expect("seed configuration should write");
+        let seed_home = MemberHome::at(fixture._root.path().join("seed"));
+        seed_home.create().expect("seed home should create");
+        seed_home
+            .record(Member::Nico, repository)
+            .expect("seed home should create");
+        let seed_identity = Manager::default()
+            .load(
+                Member::Nico,
+                &seed_home,
+                &Provider::RadicleHome {
+                    home: fixture.operator.home().path().to_owned(),
+                    expected_did: Some(fixture.operator.did()),
+                },
+            )
+            .expect("seed identity should load");
+        let seed = NodeManager::start(&seed_identity, &seed_home)
+            .await
+            .expect("seed node should start");
+        let mut node = seed.node().clone();
+        fixture
+            .operator
+            .seed(repository, Scope::All, &mut node)
+            .expect("operator should seed all member namespaces");
+        let address = node
+            .listen_addrs()
+            .expect("seed addresses should read")
+            .into_iter()
+            .next()
+            .expect("seed should listen");
+        let application = fixture
+            .application
+            .clone()
+            .with_seed(*fixture.operator.id());
+        let checkout = RepositoryCheckout::open(&application)
+            .await
+            .expect("member checkout should open");
+        let mut config = checkout.identity.profile().config.clone();
+        config.preferred_seeds = vec![
+            (
+                *fixture.operator.id(),
+                address
+                    .to_string()
+                    .parse()
+                    .expect("seed address should parse"),
+            )
+                .into(),
+        ];
+        config.node.peers = PeerConfig::Static;
+        config
+            .write(&checkout.identity.profile().home().config())
+            .expect("member configuration should write");
+        checkout
+            .prepare(fixture.proposal(&checkout))
+            .expect("manifest should prepare");
+        let id = checkout.publish(1).expect("patch should publish locally");
+        let did = checkout.identity.did();
+        let socket = checkout.identity.profile().home().socket_default();
+        drop(checkout);
+
+        let stored = fixture
+            .operator
+            .storage
+            .repository(repository)
+            .expect("seed storage should open");
+        let patches =
+            radicle::cob::patch::Patches::open(&stored, radicle::cob::store::access::ReadOnly)
+                .expect("seed patches should open");
+        assert!(
+            patches
+                .get(&id)
+                .expect("seed patches should read")
+                .is_none()
+        );
+        application
+            .announce_setup_patch()
+            .await
+            .expect("setup should replicate the patch before returning");
+        let patch = patches
+            .get(&id)
+            .expect("replicated patch should read")
+            .expect("patch must already exist in seed storage");
+        assert_eq!(patch.author().id(), &did);
+        assert_eq!(
+            stored
+                .canonical_head()
+                .expect("canonical head should read")
+                .1,
+            fixture.base
+        );
+        assert!(
+            Manifest::load_optional_repository(&stored)
+                .expect("canonical manifest should read")
+                .is_none()
+        );
+        assert!(!socket.exists(), "setup must stop and reap its member node");
+
+        assert_eq!(patches.counts().expect("patch count should read").open, 1);
+        seed.stop().await.expect("seed should stop cleanly");
     }
 
     #[tokio::test]
