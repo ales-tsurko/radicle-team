@@ -35,7 +35,7 @@ With the [prerequisites](docs/setup.md#prerequisites) installed, install the
 ```sh
 cargo install --path . --locked
 rad-team setup nico --repo rad:... --home ../nico
-rad-team run nico --repo rad:... --home ../nico
+rad-team run --home ../nico
 ```
 
 Replace `rad:...` with your repository ID and follow the setup prompts.

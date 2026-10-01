@@ -326,11 +326,22 @@ working copy.
 
 ## Run a member
 
-After setup finishes, start the watcher:
+After setup finishes, start the watcher from the member directory or any of its
+subdirectories:
 
 ```sh
-rad-team run nico --repo rad:...
+rad-team run
 ```
+
+From elsewhere, select the member directory explicitly:
+
+```sh
+rad-team run --home ./nico-z3cyot...
+```
+
+`run` reads both the member and repository ID recorded by setup. It accepts
+neither a member argument nor `--repo`. An ordinary repository checkout does not
+contain the member's identity and state; run setup first.
 
 The process owns the member's node for its lifetime. If manifest approval is
 pending, it keeps synchronizing and waits for the canonical binding. Once
@@ -344,7 +355,7 @@ destination and verbosity are chosen by the process rather than fixed in the
 library. `RUST_LOG` selects the verbosity, defaulting to `warn`:
 
 ```sh
-RUST_LOG=radicle_team=debug rad-team run nico --repo rad:...
+RUST_LOG=radicle_team=debug rad-team run
 ```
 
 At `info` the process reports what it decided and why:
@@ -388,8 +399,8 @@ needs beyond the provider's API is in
 Set up and run each member independently:
 
 ```sh
-rad-team run nico --repo rad:...
-rad-team run maya --repo rad:...
+rad-team run --home ~/Desktop/nico-z3cyot...
+rad-team run --home ~/Desktop/maya-z3cyot...
 ```
 
 Each gets its own folder, side by side:

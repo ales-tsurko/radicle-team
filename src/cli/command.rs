@@ -14,7 +14,7 @@ use crate::{
         provider as provider_command,
         setup::{Error as SetupError, SetupWizard},
     },
-    home::ENVIRONMENT_VARIABLE,
+    home::{ENVIRONMENT_VARIABLE, MemberHome},
     identity::{KeyProtection, Provider},
     member::Member,
     shutdown::Shutdown,
@@ -46,19 +46,21 @@ impl Cli {
         }
     }
 
-    /// Returns the selected team member, for the commands which run one.
+    /// Returns the member explicitly selected for setup; `run` reads it from the member home.
     #[must_use]
     pub fn member(&self) -> Option<Member> {
-        self.options().map(|options| options.member)
+        match &self.command {
+            Command::Setup(options) => Some(options.member),
+            Command::Run(_) | Command::Providers(_) | Command::Login(_) => None,
+        }
     }
 
-    /// Returns the repository to use, for the commands which need one.
+    /// Returns the repository explicitly selected for setup; `run` reads it from the member home.
     #[must_use]
     pub fn repository(&self) -> Option<RepoId> {
         match &self.command {
             Command::Setup(options) => options.repo,
-            Command::Run(options) => Some(options.repo),
-            Command::Providers(_) | Command::Login(_) => None,
+            Command::Run(_) | Command::Providers(_) | Command::Login(_) => None,
         }
     }
 
@@ -84,38 +86,29 @@ impl Cli {
     ///
     /// # Errors
     ///
-    /// Returns an error when `setup` was given no directory and the working directory cannot be
-    /// read, or identity-only setup has no repository to build an application for.
+    /// Returns an error when the member directory cannot be resolved, its recorded member or
+    /// repository is invalid, or no repository has been selected.
     pub fn application(self) -> Result<Application, Error> {
-        let mode = self.mode();
-        let repository = self.repository();
-        let options = self
-            .command
-            .into_options()
-            .ok_or(Error::NotAMemberCommand)?;
-        let repository = repository.ok_or(Error::RepositoryRequired)?;
-        let mut application = Application::new(options.member, repository)
-            .with_identity_provider(options.identity_provider());
-        match (options.home, mode) {
-            (Some(home), _) => application = application.with_home(home),
-            (None, Mode::Setup) => {
-                application = application.with_home(
-                    Application::default_setup_home(options.member, Some(repository))?.path(),
-                );
+        match self.command {
+            Command::Setup(options) => options.options.application(
+                options.member,
+                options.repo.ok_or(Error::RepositoryRequired)?,
+            ),
+            Command::Run(mut options) => {
+                let home = match &options.home {
+                    Some(path) => MemberHome::at(path),
+                    None => MemberHome::discover()?,
+                };
+                let marker = home.marker()?;
+                let member = marker.member()?;
+                let repository = marker
+                    .repository()?
+                    .ok_or_else(|| Error::UnboundIdentity(home.path().into()))?;
+                options.home = Some(home.path().into());
+                options.application(member, repository)
             }
-            (None, _) => {}
+            Command::Providers(_) | Command::Login(_) => Err(Error::NotAMemberCommand),
         }
-        if let Some(manifest) = options.manifest {
-            application = application.with_manifest_file(manifest);
-        }
-        if let Some(provider) = options.provider {
-            application = application.with_provider(provider);
-        }
-        for seed in options.seeds {
-            application = application.with_seed(seed);
-        }
-
-        Ok(application)
     }
 
     /// Executes the selected command.
@@ -145,8 +138,8 @@ impl Cli {
         if let Command::Setup(options) = &self.command
             && options.identity_only
         {
-            let member = options.member.member;
-            let home = match &options.member.home {
+            let member = options.member;
+            let home = match &options.options.home {
                 Some(home) => crate::home::MemberHome::at(home),
                 None => Application::default_setup_home(member, options.repo)?,
             };
@@ -154,7 +147,7 @@ impl Cli {
                 member,
                 options.repo,
                 home,
-                options.member.identity_provider(),
+                options.options.identity_provider(),
             )
             .await?;
             println!("{member} identity: {did}");
@@ -198,8 +191,19 @@ pub enum Error {
     #[error("this command does not run a team member")]
     NotAMemberCommand,
     /// A repository operation was requested without selecting a repository.
-    #[error("--repo is required for full setup or run")]
+    #[error("--repo is required for full setup")]
     RepositoryRequired,
+    /// The member directory records an unknown member.
+    #[error("invalid member in the member directory: {0}")]
+    Member(#[from] crate::member::UnknownMember),
+    /// The member directory records an invalid repository identifier.
+    #[error("invalid repository ID in the member directory: {0}")]
+    Repository(#[from] radicle::identity::IdError),
+    /// Only an identity has been prepared in this member directory.
+    #[error(
+        "member home '{0}' has no repository binding; complete setup with --repo and --home first"
+    )]
+    UnboundIdentity(PathBuf),
 }
 
 impl From<provider_command::Error> for Error {
@@ -237,8 +241,8 @@ pub enum Mode {
 enum Command {
     /// Prepare a member identity and repository.
     Setup(SetupOptions),
-    /// Run a member.
-    Run(RunOptions),
+    /// Run the member configured in the current directory or --home.
+    Run(Options),
     /// List the model providers this machine can run members on.
     Providers(ProvidersOptions),
     /// Authorize a model provider.
@@ -248,16 +252,8 @@ enum Command {
 impl Command {
     const fn options(&self) -> Option<&Options> {
         match self {
-            Self::Setup(options) => Some(&options.member),
-            Self::Run(options) => Some(&options.member),
-            Self::Providers(_) | Self::Login(_) => None,
-        }
-    }
-
-    fn into_options(self) -> Option<Options> {
-        match self {
-            Self::Setup(options) => Some(options.member),
-            Self::Run(options) => Some(options.member),
+            Self::Setup(options) => Some(&options.options),
+            Self::Run(options) => Some(options),
             Self::Providers(_) | Self::Login(_) => None,
         }
     }
@@ -265,23 +261,16 @@ impl Command {
 
 #[derive(Debug, Args)]
 struct SetupOptions {
+    // Team member to select: nico, maya, leon, vera, nora, or theo.
+    member: Member,
     #[command(flatten)]
-    member: Options,
+    options: Options,
     /// Repository to prepare; optional when only provisioning an identity.
     #[arg(short, long, required_unless_present = "identity_only")]
     repo: Option<RepoId>,
     /// Save the member identity and print its DID without starting a node or fetching.
     #[arg(long)]
     identity_only: bool,
-}
-
-#[derive(Debug, Args)]
-struct RunOptions {
-    #[command(flatten)]
-    member: Options,
-    /// Radicle repository to watch.
-    #[arg(short, long)]
-    repo: RepoId,
 }
 
 #[derive(Debug, Args)]
@@ -309,8 +298,6 @@ struct LoginOptions {
 
 #[derive(Debug, Args)]
 struct Options {
-    // Team member to select: nico, maya, leon, vera, nora, or theo.
-    member: Member,
     // Application home containing isolated member data.
     #[arg(long, env = ENVIRONMENT_VARIABLE, value_name = "PATH")]
     home: Option<PathBuf>,
@@ -335,6 +322,29 @@ struct Options {
 }
 
 impl Options {
+    fn application(self, member: Member, repository: RepoId) -> Result<Application, Error> {
+        let mut application =
+            Application::new(member, repository).with_identity_provider(self.identity_provider());
+        let home = match self.home {
+            Some(home) => home,
+            None => Application::default_setup_home(member, Some(repository))?
+                .path()
+                .into(),
+        };
+        application = application.with_home(home);
+        if let Some(manifest) = self.manifest {
+            application = application.with_manifest_file(manifest);
+        }
+        if let Some(provider) = self.provider {
+            application = application.with_provider(provider);
+        }
+        for seed in self.seeds {
+            application = application.with_seed(seed);
+        }
+
+        Ok(application)
+    }
+
     fn identity_provider(&self) -> Provider {
         match &self.identity_home {
             Some(home) => Provider::RadicleHome {
@@ -358,7 +368,8 @@ mod tests {
     use radicle::identity::RepoId;
 
     use crate::{
-        cli::{Cli, Mode},
+        cli::{Cli, Error, Mode},
+        home::{self, MemberHome},
         member::Member,
     };
 
@@ -368,7 +379,7 @@ mod tests {
     fn parses_every_member() {
         for member in Member::ALL {
             assert!(matches!(
-                Cli::try_parse_from(["rad-team", "run", member.id(), "--repo", REPOSITORY]),
+                Cli::try_parse_from(["rad-team", "setup", member.id(), "--repo", REPOSITORY]),
                 Ok(cli) if cli.member() == Some(member)
             ));
         }
@@ -377,7 +388,7 @@ mod tests {
     #[test]
     fn parses_repository() {
         assert!(matches!(
-            Cli::try_parse_from(["rad-team", "run", "nico", "--repo", REPOSITORY]),
+            Cli::try_parse_from(["rad-team", "setup", "nico", "--repo", REPOSITORY]),
             Ok(cli)
                 if cli.repository()
                     == Some(
@@ -391,15 +402,7 @@ mod tests {
     #[test]
     fn parses_home() {
         assert!(matches!(
-            Cli::try_parse_from([
-                "rad-team",
-                "run",
-                "nico",
-                "--repo",
-                REPOSITORY,
-                "--home",
-                "/team"
-            ]),
+            Cli::try_parse_from(["rad-team", "run", "--home", "/team"]),
             Ok(cli) if cli.home() == Some(std::path::Path::new("/team"))
         ));
     }
@@ -410,9 +413,6 @@ mod tests {
         let cli = Cli::try_parse_from([
             "rad-team",
             "run",
-            "nico",
-            "--repo",
-            REPOSITORY,
             "--identity-home",
             "/radicle",
             "--expected-did",
@@ -436,15 +436,8 @@ mod tests {
 
     #[test]
     fn configures_an_unencrypted_managed_identity() {
-        let cli = Cli::try_parse_from([
-            "rad-team",
-            "run",
-            "nico",
-            "--repo",
-            REPOSITORY,
-            "--unencrypted-identity",
-        ])
-        .expect("CLI should parse");
+        let cli = Cli::try_parse_from(["rad-team", "run", "--unencrypted-identity"])
+            .expect("CLI should parse");
 
         assert_eq!(
             cli.identity_provider(),
@@ -460,9 +453,6 @@ mod tests {
             Cli::try_parse_from([
                 "rad-team",
                 "run",
-                "nico",
-                "--repo",
-                REPOSITORY,
                 "--expected-did",
                 "did:key:z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7"
             ]),
@@ -471,34 +461,58 @@ mod tests {
     }
 
     #[test]
-    fn builds_the_application() {
+    fn builds_the_application_from_the_member_home() {
+        const SEED: &str = "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let home = MemberHome::at(root.path());
+        let repository = REPOSITORY.parse().expect("repository should parse");
+        home.record(Member::Maya, repository)
+            .expect("member marker should be recorded");
         let application = Cli::try_parse_from([
             "rad-team",
             "run",
-            "nico",
-            "--repo",
-            REPOSITORY,
             "--home",
-            "/team",
+            home.path().to_str().expect("home should be UTF-8"),
             "--manifest",
             "/manifest.toml",
+            "--provider",
+            "claude",
+            "--seed",
+            SEED,
+            "--unencrypted-identity",
         ])
         .expect("CLI should parse")
         .application();
 
         let application = application.expect("application should build");
-        assert_eq!(application.member(), Member::Nico);
-        assert_eq!(application.home(), Some(std::path::Path::new("/team")));
+        assert_eq!(application.member(), Member::Maya);
+        assert_eq!(application.repository(), repository);
+        assert_eq!(application.home(), Some(home.path()));
         assert_eq!(
             application.manifest_file(),
             Some(std::path::Path::new("/manifest.toml"))
+        );
+        assert_eq!(application.provider(), Some("claude"));
+        assert_eq!(
+            application.seeds(),
+            &[SEED.parse().expect("seed should parse")]
+        );
+        assert_eq!(
+            application.identity_provider(),
+            &crate::identity::Provider::Managed {
+                protection: crate::identity::KeyProtection::Unencrypted,
+            }
+        );
+        assert!(
+            !home.identity().exists(),
+            "resolving a run must not provision an identity"
         );
     }
 
     #[test]
     fn rejects_an_unknown_member() {
         assert!(matches!(
-            Cli::try_parse_from(["rad-team", "run", "unknown", "--repo", REPOSITORY]),
+            Cli::try_parse_from(["rad-team", "setup", "unknown", "--repo", REPOSITORY]),
             Err(error) if error.kind() == ErrorKind::ValueValidation
         ));
     }
@@ -512,12 +526,13 @@ mod tests {
         .expect("setup CLI should parse");
 
         assert_eq!(cli.mode(), Mode::Setup);
-        assert_eq!(
-            cli.application()
-                .expect("application should build")
-                .seeds()
-                .len(),
-            1
+        let application = cli.application().expect("application should build");
+        assert_eq!(application.seeds().len(), 1);
+        assert!(
+            application
+                .home()
+                .expect("home should be selected")
+                .ends_with("nico-z3cyotNH")
         );
     }
 
@@ -533,20 +548,13 @@ mod tests {
         ])
         .expect("setup should accept identity-only provisioning");
         assert!(matches!(
-            Cli::try_parse_from([
-                "rad-team",
-                "run",
-                "maya",
-                "--repo",
-                REPOSITORY,
-                "--identity-only",
-            ]),
+            Cli::try_parse_from(["rad-team", "run", "--identity-only"]),
             Err(error) if error.kind() == ErrorKind::UnknownArgument
         ));
     }
 
     #[test]
-    fn provisions_without_a_repository_but_full_setup_and_run_require_one() {
+    fn provisions_without_a_repository_but_full_setup_requires_one() {
         let cli = Cli::try_parse_from(["rad-team", "setup", "maya", "--identity-only"])
             .expect("identity provisioning should not require a home or repository");
         assert_eq!(cli.repository(), None);
@@ -561,10 +569,89 @@ mod tests {
         .expect("identity provisioning should not need a repository");
         assert_eq!(cli.repository(), None);
         assert_eq!(cli.home(), Some(std::path::Path::new("/team/maya")));
-        for command in ["setup", "run"] {
+        assert!(matches!(cli.application(), Err(Error::RepositoryRequired)));
+        assert!(matches!(
+            Cli::try_parse_from(["rad-team", "setup", "maya", "--home", "/team/maya"]),
+            Err(error) if error.kind() == ErrorKind::MissingRequiredArgument
+        ));
+    }
+
+    #[test]
+    fn run_takes_neither_a_member_nor_a_repository() {
+        let cli = Cli::try_parse_from(["rad-team", "run"])
+            .expect("run should need no member or repository argument");
+        assert_eq!(cli.mode(), Mode::Run);
+        assert_eq!(cli.member(), None);
+        assert_eq!(cli.repository(), None);
+        for arguments in [
+            vec!["rad-team", "run", "maya"],
+            vec!["rad-team", "run", "--repo", REPOSITORY],
+        ] {
             assert!(matches!(
-                Cli::try_parse_from(["rad-team", command, "maya", "--home", "/team/maya"]),
-                Err(error) if error.kind() == ErrorKind::MissingRequiredArgument
+                Cli::try_parse_from(arguments),
+                Err(error) if error.kind() == ErrorKind::UnknownArgument
+            ));
+        }
+    }
+
+    #[test]
+    fn run_rejects_a_home_without_a_repository_binding() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let home = MemberHome::at(root.path());
+        home.record_identity(Member::Maya)
+            .expect("member marker should be recorded");
+        let cli = Cli::try_parse_from([
+            "rad-team",
+            "run",
+            "--home",
+            home.path().to_str().expect("home should be UTF-8"),
+        ])
+        .expect("run should parse");
+        assert!(
+            matches!(cli.application(), Err(Error::UnboundIdentity(path)) if path == home.path())
+        );
+        assert!(
+            !home.process_lock().exists(),
+            "run must fail before acquiring the identity"
+        );
+    }
+
+    #[test]
+    fn run_rejects_missing_or_invalid_member_markers() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let home = MemberHome::at(root.path().join("missing"));
+        let cli = Cli::try_parse_from([
+            "rad-team",
+            "run",
+            "--home",
+            home.path().to_str().expect("home should be UTF-8"),
+        ])
+        .expect("run should parse");
+        assert!(matches!(
+            cli.application(),
+            Err(Error::Home(home::Error::MarkerUnreadable { .. }))
+        ));
+        assert!(!home.path().exists(), "run must not create a member home");
+
+        for (member, repository) in [("unknown", REPOSITORY), ("maya", "invalid")] {
+            std::fs::write(
+                root.path().join(home::MARKER),
+                format!("member = {member:?}\nrepository = {repository:?}\n"),
+            )
+            .expect("invalid marker should be written");
+            let cli = Cli::try_parse_from([
+                "rad-team",
+                "run",
+                "--home",
+                root.path().to_str().expect("home should be UTF-8"),
+            ])
+            .expect("run should parse");
+            let error = cli
+                .application()
+                .expect_err("invalid recorded binding must be rejected");
+            assert!(matches!(
+                (member, error),
+                ("unknown", Error::Member(_)) | ("maya", Error::Repository(_))
             ));
         }
     }
