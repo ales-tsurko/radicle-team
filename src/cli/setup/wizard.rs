@@ -9,7 +9,7 @@ use std::{
     str::FromStr as _,
 };
 
-use radicle::identity::Did;
+use radicle::identity::{Did, project::ProjectName};
 
 use crate::{
     Application, Setup, SetupStatus,
@@ -472,7 +472,11 @@ impl SetupWizard {
     }
 
     async fn provision_security_repository(&self, did: Did) -> Result<SecuritySetup, Error> {
-        tokio::task::spawn_blocking(move || SecuritySetup::provision(did)).await?
+        let name: ProjectName = cliclack::input("Security repository name")
+            .placeholder("my-project-security")
+            .validate(|value: &String| value.parse::<ProjectName>().map(|_| ()))
+            .interact()?;
+        tokio::task::spawn_blocking(move || SecuritySetup::provision(name, did)).await?
     }
 
     async fn select_security_repository(&self, did: Did) -> Result<SecuritySetup, Error> {

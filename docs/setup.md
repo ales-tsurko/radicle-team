@@ -300,13 +300,16 @@ does not require a canonical merge.
 ### Creating a manifest from scratch
 
 The wizard asks who may trigger the repository's artificial contributors, then
-whether to create the security-report repository or use an existing RID. It
-grants the member DID access, generates an age encryption identity, and shows
-its recovery key once — save that key outside every agent environment. Later
-members are granted access through the same repository authority.
+whether to create the security-report repository or use an existing RID. When
+creating one, it asks for a recognizable name, such as `my-project-security`.
+Names follow Radicle's rules: letters, numbers, `-`, `_`, and `.`. It grants the
+member DID access, generates an age encryption identity, and shows its recovery
+key once — save that key outside every agent environment. Later members are
+granted access through the same repository authority.
 
-Each newly created security repository has a unique name and RID, so another
-team or a repeated setup attempt does not collide with an earlier creation.
+Each newly created security repository has a distinct RID, including when a name
+is reused, so another team or a repeated setup attempt does not collide with an
+earlier creation.
 
 That repository must be private, the user's own Radicle node must be running,
 and the user's Radicle identity must be able to update its access list. A public

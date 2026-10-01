@@ -4,7 +4,7 @@ use std::{process::Command, str::FromStr as _};
 
 use age::{secrecy::ExposeSecret as _, x25519};
 use radicle::{
-    identity::{Did, RepoId},
+    identity::{Did, RepoId, project::ProjectName},
     profile::Profile,
 };
 
@@ -23,9 +23,9 @@ pub(crate) struct SecuritySetup {
 }
 
 impl SecuritySetup {
-    pub(super) fn provision(did: Did) -> Result<Self, Error> {
+    pub(super) fn provision(name: ProjectName, did: Did) -> Result<Self, Error> {
         Self::authenticate()?;
-        let repository = Self::create_repository()?;
+        let repository = Self::create_repository(&name)?;
         Self::grant_access(repository, did)?;
         Ok(Self::generate(repository))
     }
@@ -36,18 +36,18 @@ impl SecuritySetup {
         Ok(Self::generate(repository))
     }
 
-    fn create_repository() -> Result<RepoId, Error> {
+    fn create_repository(name: &ProjectName) -> Result<RepoId, Error> {
         let directory = tempfile::tempdir()?;
         Self::initialize_git(directory.path())?;
-        let name = Self::repository_name();
+        let description = Self::repository_description();
         Self::command(
             Command::new("rad")
                 .args([
                     "init",
                     "--name",
-                    &name,
+                    name.as_str(),
                     "--description",
-                    "Encrypted radicle-team security reports",
+                    &description,
                     "--private",
                     "--no-confirm",
                 ])
@@ -58,10 +58,13 @@ impl SecuritySetup {
         Ok(repository)
     }
 
-    fn repository_name() -> String {
-        // The RID hashes the initial identity document, not the Git history. A fixed name and
-        // description under the same delegate would try to initialize the same repository again.
-        format!("radicle-team-security-{:032x}", rand::random::<u128>())
+    fn repository_description() -> String {
+        // The RID hashes the initial identity document, not the Git history. Keep a nonce in the
+        // description so using the same human-readable name again still creates a distinct RID.
+        format!(
+            "Encrypted radicle-team security reports ({:032x})",
+            rand::random::<u128>()
+        )
     }
 
     fn generate(repository: RepoId) -> Self {
@@ -243,18 +246,22 @@ mod tests {
             let source = tempfile::tempdir().expect("source directory should be created");
             SecuritySetup::initialize_git(source.path()).expect("source should initialize");
             let git = git2::Repository::open(source.path()).expect("Git repository should open");
-            let (repository, _, _) = radicle::rad::init(
+            let (repository, document, _) = radicle::rad::init(
                 &git,
-                SecuritySetup::repository_name()
+                "my-project-security"
                     .parse()
-                    .expect("generated name should be valid"),
-                "Encrypted radicle-team security reports",
+                    .expect("chosen name should be valid"),
+                &SecuritySetup::repository_description(),
                 "main".try_into().expect("branch name should parse"),
                 Visibility::private([]),
                 &signer,
                 &profile.storage,
             )
             .expect("another security repository must initialize under the same operator");
+            assert_eq!(
+                document.project().expect("project should read").name(),
+                "my-project-security"
+            );
             repositories.push(repository);
         }
         assert_ne!(repositories.first(), repositories.last());
@@ -293,7 +300,11 @@ mod tests {
                 .parse()
                 .expect("repository ID should parse");
             for result in [
-                SecuritySetup::provision(profile.did()).map(|_| ()),
+                SecuritySetup::provision(
+                    "my-project-security".parse().expect("name should parse"),
+                    profile.did(),
+                )
+                .map(|_| ()),
                 SecuritySetup::grant(repository, profile.did()),
             ] {
                 if case == "auth-fails" {
