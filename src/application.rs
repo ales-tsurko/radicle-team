@@ -1985,14 +1985,14 @@ pub enum Error {
     /// Nothing says which models this member runs on.
     #[error(
         "no model provider chosen for this member; name one in the manifest binding or pass \
-         --provider NAME, and see `radicle-team providers` for what this machine has"
+         --provider NAME, and see `rad-team providers` for what this machine has"
     )]
     NoModelProvider,
     /// The provider names an agent application this build has no adapter for.
     #[error(transparent)]
     UnknownAdapter(#[from] agent::adapter::Unknown),
     /// The provider needs authorizing and nothing on this machine has authorized it.
-    #[error("provider '{0}' is not authorized on this machine; run `radicle-team login {0}`")]
+    #[error("provider '{0}' is not authorized on this machine; run `rad-team login {0}`")]
     UnauthorizedProvider(String),
     /// Writing a role's standing instructions failed.
     #[error("could not install the member's instructions: {0}")]

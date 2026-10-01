@@ -32,14 +32,14 @@ signing_did = "did:key:z6Mk..."          # required
 generation = 1                           # required, monotonic
 state = "active"                         # required, "active" or "inactive"
 mcp_allow = ["read", "comments"]         # required, may be empty
-provider = "gpt"                         # optional, a name from `radicle-team providers`
+provider = "gpt"                         # optional, a name from `rad-team providers`
 ```
 
 `provider` names which models a member runs on, never a model itself: which
 model of that provider it gets is decided from the member's character sheet by
 that provider's own configuration, which is machine-local. Whoever runs the
-member holds its credentials and pays for it, so
-`radicle-team run --provider NAME` overrides what the manifest says.
+member holds its credentials and pays for it, so `rad-team run --provider NAME`
+overrides what the manifest says.
 
 Every value here is read once at startup, so changing one needs a restart. The
 single exception is the delegate set, which is re-read on every scan: granting

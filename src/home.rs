@@ -320,8 +320,8 @@ pub enum Error {
     WorkingDirectory(#[source] io::Error),
     /// No member directory was found.
     #[error(
-        "no member directory found in '{start}' or its parents; run `radicle-team setup` to \
-         create one, or pass --home PATH"
+        "no member directory found in '{start}' or its parents; run `rad-team setup` to create \
+         one, or pass --home PATH"
     )]
     NotFound {
         /// Directory the search started from.

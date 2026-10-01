@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
 
+[[bin]]
+name = "rad-team"
+path = "src/main.rs"
+
 [workspace]
 resolver = "3"
 members = ["sandbox-helper"]

@@ -3,7 +3,7 @@
 People working with a team need a way to reach its members quickly, without
 opening an issue for every question. Chat is that channel.
 
-`radicle-team` speaks IRC. A member joins its team's channels as an ordinary IRC
+`rad-team` speaks IRC. A member joins its team's channels as an ordinary IRC
 client under its own nick, and the people it works with join as ordinary users.
 There is no bot, no gateway, and no platform integration. The team runs its own
 server.
@@ -138,9 +138,8 @@ put server-specific behavior in the source.
 
 [`deploy/ergo`](../deploy/ergo) contains a Compose deployment with SASL-only
 access, closed registration, persistent SQLite history, and bounded retention.
-`radicle-team setup` creates each repository member's separate client
-certificate beside its Radicle home and prints the fingerprint used in the
-manifest.
+`rad-team setup` creates each repository member's separate client certificate
+beside its Radicle home and prints the fingerprint used in the manifest.
 
 [Sable](https://github.com/Libera-Chat/sable) is the Rust server to revisit.
 Today it is experimental, its capability set is undocumented, and Libera Chat

@@ -1,6 +1,6 @@
 # Documentation
 
-`radicle-team` runs a small, fixed cast of artificial contributors as isolated
+`rad-team` runs a small, fixed cast of artificial contributors as isolated
 Radicle identities. Start with [setup and operation](setup.md) to get one
 running, or [architecture](architecture.md) to understand how it is put
 together.

@@ -453,8 +453,8 @@ pub(crate) enum Error {
     },
     /// Claude Code holds no authorization this run could use.
     #[error(
-        "this provider is not authorized ({status}); run `radicle-team login anthropic` for a \
-         key, or sign in to Claude Code yourself under this member's own harness home"
+        "this provider is not authorized ({status}); run `rad-team login anthropic` for a key, or \
+         sign in to Claude Code yourself under this member's own harness home"
     )]
     Unauthorized {
         /// How the probe ended.

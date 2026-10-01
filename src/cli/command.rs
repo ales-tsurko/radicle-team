@@ -21,7 +21,7 @@ use crate::{
 };
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Run an AI contributor on Radicle")]
+#[command(name = "rad-team", version, about = "Run an AI contributor on Radicle")]
 /// Command-line interface for the Radicle team application.
 pub struct Cli {
     #[command(subcommand)]
@@ -368,7 +368,7 @@ mod tests {
     fn parses_every_member() {
         for member in Member::ALL {
             assert!(matches!(
-                Cli::try_parse_from(["radicle-team", "run", member.id(), "--repo", REPOSITORY]),
+                Cli::try_parse_from(["rad-team", "run", member.id(), "--repo", REPOSITORY]),
                 Ok(cli) if cli.member() == Some(member)
             ));
         }
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn parses_repository() {
         assert!(matches!(
-            Cli::try_parse_from(["radicle-team", "run", "nico", "--repo", REPOSITORY]),
+            Cli::try_parse_from(["rad-team", "run", "nico", "--repo", REPOSITORY]),
             Ok(cli)
                 if cli.repository()
                     == Some(
@@ -392,7 +392,7 @@ mod tests {
     fn parses_home() {
         assert!(matches!(
             Cli::try_parse_from([
-                "radicle-team",
+                "rad-team",
                 "run",
                 "nico",
                 "--repo",
@@ -408,7 +408,7 @@ mod tests {
     fn configures_an_existing_identity() {
         const DID: &str = "did:key:z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
         let cli = Cli::try_parse_from([
-            "radicle-team",
+            "rad-team",
             "run",
             "nico",
             "--repo",
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn configures_an_unencrypted_managed_identity() {
         let cli = Cli::try_parse_from([
-            "radicle-team",
+            "rad-team",
             "run",
             "nico",
             "--repo",
@@ -458,7 +458,7 @@ mod tests {
     fn expected_did_requires_existing_identity_home() {
         assert!(matches!(
             Cli::try_parse_from([
-                "radicle-team",
+                "rad-team",
                 "run",
                 "nico",
                 "--repo",
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn builds_the_application() {
         let application = Cli::try_parse_from([
-            "radicle-team",
+            "rad-team",
             "run",
             "nico",
             "--repo",
@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn rejects_an_unknown_member() {
         assert!(matches!(
-            Cli::try_parse_from(["radicle-team", "run", "unknown", "--repo", REPOSITORY]),
+            Cli::try_parse_from(["rad-team", "run", "unknown", "--repo", REPOSITORY]),
             Err(error) if error.kind() == ErrorKind::ValueValidation
         ));
     }
@@ -507,13 +507,7 @@ mod tests {
     fn parses_setup_mode_and_seeds() {
         const SEED: &str = "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
         let cli = Cli::try_parse_from([
-            "radicle-team",
-            "setup",
-            "nico",
-            "--repo",
-            REPOSITORY,
-            "--seed",
-            SEED,
+            "rad-team", "setup", "nico", "--repo", REPOSITORY, "--seed", SEED,
         ])
         .expect("setup CLI should parse");
 
@@ -530,7 +524,7 @@ mod tests {
     #[test]
     fn identity_only_is_available_only_for_setup() {
         let _cli = Cli::try_parse_from([
-            "radicle-team",
+            "rad-team",
             "setup",
             "maya",
             "--repo",
@@ -540,7 +534,7 @@ mod tests {
         .expect("setup should accept identity-only provisioning");
         assert!(matches!(
             Cli::try_parse_from([
-                "radicle-team",
+                "rad-team",
                 "run",
                 "maya",
                 "--repo",
@@ -553,11 +547,11 @@ mod tests {
 
     #[test]
     fn provisions_without_a_repository_but_full_setup_and_run_require_one() {
-        let cli = Cli::try_parse_from(["radicle-team", "setup", "maya", "--identity-only"])
+        let cli = Cli::try_parse_from(["rad-team", "setup", "maya", "--identity-only"])
             .expect("identity provisioning should not require a home or repository");
         assert_eq!(cli.repository(), None);
         let cli = Cli::try_parse_from([
-            "radicle-team",
+            "rad-team",
             "setup",
             "maya",
             "--identity-only",
@@ -569,7 +563,7 @@ mod tests {
         assert_eq!(cli.home(), Some(std::path::Path::new("/team/maya")));
         for command in ["setup", "run"] {
             assert!(matches!(
-                Cli::try_parse_from(["radicle-team", command, "maya", "--home", "/team/maya"]),
+                Cli::try_parse_from(["rad-team", command, "maya", "--home", "/team/maya"]),
                 Err(error) if error.kind() == ErrorKind::MissingRequiredArgument
             ));
         }

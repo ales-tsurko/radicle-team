@@ -36,7 +36,7 @@ async fn run() -> ExitCode {
     match cli.execute().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            tracing::error!(%error, "application stopped");
+            tracing::error!(target: "radicle_team", %error, "application stopped");
             ExitCode::FAILURE
         }
     }

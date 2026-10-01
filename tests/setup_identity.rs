@@ -12,7 +12,7 @@ use radicle_team::{
 const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
 
 fn provision(home: &Path, member: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_radicle-team"))
+    Command::new(env!("CARGO_BIN_EXE_rad-team"))
         .args([
             "setup",
             member,
@@ -34,7 +34,7 @@ fn identity_only_creates_a_default_folder_and_reuses_its_identity() {
     for (repository, folder) in [(None, "maya"), (Some(REPOSITORY), "maya-z3cyotNH")] {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let home = MemberHome::at(root.path().join(folder));
-        let mut command = Command::new(env!("CARGO_BIN_EXE_radicle-team"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rad-team"));
         command
             .current_dir(root.path())
             .args(["setup", "maya", "--identity-only", "--unencrypted-identity"])
@@ -138,7 +138,7 @@ fn provisions_a_stable_identity_without_repository_access_or_node_tools() {
     );
 
     // Selecting a repository later must preserve the key rather than provisioning another one.
-    let bound = Command::new(env!("CARGO_BIN_EXE_radicle-team"))
+    let bound = Command::new(env!("CARGO_BIN_EXE_rad-team"))
         .args([
             "setup",
             "maya",

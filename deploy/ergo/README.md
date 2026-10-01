@@ -21,7 +21,7 @@ first accounts. Remove it after provisioning:
 ERGO_SASL_EXEMPTED='[]' docker compose -f deploy/ergo/compose.yaml up -d
 ```
 
-Run `radicle-team setup` once for each repository member. It creates
+Run `rad-team setup` once for each repository member. It creates
 `<member folder>/irc-identity.pem` with mode `0600` and prints the certificate
 fingerprint needed by the manifest.
 
@@ -33,7 +33,7 @@ certificate with `NickServ CERT`, then register the channel. Set it invite-only,
 registered-only, and secret, and grant persistent access only to that
 repository's participants. Ergo documents the exact commands through
 `NickServ HELP` and `ChanServ HELP`; this avoids encoding Ergo-specific services
-syntax in `radicle-team`.
+syntax in `rad-team`.
 
 The server SPKI pin can be derived from its certificate with:
 

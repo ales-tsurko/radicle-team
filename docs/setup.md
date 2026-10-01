@@ -1,6 +1,6 @@
 # Setup and operation
 
-Installing `radicle-team`, provisioning a member, running it, and finding things
+Installing `rad-team`, provisioning a member, running it, and finding things
 when something goes wrong. Configuration lives in
 [the manifest reference](manifest.md) and [the sandbox reference](sandbox.md).
 
@@ -59,7 +59,7 @@ projects:
 
 ```sh
 cd ~/Desktop
-radicle-team setup nico --repo rad:z3cyot...
+rad-team setup nico --repo rad:z3cyot...
 ```
 
 Setup starts and stops its own Radicle node; no running node is required. If
@@ -123,7 +123,7 @@ Pass `--home PATH` to name the folder yourself.
 Create the identity before granting repository access:
 
 ```sh
-radicle-team setup nico --identity-only
+rad-team setup nico --identity-only
 ```
 
 This succeeds without starting a node, connecting to seeds, fetching the
@@ -146,7 +146,7 @@ Grant the trusted seed access and arrange replication as described in the
 setup with that seed's NID:
 
 ```sh
-radicle-team setup nico --home ./nico --repo rad:z3cyot... --seed z6Mk...
+rad-team setup nico --home ./nico --repo rad:z3cyot... --seed z6Mk...
 ```
 
 For full setup, point `--home` at the folder created in the first stage. Full
@@ -168,7 +168,7 @@ RAD_HOME=./nico/identity rad self --did
 ### Choosing models
 
 ```sh
-radicle-team providers
+rad-team providers
 ```
 
 ```text
@@ -193,7 +193,7 @@ settings, and how it accepts being authorized. Adding a model, a setting, or a
 whole provider is an edited file rather than a new release.
 
 ```sh
-radicle-team login gpt
+rad-team login gpt
 ```
 
 Once per provider, per machine — one person's account is one account however
@@ -326,7 +326,7 @@ working copy.
 After setup finishes, start the watcher:
 
 ```sh
-radicle-team run nico --repo rad:...
+rad-team run nico --repo rad:...
 ```
 
 The process owns the member's node for its lifetime. If manifest approval is
@@ -341,7 +341,7 @@ destination and verbosity are chosen by the process rather than fixed in the
 library. `RUST_LOG` selects the verbosity, defaulting to `warn`:
 
 ```sh
-RUST_LOG=radicle_team=debug radicle-team run nico --repo rad:...
+RUST_LOG=radicle_team=debug rad-team run nico --repo rad:...
 ```
 
 At `info` the process reports what it decided and why:
@@ -385,8 +385,8 @@ needs beyond the provider's API is in
 Set up and run each member independently:
 
 ```sh
-radicle-team run nico --repo rad:...
-radicle-team run maya --repo rad:...
+rad-team run nico --repo rad:...
+rad-team run maya --repo rad:...
 ```
 
 Each gets its own folder, side by side:
@@ -396,7 +396,7 @@ Each gets its own folder, side by side:
 ~/Desktop/maya-z3cyot.../
 ```
 
-Run `radicle-team run` from inside one of them, or from anywhere with `--home`.
+Run `rad-team run` from inside one of them, or from anywhere with `--home`.
 Commands search the current directory and its parents for
 `radicle-team-member.toml`, the way `git` finds a repository. A file of that
 name which does not read back as a marker does not end the search, since

@@ -1,6 +1,6 @@
 # Architecture
 
-`radicle-team` runs one selected team member as an isolated Radicle identity and
+`rad-team` runs one selected team member as an isolated Radicle identity and
 node. The same machine can run multiple members as separate processes.
 
 Each member is an artificial contributor: a persistent identity that receives
@@ -111,8 +111,8 @@ To everyone in the channel a member looks like any other user. Addressing one by
 nick reaches it. Two members in the same channel are two users, the same way two
 people are.
 
-Nothing about the chosen server appears in the source. `radicle-team` speaks IRC
-and IRCv3, so any conforming server works. See [chat](chat.md) for what a server
+Nothing about the chosen server appears in the source. `rad-team` speaks IRC and
+IRCv3, so any conforming server works. See [chat](chat.md) for what a server
 must provide and how to deploy one.
 
 

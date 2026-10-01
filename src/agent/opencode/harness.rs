@@ -443,7 +443,7 @@ pub(crate) enum Error {
     /// OpenCode does not offer the configured model.
     #[error(
         "OpenCode does not offer '{0}'; check the name against models.dev and that this provider \
-         is authorized, with `radicle-team login`"
+         is authorized, with `rad-team login`"
     )]
     Model(String),
     /// OpenCode itself could not be run.

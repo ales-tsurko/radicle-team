@@ -10,9 +10,9 @@ and the application that talks to them. What an adapter must do is in
 
 ## What ships
 
-`radicle-team providers` prints the same list on your own machine, and adds
-whether each one is authorized. The models are listed from the one a member
-scored 1 runs on to the one a member scored 5 runs on.
+`rad-team providers` prints the same list on your own machine, and adds whether
+each one is authorized. The models are listed from the one a member scored 1
+runs on to the one a member scored 5 runs on.
 
 |Provider|Adapter|Models|ACC|Authorized with|
 |---|---|---|---|---|

@@ -29,13 +29,13 @@ time rather than run without one.
 
 ## Quick start
 
-With the [prerequisites](docs/setup.md#prerequisites) installed, run from this
-checkout:
+With the [prerequisites](docs/setup.md#prerequisites) installed, install the
+`rad-team` executable from this checkout:
 
 ```sh
 cargo install --path . --locked
-radicle-team setup nico --repo rad:... --home ../nico
-radicle-team run nico --repo rad:... --home ../nico
+rad-team setup nico --repo rad:... --home ../nico
+rad-team run nico --repo rad:... --home ../nico
 ```
 
 Replace `rad:...` with your repository ID and follow the setup prompts.
