@@ -494,7 +494,15 @@ impl Application {
 
     async fn start_run(&self) -> Result<(Runtime, manifest::ValidatedBinding), Error> {
         let runtime = Runtime::start(self, Ownership::Verify).await?;
-        match self.prepare_run(&runtime).await {
+        let prepared = async {
+            let state = watcher::ProcessedActivities::open(&runtime.home.state_database()).await?;
+            let _started = state
+                .started(self.repository, runtime.node.started())
+                .await?;
+            self.prepare_run(&runtime).await
+        }
+        .await;
+        match prepared {
             Ok(binding) => Ok((runtime, binding)),
             Err(error) => self.abandon_run(runtime, error).await,
         }
@@ -1551,6 +1559,7 @@ impl AgentRuntime {
         let watching = watcher.run(
             &profile,
             self.runtime.node.node(),
+            self.runtime.node.started(),
             &state_database,
             watcher::DeliveryRuntime::new(
                 profile.storage.clone(),
@@ -2047,8 +2056,8 @@ pub enum Error {
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    fn refuses_a_directory_belonging_to_another_member_or_repository() {
+    #[tokio::test]
+    async fn refuses_a_directory_belonging_to_another_member_or_repository() {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let repository =
             RepoId::from_urn("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc").expect("repository should parse");
@@ -2069,12 +2078,23 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    wrong.validate_member_home(&home),
+                    wrong.with_home(home.path()).start_run().await,
                     Err(super::Error::MemberDirectory { .. })
                 ),
                 "running in another member's directory would publish under the wrong identity"
             );
         }
+
+        assert!(
+            !home.identity().exists()
+                && !home.node_log().exists()
+                && !home.state_database().exists(),
+            "a refused run must not load keys, start a node, or record a startup cutoff"
+        );
+        drop(
+            crate::identity::MemberLock::acquire(&home)
+                .expect("the rejected run must release its lock"),
+        );
 
         let empty = crate::home::MemberHome::at(root.path().join("empty"));
         empty.create().expect("directory should be created");

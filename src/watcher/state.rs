@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use radicle::{
-    cob::{EntryId, ObjectId},
+    cob::{EntryId, ObjectId, Timestamp},
     identity::RepoId,
 };
 use sqlite::State;
@@ -18,14 +18,19 @@ const SCHEMA: &str = "
         action TEXT NOT NULL,
         PRIMARY KEY (repository, object, operation, action)
     ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS watcher_starts (
+        repository TEXT PRIMARY KEY,
+        started INTEGER NOT NULL
+    ) STRICT;
 ";
 
-pub(super) struct ProcessedActivities {
+pub(crate) struct ProcessedActivities {
     database: Database,
 }
 
 impl ProcessedActivities {
-    pub(super) async fn open(path: &Path) -> Result<Self, Error> {
+    pub(crate) async fn open(path: &Path) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -40,6 +45,33 @@ impl ProcessedActivities {
     async fn from_database(database: Database) -> Result<Self, Error> {
         database.execute(SCHEMA).await?;
         Ok(Self { database })
+    }
+
+    pub(crate) async fn started(
+        &self,
+        repository: RepoId,
+        started: Timestamp,
+    ) -> Result<Timestamp, Error> {
+        let repository = repository.to_string();
+        let started =
+            i64::try_from(started.as_secs()).map_err(|error| Error::Database(error.to_string()))?;
+        let saved = self
+            .database
+            .call(move |connection| {
+                let mut select = connection.prepare(
+                    "INSERT INTO watcher_starts (repository, started) VALUES (?1, ?2)
+                     ON CONFLICT (repository) DO UPDATE SET started = watcher_starts.started
+                     RETURNING started",
+                )?;
+                select.bind((1, repository.as_str()))?;
+                select.bind((2, started))?;
+                select.next()?;
+                select.read::<i64, _>("started")
+            })
+            .await
+            .map_err(Error::from)?;
+        let seconds = u64::try_from(saved).map_err(|error| Error::Database(error.to_string()))?;
+        Ok(Timestamp::from_secs(seconds))
     }
 
     pub(super) async fn contains(
@@ -141,11 +173,43 @@ mod tests {
     use std::str::FromStr as _;
 
     use radicle::{
-        cob::{EntryId, ObjectId},
+        cob::{EntryId, ObjectId, Timestamp},
         identity::RepoId,
     };
 
     use crate::watcher::state::ProcessedActivities;
+
+    #[tokio::test]
+    async fn keeps_the_first_startup_cutoff_across_restarts() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let path = root.path().join("state.db");
+        let repository =
+            RepoId::from_str("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc").expect("valid repository");
+        let state = ProcessedActivities::open(&path)
+            .await
+            .expect("state should open");
+        let first = Timestamp::from_secs(100);
+        assert_eq!(
+            state
+                .started(repository, first)
+                .await
+                .expect("cutoff should be saved"),
+            first
+        );
+        drop(state);
+
+        let reopened = ProcessedActivities::open(&path)
+            .await
+            .expect("state should reopen");
+        assert_eq!(
+            reopened
+                .started(repository, Timestamp::from_secs(200))
+                .await
+                .expect("cutoff should be read"),
+            first,
+            "restarting must not discard activity received after the first startup"
+        );
+    }
 
     #[tokio::test]
     async fn tracks_each_action_once() {

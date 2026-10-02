@@ -52,6 +52,15 @@ agent events:
   and what it publishes back is signed Radicle comments, issues, patches,
   reviews, or reactions.
 
+Assignment discovery and conversation handling scan independently. The node
+subscription is drained continuously, updates are coalesced for both scanners.
+If that subscription closes, it reconnects and requests a rescan. A fresh state
+database saves the node's startup time as its conversation cutoff. Every scan
+skips earlier conversation operations, including history fetched later, while
+operations created during initialization remain eligible. Restarts retain the
+cutoff and delivery checkpoints. Current open assignments still enter the task
+queue regardless of age.
+
 Agent integrations implement the provider-neutral
 [`Talker`](../src/agent/interface.rs), [`Chatter`](../src/agent/interface.rs),
 and [`Coder`](../src/agent/interface.rs) interfaces. The runtime calls `start`

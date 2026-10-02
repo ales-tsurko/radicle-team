@@ -1,10 +1,10 @@
 //! Watcher lifecycle, scanning, and event-stream orchestration.
 
-use std::{path::Path, time::Duration};
+use std::path::Path;
 
 use radicle::{
     cob::{
-        Label, ObjectId, Op, TypedId,
+        Label, ObjectId, Op, Timestamp,
         issue::{Action as IssueAction, IssueStream, Issues, State as IssueState},
         patch::{Action as PatchAction, PatchStream, Patches, State as PatchState},
         store::access::ReadOnly,
@@ -12,9 +12,9 @@ use radicle::{
     },
     crypto::PublicKey,
     identity::{Did, RepoId},
-    node::{Handle as _, Node, NodeId, events::Event as NodeEvent},
+    node::{Handle as _, Node, NodeId},
     profile::Profile as RadicleProfile,
-    storage::{ReadRepository as _, ReadStorage as _, RefUpdate, git::Storage},
+    storage::{ReadRepository as _, ReadStorage as _, git::Storage},
 };
 
 use crate::{
@@ -26,11 +26,11 @@ use crate::{
     watcher::{
         activity::{Activity, Delivery, Kind, Subject},
         classification::{ActionEnvelope, Context as ClassificationContext, NormalizedAction},
+        events::NodeEvents,
         state::ProcessedActivities,
     },
 };
 
-const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 const HISTORY_BUFFER: usize = 32;
 
 macro_rules! history_scanner {
@@ -101,15 +101,22 @@ impl Watcher {
         &self,
         profile: &RadicleProfile,
         node: &Node,
+        started: Timestamp,
         state_path: &Path,
         delivery: DeliveryRuntime,
     ) -> Result<(), Error> {
         let member_id = Self::verify_profile(*profile.id(), node.clone()).await?;
         let storage = profile.storage.clone();
         let state = ProcessedActivities::open(state_path).await?;
-        let events = self.subscribe(node.clone()).await?;
-        self.watch(&storage, member_id, &state, events, &delivery)
-            .await
+        let mut events = NodeEvents::subscribe(self.repository, node.clone()).await?;
+        tokio::select! {
+            watched = self.watch(
+                &storage, member_id, &state, started, events.changes, &delivery,
+            ) => watched,
+            failed = &mut events.failure => {
+                Err(failed.map_err(|error| Error::Task(error.to_string()))?)
+            }
+        }
     }
 
     async fn verify_profile(member_id: PublicKey, node: Node) -> Result<NodeId, Error> {
@@ -126,63 +133,26 @@ impl Watcher {
         storage: &Storage,
         member_id: PublicKey,
         state: &ProcessedActivities,
-        mut events: tokio::sync::mpsc::Receiver<Result<(), Error>>,
+        started: Timestamp,
+        events: tokio::sync::watch::Receiver<()>,
         delivery: &DeliveryRuntime,
     ) -> Result<(), Error> {
-        self.scan_all(storage, member_id, state, delivery).await?;
-        loop {
-            Self::await_update(&mut events).await?;
-            self.scan_all(storage, member_id, state, delivery).await?;
-        }
-    }
-
-    async fn await_update(
-        events: &mut tokio::sync::mpsc::Receiver<Result<(), Error>>,
-    ) -> Result<(), Error> {
-        events.recv().await.ok_or(Error::EventStreamClosed)??;
-        while let Ok(event) = events.try_recv() {
-            event?;
-        }
-        Ok(())
-    }
-
-    async fn subscribe(
-        &self,
-        node: Node,
-    ) -> Result<tokio::sync::mpsc::Receiver<Result<(), Error>>, Error> {
-        let watcher = self.clone();
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let (ready, readiness) = tokio::sync::oneshot::channel();
-        tokio::task::spawn_blocking(move || {
-            let mut events = match node.subscribe(EVENT_TIMEOUT).map_err(Error::from) {
-                Ok(events) => {
-                    if ready.send(Ok(())).is_err() {
-                        return;
-                    }
-                    events
+        let started = state.started(self.repository, started).await?;
+        let scan = |mode, mut updates: tokio::sync::watch::Receiver<()>| async move {
+            loop {
+                updates.borrow_and_update();
+                self.scan_all(storage, member_id, state, delivery, mode)
+                    .await?;
+                if updates.changed().await.is_err() {
+                    return Err::<(), Error>(Error::EventStreamClosed);
                 }
-                Err(error) => {
-                    let _ignored = ready.send(Err(error));
-                    return;
-                }
-            };
-            let result: Result<(), Error> = (|| {
-                loop {
-                    if watcher.next_event_updates_cobs(&mut events)? {
-                        sender
-                            .blocking_send(Ok(()))
-                            .map_err(|_send| Error::EventStreamClosed)?;
-                    }
-                }
-            })();
-            if let Err(error) = result {
-                let _ignored = sender.blocking_send(Err(error));
             }
-        });
-        readiness
-            .await
-            .map_err(|error| Error::Task(error.to_string()))??;
-        Ok(receiver)
+        };
+        tokio::try_join!(
+            scan(ScanMode::Assignments, events.clone()),
+            scan(ScanMode::Conversations(started), events),
+        )?;
+        Ok(())
     }
 
     async fn scan_all(
@@ -191,11 +161,13 @@ impl Watcher {
         member_id: PublicKey,
         state: &ProcessedActivities,
         delivery: &DeliveryRuntime,
+        mode: ScanMode,
     ) -> Result<(), Error> {
         let triggers = self.resolve_triggers(storage).await?;
         tracing::debug!(
             member = %self.member,
             repository = %self.repository,
+            ?mode,
             "scanning repository histories"
         );
         let issues = self.issue_histories(storage.clone());
@@ -203,7 +175,7 @@ impl Watcher {
             issues,
             state,
             delivery,
-            HistorySource::new(member_id, Subject::Issue, &triggers),
+            HistorySource::new(member_id, Subject::Issue, &triggers, mode),
         )
         .await?;
         let patches = self.patch_histories(storage.clone());
@@ -211,7 +183,7 @@ impl Watcher {
             patches,
             state,
             delivery,
-            HistorySource::new(member_id, Subject::Patch, &triggers),
+            HistorySource::new(member_id, Subject::Patch, &triggers, mode),
         )
         .await
     }
@@ -307,7 +279,7 @@ impl Watcher {
                 self.begin_history(object, actionable, source.member_id, source.subject, active)
             }
             HistoryEvent::Operation(operation) => {
-                Self::scan_active(operation, active, state, source.triggers).await
+                Self::scan_active(operation, active, state, source.triggers, source.mode).await
             }
             HistoryEvent::End => Self::finish_active(active, state, delivery).await,
             HistoryEvent::Failed(error) => Err(error),
@@ -348,6 +320,7 @@ impl Watcher {
         active: &mut Option<ActiveHistory>,
         state: &ProcessedActivities,
         triggers: &Triggers,
+        mode: ScanMode,
     ) -> Result<(), Error>
     where
         for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
@@ -362,6 +335,7 @@ impl Watcher {
             &mut active.pending,
             state,
             triggers,
+            mode,
         )
         .await
     }
@@ -403,6 +377,7 @@ impl Watcher {
         pending: &mut PendingActivities,
         state: &ProcessedActivities,
         triggers: &Triggers,
+        mode: ScanMode,
     ) -> Result<(), Error>
     where
         for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
@@ -415,7 +390,26 @@ impl Watcher {
             scope.subject,
             triggers,
         );
+        if matches!(mode, ScanMode::Conversations(started) if operation.timestamp < started) {
+            // The cutoff comes from node startup, not the time this scan encounters an operation.
+            // Apply it on every rescan, including history fetched after initialization. Record
+            // ignored actions too so changing delegates cannot revive historical conversations.
+            // Current open assignments still go through the independent durable task queue.
+            for action in 0..operation.actions.len() {
+                if !activities
+                    .iter()
+                    .any(|activity| activity.action == action && activity.kind == Kind::Assigned)
+                {
+                    let _inserted = state
+                        .insert(scope.repository, scope.object, operation.id, action)
+                        .await?;
+                }
+            }
+        }
         for activity in activities {
+            if !mode.accepts(activity.kind) {
+                continue;
+            }
             let delivery = activity.delivery_id();
             let delivered = state
                 .contains(
@@ -432,43 +426,12 @@ impl Watcher {
         Ok(())
     }
 
-    fn next_event_updates_cobs(
-        &self,
-        events: &mut impl Iterator<Item = Result<NodeEvent, radicle::node::Error>>,
-    ) -> Result<bool, Error> {
-        let event = events.next().ok_or(Error::EventStreamClosed)?;
-        self.event_updates_cobs(event)
-    }
-
-    fn event_updates_cobs(
-        &self,
-        event: Result<NodeEvent, radicle::node::Error>,
-    ) -> Result<bool, Error> {
-        match event {
-            Ok(NodeEvent::RefsFetched { rid, updated, .. }) => {
-                Ok(rid == self.repository && Self::updates_cobs(&updated))
-            }
-            Ok(_) | Err(radicle::node::Error::TimedOut) => Ok(false),
-            Err(error) => Err(error.into()),
-        }
-    }
-
     fn verify_identity(profile: NodeId, node: NodeId) -> Result<(), Error> {
         if profile == node {
             Ok(())
         } else {
             Err(Error::IdentityMismatch { profile, node })
         }
-    }
-
-    fn updates_cobs(updates: &[RefUpdate]) -> bool {
-        updates.iter().any(|update| {
-            update
-                .name()
-                .to_namespaced()
-                .and_then(|name| TypedId::from_namespaced(&name).ok().flatten())
-                .is_some_and(|id| id.is_issue() || id.is_patch())
-        })
     }
 }
 
@@ -564,6 +527,21 @@ impl Assignment {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanMode {
+    Assignments,
+    Conversations(Timestamp),
+}
+
+impl ScanMode {
+    const fn accepts(self, kind: Kind) -> bool {
+        matches!(
+            (self, kind),
+            (Self::Assignments, Kind::Assigned) | (Self::Conversations(_), Kind::Delivered(_))
+        )
+    }
+}
+
 enum HistoryEvent<A> {
     Begin { object: ObjectId, actionable: bool },
     Operation(Op<A>),
@@ -582,6 +560,7 @@ struct HistorySource<'a> {
     member_id: PublicKey,
     subject: fn(ObjectId) -> Subject,
     triggers: &'a Triggers,
+    mode: ScanMode,
 }
 
 impl<'a> HistorySource<'a> {
@@ -589,11 +568,13 @@ impl<'a> HistorySource<'a> {
         member_id: PublicKey,
         subject: fn(ObjectId) -> Subject,
         triggers: &'a Triggers,
+        mode: ScanMode,
     ) -> Self {
         Self {
             member_id,
             subject,
             triggers,
+            mode,
         }
     }
 }
@@ -656,13 +637,13 @@ impl PendingActivities {
         runtime: &DeliveryRuntime,
     ) -> Result<(), Error> {
         for activity in self.skipped {
-            Self::checkpoint(activity, scope, state, runtime).await?;
+            Self::record_delivery(activity.delivery_id(), scope, state).await?;
         }
         if let Some(activity) = self.assignment {
             if assigned && actionable {
                 Self::enqueue(activity, scope, state, runtime).await?;
             } else {
-                Self::checkpoint(activity, scope, state, runtime).await?;
+                Self::record_delivery(activity.delivery_id(), scope, state).await?;
             }
         }
         for (activity, delivery) in self.activities {
@@ -702,7 +683,9 @@ impl PendingActivities {
             ?position,
             "assignment recorded as queued work"
         );
-        Self::checkpoint(activity, scope, state, runtime).await
+        // Assignments do not publish under a talker delivery identity, so acknowledging the
+        // durable task must not wait behind a conversation.
+        Self::record_delivery(activity.delivery_id(), scope, state).await
     }
 
     async fn deliver(
@@ -719,30 +702,6 @@ impl PendingActivities {
             .await
             .map_err(Error::from)?;
         Self::record_delivery(identity, scope, state).await
-    }
-
-    async fn checkpoint(
-        activity: Activity,
-        scope: ScanScope,
-        state: &ProcessedActivities,
-        runtime: &DeliveryRuntime,
-    ) -> Result<(), Error> {
-        let delivery = activity.delivery_id();
-        Self::checkpoint_delivery(delivery, scope, state, runtime).await
-    }
-
-    async fn checkpoint_delivery(
-        delivery: crate::agent::DeliveryId,
-        scope: ScanScope,
-        state: &ProcessedActivities,
-        runtime: &DeliveryRuntime,
-    ) -> Result<(), Error> {
-        runtime
-            .conversations
-            .reconcile(delivery.into())
-            .await
-            .map_err(Error::from)?;
-        Self::record_delivery(delivery, scope, state).await
     }
 
     async fn record_delivery(
@@ -862,12 +821,22 @@ impl From<conversation::Error> for Error {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr as _;
+    use std::{
+        str::FromStr as _,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, UNIX_EPOCH},
+    };
 
     use radicle::{
-        cob::{EntryId, Label, ObjectId, Title},
-        crypto::Seed,
-        identity::{RepoId, doc::Visibility},
+        cob::{
+            EntryId, Label, Manifest, ObjectId, Op, Timestamp, Title, Version,
+            issue::{Action as IssueAction, TYPENAME},
+        },
+        crypto::{PublicKey, Seed},
+        identity::{Did, RepoId, doc::Visibility},
         node::Alias,
         profile::{Home, Profile},
         storage::ReadStorage as _,
@@ -875,14 +844,15 @@ mod tests {
 
     use crate::{
         agent::{Context, McpEndpoint, Talker},
-        conversation::Dispatcher,
-        manifest::{PriorityLabels, QueuePosition},
+        conversation::{Dispatcher, Triggers},
+        manifest::{Limits, PriorityLabels, QueuePosition, RepositoryPolicy, TriggerAccess},
         member::{Member, Profile as MemberProfile},
         queue::TaskQueue,
         watcher::{
             Change, Comment, Subject, Target,
             activity::{Activity, Delivery, Kind},
-            runtime::{DeliveryRuntime, PendingActivities, ScanScope},
+            classification::Context as ClassificationContext,
+            runtime::{DeliveryRuntime, PendingActivities, ScanMode, ScanScope, Watcher},
             state::ProcessedActivities,
         },
         workspace::Workspaces,
@@ -1259,8 +1229,339 @@ mod tests {
         }
     }
 
+    struct RuntimeFixture {
+        _root: tempfile::TempDir,
+        profile: Profile,
+        repository: RepoId,
+        issue: ObjectId,
+        member_id: PublicKey,
+        queue: TaskQueue,
+        state: ProcessedActivities,
+        watcher: Watcher,
+        delivery: DeliveryRuntime,
+        dispatcher: Option<Dispatcher>,
+    }
+
+    impl RuntimeFixture {
+        async fn new() -> Self {
+            let root = tempfile::tempdir().expect("temporary directory should be created");
+            let (profile, repository, issue) = assigned_issue(root.path(), &[]);
+            let member_id = PublicKey::from_str("z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7")
+                .expect("member key should be valid");
+            let queue = TaskQueue::memory(repository, Member::Nico)
+                .await
+                .expect("queue should open");
+            let state = ProcessedActivities::open(&root.path().join("state.db"))
+                .await
+                .expect("state should open");
+            let home = crate::home::MemberHome::at(root.path().join("member"));
+            home.create().expect("home should be created");
+            let workspaces = Workspaces::new(
+                Member::Nico,
+                home,
+                profile.storage.clone(),
+                repository,
+                profile.info(),
+                queue.clone(),
+            );
+            workspaces
+                .initialize()
+                .await
+                .expect("working copies should be prepared");
+            let (conversations, dispatcher) = Dispatcher::new(
+                Member::Nico,
+                workspaces,
+                crate::mcp::ActivityScope::default(),
+            );
+            let delivery = DeliveryRuntime::new(
+                profile.storage.clone(),
+                queue.clone(),
+                PriorityLabels::default(),
+                conversations,
+            );
+            let watcher = Watcher::new(
+                Member::Nico,
+                repository,
+                RepositoryPolicy::new(
+                    TriggerAccess::Anyone,
+                    vec![Did::from(member_id)],
+                    PriorityLabels::default(),
+                    Limits::default(),
+                ),
+            );
+            Self {
+                _root: root,
+                profile,
+                repository,
+                issue,
+                member_id,
+                queue,
+                state,
+                watcher,
+                delivery,
+                dispatcher: Some(dispatcher),
+            }
+        }
+
+        fn comment(&self, body: &str) -> EntryId {
+            let signer = self.profile.signer().expect("signer should load");
+            let stored = self
+                .profile
+                .storage
+                .repository(self.repository)
+                .expect("stored repository should open");
+            let mut issues = self
+                .profile
+                .issues_mut(&stored, &signer)
+                .expect("issues should open");
+            issues
+                .get_mut(&self.issue)
+                .expect("issue should open")
+                .comment(body, *self.issue, [])
+                .expect("comment should be created")
+        }
+
+        fn assign_existing_issue(&self) {
+            let signer = self.profile.signer().expect("signer should load");
+            let stored = self
+                .profile
+                .storage
+                .repository(self.repository)
+                .expect("stored repository should open");
+            let mut issues = self
+                .profile
+                .issues_mut(&stored, &signer)
+                .expect("issues should open");
+            issues
+                .get_mut(&self.issue)
+                .expect("issue should open")
+                .assign([Did::from(self.member_id)])
+                .expect("issue should be assigned");
+        }
+
+        fn create_assignment(&self) -> ObjectId {
+            let signer = self.profile.signer().expect("signer should load");
+            let stored = self
+                .profile
+                .storage
+                .repository(self.repository)
+                .expect("stored repository should open");
+            let mut issues = self
+                .profile
+                .issues_mut(&stored, &signer)
+                .expect("issues should open");
+            *issues
+                .create(
+                    Title::try_from("Implement CRUD operations".to_owned())
+                        .expect("title should be valid"),
+                    "add, done, delete and edit",
+                    &[],
+                    &[Did::from(self.member_id)],
+                    [],
+                )
+                .expect("issue should be created")
+                .id()
+        }
+
+        async fn wait_for_tasks(&self, count: usize) {
+            while self
+                .queue
+                .waiting()
+                .await
+                .expect("queue should be readable")
+                != count
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_state_skips_old_replies_and_discovers_tasks_during_a_slow_reply() {
+        let mut fixture = RuntimeFixture::new().await;
+        let historical = fixture.comment("@nico please inspect this");
+        fixture.assign_existing_issue();
+        let cutoff = Timestamp::from_secs(
+            UNIX_EPOCH
+                .elapsed()
+                .expect("clock should be after the epoch")
+                .as_secs()
+                + 1,
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // This mention arrives after node startup, before the watcher finishes initialization.
+        let current = fixture.comment("@nico please explain the new request");
+        let (updates, events) = tokio::sync::watch::channel(());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut agent = NoopAgent {
+            release: Some(release.clone()),
+            ..NoopAgent::default()
+        };
+        let calls = agent.calls.clone();
+        let reply_started = agent.started.clone();
+        let dispatcher = fixture.dispatcher.take().expect("dispatcher should exist");
+        let exercise = async {
+            reply_started.notified().await;
+            fixture.wait_for_tasks(1).await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "only the mention created during initialization should start the talker"
+            );
+            assert!(
+                fixture
+                    .state
+                    .contains(fixture.repository, fixture.issue, historical, 0)
+                    .await
+                    .expect("historical checkpoint should be readable")
+            );
+
+            assert!(
+                !fixture
+                    .state
+                    .contains(fixture.repository, fixture.issue, current, 0)
+                    .await
+                    .expect("current checkpoint should be readable")
+            );
+
+            let new_issue = fixture.create_assignment();
+            updates.send(()).expect("scanners should be notified");
+            fixture.wait_for_tasks(2).await;
+            let tasks = fixture
+                .queue
+                .pending()
+                .await
+                .expect("tasks should be readable");
+            assert!(
+                tasks
+                    .iter()
+                    .any(|task| task.source == Subject::Issue(new_issue).into()
+                        && task.brief.contains("add, done, delete and edit"))
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the first reply must still be active"
+            );
+            assert!(
+                !fixture
+                    .state
+                    .contains(fixture.repository, fixture.issue, current, 0)
+                    .await
+                    .expect("a slow reply must remain unacknowledged")
+            );
+
+            release.notify_one();
+            while !fixture
+                .state
+                .contains(fixture.repository, fixture.issue, current, 0)
+                .await
+                .expect("completed reply should be readable")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "rescans must not duplicate a reply"
+            );
+        };
+        let watching = fixture.watcher.watch(
+            &fixture.profile.storage,
+            fixture.member_id,
+            &fixture.state,
+            cutoff,
+            events,
+            &fixture.delivery,
+        );
+        tokio::pin!(watching);
+        let dispatching = dispatcher.run(&mut agent);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                () = exercise => Ok(()),
+                result = watching => result.and(Err(super::Error::EventStreamClosed)),
+                result = dispatching => Err(result.err().map(super::Error::from)
+                    .unwrap_or(super::Error::ConversationUnavailable)),
+            }
+        })
+        .await
+        .expect("task discovery must not wait for the slow reply");
+        outcome.expect("the watcher and dispatcher should stay running");
+    }
+
+    #[tokio::test]
+    async fn startup_cutoff_uses_creation_time_on_every_rescan() {
+        let fixture = RuntimeFixture::new().await;
+        let scope = ScanScope::new(
+            Member::Nico,
+            fixture.member_id,
+            fixture.repository,
+            fixture.issue,
+            Subject::Issue(fixture.issue),
+            true,
+        );
+        let triggers = Triggers::new(TriggerAccess::Anyone, Vec::new(), Vec::new());
+        let cutoff = Timestamp::from_secs(100);
+        for _rescan in 0..2 {
+            let mut context = ClassificationContext::new(Limits::default());
+            let mut pending = PendingActivities::default();
+            for (id, seconds) in [
+                ("1111111111111111111111111111111111111111", 99),
+                ("2222222222222222222222222222222222222222", 100),
+                ("3333333333333333333333333333333333333333", 101),
+            ] {
+                let operation = Op::new(
+                    id.parse().expect("operation ID should be valid"),
+                    (
+                        IssueAction::Comment {
+                            body: "@nico please inspect this".to_owned(),
+                            reply_to: None,
+                            embeds: Vec::new(),
+                        },
+                        Vec::new(),
+                    ),
+                    *fixture.profile.id(),
+                    Timestamp::from_secs(seconds),
+                    None,
+                    Manifest::new(TYPENAME.clone(), Version::default()),
+                );
+                let entry = operation.id;
+                Watcher::scan_operation(
+                    operation,
+                    scope,
+                    &mut context,
+                    &mut pending,
+                    &fixture.state,
+                    &triggers,
+                    ScanMode::Conversations(cutoff),
+                )
+                .await
+                .expect("operation should be scanned");
+                assert_eq!(
+                    fixture
+                        .state
+                        .contains(fixture.repository, fixture.issue, entry, 0)
+                        .await
+                        .expect("checkpoint should be readable"),
+                    seconds < 100,
+                    "old operations fetched later must be skipped; startup-second operations stay \
+                     live"
+                );
+            }
+            assert_eq!(
+                pending.activities.len(),
+                2,
+                "the startup-second and later mentions must still await successful delivery"
+            );
+        }
+    }
+
+    #[derive(Default)]
     struct NoopAgent {
         fail_mentions: bool,
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Option<Arc<tokio::sync::Notify>>,
     }
 
     async fn dispatch_pending(
@@ -1272,7 +1573,10 @@ mod tests {
         dispatcher: Dispatcher,
         fail_mentions: bool,
     ) -> Result<(), super::Error> {
-        let mut agent = NoopAgent { fail_mentions };
+        let mut agent = NoopAgent {
+            fail_mentions,
+            ..NoopAgent::default()
+        };
         let (assigned, actionable) = state_flags;
         let pending = pending.dispatch(assigned, actionable, scope, state, runtime);
         let dispatching = dispatcher.run(&mut agent);
@@ -1310,6 +1614,11 @@ mod tests {
             _context: Context,
             _target: Target,
         ) -> Result<(), crate::agent::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
             if self.fail_mentions {
                 Err(crate::agent::Error::new(std::io::Error::other(
                     "expected test failure",

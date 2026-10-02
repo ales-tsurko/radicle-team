@@ -18,10 +18,11 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use radicle::{
+    cob::Timestamp,
     identity::RepoId,
     node::{
         Command as NodeCommand, ConnectOptions, ConnectResult, Handle as _, Node, NodeId, Session,
@@ -44,6 +45,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub struct NodeManager {
     child: ChildHandle,
     node: Node,
+    started: Timestamp,
     socket: PathBuf,
     log: PathBuf,
 }
@@ -166,10 +168,11 @@ impl NodeManager {
             .await
             .map_err(|error| Error::Task(error.to_string()))??;
         let log = home.node_log();
-        let child = Self::spawn(identity, &log).await?;
+        let (child, started) = Self::spawn(identity, &log).await?;
         Ok(Self {
             child: ChildHandle::new(child),
             node,
+            started,
             socket,
             log,
         })
@@ -185,7 +188,7 @@ impl NodeManager {
         Ok(node)
     }
 
-    async fn spawn(identity: &Identity, log: &Path) -> Result<Child, Error> {
+    async fn spawn(identity: &Identity, log: &Path) -> Result<(Child, Timestamp), Error> {
         let output = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -209,13 +212,21 @@ impl NodeManager {
             .stderr(Stdio::from(error))
             .kill_on_drop(true);
         identity.configure_radicle_command(command.as_std_mut());
-        command.spawn().map_err(Error::Spawn)
+        // COB timestamps have second precision. Include that whole second so an operation
+        // created immediately after spawning is not mistaken for historical conversation.
+        let started = Timestamp::from_secs(UNIX_EPOCH.elapsed().map_err(Error::Clock)?.as_secs());
+        let child = command.spawn().map_err(Error::Spawn)?;
+        Ok((child, started))
     }
 
     /// Returns the connected Radicle node handle.
     #[must_use]
     pub const fn node(&self) -> &Node {
         &self.node
+    }
+
+    pub(crate) const fn started(&self) -> Timestamp {
+        self.started
     }
 
     /// Connects configured seeds and waits for their protocol handshakes before fetching.
@@ -553,6 +564,9 @@ pub enum Error {
     /// The node process could not be started.
     #[error("failed to start radicle-node: {0}")]
     Spawn(io::Error),
+    /// The system clock is before the Unix epoch.
+    #[error("failed to record Radicle node startup time: {0}")]
+    Clock(std::time::SystemTimeError),
     /// The node process could not be inspected or reaped.
     #[error("failed to wait for radicle-node: {0}")]
     Wait(io::Error),
@@ -611,7 +625,10 @@ pub enum Error {
 mod tests {
     use std::{fs, path::PathBuf, time::Duration};
 
-    use radicle::node::{Node, NodeId};
+    use radicle::{
+        cob::Timestamp,
+        node::{Node, NodeId},
+    };
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     use crate::{
@@ -672,6 +689,7 @@ mod tests {
         let mut manager = NodeManager {
             child: handle.clone(),
             node: Node::new("unused-control.sock"),
+            started: Timestamp::from_secs(0),
             socket: socket.clone(),
             log: PathBuf::from("node.log"),
         };
@@ -703,6 +721,7 @@ mod tests {
         let mut manager = NodeManager {
             child: ChildHandle::new(child),
             node: Node::new("unused-control.sock"),
+            started: Timestamp::from_secs(0),
             socket: PathBuf::from("unused-control.sock"),
             log: PathBuf::from("node.log"),
         };
@@ -725,6 +744,7 @@ mod tests {
         let manager = NodeManager {
             child: handle.clone(),
             node: Node::new(&socket),
+            started: Timestamp::from_secs(0),
             socket,
             log: root.path().join("node.log"),
         };
@@ -812,6 +832,7 @@ mod tests {
         let manager = NodeManager {
             child: ChildHandle::new(child),
             node: Node::new(&socket),
+            started: Timestamp::from_secs(0),
             socket,
             log: home.node_log(),
         };
@@ -969,6 +990,7 @@ mod tests {
             let mut manager = NodeManager {
                 child: ChildHandle::new(child),
                 node: Node::new(&socket),
+                started: Timestamp::from_secs(0),
                 socket,
                 log: root.path().join("node.log"),
             };
@@ -1012,6 +1034,7 @@ mod tests {
         let mut manager = NodeManager {
             child: ChildHandle::new(child),
             node: Node::new(&socket),
+            started: Timestamp::from_secs(0),
             socket,
             log: PathBuf::from("node.log"),
         };
@@ -1035,6 +1058,7 @@ mod tests {
         let manager = NodeManager {
             child: handle.clone(),
             node: Node::new(std::env::temp_dir().join("radicle-team-unused-socket")),
+            started: Timestamp::from_secs(0),
             socket: std::env::temp_dir().join("radicle-team-unused-socket"),
             log: PathBuf::from("node.log"),
         };

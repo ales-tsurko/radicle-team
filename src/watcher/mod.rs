@@ -11,16 +11,21 @@
 //!
 //! 1. Receive a profile already provisioned and validated by the identity subsystem.
 //! 2. Connect to the local node and verify that its identity matches the profile.
-//! 3. Replay every issue and patch operation to reconstruct classification state.
-//! 4. Dispatch only operations not recorded in the member's local state database.
-//! 5. Subscribe to node events and rescan after relevant collaborative-object references are
-//!    fetched.
+//! 3. Persist the first node startup time as the conversation cutoff. Skip earlier conversations,
+//!    including history fetched later, and queue current open assignments regardless of age.
+//! 4. Replay histories independently for assignments and conversations; dispatch only operations
+//!    not recorded in the member's local state database.
+//! 5. Continuously drain node events and coalesce relevant fetches into rescan notifications for
+//!    both scanners. Renew a closed subscription and rescan to cover missed updates.
 //!
 //! Replaying full histories is intentional: assignments and ownership depend on earlier operations.
 //! The SQLite state store suppresses duplicate output while still allowing the in-memory
 //! classification context to be rebuilt on every scan. Assignment notifications are delayed until
 //! replay completes so closed, merged, or subsequently unassigned objects do not produce stale
 //! work.
+//!
+//! A slow conversation cannot hold up task discovery. Conversation handling remains serialized,
+//! and an unfinished delivery stays uncheckpointed so it can be retried after a restart.
 //!
 //! # Classification architecture
 //!
@@ -41,6 +46,7 @@
 //! - `issue` and `patch` adapt Radicle action enums into normalized actions.
 //! - repository actions are performed through delivery-scoped MCP methods.
 //! - `runtime` owns scanning and node-event orchestration.
+//! - `events` drains node subscriptions without waiting for agents or scans.
 //! - `state` persists processed operation IDs for idempotent rescanning.
 
 pub use crate::watcher::{
@@ -50,10 +56,12 @@ pub use crate::watcher::{
 pub(crate) use crate::watcher::{
     activity::{Activity, Delivery},
     runtime::DeliveryRuntime,
+    state::ProcessedActivities,
 };
 
 mod activity;
 mod classification;
+mod events;
 mod issue;
 mod patch;
 mod runtime;

@@ -409,6 +409,16 @@ reviews, revisions, reactions, resolutions, lifecycle changes, and merges until
 stopped. `SIGINT` and `SIGTERM` trigger graceful node shutdown before the child
 is reaped.
 
+With fresh state, `run` fixes the conversation cutoff when it starts the
+member's node. It skips replies and mentions created before that cutoff,
+including older history fetched afterward. Replies and mentions created from
+startup onward are handled, even if synchronization or initialization is still
+in progress. Current open assignments enter the queue regardless of age.
+Restarting preserves the cutoff and checkpoints and retries unfinished
+deliveries. Task discovery continues while the talking agent is busy. Radicle
+timestamps have second precision, so activity in the startup second counts as
+new.
+
 Operational events are emitted as structured records through `tracing`, so the
 destination and verbosity are chosen by the process rather than fixed in the
 library. Logging defaults to `warn`. Use `--log` to select the verbosity:

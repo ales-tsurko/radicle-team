@@ -175,22 +175,9 @@ impl Handle {
     ) -> Result<(), Error> {
         let (completion, completed) = oneshot::channel();
         self.sender
-            .send(Request::Deliver {
+            .send(Request {
                 activity,
                 delivery,
-                completion,
-            })
-            .await
-            .map_err(|_error| Error::Unavailable)?;
-        completed.await.map_err(|_error| Error::Unavailable)?
-    }
-
-    /// Recovers publications made by a delivery which no longer needs agent attention.
-    pub(crate) async fn reconcile(&self, activity: ActivityId) -> Result<(), Error> {
-        let (completion, completed) = oneshot::channel();
-        self.sender
-            .send(Request::Reconcile {
-                activity,
                 completion,
             })
             .await
@@ -283,23 +270,10 @@ impl Dispatcher {
     /// Runs until every ingress handle has been dropped.
     pub(crate) async fn run(mut self, agent: &mut (impl Talker + ?Sized)) -> Result<(), Error> {
         while let Some(request) = self.receiver.recv().await {
-            match request {
-                Request::Deliver {
-                    activity,
-                    delivery,
-                    completion,
-                } => {
-                    let result = self.dispatch(activity, delivery, agent).await;
-                    let _delivered = completion.send(result);
-                }
-                Request::Reconcile {
-                    activity,
-                    completion,
-                } => {
-                    let result = self.scoped.reconcile(activity).await;
-                    let _reconciled = completion.send(result);
-                }
-            }
+            let result = self
+                .dispatch(request.activity, request.delivery, agent)
+                .await;
+            let _delivered = request.completion.send(result);
         }
         Err(Error::Unavailable)
     }
@@ -334,16 +308,10 @@ impl Dispatcher {
     }
 }
 
-enum Request {
-    Deliver {
-        activity: Activity,
-        delivery: Delivery,
-        completion: oneshot::Sender<Result<(), Error>>,
-    },
-    Reconcile {
-        activity: ActivityId,
-        completion: oneshot::Sender<Result<(), Error>>,
-    },
+struct Request {
+    activity: Activity,
+    delivery: Delivery,
+    completion: oneshot::Sender<Result<(), Error>>,
 }
 
 /// Failure while serializing or handling a conversation delivery.

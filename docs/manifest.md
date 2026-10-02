@@ -219,9 +219,10 @@ pin to match before an `account-tag` can produce a sender DID.
 
 ## Where new work goes
 
-An assignment becomes a task in the member's queue. New work joins the end of
-that queue, an assignment labelled `urgent` goes to the front, and one labelled
-`next` goes after the running task.
+An assignment becomes a task in the member's queue. Waiting tasks run in this
+order: `urgent`, then `next`, then tasks without either label. Within each
+priority, tasks run in arrival order. New assignments do not interrupt the
+running task. If both labels are present, `urgent` wins.
 
 ```toml
 [priority]
