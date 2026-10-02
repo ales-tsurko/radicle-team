@@ -24,7 +24,7 @@ use crate::{
         session::{Outcome, Session},
     },
     member::Profile,
-    provider::{Credentials, Provider, Way},
+    provider::{Credentials, Provider},
     queue::Job,
     sandbox::{AgentCommand, AgentSandbox, Output},
 };
@@ -39,6 +39,9 @@ const PROGRAM: &str = "opencode";
 // their other agent applications' instructions are read as if they were the team's.
 const HOME_VAR: &str = "HOME";
 const CONFIG_VAR: &str = "OPENCODE_CONFIG";
+// The runtime supplies this role's configuration. Project discovery would walk out of its
+// checkout into directories the sandbox deliberately does not grant.
+const PROJECT_CONFIG_VAR: &str = "OPENCODE_CONFIG_PROJECT_DISABLE";
 // What anything run inside the sandbox downloads or builds, from OpenCode's own model registry to
 // whatever a project's toolchain caches. Pointed at the member's cache directory, which its three
 // roles share and which can be removed at any time.
@@ -234,10 +237,13 @@ impl OpenCode {
         layout: &Layout,
     ) -> Result<BTreeMap<String, String>, Error> {
         let cache = config::prepare(layout.cache())?;
+        let data = config::prepare(&layout.provider_state("opencode").join("data"))?;
         let mut environment = BTreeMap::from([
             (HOME_VAR.to_owned(), path(harness)),
             (CONFIG_VAR.to_owned(), path(configuration)),
+            (PROJECT_CONFIG_VAR.to_owned(), "1".to_owned()),
             (CACHE_VAR.to_owned(), path(&cache)),
+            ("XDG_DATA_HOME".to_owned(), path(&data)),
             (AUTOUPDATE_VAR.to_owned(), "1".to_owned()),
         ]);
         if let Some(credentials) = &self.credentials {
@@ -248,14 +254,6 @@ impl OpenCode {
                 variables = ?credentials.variables().keys(),
                 "authorizing OpenCode"
             );
-            if credentials.way() == Way::Subscription {
-                tracing::warn!(
-                    role = %self.role,
-                    harness = %harness.display(),
-                    "this provider was authorized as a subscription, so OpenCode must already be \
-                     signed in under this member's own harness home"
-                );
-            }
             environment.extend(credentials.variables().clone());
         }
 
@@ -443,7 +441,7 @@ pub(crate) enum Error {
     /// OpenCode does not offer the configured model.
     #[error(
         "OpenCode does not offer '{0}'; check the name against models.dev and that this provider \
-         is authorized, with `rad-team login`"
+         is authorized, with `rad-team provider login`"
     )]
     Model(String),
     /// OpenCode itself could not be run.
@@ -605,8 +603,9 @@ mod tests {
             path(&layout.cache().canonicalize().expect("cache"))
         );
         assert_eq!(environment["OPENCODE_DISABLE_AUTOUPDATE"], "1");
+        assert_eq!(environment["OPENCODE_CONFIG_PROJECT_DISABLE"], "1");
         assert_eq!(environment["PROVIDER_API_KEY"], "test-secret");
-        assert_eq!(environment.len(), 5);
+        assert_eq!(environment.len(), 7);
         assert!(!format!("{adapter:?}").contains("test-secret"));
     }
 
@@ -617,7 +616,7 @@ mod tests {
             .prepare_home(&layout(temporary.path(), Role::Talker))
             .expect("subscription home");
 
-        assert_eq!(environment.len(), 4);
+        assert_eq!(environment.len(), 6);
         assert!(!environment.contains_key("PROVIDER_API_KEY"));
     }
 

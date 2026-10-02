@@ -296,6 +296,7 @@ impl Store {
         let mut writable = vec![
             self.home.cache(),
             self.home.harness(self.role),
+            self.home.harnesses().join(".providers"),
             self.common.clone(),
             self.mine.clone(),
         ];

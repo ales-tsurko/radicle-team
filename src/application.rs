@@ -353,7 +353,7 @@ impl Application {
     /// or agent dispatch fails.
     pub async fn run(&self) -> Result<(), Error> {
         let (runtime, binding) = self.start_run().await?;
-        let mut roles = match self.roles(&runtime, &binding) {
+        let mut roles = match self.roles(&runtime, &binding).await {
             Ok(roles) => roles,
             Err(error) => return self.abandon_run(runtime, error).await,
         };
@@ -374,13 +374,15 @@ impl Application {
     /// may edit. Everything which can be checked before an agent starts is checked here, so a
     /// mistake is reported at startup rather than on the first delivery. Which agent application
     /// ends up behind the roles is [`crate::agent::adapter::select`]'s business.
-    fn roles(
+    async fn roles(
         &self,
         runtime: &Runtime,
         binding: &manifest::ValidatedBinding,
     ) -> Result<adapter::Roles, Error> {
         let (configuration, name, selected) = self.selected(binding)?;
-        let held = Self::authorization(&configuration, runtime, &selected, &name)?;
+        let held = self
+            .authorization(&configuration, runtime, &selected, &name)
+            .await?;
         let roles = adapter::select(selected.adapter(), &selected, held.as_ref())?;
         tracing::info!(
             provider = name,
@@ -409,7 +411,8 @@ impl Application {
     ///
     /// The member's own store wins over the machine's, which is how one project is billed to an
     /// account of its own.
-    fn authorization(
+    async fn authorization(
+        &self,
         configuration: &Path,
         runtime: &Runtime,
         selected: &provider::Provider,
@@ -420,8 +423,20 @@ impl Application {
             Some(&credentials::directory(runtime.home.path())),
             name,
         )?;
-        if selected.needs_authorizing() && held.is_none() {
-            return Err(Error::UnauthorizedProvider(name.to_owned()));
+        let authorized =
+            agent::authentication::Authentication::new(selected, self.member, &runtime.home)
+                .authorized(held.as_ref())
+                .await
+                .map_err(|source| Error::ProviderAuthorization {
+                    provider: name.into(),
+                    home: runtime.home.path().into(),
+                    source,
+                })?;
+        if !authorized {
+            return Err(Error::UnauthorizedProvider {
+                provider: name.into(),
+                home: runtime.home.path().into(),
+            });
         }
 
         Ok(held)
@@ -534,7 +549,7 @@ impl Application {
         }
     }
 
-    pub(crate) async fn announce_setup_patch(&self) -> Result<(), Error> {
+    pub(crate) async fn announce_manifest_patch(&self) -> Result<(), Error> {
         let runtime = Runtime::start(self, Ownership::Verify).await?;
         self.report_setup("Replicating manifest patch to a repository seed");
         // `announce_refs_for` only queues an announcement. Keep the node alive while the CLI
@@ -1984,16 +1999,37 @@ pub enum Error {
     Credentials(#[from] crate::provider::CredentialsError),
     /// Nothing says which models this member runs on.
     #[error(
-        "no model provider chosen for this member; name one in the manifest binding or pass \
-         --provider NAME, and see `rad-team providers` for what this machine has"
+        "no model provider chosen for this member; run `rad-team provider select` from the member \
+         directory and merge its manifest patch"
     )]
     NoModelProvider,
     /// The provider names an agent application this build has no adapter for.
     #[error(transparent)]
     UnknownAdapter(#[from] agent::adapter::Unknown),
     /// The provider needs authorizing and nothing on this machine has authorized it.
-    #[error("provider '{0}' is not authorized on this machine; run `rad-team login {0}`")]
-    UnauthorizedProvider(String),
+    #[error(
+        "provider '{provider}' is not authorized for this member; run `rad-team provider login \
+         --home '{home}'`"
+    )]
+    UnauthorizedProvider {
+        /// Selected provider.
+        provider: String,
+        /// Member directory to authorize.
+        home: PathBuf,
+    },
+    /// Native provider authorization could not be checked.
+    #[error(
+        "could not check provider '{provider}': {source}; run `rad-team provider login --home \
+         '{home}'`"
+    )]
+    ProviderAuthorization {
+        /// Selected provider.
+        provider: String,
+        /// Member directory to authorize.
+        home: PathBuf,
+        /// Native adapter failure.
+        source: agent::authentication::Error,
+    },
     /// Writing a role's standing instructions failed.
     #[error("could not install the member's instructions: {0}")]
     Documents(#[source] io::Error),
@@ -2111,6 +2147,19 @@ mod tests {
 
     // The manifest records what the team agreed; the operator running the member pays for it and
     // holds the credentials. So a command-line choice wins, and neither being set is normal.
+    #[test]
+    fn unauthorized_provider_reports_the_member_local_login_command() {
+        let error = crate::application::Error::UnauthorizedProvider {
+            provider: "gpt".into(),
+            home: "/team/maya".into(),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("rad-team provider login --home '/team/maya'")
+        );
+    }
+
     #[test]
     fn prefers_the_command_lines_provider_over_the_manifests() {
         let repository =

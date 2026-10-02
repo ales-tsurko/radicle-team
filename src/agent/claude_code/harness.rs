@@ -33,9 +33,7 @@ pub(crate) const ADAPTER: &str = "claude-code";
 
 // The program itself, found on the operator's `PATH` inside the sandbox.
 const PROGRAM: &str = "claude";
-// Where Claude Code keeps its settings, sessions and credentials. Pointed at the role's own harness
-// directory, so one member's state is that member's, and so neither the operator's `CLAUDE.md` nor
-// their other agent applications' instructions are read as if they were the team's.
+// HOME remains private to the role; native authorization uses the member's shared configuration.
 const HOME_VAR: &str = "HOME";
 const CONFIG_VAR: &str = "CLAUDE_CONFIG_DIR";
 // What anything run inside the sandbox downloads or builds. Pointed at the member's cache
@@ -52,8 +50,6 @@ const TRAFFIC_VAR: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
 // by the same account as everything else, so they run on this member's own model rather than on a
 // Haiku nobody here authorized.
 const ERRANDS_VAR: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
-// Where the harness's own settings live under its home.
-const CONFIG_SUBDIR: &str = ".claude";
 
 /// One role of one member, run through Claude Code.
 pub(crate) struct ClaudeCode {
@@ -123,7 +119,8 @@ impl ClaudeCode {
         let cache = config::prepare(layout.cache())?;
         let mcp_file = config::write_mcp(&harness, mcp)?;
         let instructions = config::combine(layout.documents())?;
-        let environment = self.environment(&harness, &cache, settings.model());
+        let state = config::prepare(&layout.provider_state("claude-code"))?;
+        let environment = self.environment(&harness, &state, &cache, settings.model());
 
         Ok(Started {
             harness,
@@ -237,10 +234,16 @@ impl ClaudeCode {
     }
 
     // Gives the environment this role's Claude Code runs in, credentials included.
-    fn environment(&self, harness: &Path, cache: &Path, model: &str) -> BTreeMap<String, String> {
+    fn environment(
+        &self,
+        harness: &Path,
+        state: &Path,
+        cache: &Path,
+        model: &str,
+    ) -> BTreeMap<String, String> {
         let mut environment = BTreeMap::from([
             (HOME_VAR.to_owned(), path(harness)),
-            (CONFIG_VAR.to_owned(), path(&harness.join(CONFIG_SUBDIR))),
+            (CONFIG_VAR.to_owned(), path(state)),
             (CACHE_VAR.to_owned(), path(cache)),
             (AUTOUPDATE_VAR.to_owned(), "1".to_owned()),
             (TRAFFIC_VAR.to_owned(), "1".to_owned()),
@@ -254,14 +257,6 @@ impl ClaudeCode {
                 variables = ?credentials.variables().keys(),
                 "authorizing Claude Code"
             );
-            if credentials.way() == Way::Subscription {
-                tracing::warn!(
-                    role = %self.role,
-                    harness = %harness.display(),
-                    "this provider was authorized as a subscription, so Claude Code must already \
-                     hold that sign-in itself: sign in once under this member's own harness home"
-                );
-            }
             environment.extend(credentials.variables().clone());
         }
 
@@ -453,8 +448,8 @@ pub(crate) enum Error {
     },
     /// Claude Code holds no authorization this run could use.
     #[error(
-        "this provider is not authorized ({status}); run `rad-team login anthropic` for a key, or \
-         sign in to Claude Code yourself under this member's own harness home"
+        "this provider is not authorized ({status}); run `rad-team provider login` from the \
+         member directory"
     )]
     Unauthorized {
         /// How the probe ended.
@@ -553,12 +548,25 @@ mod tests {
 
     #[test]
     fn pins_the_environment_a_headless_run_needs() {
-        let environment = keyed().environment(&harness(), &cache(), "claude-sonnet-5");
+        let environment = keyed().environment(
+            &harness(),
+            &harness()
+                .parent()
+                .expect("parent")
+                .join(".providers/claude-code"),
+            &cache(),
+            "claude-sonnet-5",
+        );
 
         assert_eq!(
             environment["CLAUDE_CONFIG_DIR"],
-            path_of(&harness().join(".claude")),
-            "settings, sessions and credentials belong to this role alone"
+            path_of(
+                &harness()
+                    .parent()
+                    .expect("parent")
+                    .join(".providers/claude-code")
+            ),
+            "credentials belong to this member and are shared by its roles"
         );
         assert_eq!(environment["HOME"], path_of(&harness()));
         assert_eq!(environment["XDG_CACHE_HOME"], path_of(&cache()));
@@ -583,7 +591,15 @@ mod tests {
             Some(Credentials::subscription()),
         );
 
-        let environment = signed_in.environment(&harness(), &cache(), "claude-sonnet-5");
+        let environment = signed_in.environment(
+            &harness(),
+            &harness()
+                .parent()
+                .expect("parent")
+                .join(".providers/claude-code"),
+            &cache(),
+            "claude-sonnet-5",
+        );
 
         assert!(
             !environment.contains_key("ANTHROPIC_API_KEY"),
@@ -663,8 +679,8 @@ mod tests {
 
         let said = error.to_string();
         assert!(
-            said.contains("login anthropic") && said.contains("harness home"),
-            "both ways of fixing it have to be named: {said}"
+            said.contains("rad-team provider login") && said.contains("member directory"),
+            "the member-local recovery command has to be named: {said}"
         );
         assert!(
             !said.contains("example.com"),
@@ -745,8 +761,13 @@ mod tests {
             assert_eq!(started.settings.model(), "claude-sonnet-5");
             assert_eq!(
                 started.environment["CLAUDE_CONFIG_DIR"],
-                format!("{}/.claude", path_of(&started.harness)),
-                "settings, sessions and credentials belong under the harness home it resolved"
+                path_of(
+                    &home
+                        .provider_state("claude-code")
+                        .canonicalize()
+                        .expect("resolved provider state")
+                ),
+                "credentials belong under the member provider directory"
             );
         }
 

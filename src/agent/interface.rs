@@ -130,6 +130,15 @@ impl Layout {
         &self.harness
     }
 
+    /// Returns native provider state shared by the roles beside this harness.
+    pub(crate) fn provider_state(&self, adapter: &str) -> PathBuf {
+        self.harness
+            .parent()
+            .unwrap_or(&self.harness)
+            .join(".providers")
+            .join(adapter)
+    }
+
     /// Returns the documents instructing this role, in the order they should be read.
     ///
     /// The documents are compiled into the binary, which ships without the repository they were

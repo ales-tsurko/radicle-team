@@ -26,6 +26,7 @@ pub(crate) use crate::agent::{
 pub(crate) use crate::agent::publisher::Announcer;
 
 pub(crate) mod adapter;
+pub(crate) mod authentication;
 pub(crate) mod claude_code;
 pub(crate) mod controls;
 pub mod documents;

@@ -10,9 +10,9 @@ and the application that talks to them. What an adapter must do is in
 
 ## What ships
 
-`rad-team providers` prints the same list on your own machine, and adds whether
-each one is authorized. The models are listed from the one a member scored 1
-runs on to the one a member scored 5 runs on.
+`rad-team provider ls` prints the same list on your own machine, and adds
+whether each one is authorized. The models are listed from the one a member
+scored 1 runs on to the one a member scored 5 runs on.
 
 |Provider|Adapter|Models|ACC|Authorized with|
 |---|---|---|---|---|
@@ -31,8 +31,9 @@ do not ship is a file you write, for whichever adapter suits it. See
 [choosing models](../setup.md#choosing-models).
 
 A member runs on the provider its manifest binding names, so moving a member
-between providers is one name in the manifest, or `--provider` on the command
-line.
+between providers uses `rad-team provider select` in its member directory. It
+authorizes the proposed provider and offers to publish a manifest patch; restart
+the member after that patch merges.
 
 
 

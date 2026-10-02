@@ -110,6 +110,7 @@ impl MemberHome {
             self.code(),
             self.cache(),
             self.harnesses(),
+            self.harnesses().join(".providers"),
         ]
         .into_iter()
         .chain(
@@ -240,6 +241,12 @@ impl MemberHome {
     #[must_use]
     pub fn harnesses(&self) -> PathBuf {
         self.path.join("harness")
+    }
+
+    /// Returns native provider state shared by this member's roles.
+    #[must_use]
+    pub fn provider_state(&self, adapter: &str) -> PathBuf {
+        self.harnesses().join(".providers").join(adapter)
     }
 
     /// Returns where one role's standing instructions are written.

@@ -74,9 +74,12 @@ headless run headless, none of which are yours to configure:
   outside the working copy by design. The sandbox controls where a member may
   write.
 
-`HOME` points at the role's harness folder. OpenCode keeps its settings,
-sessions, credentials and logs there. Its log is under
-`harness/<role>/.local/share/opencode/log/`.
+`HOME` points at the role's harness folder, keeping its configuration separate.
+`XDG_DATA_HOME` points at `harness/.providers/opencode/data/` inside the member
+home. OpenCode keeps native credentials, sessions, and logs in that shared data
+store; each delivery still starts a fresh session. Its log is under
+`harness/.providers/opencode/data/opencode/log/`. Run `rad-team provider login`
+from the member directory to sign in once for all roles.
 
 `XDG_CACHE_HOME` points at the member's `cache/` folder, which its three roles
 share and which is safe to delete. The model registry download lands there, and

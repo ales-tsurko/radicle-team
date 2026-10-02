@@ -36,7 +36,7 @@ pub(crate) struct RepositoryCheckout {
 }
 
 impl RepositoryCheckout {
-    pub(super) async fn open(application: &Application) -> Result<Self, Error> {
+    pub(crate) async fn open(application: &Application) -> Result<Self, Error> {
         let application = application.clone();
         let (checkout, home) = tokio::task::spawn_blocking(move || {
             let home = application.member_home().map_err(crate::Error::from)?;
@@ -141,7 +141,7 @@ impl RepositoryCheckout {
         Ok(())
     }
 
-    pub(super) fn prepare(&self, update: ManifestUpdate) -> Result<(), Error> {
+    pub(crate) fn prepare(&self, update: ManifestUpdate) -> Result<(), Error> {
         let repository = Repository::open(&self.path)?;
         self.ensure_clean(&repository)?;
         let base = repository.head()?.peel_to_commit()?.id();
@@ -157,7 +157,7 @@ impl RepositoryCheckout {
         Ok(())
     }
 
-    pub(super) fn preview(&self, generation: u64) -> Result<Option<(String, bool)>, Error> {
+    pub(crate) fn preview(&self, generation: u64) -> Result<Option<(String, bool)>, Error> {
         let Some(proposal) = self.validated_proposal(generation)? else {
             return Ok(None);
         };
@@ -184,6 +184,17 @@ impl RepositoryCheckout {
             });
         }
         Ok(Some(proposal))
+    }
+
+    pub(crate) fn proposed_provider(&self, generation: u64) -> Result<Option<String>, Error> {
+        self.validated_proposal(generation)?
+            .map(|proposal| {
+                Manifest::validate_candidate(&proposal.manifest, self.member, self.identity.did())
+                    .map(|binding| binding.provider().map(str::to_owned))
+            })
+            .transpose()
+            .map(Option::flatten)
+            .map_err(Error::from)
     }
 
     fn manifest(&self) -> Result<Option<String>, Error> {
@@ -287,12 +298,17 @@ impl RepositoryCheckout {
         Ok(None)
     }
 
-    pub(super) fn publish(&self, generation: u64) -> Result<PatchId, Error> {
+    pub(crate) fn publish(
+        &self,
+        generation: u64,
+        title: &str,
+        description: &str,
+    ) -> Result<PatchId, Error> {
         let proposal = self
             .validated_proposal(generation)?
             .ok_or(Error::MissingProposal)?;
         let repository = Repository::open(&self.path)?;
-        let head = proposal.commit(&repository, self.member)?;
+        let head = proposal.commit(&repository, title)?;
         let stored = self
             .identity
             .profile()
@@ -315,9 +331,8 @@ impl RepositoryCheckout {
             None => {
                 let mut patches = self.identity.profile().patches_mut(&stored, &signer)?;
                 let patch = patches.create(
-                    Title::try_from(format!("Bind {} to radicle-team", self.member))?,
-                    "Provision this member's identity and configuration. Activation requires \
-                     merging this manifest into the canonical branch.",
+                    Title::try_from(title.to_owned())?,
+                    description,
                     MergeTarget::Delegates,
                     proposal.base,
                     head,
@@ -340,7 +355,7 @@ struct Proposal {
 }
 
 impl Proposal {
-    fn commit(&self, repository: &Repository, member: Member) -> Result<git2::Oid, Error> {
+    fn commit(&self, repository: &Repository, title: &str) -> Result<git2::Oid, Error> {
         let parent = repository.find_commit(self.base)?;
         let blob = repository.blob(self.manifest.as_bytes())?;
         let mut tree = repository.treebuilder(Some(&parent.tree()?))?;
@@ -359,7 +374,7 @@ impl Proposal {
                     Some("HEAD"),
                     &signature,
                     &signature,
-                    &format!("Bind {member} to radicle-team"),
+                    title,
                     &tree,
                     &[&parent],
                 )?
@@ -525,12 +540,14 @@ mod tests {
         checkout
             .prepare(fixture.proposal(&checkout))
             .expect("manifest should prepare");
-        let id = checkout.publish(1).expect("patch should publish locally");
+        let id = checkout
+            .publish(1, "Bind maya to radicle-team", "Set up Maya")
+            .expect("patch should publish locally");
         let socket = checkout.identity.profile().home().socket_default();
         drop(checkout);
 
         assert!(matches!(
-            fixture.application.announce_setup_patch().await,
+            fixture.application.announce_manifest_patch().await,
             Err(crate::application::Error::ReplicationUnconfirmed { .. })
         ));
         assert!(!socket.exists(), "failed setup must also stop its node");
@@ -538,7 +555,9 @@ mod tests {
             .await
             .expect("failed setup should release the member lock");
         assert_eq!(
-            checkout.publish(1).expect("retry should reuse the patch"),
+            checkout
+                .publish(1, "Bind maya to radicle-team", "Set up Maya")
+                .expect("retry should reuse the patch"),
             id
         );
     }
@@ -609,7 +628,9 @@ mod tests {
         checkout
             .prepare(fixture.proposal(&checkout))
             .expect("manifest should prepare");
-        let id = checkout.publish(1).expect("patch should publish locally");
+        let id = checkout
+            .publish(1, "Bind maya to radicle-team", "Set up Maya")
+            .expect("patch should publish locally");
         let did = checkout.identity.did();
         let socket = checkout.identity.profile().home().socket_default();
         drop(checkout);
@@ -629,7 +650,7 @@ mod tests {
                 .is_none()
         );
         application
-            .announce_setup_patch()
+            .announce_manifest_patch()
             .await
             .expect("setup should replicate the patch before returning");
         let patch = patches
@@ -719,7 +740,7 @@ mod tests {
             "saving a preview must not make a commit before confirmation"
         );
         let id = checkout
-            .publish(1)
+            .publish(1, "Bind maya to radicle-team", "Set up Maya")
             .expect("patch should publish without a merge");
         assert_eq!(
             branches(),
@@ -886,7 +907,9 @@ mod tests {
         let checkout = RepositoryCheckout::open(&fixture.application)
             .await
             .expect("committed draft should survive restart");
-        let id = checkout.publish(1).expect("committed draft should publish");
+        let id = checkout
+            .publish(1, "Bind maya to radicle-team", "Set up Maya")
+            .expect("committed draft should publish");
         assert_eq!(
             git.head()
                 .expect("HEAD should exist")
@@ -912,7 +935,9 @@ mod tests {
                 .1
         );
         assert_eq!(
-            checkout.publish(1).expect("retry should reuse the patch"),
+            checkout
+                .publish(1, "Bind maya to radicle-team", "Set up Maya")
+                .expect("retry should reuse the patch"),
             id
         );
         assert_eq!(
@@ -945,7 +970,9 @@ mod tests {
         checkout
             .prepare(fixture.proposal(&checkout))
             .expect("manifest should prepare");
-        let patch = checkout.publish(1).expect("patch should publish");
+        let patch = checkout
+            .publish(1, "Bind maya to radicle-team", "Set up Maya")
+            .expect("patch should publish");
         let home = fixture
             .application
             .member_home()
@@ -1054,7 +1081,7 @@ mod tests {
             .await
             .expect("checkout should open");
         let error = checkout
-            .publish(1)
+            .publish(1, "Bind maya to radicle-team", "Set up Maya")
             .expect_err("publication without a proposal should be refused");
         assert!(matches!(error, Error::MissingProposal));
         checkout
@@ -1079,7 +1106,7 @@ mod tests {
             .expect("notes should stage");
         index.write().expect("index should write");
         let error = checkout
-            .publish(1)
+            .publish(1, "Bind maya to radicle-team", "Set up Maya")
             .expect_err("unrelated staged work should be refused");
         assert!(matches!(error, Error::StagedChanges));
         assert_eq!(repository.head().expect("HEAD should read").target(), head);
@@ -1240,7 +1267,9 @@ mcp_allow = ["read"]
             fs::read_to_string(checkout.path.join(FILE_NAME)).expect("draft should remain"),
             draft
         );
-        let id = checkout.publish(1).expect("binding patch should publish");
+        let id = checkout
+            .publish(1, "Bind maya to radicle-team", "Set up Maya")
+            .expect("binding patch should publish");
         let patch =
             radicle::cob::patch::Patches::open(&stored, radicle::cob::store::access::ReadOnly)
                 .expect("patches should open")
@@ -1262,5 +1291,296 @@ mcp_allow = ["read"]
             .expect("existing member must remain valid");
         Manifest::validate_candidate(&proposed, Member::Maya, did)
             .expect("new member must be valid");
+    }
+    #[tokio::test]
+    async fn provider_patch_changes_only_provider_and_activates_after_canonical_merge() {
+        let fixture = Fixture::new();
+        let checkout = RepositoryCheckout::open(&fixture.application)
+            .await
+            .expect("checkout");
+        checkout
+            .prepare(fixture.proposal(&checkout))
+            .expect("setup draft");
+        let context = crate::cli::provider::Context::load(
+            fixture.application.home().map(std::path::Path::to_path_buf),
+        )
+        .expect("pending context");
+        assert!(!context.canonical);
+        assert_eq!(context.provider().expect("initial provider"), "gpt");
+        checkout
+            .publish(1, "Bind maya to radicle-team", "Setup")
+            .expect("setup patch");
+        let git = git2::Repository::open(&checkout.path).expect("coder repository");
+        let setup_head = git
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("setup commit")
+            .id();
+        let stored = checkout
+            .identity
+            .profile()
+            .storage
+            .repository(fixture.application.repository())
+            .expect("stored repository");
+        let delegate = format!("refs/namespaces/{}/refs/heads/main", fixture.operator.id());
+        stored
+            .raw()
+            .reference(&delegate, setup_head, true, "Approve setup")
+            .expect("approve setup");
+        stored
+            .sign_refs(&fixture.operator.signer().expect("delegate signer"))
+            .expect("signed delegate refs");
+        drop(checkout);
+
+        let checkout = RepositoryCheckout::open(&fixture.application)
+            .await
+            .expect("approved checkout");
+        let before = fs::read_to_string(checkout.path.join(FILE_NAME)).expect("canonical manifest");
+        let before: toml_edit::DocumentMut = before.parse().expect("manifest document");
+        checkout
+            .prepare(ManifestUpdate::Provider(ManifestEntry {
+                member: Member::Maya,
+                did: checkout.identity.did(),
+                generation: 1,
+                provider: Some("anthropic".into()),
+            }))
+            .expect("provider draft");
+        assert!(
+            git.statuses(None)
+                .expect("draft status")
+                .iter()
+                .any(|entry| entry.path() == Some(FILE_NAME))
+        );
+        let mut changed: toml_edit::DocumentMut = fs::read_to_string(checkout.path.join(FILE_NAME))
+            .expect("draft manifest")
+            .parse()
+            .expect("draft document");
+        assert_eq!(
+            changed["members"]["maya"]["provider"].as_str(),
+            Some("anthropic")
+        );
+        changed["members"]["maya"]["provider"] = before["members"]["maya"]["provider"].clone();
+        assert_eq!(
+            changed.to_string(),
+            before.to_string(),
+            "all identity and repository policy fields remain unchanged"
+        );
+        assert_eq!(
+            checkout
+                .proposed_provider(1)
+                .expect("pending provider")
+                .as_deref(),
+            Some("anthropic")
+        );
+        let patch = checkout
+            .publish(1, "Use anthropic for maya", "Change Maya's provider")
+            .expect("provider patch");
+        assert_eq!(
+            checkout
+                .publish(1, "Use anthropic for maya", "Change Maya's provider")
+                .expect("retry same patch"),
+            patch
+        );
+        let patches =
+            radicle::cob::patch::Patches::open(&stored, radicle::cob::store::access::ReadOnly)
+                .expect("patch store");
+        let patch = patches
+            .get(&patch)
+            .expect("patch read")
+            .expect("patch exists");
+        assert_eq!(patch.author().id(), &checkout.identity.did());
+        assert_eq!(patch.title(), "Use anthropic for maya");
+        assert_eq!(
+            stored.canonical_head().expect("canonical head").1,
+            setup_head
+        );
+        let home = fixture.application.home().map(std::path::Path::to_path_buf);
+        let context =
+            crate::cli::provider::Context::load(home.clone()).expect("canonical provider context");
+        assert!(context.canonical);
+        assert_eq!(
+            context.provider().expect("current provider"),
+            "gpt",
+            "an unmerged patch never selects the new provider"
+        );
+        let proposed = patch.latest().1.head();
+        stored
+            .raw()
+            .reference(&delegate, proposed.into(), true, "Approve provider")
+            .expect("merge provider");
+        stored
+            .sign_refs(&fixture.operator.signer().expect("delegate signer"))
+            .expect("sign approved provider");
+        assert_eq!(
+            crate::cli::provider::Context::load(home)
+                .expect("updated context")
+                .provider()
+                .expect("approved provider"),
+            "anthropic"
+        );
+        assert_eq!(
+            git2::Repository::open(&fixture.source)
+                .expect("operator checkout")
+                .head()
+                .expect("operator head")
+                .target(),
+            Some(fixture.base.into())
+        );
+    }
+    #[tokio::test]
+    async fn provider_commands_keep_manual_changes_and_publish_only_after_confirmation() {
+        const FLAG: &str = "RAD_TEAM_TEST_PROVIDER_COMMANDS";
+        if std::env::var_os(FLAG).is_some() {
+            let fixture = Fixture::new();
+            let checkout = RepositoryCheckout::open(&fixture.application)
+                .await
+                .expect("checkout");
+            let mut update = fixture.proposal(&checkout);
+            if let ManifestUpdate::Create { entry, .. } = &mut update {
+                entry.provider = Some("ollama".into());
+            }
+            checkout.prepare(update).expect("setup draft");
+            let home = fixture.application.home().map(std::path::Path::to_path_buf);
+            let pending =
+                crate::cli::provider::Context::load(home.clone()).expect("pending context");
+            assert!(matches!(
+                pending.select().await,
+                Err(crate::cli::provider::Error::PendingSetup)
+            ));
+            checkout
+                .publish(1, "Set up maya", "Setup")
+                .expect("setup patch");
+            let git = git2::Repository::open(&checkout.path).expect("coder Git");
+            let head = git
+                .head()
+                .expect("head")
+                .peel_to_commit()
+                .expect("setup commit")
+                .id();
+            let stored = checkout
+                .identity
+                .profile()
+                .storage
+                .repository(fixture.application.repository())
+                .expect("stored repository");
+            let delegate = format!("refs/namespaces/{}/refs/heads/main", fixture.operator.id());
+            stored
+                .raw()
+                .reference(&delegate, head, true, "Approve setup")
+                .expect("approve setup");
+            stored
+                .sign_refs(&fixture.operator.signer().expect("delegate signer"))
+                .expect("approve refs");
+            let configuration = crate::provider::configuration().expect("isolated configuration");
+            let directory = crate::provider::directory(&configuration);
+            fs::create_dir_all(&directory).expect("provider directory");
+            fs::write(
+                crate::provider::path(&directory, "aaa-test"),
+                "adapter = \"opencode\"\n[auth]\nways = [\"none\"]\n",
+            )
+            .expect("test provider");
+            fs::write(crate::provider::path(&directory, "bad-test"), "invalid = [")
+                .expect("unreadable provider");
+            drop(checkout);
+            let context =
+                crate::cli::provider::Context::load(home.clone()).expect("approved context");
+            context
+                .list()
+                .await
+                .expect("list providers including an unreadable file");
+            context
+                .login()
+                .await
+                .expect("login infers the configured provider needing no auth");
+            context.select().await.expect("manual publication choice");
+            assert_eq!(
+                git.head().expect("head after manual choice").target(),
+                Some(head)
+            );
+            assert!(
+                git.statuses(None)
+                    .expect("manual draft status")
+                    .iter()
+                    .any(|entry| entry.path() == Some(FILE_NAME))
+            );
+            assert_eq!(
+                crate::cli::provider::Context::load(home.clone())
+                    .expect("current context")
+                    .provider()
+                    .expect("current provider"),
+                "ollama"
+            );
+            let error = context
+                .select()
+                .await
+                .expect_err("fake node prevents announcement");
+            assert!(
+                matches!(error, crate::cli::provider::Error::Application(_)),
+                "{error}"
+            );
+            assert_ne!(git.head().expect("published head").target(), Some(head));
+            assert!(git.statuses(None).expect("committed status").is_empty());
+            assert_eq!(stored.canonical_head().expect("canonical head").1, head);
+            assert_eq!(
+                crate::cli::provider::Context::load(home)
+                    .expect("canonical selection")
+                    .provider()
+                    .expect("current provider"),
+                "ollama"
+            );
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("isolated environment");
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).expect("fake node binaries");
+        for name in ["rad", "radicle-node"] {
+            let file = bin.join(name);
+            fs::write(&file, "#!/bin/sh\nexit 1\n").expect("offline node executable");
+            fs::set_permissions(file, fs::Permissions::from_mode(0o700)).expect("executable");
+        }
+        let driver = r#"
+import os,pty,select,sys,time,signal
+pid,fd=pty.fork()
+if pid==0:
+    os.execv(sys.argv[1],[sys.argv[1],'--exact','cli::setup::checkout::tests::provider_commands_keep_manual_changes_and_publish_only_after_confirmation','--nocapture'])
+answers=[(b'Which provider should this member use?',b'\r'),(b'Publish this provider change as a Radicle patch?',b'n'),(b'Which provider should this member use?',b'\r'),(b'Publish this provider change as a Radicle patch?',b'y')]
+buffer=b''; transcript=b''; deadline=time.monotonic()+45
+while time.monotonic()<deadline:
+    ready,_,_=select.select([fd],[],[],0.1)
+    if ready:
+        try: data=os.read(fd,65536)
+        except OSError: data=b''
+        buffer+=data; transcript+=data
+        if answers and answers[0][0] in buffer:
+            _,answer=answers.pop(0); os.write(fd,answer); buffer=b''
+    done,status=os.waitpid(pid,os.WNOHANG)
+    if done:
+        if status or answers:
+            print(transcript.decode(errors='replace')); sys.exit(1)
+        sys.exit(0)
+os.killpg(pid,signal.SIGKILL); os.waitpid(pid,0)
+print(transcript.decode(errors='replace')); raise RuntimeError('provider prompts timed out')
+"#;
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").expect("PATH"),
+        )))
+        .expect("isolated PATH");
+        let output = std::process::Command::new("python3")
+            .args(["-c", driver])
+            .arg(std::env::current_exe().expect("test binary"))
+            .env(FLAG, "1")
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("PATH", path)
+            .env_remove(crate::home::ENVIRONMENT_VARIABLE)
+            .output()
+            .expect("terminal prompt driver");
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

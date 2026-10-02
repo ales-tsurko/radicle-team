@@ -238,7 +238,9 @@ where
         Ok(identity)
     }
 
-    fn load_profile(home: RadicleHome) -> Result<RadicleProfile, radicle::profile::Error> {
+    pub(crate) fn load_profile(
+        home: RadicleHome,
+    ) -> Result<RadicleProfile, radicle::profile::Error> {
         let keystore = Keystore::new(&home.keys());
         let public_key = keystore
             .public_key()?

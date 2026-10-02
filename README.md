@@ -116,4 +116,7 @@ documents.
 - `make fmt` formats Rust with nightly `rustfmt` and Markdown with rumdl.
 - `make code-health` runs the extended health and analysis suite.
 
+Terminal workflow tests require Python 3 and use disposable member homes and
+fake adapter and node binaries.
+
 CI runs `check`, `test-all`, `lint`, and `code-health`.

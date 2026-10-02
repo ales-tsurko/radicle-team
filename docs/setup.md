@@ -78,7 +78,7 @@ Nico needs goes inside it:
 ├── irc-identity.pem
 ├── node.log
 ├── cache/               build output, shared by nico's three roles
-├── harness/             agent state, one folder per role
+├── harness/             role configs and shared .providers/ sign-in state
 └── code/
     ├── .git-common      commits shared by setup and all three roles
     ├── talker/          issues and patches
@@ -168,7 +168,7 @@ RAD_HOME=./nico/identity rad self --did
 ### Choosing models
 
 ```sh
-rad-team providers
+rad-team provider ls
 ```
 
 ```text
@@ -193,22 +193,35 @@ settings, and how it accepts being authorized. Adding a model, a setting, or a
 whole provider is an edited file rather than a new release.
 
 ```sh
-rad-team login gpt
+rad-team provider login
 ```
 
-Once per provider, per machine — one person's account is one account however
-many members use it. Add `--home PATH` to authorize one member alone, which is
-what you want when a project has to be billed to its own account. Pass the same
-`--home PATH` to `providers` to see that login; without it the listing reports
-only the machine-wide one.
+Run these commands from the prepared member directory, or pass `--home PATH`.
+`provider ls` marks the configured provider with `*`. `provider login` reads
+that provider from the canonical manifest; while initial setup approval is
+pending, it reads the member's setup proposal. It never asks which provider to
+use.
 
-The key you give is placed in the agent's environment under the variable that
-provider names, and nowhere else.
+Setup authorizes the selected provider for this member. An API key is saved in
+its private `credentials/` directory and placed in each role's environment.
+Subscription login opens the adapter's actual sign-in flow. Sign in once for all
+of this member's roles; your personal adapter sign-in is separate. Native state
+lives under `harness/.providers/<adapter>/` inside the member home. Claude Code
+on macOS stores credentials in a keychain entry scoped to that directory. A
+saved subscription choice is checked against the adapter's sign-in status.
 
-A provider you are already signed in to through its agent application is
-recorded as a subscription instead of asking for a key, which is how a
-subscription rather than an API key pays for a member. The sign-in itself lives
-with that application, under the member's own `harness/<role>/` folder.
+To change the provider:
+
+```sh
+rad-team provider select
+```
+
+Choose and authorize the new provider, then review the proposed manifest. The
+command asks whether to publish a Radicle patch. Declining leaves the manifest
+change in `code/coder/radicle-team.toml` for manual publication. The current
+provider remains active until the manifest change reaches the canonical branch.
+After merging, restart `rad-team run` to apply it. Selection requires the
+member's initial setup patch to have merged first.
 
 We replace the files we ship when the application is updated, so keep your own
 edits under a different name. Credentials are never touched. A provider file we

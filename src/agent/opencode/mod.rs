@@ -10,9 +10,8 @@
 //! issue, patch, or chat message it is answering through MCP, which is the record everybody else
 //! reads too, so a lost transcript costs nothing and a stale one would cost correctness.
 //!
-//! Each role runs its own OpenCode with its own harness home, so the three never share a session
-//! store, a log, or a configuration file. They do share a build cache, which is the one thing too
-//! large to keep three copies of.
+//! Each role has its own configuration and starts fresh sessions. Native credentials, the OpenCode
+//! data store, and the build cache are shared within one member home.
 
 pub(crate) use crate::agent::opencode::harness::{ADAPTER, Error, OpenCode};
 

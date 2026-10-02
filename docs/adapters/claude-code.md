@@ -29,13 +29,11 @@ host — plus the two below when they apply — is enough.
 A member authorized as a subscription also refreshes its sign-in through
 `claude.ai` and `platform.claude.com`, so those belong on the list too.
 
-Where that sign-in lives depends on the platform. On Linux Claude Code keeps
-credentials under its own configuration directory, which is the role's harness
-home, so signing in once per role signs in that role alone. On macOS they live
-in the system keychain, which every Claude Code on the machine shares: one
-account per machine, whichever member or project it was signed into from. An
-operator who needs members billed apart on macOS should authorize with an API
-key instead.
+Run `rad-team provider login` from the member directory to sign in once for all
+roles. `CLAUDE_CONFIG_DIR` points at the member's shared
+`harness/.providers/claude-code/` directory. On macOS, Claude Code uses a
+keychain entry scoped to that configuration directory; on Linux, it stores
+credentials in the directory.
 
 
 
@@ -83,11 +81,11 @@ Two files per role, both rewritten every time the role starts:
   sandbox keeps read-only to the agent, and an instruction file an agent could
   rewrite would not stay an instruction for long.
 
-`HOME` and `CLAUDE_CONFIG_DIR` point at the role's harness folder for the run,
-so settings, logs, transcripts and credentials land there — one folder per role,
-removable, and never your own `~/.claude` or the instructions of another agent
-application you happen to use. `XDG_CACHE_HOME` points at the member's `cache/`
-folder, which its three roles share and which is safe to delete.
+`HOME` points at the role's harness folder. `CLAUDE_CONFIG_DIR` points at the
+member's shared `harness/.providers/claude-code/` directory so all roles use one
+sign-in. Runtime MCP settings and instructions stay separate per role.
+`XDG_CACHE_HOME` points at the member's `cache/` folder, which its three roles
+share and which is safe to delete.
 
 Besides the settings above, every delivery runs under pins none of which are
 yours to configure:

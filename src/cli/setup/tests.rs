@@ -431,18 +431,21 @@ fn rejects_a_symlink_when_writing_an_explicit_manifest() {
 
 // Setup finishing without credentials would leave a member which fails at its first delivery, so
 // the wizard authorizes as part of choosing. A provider needing nothing must not be asked about.
-#[test]
-fn authorizes_only_a_chosen_provider_which_needs_it() {
+#[tokio::test]
+async fn authorizes_only_a_chosen_provider_which_needs_it() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("setup-provider-auth");
     let _removed = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("test directory should be created");
     let providers = crate::provider::installed(&root).expect("providers should install");
-    let wizard = SetupWizard::new(crate::Application::new(
-        Member::Nico,
-        RepoId::from_str(REPOSITORY).expect("repository should parse"),
-    ));
+    let wizard = SetupWizard::new(
+        crate::Application::new(
+            Member::Nico,
+            RepoId::from_str(REPOSITORY).expect("repository should parse"),
+        )
+        .with_home(root.join("member")),
+    );
 
     let (local, provider) = providers
         .iter()
@@ -452,6 +455,7 @@ fn authorizes_only_a_chosen_provider_which_needs_it() {
 
     wizard
         .authorize(&root, local, provider)
+        .await
         .expect("a provider needing nothing must not prompt");
 
     let (keyed, provider) = providers
@@ -462,57 +466,20 @@ fn authorizes_only_a_chosen_provider_which_needs_it() {
     crate::provider::credentials::store(
         &root.join(crate::provider::credentials::DIRECTORY),
         keyed,
-        &crate::provider::Credentials::subscription(),
+        &crate::provider::Credentials::key(
+            provider
+                .key_variables()
+                .iter()
+                .map(|name| (name.clone(), "test-key".into()))
+                .collect(),
+        ),
     )
     .expect("credentials should be written");
 
     wizard
         .authorize(&root, keyed, provider)
+        .await
         .expect("an already authorized provider must not prompt again");
-}
-
-// A subscription is the whole reason the Claude Code adapter exists, so setup has to be able to
-// record one. Forcing an API key on somebody who holds a subscription makes them buy credit they
-// do not need, or abandon setup.
-#[test]
-fn records_a_subscription_without_demanding_an_api_key() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("setup-provider-subscription");
-    let _removed = fs::remove_dir_all(&root);
-    let directory = root.join(crate::provider::DIRECTORY);
-    fs::create_dir_all(&directory).expect("provider directory should be created");
-    fs::write(
-        crate::provider::path(&directory, "signed-in"),
-        "adapter = \"claude-code\"\n\n[auth]\nways = [\"subscription\"]\n",
-    )
-    .expect("provider should be written");
-    let provider = crate::provider::find(&directory, "signed-in").expect("provider should read");
-    let wizard = SetupWizard::new(crate::Application::new(
-        Member::Nico,
-        RepoId::from_str(REPOSITORY).expect("repository should parse"),
-    ));
-
-    wizard
-        .authorize(&root, "signed-in", &provider)
-        .expect("a subscription must be recordable with no key prompt");
-
-    let held = crate::provider::credentials::load(
-        &crate::provider::credentials::directory(&root),
-        None,
-        "signed-in",
-    )
-    .expect("credentials should read back")
-    .expect("the subscription must have been recorded");
-    assert_eq!(
-        held.way(),
-        crate::provider::Way::Subscription,
-        "recorded as a subscription, so nothing asks for a key again"
-    );
-    assert!(
-        held.variables().is_empty(),
-        "a subscription puts nothing in the agent's environment"
-    );
 }
 
 // A name nobody installed would be written into the shared manifest and accepted there forever,

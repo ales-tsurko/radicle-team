@@ -17,15 +17,15 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub(crate) struct ManifestEntry {
-    pub(super) member: Member,
-    pub(super) did: Did,
+    pub(crate) member: Member,
+    pub(crate) did: Did,
     /// Narrowed here rather than at each use, so rendering a binding cannot fail.
     ///
     /// TOML holds no integer wider than this, so a generation which does not fit is an entry that
     /// could never be written. Saying so once, where it can be reported, beats every renderer
     /// carrying a failure it has no way to express.
-    pub(super) generation: i64,
-    pub(super) provider: Option<String>,
+    pub(crate) generation: i64,
+    pub(crate) provider: Option<String>,
 }
 
 impl ManifestEntry {
@@ -54,6 +54,7 @@ pub(crate) enum ManifestUpdate {
         triggered_by: TriggerAccess,
     },
     Extend(ManifestEntry),
+    Provider(ManifestEntry),
 }
 
 #[derive(Serialize)]
@@ -130,7 +131,7 @@ impl ManifestUpdate {
 
     pub(super) const fn entry(&self) -> &ManifestEntry {
         match self {
-            Self::Create { entry, .. } | Self::Extend(entry) => entry,
+            Self::Create { entry, .. } | Self::Extend(entry) | Self::Provider(entry) => entry,
         }
     }
 
@@ -153,6 +154,9 @@ impl ManifestUpdate {
             Self::Extend(entry) => {
                 entry.extend(existing.as_deref().ok_or(Error::MissingManifest)?)?
             }
+            Self::Provider(entry) => {
+                entry.change_provider(existing.as_deref().ok_or(Error::MissingManifest)?)?
+            }
         };
         if existing.as_deref() == Some(contents.as_str()) {
             return Ok(false);
@@ -166,6 +170,25 @@ impl ManifestUpdate {
 }
 
 impl ManifestEntry {
+    fn change_provider(&self, contents: &str) -> Result<String, Error> {
+        let binding = Manifest::validate_candidate(contents, self.member, self.did)?;
+        if binding.generation() != self.generation.unsigned_abs() {
+            return Err(Error::ConflictingBinding(self.member));
+        }
+        let mut document = contents.parse::<DocumentMut>()?;
+        let member = document
+            .get_mut("members")
+            .and_then(Item::as_table_like_mut)
+            .and_then(|members| members.get_mut(self.member.id()))
+            .and_then(Item::as_table_like_mut)
+            .ok_or(Error::InvalidMembers)?;
+        let _previous = member.insert(
+            "provider",
+            value(self.provider.as_deref().ok_or(Error::MissingProposal)?),
+        );
+        Ok(document.to_string())
+    }
+
     fn extend(&self, contents: &str) -> Result<String, Error> {
         let mut document = contents.parse::<DocumentMut>()?;
         let has_member = document

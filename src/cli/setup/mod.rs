@@ -1,7 +1,7 @@
 //! Interactive setup workflow.
 
 pub use crate::cli::setup::wizard::Error;
-pub(super) use crate::cli::setup::{
+pub(crate) use crate::cli::setup::{
     checkout::RepositoryCheckout,
     manifest::{ManifestEntry, ManifestUpdate},
     sandbox::SandboxSetup,

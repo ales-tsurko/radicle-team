@@ -453,7 +453,7 @@ pub enum Error {
     #[error("this platform has no configuration directory to read providers from")]
     NoConfigurationDirectory,
     /// No provider of that name is configured.
-    #[error("unknown provider '{0}'; run `rad-team providers` to see which are configured")]
+    #[error("unknown provider '{0}'; run `rad-team provider ls` to see which are configured")]
     Unknown(String),
     /// A provider file could not be written.
     #[error(transparent)]

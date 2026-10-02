@@ -41,8 +41,7 @@ impl Cli {
         match self.command {
             Command::Setup(_) => Mode::Setup,
             Command::Run(_) => Mode::Run,
-            Command::Providers(_) => Mode::Providers,
-            Command::Login(_) => Mode::Login,
+            Command::Provider(_) => Mode::Provider,
         }
     }
 
@@ -51,7 +50,7 @@ impl Cli {
     pub fn member(&self) -> Option<Member> {
         match &self.command {
             Command::Setup(options) => Some(options.member),
-            Command::Run(_) | Command::Providers(_) | Command::Login(_) => None,
+            Command::Run(_) | Command::Provider(_) => None,
         }
     }
 
@@ -60,14 +59,17 @@ impl Cli {
     pub fn repository(&self) -> Option<RepoId> {
         match &self.command {
             Command::Setup(options) => options.repo,
-            Command::Run(_) | Command::Providers(_) | Command::Login(_) => None,
+            Command::Run(_) | Command::Provider(_) => None,
         }
     }
 
     /// Returns the explicit application home, if configured.
     #[must_use]
     pub fn home(&self) -> Option<&Path> {
-        self.options()?.home.as_deref()
+        match &self.command {
+            Command::Provider(options) => options.home.as_deref(),
+            _ => self.options()?.home.as_deref(),
+        }
     }
 
     /// Returns the selected identity provider, for the commands which load one.
@@ -107,7 +109,7 @@ impl Cli {
                 options.home = Some(home.path().into());
                 options.application(member, repository)
             }
-            Command::Providers(_) | Command::Login(_) => Err(Error::NotAMemberCommand),
+            Command::Provider(_) => Err(Error::NotAMemberCommand),
         }
     }
 
@@ -118,12 +120,14 @@ impl Cli {
     /// Returns an error when setup or member execution fails.
     pub async fn execute(self) -> Result<(), Error> {
         match self.command {
-            Command::Providers(options) => {
-                provider_command::list_configured(options.home).map_err(Error::from)
-            }
-            Command::Login(options) => {
-                provider_command::login_configured(&options.provider, options.home)
-                    .map_err(Error::from)
+            Command::Provider(options) => {
+                let context = provider_command::Context::load(options.home)?;
+                match options.command {
+                    ProviderCommand::Ls => context.list().await,
+                    ProviderCommand::Login => context.login().await,
+                    ProviderCommand::Select => context.select().await,
+                }
+                .map_err(Error::from)
             }
             command @ (Command::Setup(_) | Command::Run(_)) => {
                 Box::pin(Self { command }.run_member()).await
@@ -231,10 +235,8 @@ pub enum Mode {
     Setup,
     /// Run the member activity watcher.
     Run,
-    /// List the model providers this machine has.
-    Providers,
-    /// Authorize a model provider.
-    Login,
+    /// List, authorize, or select this member's model provider.
+    Provider,
 }
 
 #[derive(Debug, Subcommand)]
@@ -243,10 +245,8 @@ enum Command {
     Setup(SetupOptions),
     /// Run the member configured in the current directory or --home.
     Run(Options),
-    /// List the model providers this machine can run members on.
-    Providers(ProvidersOptions),
-    /// Authorize a model provider.
-    Login(LoginOptions),
+    /// Manage the configured member's model provider.
+    Provider(ProviderOptions),
 }
 
 impl Command {
@@ -254,7 +254,7 @@ impl Command {
         match self {
             Self::Setup(options) => Some(&options.options),
             Self::Run(options) => Some(options),
-            Self::Providers(_) | Self::Login(_) => None,
+            Self::Provider(_) => None,
         }
     }
 }
@@ -274,26 +274,22 @@ struct SetupOptions {
 }
 
 #[derive(Debug, Args)]
-struct ProvidersOptions {
-    // Also report what this member alone was authorized with.
-    //
-    // The same store `login --home` writes to. Without it the listing sees only the machine-wide
-    // one, and a member-scoped login reads as never having happened.
-    #[arg(long, value_name = "PATH")]
+struct ProviderOptions {
+    #[command(subcommand)]
+    command: ProviderCommand,
+    /// Member directory; defaults to the current member home.
+    #[arg(long, global = true, env = ENVIRONMENT_VARIABLE, value_name = "PATH")]
     home: Option<PathBuf>,
 }
 
-#[derive(Debug, Args)]
-struct LoginOptions {
-    // Provider to authorize, as listed by `providers`.
-    provider: String,
-    // Authorize this member alone rather than everything on the machine.
-    //
-    // Deliberately not read from the environment, unlike the member commands. An exported member
-    // home would otherwise redirect a machine-wide login into one member's store, which nothing
-    // else looks in.
-    #[arg(long, value_name = "PATH")]
-    home: Option<PathBuf>,
+#[derive(Debug, Subcommand)]
+enum ProviderCommand {
+    /// List available providers and this member's authorization status.
+    Ls,
+    /// Authorize the provider configured for this member.
+    Login,
+    /// Choose and authorize a provider, then propose its manifest change.
+    Select,
 }
 
 #[derive(Debug, Args)]
@@ -374,6 +370,20 @@ mod tests {
     };
 
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+
+    #[test]
+    fn provider_commands_are_member_local_and_take_no_provider_argument() {
+        for action in ["ls", "login", "select"] {
+            let cli = Cli::try_parse_from(["rad-team", "provider", action, "--home", "/team/maya"])
+                .expect("member-local provider command should parse");
+            assert_eq!(cli.mode(), Mode::Provider);
+            assert_eq!(cli.home(), Some(std::path::Path::new("/team/maya")));
+            Cli::try_parse_from(["rad-team", "provider", action, "gpt"])
+                .expect_err("the manifest selects the provider");
+        }
+        Cli::try_parse_from(["rad-team", "providers"]).expect_err("use provider ls");
+        Cli::try_parse_from(["rad-team", "login", "gpt"]).expect_err("use provider login");
+    }
 
     #[test]
     fn parses_every_member() {

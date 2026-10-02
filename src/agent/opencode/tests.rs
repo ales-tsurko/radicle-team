@@ -220,7 +220,9 @@ async fn starts_with_installed_opencode_v2() {
         sandbox::AgentSandbox,
     };
 
-    let temporary = tempfile::tempdir().expect("temporary home");
+    // System temporary directories are already readable in the sandbox, hiding failures when
+    // OpenCode walks above a role's checkout to discover project configuration.
+    let temporary = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary home");
     let home = MemberHome::at(temporary.path().canonicalize().expect("canonical home"));
     home.create().expect("member directories");
     let harness = home.harness(Role::Talker);

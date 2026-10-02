@@ -56,17 +56,19 @@ Radicle Team loads Zerobox's embedded platform and sensitive-path policies
 directly, so user-defined Zerobox profiles cannot replace them. It also enables
 common Rust, Node.js, Python, Go, and Nix toolchain paths. It grants write
 access to the one working copy belonging to the role being run, that role's own
-`harness/` directory, the member's `cache/` directory, and the shared object
-store in `.git-common`, without which the agent could edit files but never
-commit them. One role therefore cannot write into another's checkout or state.
+`harness/` directory, shared native provider state in `harness/.providers/`, the
+member's `cache/` directory, and the shared object store in `.git-common`,
+without which the agent could edit files but never commit them. Each role has
+its own checkout and configuration.
 
-`cache/` is the exception: the member's three roles share it, because build
-output is far too large to keep three copies of. Sharing it there costs nothing.
-The separation between one member's roles is about not standing on each other's
-work — a checked-out branch, a build lock, a transcript — and never about
-holding one of them away from the others. They are one person under one key, and
-the repository's own build scripts already run inside the building agent's
-sandbox every time it builds.
+Native provider state gives all roles one sign-in. `cache/` also stays shared:
+the member's three roles share it, because build output is far too large to keep
+three copies of. Sharing it there costs nothing. The separation between one
+member's roles is about not standing on each other's work — a checked-out
+branch, a build lock, a transcript — and never about holding one of them away
+from the others. They are one person under one key, and the repository's own
+build scripts already run inside the building agent's sandbox every time it
+builds.
 
 It never reaches further than the member, and that boundary is real. A build
 cache holds compiled build scripts and plugins which the next build runs, so two

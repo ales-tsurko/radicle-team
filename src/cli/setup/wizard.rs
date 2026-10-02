@@ -13,13 +13,16 @@ use radicle::identity::{Did, project::ProjectName};
 
 use crate::{
     Application, Setup, SetupStatus,
-    cli::setup::{
-        ManifestEntry, ManifestUpdate, RepositoryCheckout, SandboxSetup, SecurityManifest,
-        SecuritySetup,
+    cli::{
+        provider::Authorization,
+        setup::{
+            ManifestEntry, ManifestUpdate, RepositoryCheckout, SandboxSetup, SecurityManifest,
+            SecuritySetup,
+        },
     },
     manifest::{FILE_NAME, TriggerAccess},
     member::Member,
-    provider::{self, Installed, Provider, credentials},
+    provider::{self, Installed, Provider},
 };
 
 // The provider a member is to run on, beside the name it is written into the manifest under, or
@@ -252,7 +255,7 @@ impl SetupWizard {
                 .insert(self.prompt_new_policy(setup.did()).await?)
                 .clone(),
         };
-        let entry = self.entry(setup, decided)?;
+        let entry = self.entry(setup, decided).await?;
 
         Ok(ManifestUpdate::create(
             entry,
@@ -263,8 +266,9 @@ impl SetupWizard {
 
     // The binding both paths write. Which provider it names is decided the same way whether the
     // manifest is being created or extended, so it is settled in one place.
-    fn entry(&self, setup: &Setup, decided: &mut Decisions) -> Result<ManifestEntry, Error> {
-        Ok(ManifestEntry::new(&self.application, setup)?.with_provider(self.provider(decided)?))
+    async fn entry(&self, setup: &Setup, decided: &mut Decisions) -> Result<ManifestEntry, Error> {
+        Ok(ManifestEntry::new(&self.application, setup)?
+            .with_provider(self.provider(decided).await?))
     }
 
     async fn prompt_new_policy(&self, did: Did) -> Result<NewManifestPolicy, Error> {
@@ -324,7 +328,7 @@ impl SetupWizard {
         decided: &mut Decisions,
     ) -> Result<ManifestUpdate, Error> {
         self.grant_security_access(setup).await?;
-        let entry = self.entry(setup, decided)?;
+        let entry = self.entry(setup, decided).await?;
 
         Ok(ManifestUpdate::extend(entry))
     }
@@ -333,19 +337,22 @@ impl SetupWizard {
     //
     // Leaving it unset is allowed and means the agent application decides, which is what somebody
     // setting up their first member before choosing a provider wants.
-    fn provider(&self, decided: &mut Decisions) -> Result<Option<String>, Error> {
+    async fn provider(&self, decided: &mut Decisions) -> Result<Option<String>, Error> {
         if let Some(chosen) = &decided.provider {
             return Ok(chosen.clone());
         }
 
-        Ok(decided.provider.insert(self.decide_provider()?).clone())
+        Ok(decided
+            .provider
+            .insert(self.decide_provider().await?)
+            .clone())
     }
 
-    fn decide_provider(&self) -> Result<Option<String>, Error> {
+    async fn decide_provider(&self) -> Result<Option<String>, Error> {
         let configuration = provider::configuration()?;
         let providers = provider::installed(&configuration)?;
         let chosen = self.choice(&providers)?;
-        self.authorize_chosen(&configuration, chosen)?;
+        self.authorize_chosen(&configuration, chosen).await?;
 
         Ok(chosen.map(|(name, _provider)| name.clone()))
     }
@@ -397,41 +404,36 @@ impl SetupWizard {
         select.interact().map_err(Error::from)
     }
 
-    fn authorize_chosen(&self, configuration: &Path, chosen: Chosen<'_>) -> Result<(), Error> {
+    async fn authorize_chosen(
+        &self,
+        configuration: &Path,
+        chosen: Chosen<'_>,
+    ) -> Result<(), Error> {
         let Some((name, provider)) = chosen else {
             return Ok(());
         };
 
-        self.authorize(configuration, name, provider)
+        self.authorize(configuration, name, provider).await
     }
 
     // Logs in when this provider has no credentials yet, so the member does not finish setup only
     // to fail at its first delivery.
-    pub(super) fn authorize(
+    pub(super) async fn authorize(
         &self,
         configuration: &Path,
         name: &str,
         provider: &Provider,
     ) -> Result<(), Error> {
-        if !provider.needs_authorizing() {
-            return Ok(());
-        }
-        // Read and write the machine's own store, which is where one account for one person
-        // belongs. Billing a project separately is `login --home`, asked for deliberately.
-        let mine = self.application.home().map(credentials::directory);
-        let held = credentials::load(
-            &credentials::directory(configuration),
-            mine.as_deref(),
+        let home = self.application.member_home().map_err(crate::Error::from)?;
+        Authorization::new(
+            provider,
+            configuration,
             name,
-        )?;
-        if held.is_some() {
-            return Ok(());
-        }
-        let path = crate::cli::provider::login_with(provider, configuration, name, None)?;
-        // Logged, not an outro: the wizard still has questions to ask, and an outro closes the
-        // session out from under them.
-        cliclack::log::success(format!("{name} authorized in {}", path.display()))?;
-
+            self.application.member(),
+            &home,
+        )
+        .authorize()
+        .await?;
         Ok(())
     }
 
@@ -617,12 +619,19 @@ impl SetupWizard {
         checkout: RepositoryCheckout,
         setup: Setup,
     ) -> Result<(), Error> {
-        let patch =
-            tokio::task::spawn_blocking(move || checkout.publish(setup.status().generation()))
-                .await??;
+        let member = self.application.member();
+        let patch = tokio::task::spawn_blocking(move || {
+            checkout.publish(
+                setup.status().generation(),
+                &format!("Bind {} to radicle-team", member),
+                "Provision this member's identity and configuration. Activation requires merging \
+                 this manifest into the canonical branch.",
+            )
+        })
+        .await??;
         // Publication releases the home lock before starting the member's node to announce it.
         cliclack::log::success(format!("Manifest patch: {patch}"))?;
-        self.application.announce_setup_patch().await?;
+        self.application.announce_manifest_patch().await?;
         Ok(())
     }
 
