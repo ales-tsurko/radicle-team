@@ -197,10 +197,10 @@ rad-team provider login
 ```
 
 Run these commands from the prepared member directory, or pass `--home PATH`.
-`provider ls` marks the configured provider with `*`. `provider login` reads
-that provider from the canonical manifest; while initial setup approval is
-pending, it reads the member's setup proposal. It never asks which provider to
-use.
+`rad-team provider` prints the configured provider's name. `provider ls` marks
+it with `*`. `provider login` reads that provider from the canonical manifest;
+while initial setup approval is pending, it reads the member's setup proposal.
+It never asks which provider to use.
 
 Setup authorizes the selected provider for this member. An API key is saved in
 its private `credentials/` directory and placed in each role's environment.
@@ -216,12 +216,13 @@ To change the provider:
 rad-team provider select
 ```
 
-Choose and authorize the new provider, then review the proposed manifest. The
-command asks whether to publish a Radicle patch. Declining leaves the manifest
-change in `code/coder/radicle-team.toml` for manual publication. The current
-provider remains active until the manifest change reaches the canonical branch.
-After merging, restart `rad-team run` to apply it. Selection requires the
-member's initial setup patch to have merged first.
+The menu labels the current provider with `(current)` and highlights it
+initially. Choose and authorize the new provider, then review the proposed
+manifest. The command asks whether to publish a Radicle patch. Declining leaves
+the manifest change in `code/coder/radicle-team.toml` for manual publication.
+The current provider remains active until the manifest change reaches the
+canonical branch. After merging, restart `rad-team run` to apply it. Selection
+requires the member's initial setup patch to have merged first.
 
 We replace the files we ship when the application is updated, so keep your own
 edits under a different name. Credentials are never touched. A provider file we
@@ -365,7 +366,7 @@ is reaped.
 
 Operational events are emitted as structured records through `tracing`, so the
 destination and verbosity are chosen by the process rather than fixed in the
-library. `RUST_LOG` selects the verbosity, defaulting to `warn`:
+library. For `run`, `RUST_LOG` selects the verbosity, defaulting to `info`:
 
 ```sh
 RUST_LOG=radicle_team=debug rad-team run
@@ -373,6 +374,7 @@ RUST_LOG=radicle_team=debug rad-team run
 
 At `info` the process reports what it decided and why:
 
+- identity unlocking, node startup, seed connections, and synchronization
 - activity dispatched to a role, or ignored and for which reason
 - a mutation published, or recovered from an interrupted delivery
 - an MCP method the manifest no longer allows

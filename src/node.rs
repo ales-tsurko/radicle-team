@@ -36,6 +36,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const READINESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Owns one supervised `radicle-node` child process.
@@ -203,7 +204,7 @@ impl NodeManager {
         let mut command = Command::new("radicle-node");
         command
             .arg("--log-level")
-            .arg("warn")
+            .arg("info")
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(error))
             .kill_on_drop(true);
@@ -296,6 +297,7 @@ impl NodeManager {
         timeout: Duration,
     ) -> Result<(), String> {
         let peer = seed.to_string();
+        tracing::info!(seed = %peer, "Connecting to Radicle seed");
         tokio::time::timeout(timeout, Self::connect_and_wait(node, seed, shutdown))
             .await
             .map_err(|_elapsed| format!("{peer}: connection timed out"))?
@@ -339,6 +341,7 @@ impl NodeManager {
             }
             let session = Self::seed_session(node.clone(), id).await?;
             if session.is_some_and(|session| session.is_connected()) {
+                tracing::info!(seed = %id, "Connected to Radicle seed");
                 return Ok(());
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -449,14 +452,20 @@ impl NodeManager {
                     log: self.log.clone(),
                 });
             }
-            if let Ok(actual) = Self::node_id(self.node.clone()).await {
-                return if actual == expected {
-                    Ok(())
-                } else {
-                    Err(Error::IdentityMismatch { expected, actual })
-                };
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            if let Ok(actual) =
+                Self::node_id(self.node.clone(), remaining.min(READINESS_REQUEST_TIMEOUT)).await
+            {
+                if actual != expected {
+                    return Err(Error::IdentityMismatch { expected, actual });
+                }
+                tracing::info!(node = %actual, "Radicle node ready");
+                return Ok(());
+            }
+            tokio::time::sleep(POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed()))).await;
         }
 
         Err(Error::StartupTimeout {
@@ -465,11 +474,15 @@ impl NodeManager {
         })
     }
 
-    async fn node_id(node: Node) -> Result<NodeId, Error> {
-        tokio::task::spawn_blocking(move || node.nid())
-            .await
-            .map_err(|error| Error::Task(error.to_string()))?
-            .map_err(Error::Control)
+    async fn node_id(node: Node, timeout: Duration) -> Result<NodeId, Error> {
+        tokio::task::spawn_blocking(move || {
+            node.call::<NodeId>(NodeCommand::NodeId, timeout)?
+                .next()
+                .ok_or(radicle::node::Error::EmptyResponse)?
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))?
+        .map_err(Error::Control)
     }
 
     async fn shutdown_node(node: Node) -> Result<(), Error> {
@@ -918,6 +931,72 @@ mod tests {
         ));
         assert!(socket.exists());
         fs::remove_file(socket).expect("socket placeholder should be removed");
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_a_delayed_response_and_bounds_an_unresponsive_socket() {
+        for responds in [true, false] {
+            let root = tempfile::tempdir().expect("temporary member home");
+            let socket = root.path().join("control.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).expect("control socket");
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("readiness connection");
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                stream
+                    .read_line(&mut request)
+                    .await
+                    .expect("readiness request");
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).expect("request JSON"),
+                    serde_json::json!({"command": "nodeId"})
+                );
+                if responds {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    stream
+                        .write_all(format!("\"{NODE}\"\n").as_bytes())
+                        .await
+                        .expect("delayed node identity");
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            });
+            let child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", "exec sleep 60"])
+                .kill_on_drop(true)
+                .spawn()
+                .expect("managed child");
+            let mut manager = NodeManager {
+                child: ChildHandle::new(child),
+                node: Node::new(&socket),
+                socket,
+                log: root.path().join("node.log"),
+            };
+            let expected = NODE.parse::<NodeId>().expect("expected node identity");
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                manager.wait_until_ready(expected, Duration::from_millis(300)),
+            )
+            .await;
+            if responds {
+                server.await.expect("control response task");
+            } else {
+                server.abort();
+                assert!(
+                    server
+                        .await
+                        .expect_err("stalled server stopped")
+                        .is_cancelled()
+                );
+            }
+            manager.terminate_and_reap().await.expect("startup cleanup");
+            let result = result.expect("a control probe must respect the startup deadline");
+            if responds {
+                result.expect("wait for a node that becomes responsive during startup");
+            } else {
+                assert!(matches!(result, Err(Error::StartupTimeout { .. })));
+            }
+        }
     }
 
     #[tokio::test]

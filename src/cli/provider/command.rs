@@ -67,11 +67,24 @@ impl Context {
         }
         let configuration = provider::configuration()?;
         let providers = provider::installed(&configuration)?;
-        cliclack::intro(format!("Select a provider for {}", self.member))?;
+        cliclack::intro(format!(
+            "Select a provider for {} (current: {})",
+            self.member,
+            self.binding.provider().unwrap_or("none")
+        ))?;
         let mut select = cliclack::select("Which provider should this member use?");
         for (name, provider) in &providers {
             if let Ok(provider) = provider {
-                select = select.item(name.as_str(), name, provider.adapter());
+                let current = self.binding.provider() == Some(name.as_str());
+                let label = if current {
+                    format!("{name} (current)")
+                } else {
+                    name.to_owned()
+                };
+                select = select.item(name.as_str(), label, provider.adapter());
+                if current {
+                    select = select.initial_value(name.as_str());
+                }
             }
         }
         let name = select.interact()?.to_owned();

@@ -28,7 +28,7 @@ fn main() -> ExitCode {
 async fn run() -> ExitCode {
     let cli = Cli::parse();
 
-    if let Err(error) = Logging::init() {
+    if let Err(error) = Logging::init(cli.mode()) {
         eprintln!("failed to initialize logging: {error}");
         return ExitCode::FAILURE;
     }

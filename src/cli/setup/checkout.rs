@@ -391,6 +391,7 @@ impl Proposal {
 mod tests {
     use std::{error::Error as _, fs};
 
+    use clap::Parser as _;
     use radicle::{
         crypto::Seed,
         identity::Visibility,
@@ -1489,10 +1490,26 @@ mcp_allow = ["read"]
                 .list()
                 .await
                 .expect("list providers including an unreadable file");
+            crate::cli::Cli::try_parse_from([
+                "rad-team",
+                "provider",
+                "--home",
+                context.home.path().to_str().expect("member home path"),
+            ])
+            .expect("current provider command")
+            .execute()
+            .await
+            .expect("print the configured provider without a subcommand");
             context
                 .login()
                 .await
                 .expect("login infers the configured provider needing no auth");
+            context
+                .select()
+                .await
+                .expect("accept the initially highlighted current provider");
+            assert_eq!(git.head().expect("unchanged head").target(), Some(head));
+            assert!(git.statuses(None).expect("unchanged status").is_empty());
             context.select().await.expect("manual publication choice");
             assert_eq!(
                 git.head().expect("head after manual choice").target(),
@@ -1545,7 +1562,13 @@ import os,pty,select,sys,time,signal
 pid,fd=pty.fork()
 if pid==0:
     os.execv(sys.argv[1],[sys.argv[1],'--exact','cli::setup::checkout::tests::provider_commands_keep_manual_changes_and_publish_only_after_confirmation','--nocapture'])
-answers=[(b'Which provider should this member use?',b'\r'),(b'Publish this provider change as a Radicle patch?',b'n'),(b'Which provider should this member use?',b'\r'),(b'Publish this provider change as a Radicle patch?',b'y')]
+answers=[
+    (b'Which provider should this member use?',b'\r'),
+    (b'Which provider should this member use?',b'k'*20+b'\r'),
+    (b'Publish this provider change as a Radicle patch?',b'n'),
+    (b'Which provider should this member use?',b'k'*20+b'\r'),
+    (b'Publish this provider change as a Radicle patch?',b'y'),
+]
 buffer=b''; transcript=b''; deadline=time.monotonic()+45
 while time.monotonic()<deadline:
     ready,_,_=select.select([fd],[],[],0.1)
@@ -1557,7 +1580,8 @@ while time.monotonic()<deadline:
             _,answer=answers.pop(0); os.write(fd,answer); buffer=b''
     done,status=os.waitpid(pid,os.WNOHANG)
     if done:
-        if status or answers:
+        if (status or answers or b'\r\nollama\r\n' not in transcript
+                or b'ollama (current)' not in transcript):
             print(transcript.decode(errors='replace')); sys.exit(1)
         sys.exit(0)
 os.killpg(pid,signal.SIGKILL); os.waitpid(pid,0)

@@ -81,9 +81,11 @@ impl Application {
 
     fn report_setup(&self, message: impl Into<String>) {
         let message = message.into();
-        tracing::debug!(%message, "setup progress");
         if let Some(progress) = &self.setup_progress {
+            tracing::debug!(%message, "setup progress");
             progress.send_replace(message);
+        } else {
+            tracing::info!(member = %self.member, "{message}");
         }
     }
 
@@ -1084,7 +1086,7 @@ impl Runtime {
         match Self::prepare_node(application, identity, &node).await {
             Ok(()) => Ok(node),
             Err(error) => {
-                application.report_setup("Stopping setup's Radicle node");
+                application.report_setup("Stopping member's Radicle node");
                 Self::stop_after_start_error(node, &application.shutdown).await;
                 Err(error)
             }

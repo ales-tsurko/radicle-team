@@ -123,9 +123,13 @@ impl Cli {
             Command::Provider(options) => {
                 let context = provider_command::Context::load(options.home)?;
                 match options.command {
-                    ProviderCommand::Ls => context.list().await,
-                    ProviderCommand::Login => context.login().await,
-                    ProviderCommand::Select => context.select().await,
+                    None => {
+                        println!("{}", context.provider()?);
+                        Ok(())
+                    }
+                    Some(ProviderCommand::Ls) => context.list().await,
+                    Some(ProviderCommand::Login) => context.login().await,
+                    Some(ProviderCommand::Select) => context.select().await,
                 }
                 .map_err(Error::from)
             }
@@ -245,7 +249,7 @@ enum Command {
     Setup(SetupOptions),
     /// Run the member configured in the current directory or --home.
     Run(Options),
-    /// Manage the configured member's model provider.
+    /// Show the configured provider or manage this member's providers.
     Provider(ProviderOptions),
 }
 
@@ -276,7 +280,7 @@ struct SetupOptions {
 #[derive(Debug, Args)]
 struct ProviderOptions {
     #[command(subcommand)]
-    command: ProviderCommand,
+    command: Option<ProviderCommand>,
     /// Member directory; defaults to the current member home.
     #[arg(long, global = true, env = ENVIRONMENT_VARIABLE, value_name = "PATH")]
     home: Option<PathBuf>,
@@ -373,6 +377,12 @@ mod tests {
 
     #[test]
     fn provider_commands_are_member_local_and_take_no_provider_argument() {
+        let cli = Cli::try_parse_from(["rad-team", "provider"])
+            .expect("provider without a subcommand should parse");
+        assert_eq!(cli.mode(), Mode::Provider);
+        let cli = Cli::try_parse_from(["rad-team", "provider", "--home", "/team/maya"])
+            .expect("current provider accepts an explicit member home");
+        assert_eq!(cli.home(), Some(std::path::Path::new("/team/maya")));
         for action in ["ls", "login", "select"] {
             let cli = Cli::try_parse_from(["rad-team", "provider", action, "--home", "/team/maya"])
                 .expect("member-local provider command should parse");
