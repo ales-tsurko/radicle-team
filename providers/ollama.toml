@@ -6,9 +6,10 @@
 #
 # Ollama is not in the models.dev registry, because what you can run is
 # whatever you have pulled. The names below are real Ollama tags. To use your
-# own, copy this file under another name and edit that -- this one is replaced
-# on update. `ollama list` shows what you have. Several rungs may name the same
-# model; a machine with one model runs every member on it.
+# own, edit your installed copy in place. `ollama list` shows what you have.
+# Several rungs may name the same model; a machine with one model runs every
+# member on it. Install or update this file by copying it into your
+# radicle-team providers directory.
 
 adapter = "opencode"
 

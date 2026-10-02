@@ -167,14 +167,25 @@ fn names_every_provider_after_its_file() {
 
 #[test]
 fn reports_no_providers_before_any_are_installed() {
-    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("provider-missing");
-    let _removed = std::fs::remove_dir_all(&directory);
-
-    let providers = provider::load(&directory).expect("a missing directory should read as empty");
-
-    assert!(providers.is_empty());
+    let root = clear("provider-missing");
+    let missing = root.join(provider::DIRECTORY);
+    for directory in [&missing, &root] {
+        let error = provider::load(directory).expect_err("no providers must be actionable");
+        assert!(matches!(&error, provider::Error::NoProviders { path } if path == directory));
+        let message = error.to_string();
+        assert!(
+            message.contains(&directory.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains("copy the provider TOML files"),
+            "{message}"
+        );
+    }
+    assert!(
+        !missing.exists(),
+        "reading must not create a provider directory"
+    );
 }
 
 // One account per person and provider, until a project has to be billed separately. The member's
@@ -279,9 +290,8 @@ fn writes_every_score_under_the_name_it_reports() {
 // thing a user sees is a parse error against a file they did not write.
 #[test]
 fn ships_providers_which_read_back() {
-    let root = clear("provider-shipped");
-
-    let providers = provider::installed(&root).expect("shipped providers should read back");
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("providers");
+    let providers = provider::load(&directory).expect("distributed providers should read back");
 
     assert!(!providers.is_empty(), "the build must ship some providers");
     for (name, shipped) in &providers {
@@ -324,27 +334,77 @@ fn ships_providers_which_read_back() {
     }
 }
 
-// An update exists to correct a stale model name, so it has to overwrite rather than skip what is
-// already there.
+// Only installed files are choices, including custom providers and edits to distributed files.
 #[test]
-fn replaces_shipped_providers_on_a_later_install() {
-    let root = clear("provider-reinstall");
-    let directory = provider::directory(&root);
-    let _first = provider::installed(&root).expect("shipped providers should be installed");
-    let anthropic = provider::path(&directory, "anthropic");
-    std::fs::write(
-        &anthropic,
-        "adapter = \"stale\"\n\n[auth]\nways = [\"none\"]\n",
-    )
-    .expect("an older copy should be written");
+fn reads_only_installed_configs_and_preserves_edits() {
+    let directory = write(
+        "provider-read-only",
+        &[("glm", OPENAI), ("my-provider", OPENAI)],
+    );
+    let glm = provider::path(&directory, "glm");
+    let edited = OPENAI.replace("gpt-5", "my-new-model");
+    std::fs::write(&glm, &edited).expect("an edited copy should be written");
+    let expected = provider::find(&directory, "glm").expect("the edited provider should read");
 
-    let _again = provider::installed(&root).expect("shipped providers should be reinstalled");
+    let listed = provider::load(&directory).expect("providers should be listed");
+    let selected = provider::find(&directory, "glm").expect("provider should be selected");
 
-    let provider = provider::find(&directory, "anthropic").expect("provider should be read");
-    assert_ne!(
-        provider.adapter(),
-        "stale",
-        "an update must replace what it shipped before"
+    assert_eq!(
+        listed.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["glm", "my-provider"]
+    );
+    assert_eq!(
+        listed["glm"].as_ref().expect("edited provider should read"),
+        &expected
+    );
+    assert_eq!(selected, expected);
+    assert_eq!(
+        std::fs::read_to_string(&glm).expect("edited file should remain readable"),
+        edited
+    );
+}
+
+#[test]
+fn reports_broken_configs_and_never_recreates_removed_files() {
+    let directory = write(
+        "provider-broken-local",
+        &[("custom", OPENAI), ("glm", "invalid toml")],
+    );
+    let glm = provider::path(&directory, "glm");
+
+    let listed = provider::load(&directory).expect("a broken provider must not fail the listing");
+    assert!(matches!(
+        listed["glm"],
+        Err(provider::Error::Malformed { .. })
+    ));
+    assert!(matches!(
+        provider::find(&directory, "glm"),
+        Err(provider::Error::Malformed { .. })
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&glm).expect("file should remain"),
+        "invalid toml"
+    );
+
+    std::fs::remove_file(&glm).expect("broken file should be removable");
+    let remaining = provider::load(&directory).expect("the custom provider should remain");
+    assert_eq!(
+        remaining.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["custom"]
+    );
+    assert!(matches!(
+        provider::find(&directory, "glm"),
+        Err(provider::Error::Unknown(_))
+    ));
+    assert!(!glm.exists(), "a removed config must stay removed");
+}
+
+#[test]
+fn refuses_a_directory_with_no_usable_providers() {
+    let directory = write("provider-all-broken", &[("glm", "invalid toml")]);
+    let error = provider::load(&directory).expect_err("broken files provide no choices");
+    assert!(
+        matches!(error, provider::Error::Malformed { path, .. } if path == provider::path(&directory, "glm"))
     );
 }
 
@@ -486,34 +546,41 @@ fn refuses_a_provider_name_which_is_a_path() {
     );
 }
 
-// Installing runs on every listing, every login, and every setup. A plain write follows a symbolic
-// link and overwrites whatever it points at, so a link left in the provider directory would make a
-// read-only-looking command destroy an unrelated file.
+// Existing links are operator configuration too, including links whose target is not present yet.
 #[cfg(unix)]
 #[test]
-fn replaces_a_linked_provider_rather_than_what_it_points_at() {
+fn preserves_linked_providers_and_their_targets() {
     let root = clear("provider-install-symlink");
     let directory = root.join(provider::DIRECTORY);
     std::fs::create_dir_all(&directory).expect("provider directory should be created");
     let victim = root.join("victim.txt");
-    std::fs::write(&victim, "not a provider").expect("victim should be written");
+    std::fs::write(&victim, OPENAI).expect("linked provider should be written");
     std::os::unix::fs::symlink(&victim, provider::path(&directory, "gpt"))
         .expect("symlink should be created");
+    let missing = root.join("missing.toml");
+    std::os::unix::fs::symlink(&missing, provider::path(&directory, "glm"))
+        .expect("dangling symlink should be created");
 
-    provider::install(&directory).expect("shipped providers should install");
+    let listed = provider::load(&directory).expect("a readable linked provider should work");
+    let _linked = listed["gpt"].as_ref().expect("linked provider should read");
+    assert!(matches!(listed["glm"], Err(provider::Error::Unknown(_))));
 
     assert_eq!(
         std::fs::read_to_string(&victim).expect("victim should still be readable"),
-        "not a provider",
-        "installing must not write through a link and destroy what it points at"
+        OPENAI,
+        "loading must not write through a link"
+    );
+    assert_eq!(
+        std::fs::read_link(provider::path(&directory, "gpt")).expect("link should remain"),
+        victim
+    );
+    assert_eq!(
+        std::fs::read_link(provider::path(&directory, "glm")).expect("dangling link should remain"),
+        missing
     );
     assert!(
-        !provider::path(&directory, "gpt")
-            .symlink_metadata()
-            .expect("the provider file should exist")
-            .file_type()
-            .is_symlink(),
-        "the link itself is what gets replaced"
+        !missing.exists(),
+        "loading must not create the missing target"
     );
 }
 

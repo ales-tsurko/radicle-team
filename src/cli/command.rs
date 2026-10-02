@@ -7,6 +7,7 @@ use radicle::{
     identity::{Did, RepoId},
     node::NodeId,
 };
+use tracing::level_filters::LevelFilter;
 
 use crate::{
     Application,
@@ -26,6 +27,9 @@ use crate::{
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Log level: error, warn, info, debug, trace, or off; overrides RUST_LOG.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log: Option<LevelFilter>,
 }
 
 impl Cli {
@@ -33,6 +37,12 @@ impl Cli {
     #[must_use]
     pub fn parse() -> Self {
         <Self as Parser>::parse()
+    }
+
+    /// Returns the explicit log level, overriding the environment when present.
+    #[must_use]
+    pub const fn log_level(&self) -> Option<LevelFilter> {
+        self.log
     }
 
     /// Returns the requested operation.
@@ -134,7 +144,14 @@ impl Cli {
                 .map_err(Error::from)
             }
             command @ (Command::Setup(_) | Command::Run(_)) => {
-                Box::pin(Self { command }.run_member()).await
+                Box::pin(
+                    Self {
+                        command,
+                        log: self.log,
+                    }
+                    .run_member(),
+                )
+                .await
             }
         }
     }
@@ -366,6 +383,7 @@ impl Options {
 mod tests {
     use clap::{Parser as _, error::ErrorKind};
     use radicle::identity::RepoId;
+    use tracing::level_filters::LevelFilter;
 
     use crate::{
         cli::{Cli, Error, Mode},
@@ -374,6 +392,31 @@ mod tests {
     };
 
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+
+    #[test]
+    fn log_level_is_optional_global_and_validated() {
+        assert_eq!(
+            Cli::try_parse_from(["rad-team", "run"])
+                .expect("default logging")
+                .log_level(),
+            None
+        );
+        for arguments in [
+            vec!["rad-team", "--log", "info", "run"],
+            vec!["rad-team", "run", "--log", "info"],
+            vec!["rad-team", "provider", "ls", "--log", "info"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(arguments)
+                    .expect("global log level")
+                    .log_level(),
+                Some(LevelFilter::INFO)
+            );
+        }
+        let error = Cli::try_parse_from(["rad-team", "run", "--log", "loud"])
+            .expect_err("unknown levels must be rejected");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
 
     #[test]
     fn provider_commands_are_member_local_and_take_no_provider_argument() {

@@ -438,7 +438,8 @@ async fn authorizes_only_a_chosen_provider_which_needs_it() {
         .join("setup-provider-auth");
     let _removed = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("test directory should be created");
-    let providers = crate::provider::installed(&root).expect("providers should install");
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("providers");
+    let providers = crate::provider::load(&directory).expect("distributed providers should read");
     let wizard = SetupWizard::new(
         crate::Application::new(
             Member::Nico,
@@ -491,7 +492,8 @@ fn refuses_a_provider_name_nobody_installed() {
         .join("setup-provider-unknown");
     let _removed = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("test directory should be created");
-    let providers = crate::provider::installed(&root).expect("providers should install");
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("providers");
+    let providers = crate::provider::load(&directory).expect("distributed providers should read");
     let wizard = SetupWizard::new(
         crate::Application::new(
             Member::Nico,

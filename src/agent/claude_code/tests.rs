@@ -234,8 +234,8 @@ fn combines_the_documents_in_the_order_they_establish() {
 // write.
 #[test]
 fn runs_every_provider_this_build_ships_for_it() {
-    let root = clear("claude-shipped");
-    let shipped = provider::installed(&root).expect("shipped providers should read back");
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("providers");
+    let shipped = provider::load(&directory).expect("distributed providers should read back");
     let mut ours = 0;
 
     for (name, shipped) in &shipped {
@@ -312,17 +312,10 @@ fn provider(name: &str, body: &str) -> Provider {
     provider::find(&directory, name).expect("provider should be read")
 }
 
-/// The provider file this build ships for Anthropic, read the way the application reads it.
-///
-/// One directory per process, because every test calling this runs at once -- nextest gives each
-/// its own process -- and they would otherwise clear a shared one out from under whichever reached
-/// it second.
+/// The distributed Anthropic provider, read without installing or rewriting anything.
 pub(crate) fn shipped_anthropic() -> Provider {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(format!("claude-shipped-anthropic-{}", std::process::id()));
-
-    provider::installed_named(&root, "anthropic").expect("the shipped provider should be read")
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("providers");
+    provider::find(&directory, "anthropic").expect("the distributed provider should be read")
 }
 
 fn clear(name: &str) -> PathBuf {

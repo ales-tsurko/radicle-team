@@ -13,7 +13,7 @@ use crate::{
 impl Context {
     pub(crate) async fn list(&self) -> Result<(), Error> {
         let configuration = provider::configuration()?;
-        let providers = provider::installed(&configuration)?;
+        let providers = provider::load(&provider::directory(&configuration))?;
         println!("{}\n", provider::directory(&configuration).display());
         for (name, provider) in providers {
             let marker = if self.binding.provider() == Some(name.as_str()) {
@@ -47,7 +47,7 @@ impl Context {
     pub(crate) async fn login(&self) -> Result<(), Error> {
         let name = self.provider()?;
         let configuration = provider::configuration()?;
-        let provider = provider::installed_named(&configuration, name)?;
+        let provider = provider::find(&provider::directory(&configuration), name)?;
         cliclack::intro(format!("Authorize {name} for {}", self.member))?;
         if provider.needs_authorizing() {
             Authorization::new(&provider, &configuration, name, self.member, &self.home)
@@ -66,7 +66,7 @@ impl Context {
             return Err(Error::PendingSetup);
         }
         let configuration = provider::configuration()?;
-        let providers = provider::installed(&configuration)?;
+        let providers = provider::load(&provider::directory(&configuration))?;
         cliclack::intro(format!(
             "Select a provider for {} (current: {})",
             self.member,
@@ -88,7 +88,7 @@ impl Context {
             }
         }
         let name = select.interact()?.to_owned();
-        let selected = provider::installed_named(&configuration, &name)?;
+        let selected = provider::find(&provider::directory(&configuration), &name)?;
         Authorization::new(&selected, &configuration, &name, self.member, &self.home)
             .authorize()
             .await?;

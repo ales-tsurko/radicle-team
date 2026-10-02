@@ -8,8 +8,8 @@
 # Authorized with a DashScope key, which is what Alibaba's international
 # console issues.
 #
-# To keep your own edits, copy this file under another name. This one is
-# replaced on update.
+# Install this file in your radicle-team providers directory. The app only
+# reads it; copy a newer version there when you want to update it.
 
 # These models are hosted in China. Recent OpenCode asks you to opt in to that
 # before it will offer them, in OpenCode itself rather than here; until you do,

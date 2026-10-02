@@ -10,8 +10,8 @@
 # nothing here has a per-token price to rank by. Its key is the same Z.AI key,
 # and `zhipuai-coding-plan/...` is the same plan bought inside China.
 #
-# To keep your own edits, copy this file under another name. This one is
-# replaced on update.
+# Install this file in your radicle-team providers directory. The app only
+# reads it; copy a newer version there when you want to update it.
 
 # These models are hosted in China. Recent OpenCode asks you to opt in to that
 # before it will offer them, in OpenCode itself rather than here; until you do,
@@ -26,15 +26,12 @@ ways = ["key"]
 env = ["ZHIPU_API_KEY"]
 
 # Which model the member runs; higher picks the sharper (and slower) one.
-#
-# Ranked by generation rather than price: 4.7 is the previous one, Turbo is the
-# fast 5, and 5.2 and 5.3 carry the million-token context.
 [INT]
 param = "model"
 values = [
-  "zai-coding-plan/glm-4.7",
-  "zai-coding-plan/glm-5-turbo",
-  "zai-coding-plan/glm-5.2",
+  "zai-coding-plan/glm-5.3-flash",
+  "zai-coding-plan/glm-5.3-flash",
+  "zai-coding-plan/glm-5.3-flash",
   "zai-coding-plan/glm-5.3",
   "zai-coding-plan/glm-5.3",
 ]

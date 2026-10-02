@@ -86,10 +86,7 @@ impl SetupWizard {
         let Some(named) = self.application.provider() else {
             return Ok(None);
         };
-        let providers = provider::installed(&provider::configuration()?)?;
-        if !matches!(providers.get(named), Some(Ok(_provider))) {
-            return Err(Self::unusable(&providers, named));
-        }
+        provider::find(&provider::directory(&provider::configuration()?), named)?;
 
         Ok(Some(named.to_owned()))
     }
@@ -350,7 +347,7 @@ impl SetupWizard {
 
     async fn decide_provider(&self) -> Result<Option<String>, Error> {
         let configuration = provider::configuration()?;
-        let providers = provider::installed(&configuration)?;
+        let providers = provider::load(&provider::directory(&configuration))?;
         let chosen = self.choice(&providers)?;
         self.authorize_chosen(&configuration, chosen).await?;
 

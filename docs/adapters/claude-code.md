@@ -126,6 +126,5 @@ a second, short run in the same working copy commits what the first reached. If
 that second run is stopped too, the changes are still in the tree and preparing
 the next job commits them to a salvage branch.
 
-`RUST_LOG=radicle_team=debug` adds every event a run emits, which is the
-quickest way to see what a member is doing without reading Claude Code's own
-logs.
+`rad-team run --log debug` adds every event a run emits, which is the quickest
+way to see what a member is doing without reading Claude Code's own logs.

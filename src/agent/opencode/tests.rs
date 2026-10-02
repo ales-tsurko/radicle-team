@@ -325,8 +325,8 @@ values = ["low", "low", "medium", "high", "max"]
 // write.
 #[test]
 fn runs_every_provider_this_build_ships_for_it() {
-    let root = clear("opencode-shipped");
-    let shipped = provider::installed(&root).expect("shipped providers should read back");
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("providers");
+    let shipped = provider::load(&directory).expect("distributed providers should read back");
     let mut ours = 0;
 
     for (name, shipped) in &shipped {

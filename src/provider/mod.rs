@@ -27,10 +27,7 @@ use std::{
 use directories::BaseDirs;
 use serde::Deserialize;
 
-use crate::{
-    identity::permissions::Permissions,
-    member::{ModelTuning, Stat},
-};
+use crate::member::{ModelTuning, Stat};
 pub use crate::provider::credentials::{Credentials, Error as CredentialsError, Way};
 
 /// Every provider file in a directory, each either read or the reason it could not be.
@@ -42,19 +39,6 @@ pub type Installed = BTreeMap<String, Result<Provider, Error>>;
 pub const DIRECTORY: &str = "providers";
 /// Extension every provider file carries. The rest of the name is the provider's name.
 pub const EXTENSION: &str = "toml";
-
-// The providers the application ships with, written into the user's directory and replaced when the
-// application is updated. A user who wants an edit to survive keeps it under another name.
-const SHIPPED: &[(&str, &str)] = &[
-    ("anthropic", include_str!("../../providers/anthropic.toml")),
-    ("deepseek", include_str!("../../providers/deepseek.toml")),
-    ("glm", include_str!("../../providers/glm.toml")),
-    ("gpt", include_str!("../../providers/gpt.toml")),
-    ("grok", include_str!("../../providers/grok.toml")),
-    ("kimi", include_str!("../../providers/kimi.toml")),
-    ("ollama", include_str!("../../providers/ollama.toml")),
-    ("qwen", include_str!("../../providers/qwen.toml")),
-];
 
 /// One provider, as read from its file.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -236,16 +220,21 @@ impl Setting {
 /// of them must not take away the providers which are fine -- nor stop setup, which only needs a
 /// different one.
 ///
-/// A missing directory is no providers rather than an error, because a machine which has not been
-/// set up yet has none.
+/// Definitions are installed separately from the application. Loading never creates or updates
+/// files; every provider comes from a local TOML file, including operator-defined providers.
 ///
 /// # Errors
 ///
-/// Returns an error when the directory itself cannot be listed.
+/// Returns an error when the directory cannot be listed or contains no usable providers. When
+/// every file is broken, returns the first file's error so the operator can fix it.
 pub fn load(directory: &Path) -> Result<Installed, Error> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Installed::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(Error::NoProviders {
+                path: directory.to_path_buf(),
+            });
+        }
         Err(source) => {
             return Err(Error::Directory {
                 path: directory.to_path_buf(),
@@ -270,7 +259,16 @@ pub fn load(directory: &Path) -> Result<Installed, Error> {
         let _replaced = providers.insert(name.to_owned(), read(&path, name));
     }
 
-    Ok(providers)
+    if providers.values().any(Result::is_ok) {
+        Ok(providers)
+    } else {
+        Err(providers
+            .into_values()
+            .find_map(Result::err)
+            .unwrap_or_else(|| Error::NoProviders {
+                path: directory.to_path_buf(),
+            }))
+    }
 }
 
 /// Reads the provider named `name` from `directory`.
@@ -313,65 +311,10 @@ pub(crate) fn configuration_in(configured: Option<&Path>, home: &Path) -> PathBu
         .join(env!("CARGO_PKG_NAME"))
 }
 
-/// Writes the providers this build ships with into `directory`, replacing earlier copies.
-///
-/// Replacing rather than merging, so an update can correct a model name which has been renamed
-/// away. Anything the user added under another name is left alone.
-///
-/// # Errors
-///
-/// Returns an error when the directory or a file cannot be written.
-pub fn install(directory: &Path) -> Result<(), Error> {
-    fs::create_dir_all(directory).map_err(|source| Error::Directory {
-        path: directory.to_path_buf(),
-        source,
-    })?;
-    for (name, body) in SHIPPED {
-        let path = path(directory, name);
-        // Compared before writing, so a directory nobody has edited keeps its modification times
-        // and a file open in an editor is not rewritten under it on every listing.
-        if fs::read_to_string(&path).is_ok_and(|existing| existing == *body) {
-            continue;
-        }
-        // Renamed into place rather than written through. A plain write follows a symlink and
-        // overwrites whatever it points at, and a truncating write interrupted part-way leaves a
-        // file which parses on no later run and cannot repair itself.
-        Permissions::replace(&path, body)?;
-    }
-
-    Ok(())
-}
-
 /// Returns the directory `root` keeps provider files in.
 #[must_use]
 pub fn directory(root: &Path) -> PathBuf {
     root.join(DIRECTORY)
-}
-
-/// Installs the providers this build ships with under `root` and reads back every one there.
-///
-/// # Errors
-///
-/// Returns an error when the directory cannot be written, or a provider cannot be read.
-pub fn installed(root: &Path) -> Result<Installed, Error> {
-    let directory = directory(root);
-    install(&directory)?;
-
-    load(&directory)
-}
-
-/// Installs the providers this build ships with under `root` and reads back the one called `name`.
-///
-/// The rest of the directory is left unparsed, which is the difference from [`installed`].
-///
-/// # Errors
-///
-/// Returns an error when the directory cannot be written, or the provider is unknown or unreadable.
-pub fn installed_named(root: &Path, name: &str) -> Result<Provider, Error> {
-    let directory = directory(root);
-    install(&directory)?;
-
-    find(&directory, name)
 }
 
 /// Returns where the provider named `name` is read from.
@@ -455,9 +398,15 @@ pub enum Error {
     /// No provider of that name is configured.
     #[error("unknown provider '{0}'; run `rad-team provider ls` to see which are configured")]
     Unknown(String),
-    /// A provider file could not be written.
-    #[error(transparent)]
-    Permissions(#[from] crate::identity::permissions::Error),
+    /// No provider configurations have been installed.
+    #[error(
+        "no provider configurations found in '{path}'; copy the provider TOML files from the \
+         source distribution's providers/ directory into this directory"
+    )]
+    NoProviders {
+        /// Directory which should hold provider definitions.
+        path: PathBuf,
+    },
     /// A provider is installed but its file cannot be used.
     #[error("provider '{provider}' cannot be used: {reason}")]
     Unusable {

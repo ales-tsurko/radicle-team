@@ -9,8 +9,8 @@
 # data. There is no model listing to check a name against before the first
 # delivery, so a mistyped one shows up there.
 #
-# To keep your own edits, copy this file under another name. This one is
-# replaced on update.
+# Install this file in your radicle-team providers directory. The app only
+# reads it; copy a newer version there when you want to update it.
 
 adapter = "claude-code"
 

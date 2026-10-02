@@ -52,6 +52,52 @@ cargo install --path . --locked
 
 
 
+## Install provider configs
+
+Provider configurations are separate TOML files in the source distribution's
+`providers/` directory. Install them before full member setup. The executable
+reads these files and never installs or updates them.
+
+
+### macOS
+
+From the source checkout, run in Terminal:
+
+```sh
+provider_dir="${XDG_CONFIG_HOME:-$HOME/.config}/radicle-team/providers"
+mkdir -p "$provider_dir"
+cp providers/*.toml "$provider_dir/"
+```
+
+The default directory is `~/.config/radicle-team/providers`.
+
+
+### Linux
+
+From the source checkout, run in your shell:
+
+```sh
+provider_dir="${XDG_CONFIG_HOME:-$HOME/.config}/radicle-team/providers"
+mkdir -p "$provider_dir"
+cp providers/*.toml "$provider_dir/"
+```
+
+The directory is `$XDG_CONFIG_HOME/radicle-team/providers` when that variable is
+set, otherwise `~/.config/radicle-team/providers`.
+
+You can install only the files you need or add your own provider TOML files.
+Choices come from the installed files. Missing files reduce the choices; an
+empty directory produces an error with installation instructions. Invalid files
+are reported and excluded from selection.
+
+Edit installed configs in place. To update them, repeat the copy step with newer
+files; this replaces local files with matching names. Updating the executable
+does not update provider configs. Deleting a config removes that provider from
+the available choices.
+
+
+
+
 ## Set up a member
 
 Run setup once for each member and repository, in the directory where you keep
@@ -224,10 +270,9 @@ The current provider remains active until the manifest change reaches the
 canonical branch. After merging, restart `rad-team run` to apply it. Selection
 requires the member's initial setup patch to have merged first.
 
-We replace the files we ship when the application is updated, so keep your own
-edits under a different name. Credentials are never touched. A provider file we
-have stopped shipping is left where it is, so an older one keeps working until
-you remove it.
+Provider configs are [installed separately](#install-provider-configs). Changing
+model settings in a provider's TOML file takes effect on the next start;
+rebuilding the executable is unnecessary.
 
 
 ### Looking inside a member's copies
@@ -366,11 +411,16 @@ is reaped.
 
 Operational events are emitted as structured records through `tracing`, so the
 destination and verbosity are chosen by the process rather than fixed in the
-library. For `run`, `RUST_LOG` selects the verbosity, defaulting to `info`:
+library. Logging defaults to `warn`. Use `--log` to select the verbosity:
 
 ```sh
-RUST_LOG=radicle_team=debug rad-team run
+rad-team run --log info
+rad-team run --log debug
 ```
+
+The flag also accepts `error`, `warn`, `trace`, and `off`, and works before or
+after any subcommand. Without `--log`, `RUST_LOG` still accepts levels and
+filters such as `radicle_team=debug`. An explicit `--log` overrides `RUST_LOG`.
 
 At `info` the process reports what it decided and why:
 

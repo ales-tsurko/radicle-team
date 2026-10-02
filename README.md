@@ -34,6 +34,12 @@ With the [prerequisites](docs/setup.md#prerequisites) installed, install the
 
 ```sh
 cargo install --path . --locked
+```
+
+Install provider configs using the [macOS](docs/setup.md#macos) or
+[Linux](docs/setup.md#linux) instructions, then set up and run a member:
+
+```sh
 rad-team setup nico --repo rad:... --home ../nico
 rad-team run --home ../nico
 ```

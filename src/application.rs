@@ -404,7 +404,7 @@ impl Application {
         let name = self
             .resolved_provider(binding)
             .ok_or(Error::NoModelProvider)?;
-        let selected = provider::installed_named(&configuration, &name)?;
+        let selected = provider::find(&provider::directory(&configuration), &name)?;
 
         Ok((configuration, name, selected))
     }

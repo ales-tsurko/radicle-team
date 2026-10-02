@@ -1,7 +1,7 @@
 //! What the operator supplies so a provider will answer.
 //!
-//! Kept apart from the provider itself on purpose. A provider file is ours and is replaced when
-//! the application is updated; a credentials file is the operator's and is never written over.
+//! Kept apart from provider definitions so installing or updating model configuration cannot change
+//! the operator's saved key or authorization choice.
 //! Global by default, because one person's account is one account however many members use it,
 //! with a per-member file for when two projects must be billed apart.
 

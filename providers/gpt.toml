@@ -5,8 +5,8 @@
 # data. Model names, prices, and the effort values below are checked against
 # models.dev, the registry OpenCode itself reads.
 #
-# To keep your own edits, copy this file under another name. This one is
-# replaced on update.
+# Install this file in your radicle-team providers directory. The app only
+# reads it; copy a newer version there when you want to update it.
 
 adapter = "opencode"
 

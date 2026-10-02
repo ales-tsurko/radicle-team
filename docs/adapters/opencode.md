@@ -114,5 +114,5 @@ working copy, told to commit what the first one reached. If that second run is
 stopped too, the changes stay in the tree and preparing the next job commits
 them to a salvage branch.
 
-`RUST_LOG=radicle_team=debug` adds every event a run emits, which is the
-quickest way to see what a member is doing without reading OpenCode's own log.
+`rad-team run --log debug` adds every event a run emits, which is the quickest
+way to see what a member is doing without reading OpenCode's own log.
