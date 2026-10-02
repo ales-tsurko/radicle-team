@@ -93,7 +93,7 @@ impl MessageStatus {
     }
 }
 
-/// Durable chat delivery state stored beside watcher and work-queue state.
+/// Durable chat delivery state stored beside watcher and task-queue state.
 #[derive(Clone)]
 pub(crate) struct State {
     database: Database,

@@ -25,7 +25,7 @@ use crate::{
     member::Member,
     node::{self, NodeManager},
     provider::{self, credentials},
-    queue::WorkQueue,
+    queue::TaskQueue,
     sandbox::AgentSandbox,
     shutdown::Shutdown,
     watcher,
@@ -340,7 +340,8 @@ impl Application {
     ///
     /// The three share one identity, one manifest binding, and one node, but not one train of
     /// thought. A half-written patch has no safe point to pause at, and an agent turn cannot be
-    /// interrupted, so neither a queued job nor a review may hold up somebody waiting in a channel.
+    /// interrupted, so neither a queued task nor a review may hold up somebody waiting in a
+    /// channel.
     ///
     /// Enabling chat therefore costs a third concurrent agent for this member whenever a message
     /// arrives, on top of the talking and building roles.
@@ -1134,7 +1135,7 @@ struct AgentRuntime {
 #[derive(Debug)]
 struct Resources {
     servers: Servers,
-    queue: WorkQueue,
+    queue: TaskQueue,
     chat_state: chat::State,
     chat_identity: Option<chat::credentials::Credentials>,
     workspaces: crate::workspace::Workspaces,
@@ -1243,7 +1244,7 @@ impl AgentRuntime {
     async fn initialize_workspaces(
         application: &Application,
         runtime: &Runtime,
-        queue: &WorkQueue,
+        queue: &TaskQueue,
     ) -> Result<crate::workspace::Workspaces, Error> {
         let profile = runtime.identity.profile();
         let workspaces = crate::workspace::Workspaces::new(
@@ -1269,7 +1270,7 @@ impl AgentRuntime {
     ) -> Result<
         (
             agent::Publisher,
-            WorkQueue,
+            TaskQueue,
             chat::State,
             Option<chat::credentials::Credentials>,
         ),
@@ -1299,8 +1300,8 @@ impl AgentRuntime {
     async fn initialize_state(
         application: &Application,
         runtime: &Runtime,
-    ) -> Result<(WorkQueue, chat::State), Error> {
-        let queue = WorkQueue::open(
+    ) -> Result<(TaskQueue, chat::State), Error> {
+        let queue = TaskQueue::open(
             &runtime.home.state_database(),
             application.repository,
             application.member,
@@ -1984,8 +1985,8 @@ pub enum Error {
     /// Preparing durable chat state failed.
     #[error("chat state error: {0}")]
     Chat(String),
-    /// Opening the member work queue failed.
-    #[error("work queue error: {0}")]
+    /// Opening the member task queue failed.
+    #[error("task queue error: {0}")]
     Queue(#[from] crate::queue::Error),
     /// Starting or stopping the run-scoped MCP server failed.
     #[error("MCP server error: {0}")]

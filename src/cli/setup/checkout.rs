@@ -22,7 +22,7 @@ use crate::{
     identity::{Identity, Manager, MemberLock},
     manifest::{FILE_NAME, Manifest},
     member::Member,
-    queue::WorkQueue,
+    queue::TaskQueue,
     workspace::Workspaces,
 };
 
@@ -55,7 +55,7 @@ impl RepositoryCheckout {
             Ok::<_, Error>((checkout, home))
         })
         .await??;
-        let queue = WorkQueue::open(&home.state_database(), checkout.repository, checkout.member)
+        let queue = TaskQueue::open(&home.state_database(), checkout.repository, checkout.member)
             .await
             .map_err(crate::Error::from)?;
         let profile = checkout.identity.profile();
@@ -412,7 +412,7 @@ mod tests {
         manifest::{FILE_NAME, Manifest, QueuePosition, TriggerAccess},
         member::Member,
         node::NodeManager,
-        queue::WorkQueue,
+        queue::TaskQueue,
         watcher::Subject,
         workspace::Workspaces,
     };
@@ -978,7 +978,7 @@ mod tests {
             .application
             .member_home()
             .expect("home should resolve");
-        let queue = WorkQueue::open(
+        let queue = TaskQueue::open(
             &home.state_database(),
             fixture.application.repository(),
             Member::Maya,
@@ -1006,24 +1006,24 @@ mod tests {
             .await
             .expect("runtime should initialize");
         queue
-            .push(
+            .push(crate::queue::TaskRequest::new(
                 "Update README".to_owned(),
                 Source::Subject(Subject::Issue(fixture.base.into())),
                 QueuePosition::End,
-            )
+            ))
             .await
-            .expect("job should enqueue");
-        let job = queue.next().await.expect("job should start");
+            .expect("task should enqueue");
+        let task = queue.next().await.expect("task should start");
         workspaces
-            .prepare_job(&job)
+            .prepare_task(&task)
             .await
-            .expect("coder should move to its job branch");
+            .expect("coder should move to its task branch");
         assert!(!home.worktree(Role::Coder).join(FILE_NAME).exists());
-        queue.finish().await.expect("job should finish");
+        queue.finish().await.expect("task should finish");
         workspaces
             .initialize()
             .await
-            .expect("finished job branch should be cleaned up");
+            .expect("finished task branch should be cleaned up");
 
         let published =
             radicle::cob::patch::Patches::open(&stored, radicle::cob::store::access::ReadOnly)
@@ -1476,6 +1476,11 @@ mcp_allow = ["read"]
             let configuration = crate::provider::configuration().expect("isolated configuration");
             let directory = crate::provider::directory(&configuration);
             fs::create_dir_all(&directory).expect("provider directory");
+            fs::copy(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers/ollama.toml"),
+                crate::provider::path(&directory, "ollama"),
+            )
+            .expect("install the fixture's configured provider");
             fs::write(
                 crate::provider::path(&directory, "aaa-test"),
                 "adapter = \"opencode\"\n[auth]\nways = [\"none\"]\n",

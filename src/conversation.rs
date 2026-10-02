@@ -6,9 +6,9 @@ use radicle::identity::Did;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    agent::{self, Role, Source, Talker, WorkId},
+    agent::{self, ActivityId, Role, Source, Talker},
     manifest::{Limits, TriggerAccess},
-    mcp::WorkScope,
+    mcp::ActivityScope,
     member::Member,
     watcher::{Activity, Delivery},
     workspace::Workspaces,
@@ -186,10 +186,13 @@ impl Handle {
     }
 
     /// Recovers publications made by a delivery which no longer needs agent attention.
-    pub(crate) async fn reconcile(&self, work: WorkId) -> Result<(), Error> {
+    pub(crate) async fn reconcile(&self, activity: ActivityId) -> Result<(), Error> {
         let (completion, completed) = oneshot::channel();
         self.sender
-            .send(Request::Reconcile { work, completion })
+            .send(Request::Reconcile {
+                activity,
+                completion,
+            })
             .await
             .map_err(|_error| Error::Unavailable)?;
         completed.await.map_err(|_error| Error::Unavailable)?
@@ -199,13 +202,13 @@ impl Handle {
 /// The workspace and MCP scope one role works inside.
 ///
 /// Each role runs its own agent under its own MCP server, so each needs its own checkout and its
-/// own active-work gate. Only the request types differ between them.
+/// own active-activity gate. Only the request types differ between them.
 #[derive(Debug)]
 pub(crate) struct Scoped {
     pub(crate) member: Member,
     role: Role,
     workspaces: Workspaces,
-    pub(crate) scope: WorkScope,
+    pub(crate) scope: ActivityScope,
 }
 
 impl Scoped {
@@ -213,7 +216,7 @@ impl Scoped {
         member: Member,
         role: Role,
         workspaces: Workspaces,
-        scope: WorkScope,
+        scope: ActivityScope,
     ) -> Self {
         Self {
             member,
@@ -234,20 +237,20 @@ impl Scoped {
     /// Closes the scope and recovers interrupted publications.
     pub(crate) async fn finish(
         &self,
-        work: WorkId,
+        activity: ActivityId,
         handled: Result<(), Error>,
     ) -> Result<(), Error> {
         self.scope.deactivate().await;
         handled.inspect_err(|error| {
-            tracing::warn!(member = %self.member, %work, %error, "agent failed to handle conversation");
+            tracing::warn!(member = %self.member, %activity, %error, "agent failed to handle conversation");
         })?;
-        self.reconcile(work).await
+        self.reconcile(activity).await
     }
 
-    /// Recovers publications belonging to `work`.
-    pub(crate) async fn reconcile(&self, work: WorkId) -> Result<(), Error> {
+    /// Recovers publications belonging to `activity`.
+    pub(crate) async fn reconcile(&self, activity: ActivityId) -> Result<(), Error> {
         self.scope
-            .reconcile(work)
+            .reconcile(activity)
             .await
             .map_err(Error::PublicationRecovery)
     }
@@ -262,7 +265,11 @@ pub(crate) struct Dispatcher {
 
 impl Dispatcher {
     /// Creates the dispatcher and its clonable ingress handle.
-    pub(crate) fn new(member: Member, workspaces: Workspaces, scope: WorkScope) -> (Handle, Self) {
+    pub(crate) fn new(
+        member: Member,
+        workspaces: Workspaces,
+        scope: ActivityScope,
+    ) -> (Handle, Self) {
         let (sender, receiver) = mpsc::channel(BUFFER);
         (
             Handle { sender },
@@ -285,8 +292,11 @@ impl Dispatcher {
                     let result = self.dispatch(activity, delivery, agent).await;
                     let _delivered = completion.send(result);
                 }
-                Request::Reconcile { work, completion } => {
-                    let result = self.scoped.reconcile(work).await;
+                Request::Reconcile {
+                    activity,
+                    completion,
+                } => {
+                    let result = self.scoped.reconcile(activity).await;
                     let _reconciled = completion.send(result);
                 }
             }
@@ -307,7 +317,7 @@ impl Dispatcher {
             .scope
             .activate(activity.context(path.clone()))
             .await
-            .map_err(Error::WorkScope)?;
+            .map_err(Error::ActivityScope)?;
         tracing::info!(
             member = %self.scoped.member,
             repository = %activity.repository,
@@ -331,7 +341,7 @@ enum Request {
         completion: oneshot::Sender<Result<(), Error>>,
     },
     Reconcile {
-        work: WorkId,
+        activity: ActivityId,
         completion: oneshot::Sender<Result<(), Error>>,
     },
 }
@@ -345,9 +355,9 @@ pub(crate) enum Error {
     /// Preparing or cleaning the delivery workspace failed.
     #[error("agent workspace failed: {0}")]
     Workspace(String),
-    /// Activating the work-scoped MCP capability failed.
-    #[error("work scope failed: {0}")]
-    WorkScope(String),
+    /// Activating the activity-scoped MCP capability failed.
+    #[error("activity scope failed: {0}")]
+    ActivityScope(String),
     /// Recovering durable MCP publications failed.
     #[error("MCP publication recovery failed: {0}")]
     PublicationRecovery(String),

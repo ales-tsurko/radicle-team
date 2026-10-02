@@ -5,7 +5,7 @@ member. The documents that actually shape them — full character, expertise,
 history, and voice — live under [`members/`](../members/).
 
 Each member carries three values, rated 1 to 5. They are a character sheet: read
-them to decide who a job suits. They are the same for a member's three roles.
+them to decide who a task suits. They are the same for a member's three roles.
 
 - `INT` **Intelligence** — how sharp it is. Picks the model, so it carries speed
   with it: the sharper models are the slower ones.
@@ -17,9 +17,9 @@ them to decide who a job suits. They are the same for a member's three roles.
 The three do not come from one place. `INT` and `ACC` are settings: the provider
 file turns them into a model and a reasoning effort, and the adapter sends both
 with every run. `TLK` comes from the member's own documents, which give the
-model rules and written examples of how that member talks. Both are enforced,
-and the documents hold far more than a number can: what a member cares about,
-when it pushes back, how it writes.
+model instructions and examples of its voice. Talkativeness is guidance rather
+than a runtime length limit. The documents also describe what a member cares
+about, when it pushes back, and how it writes.
 
 The scale is relative to the provider a member runs on, which the repository
 manifest sets per member. `INT 5` means the best model that provider offers, so

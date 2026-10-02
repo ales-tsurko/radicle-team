@@ -239,7 +239,7 @@ impl fmt::Display for Stat {
 
 /// The part of a member's character sheet a provider file can set, rated 1 to 5.
 ///
-/// A character sheet: these are read to decide who a job suits, not set by whoever runs one.
+/// A character sheet: these are read to decide who a task suits, not set by whoever runs one.
 ///
 /// Two, because two is what a model control can carry: which model runs, and how far it ranges
 /// before answering. The rest of the sheet is no less real -- how much a member says, what it cares

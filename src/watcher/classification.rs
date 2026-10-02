@@ -164,7 +164,7 @@ impl Context {
                 }
                 Signal::Change { audience, change }
                     if !change.is_reaction()
-                        && (origin != Author::Peer || change.is_work_submission())
+                        && (origin != Author::Peer || change.is_task_submission())
                         && audience.matches(self) =>
                 {
                     return Relevance::Relevant(Kind::Delivered(Delivery::Changed(change)));

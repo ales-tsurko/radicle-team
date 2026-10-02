@@ -27,39 +27,59 @@ wait behind another.
 A member answers, chats, and builds at the same time, which one conversation
 cannot do. A half-written patch has no safe point to pause at, and an agent turn
 cannot be interrupted once it begins, so sharing one would put a question behind
-a twenty-minute job. Each member therefore runs three agents under one identity,
-one per role, with one MCP server each. To everybody reading the repository it
-is one person.
+a twenty-minute task. Each member therefore runs three agents under one
+identity, one per role, with one MCP server each. To everybody reading the
+repository it is one person.
 
 `Talker` answers repository activity, `Chatter` answers chat, and `Coder`
 carries out queued work. The chatting role is started only when the manifest has
 a `[chat]` section, so a repository without chat runs two agents.
+
+A **task** is a durable request queued for the coder, with its specification and
+context. An **activity** is one agent execution: handling a repository event,
+answering a chat message, or executing a task.
 
 The runtime watches Radicle histories and converts relevant activity into typed
 agent events:
 
 - a mention, reply, or relevant change in a Radicle issue or patch goes to the
   member's talking agent;
-- an assignment goes to the member's work queue, which the building agent takes
-  jobs from;
+- an assignment goes to the member's task queue, which the building agent takes
+  tasks from;
 - an authenticated chat message goes to the member's chatting agent, which may
   in turn record work in the queue when it decides work is needed;
-- each agent runs inside a work-scoped workspace with a scoped MCP server, and
-  what it publishes back is signed Radicle comments, issues, patches, reviews,
-  or reactions.
+- each agent runs inside an activity-scoped workspace with a scoped MCP server,
+  and what it publishes back is signed Radicle comments, issues, patches,
+  reviews, or reactions.
 
 Agent integrations implement the provider-neutral
 [`Talker`](../src/agent/interface.rs), [`Chatter`](../src/agent/interface.rs),
 and [`Coder`](../src/agent/interface.rs) interfaces. The runtime calls `start`
 on each with the selected member's `Profile` and its own run-scoped MCP
 endpoint, then delivers typed activity to the first, authenticated messages to
-the second, and queued jobs to the third.
+the second, and queued tasks to the third.
 
-Four MCP tools connect the two. The talking agent records work with `add_job`,
-checks `work_status`, corrects a running job with `note`, and stops it with
-`cancel`. A note arrives on the building agent's next tool result, so nothing
-polls, and cancelling asks it to commit what it has to a branch rather than
-discarding it.
+MCP tools connect the roles. The talking agent records work with `add_task`,
+checks `task_status`, and reads or saves context with `get_task_context` and
+`update_task_context`. `note` corrects a specific running or waiting task by ID;
+`cancel` removes that waiting task or asks that running task to preserve its
+work and stop. A note arrives on the building agent's next tool result, so
+nothing polls, and cancelling asks it to commit what it has to a branch rather
+than discarding it.
+
+Each task retains its original request and specification, related issues and
+patches, pinned message and revision IDs, and selected working notes. This
+context survives interruptions and is shared between the member's roles. Created
+artifacts are recorded automatically. A saved reference does not grant write
+access; task relationships and existing permissions are verified separately.
+Repository reads can inspect related artifacts without moving the role's
+checkout or changing the task's source.
+
+Recording the same request reuses its task, including assignment and mention
+handling from one operation. Related live work is reused unless the request
+explicitly identifies a distinct deliverable. A task revises its existing patch.
+On completion or cancellation, working context is removed while a minimal
+request-to-result record remains for replay and duplicate prevention.
 
 Each adapter is responsible for:
 
@@ -67,7 +87,7 @@ Each adapter is responsible for:
 - Supplying the member and shared Markdown documents as model context
 - Managing the provider's conversation or execution runtime
 - Using only the supplied workspace and allowed MCP tools
-- Returning success only after the event or job has been handled durably
+- Returning success only after the event or task has been handled durably
 
 The core does not depend on a particular model vendor or agent framework.
 
@@ -88,17 +108,17 @@ The cost is a third concurrent agent for this member whenever a message arrives.
 A repository whose manifest has no `[chat]` section never pays it.
 
 Each agent serialises its own work, so a member is at most one repository
-delivery, one chat message, and one job at a time.
+delivery, one chat message, and one task at a time.
 
-Nothing limits how long a delivery or a job may take, because reading a long
+Nothing limits how long a delivery or a task may take, because reading a long
 patch or building a real change legitimately takes a while. What is limited is
 silence. Each adapter reports when it last saw its agent act, and one which has
-shown nothing for fifteen minutes is stopped. A cancelled job is asked to commit
-what it has, then killed thirty seconds later if it has not. Deciding that
-belongs to the runtime, which is why the roles are internal to this crate rather
-than an open interface.
+shown nothing for fifteen minutes is stopped. A cancelled task is asked to
+commit what it has, then killed thirty seconds later if it has not. Deciding
+that belongs to the runtime, which is why the roles are internal to this crate
+rather than an open interface.
 
-A job which was running when the process died is still marked taken in the
+A task which was running when the process died is still marked taken in the
 queue, so it is put back at the front on the next start rather than left
 silently lost.
 

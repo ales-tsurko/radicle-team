@@ -33,7 +33,7 @@ use crate::{
     agent::{Role, Source},
     home::MemberHome,
     member::Member,
-    queue::{Job, WorkQueue},
+    queue::{Task, TaskQueue},
     sandbox::AgentSandbox,
     watcher::Subject,
 };
@@ -85,10 +85,10 @@ pub(crate) struct Workspaces {
     storage: Storage,
     repository: RepoId,
     info: UserInfo,
-    // Which branches still have work behind them. A branch belongs to one job and lives exactly as
-    // long as that job's row does, so the queue is the only thing that decides what may be
+    // Which branches still have work behind them. A branch belongs to one task and lives exactly
+    // as long as that task's row does, so the queue is the only thing that decides what may be
     // removed.
-    queue: WorkQueue,
+    queue: TaskQueue,
     // Serialises fetches and reference updates, which every role performs against the one shared
     // store. Git would refuse a concurrent reference update rather than corrupt anything, so this
     // exists to avoid spurious failures rather than to protect the repository.
@@ -106,7 +106,7 @@ impl Workspaces {
         storage: Storage,
         repository: RepoId,
         info: UserInfo,
-        queue: WorkQueue,
+        queue: TaskQueue,
     ) -> Self {
         Self {
             member,
@@ -137,7 +137,7 @@ impl Workspaces {
         storage: Storage,
         repository: RepoId,
         info: UserInfo,
-        queue: WorkQueue,
+        queue: TaskQueue,
     ) -> Result<Self, Error> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -202,7 +202,7 @@ impl Workspaces {
 
     // Takes every working copy off the branch it was left standing on.
     //
-    // Nothing is running yet, so holding one would only keep a finished job's branch alive. The
+    // Nothing is running yet, so holding one would only keep a finished task's branch alive. The
     // tree is untouched, so a crashed run's uncommitted work is still there to salvage.
     async fn detach_copies(&self) -> Result<(), Error> {
         for role in Role::ALL {
@@ -223,16 +223,20 @@ impl Workspaces {
         self.settle(role, source, None).await
     }
 
-    /// Moves the building role's working copy onto the branch belonging to `job`.
+    /// Moves the building role's working copy onto the branch belonging to `task`.
     ///
-    /// Named after the job alone, which is the only identifier both known before the work starts
+    /// Named after the task alone, which is the only identifier both known before the work starts
     /// and never shared with another piece of work.
-    pub(crate) async fn prepare_job(&self, job: &Job) -> Result<PathBuf, Error> {
-        self.settle(Role::Coder, job.source.clone(), Some(job.id))
-            .await
+    pub(crate) async fn prepare_task(&self, task: &Task) -> Result<PathBuf, Error> {
+        self.settle(Role::Coder, task.target(), Some(task.id)).await
     }
 
-    async fn settle(&self, role: Role, source: Source, job: Option<i64>) -> Result<PathBuf, Error> {
+    async fn settle(
+        &self,
+        role: Role,
+        source: Source,
+        task: Option<i64>,
+    ) -> Result<PathBuf, Error> {
         let worktree = self.home.worktree(role);
         let head = self.head(source).await?;
         // Held across the whole preparation, not only the fetch. Salvaging and placing a branch
@@ -244,10 +248,10 @@ impl Workspaces {
         // Placing the branch comes second because resetting while standing on one moves it, which
         // would throw away commits the agent made but had not published yet. It is also what moves
         // the copy off the branch salvaging left it on.
-        let head = match job {
-            Some(job) => {
-                self.salvage(place, job).await?;
-                self.place_branch(place, job, &head).await?
+        let head = match task {
+            Some(task) => {
+                self.salvage(place, task).await?;
+                self.place_branch(place, task, &head).await?
             }
             None => head,
         };
@@ -259,7 +263,7 @@ impl Workspaces {
         // Last, because moving this working copy is what frees the branch it was standing on.
         // Tidy-up, so a failure is reported rather than allowed to fail a prepared delivery.
         if let Err(error) = self.sweep().await {
-            tracing::warn!(%error, "could not remove the branches of finished jobs");
+            tracing::warn!(%error, "could not remove the branches of finished tasks");
         }
 
         Ok(worktree)
@@ -279,11 +283,11 @@ impl Workspaces {
     }
 
     // Preserves anything the previous run left uncommitted before the tree is reset.
-    async fn salvage(&self, place: In, job: i64) -> Result<(), Error> {
+    async fn salvage(&self, place: In, task: i64) -> Result<(), Error> {
         if self.status(place).await?.is_empty() {
             return Ok(());
         }
-        let branch = self.salvage_branch(place, job).await?;
+        let branch = self.salvage_branch(place, task).await?;
         let head = self.capture(place, ["rev-parse", "HEAD"]).await?;
         self.stand_on(place, &branch, &head).await?;
         self.git(place, ["add", "--all"]).await?;
@@ -294,7 +298,7 @@ impl Workspaces {
         .await?;
         tracing::warn!(
             role = ?place.role(),
-            job,
+            task,
             %branch,
             "previous run left uncommitted work; it was committed rather than discarded"
         );
@@ -302,17 +306,17 @@ impl Workspaces {
         Ok(())
     }
 
-    // Puts the building role on the branch for `job` without losing commits.
+    // Puts the building role on the branch for `task` without losing commits.
     //
     // The branch may already be ahead of the published patch, because the agent commits before it
     // publishes. Forcing the branch back to the patch head would destroy exactly that work.
-    async fn place_branch(&self, place: In, job: i64, head: &str) -> Result<String, Error> {
-        let branch = self.branch(job);
+    async fn place_branch(&self, place: In, task: i64, head: &str) -> Result<String, Error> {
+        let branch = self.branch(task);
         let tip = self.tip(place, &branch).await?;
         let target = match tip {
             Some(tip) if self.contains(place, &branch, head).await? => tip,
             Some(tip) => {
-                self.copy_diverged(place, job, &tip).await?;
+                self.copy_diverged(place, task, &tip).await?;
                 head.to_owned()
             }
             None => head.to_owned(),
@@ -323,11 +327,11 @@ impl Workspaces {
     }
 
     // Keeps a copy of a branch which has drifted away from the published patch.
-    async fn copy_diverged(&self, place: In, job: i64, tip: &str) -> Result<(), Error> {
-        let salvage = self.salvage_branch(place, job).await?;
+    async fn copy_diverged(&self, place: In, task: i64, tip: &str) -> Result<(), Error> {
+        let salvage = self.salvage_branch(place, task).await?;
         self.set_reference(place, &salvage, tip).await?;
         tracing::warn!(
-            job,
+            task,
             %salvage,
             "branch had diverged from the published patch; kept a copy before resetting"
         );
@@ -360,9 +364,9 @@ impl Workspaces {
         format!("refs/heads/{branch}")
     }
 
-    /// Removes every branch whose job is over.
+    /// Removes every branch whose task is over.
     ///
-    /// The queue decides: a job which finished has had its row removed, one which failed has not.
+    /// The queue decides: a task which finished has had its row removed, one which failed has not.
     /// A branch a working copy still stands on waits for the next preparation.
     async fn sweep(&self) -> Result<(), Error> {
         let present = self.namespace().await?;
@@ -376,13 +380,13 @@ impl Workspaces {
             .map_err(|error| Error::Queue(error.to_string()))?;
         let held = self.checked_out().await?;
         for branch in present {
-            // Only names this runtime gave a job. A salvage branch is what a failed run left
+            // Only names this runtime gave a task. A salvage branch is what a failed run left
             // behind and is the one copy of work nobody published, and anything else under this
             // namespace was not put there by the runtime at all.
-            let Some(job) = self.job_of(&branch) else {
+            let Some(task) = self.task_of(&branch) else {
                 continue;
             };
-            if !live.contains(&job) && !held.contains(&branch) {
+            if !live.contains(&task) && !held.contains(&branch) {
                 self.remove_branch(&branch).await?;
             }
         }
@@ -390,13 +394,13 @@ impl Workspaces {
         Ok(())
     }
 
-    // Reads back the job a branch was named after, and nothing for any other name.
+    // Reads back the task a branch was named after, and nothing for any other name.
     //
     // The inverse of [`Self::branch`].
-    fn job_of(&self, branch: &str) -> Option<i64> {
+    fn task_of(&self, branch: &str) -> Option<i64> {
         branch
             .strip_prefix(&self.branches())?
-            .strip_prefix("/job-")?
+            .strip_prefix("/task-")?
             .parse()
             .ok()
     }
@@ -443,10 +447,10 @@ impl Workspaces {
 
     // Picks a salvage branch name which is not already in use.
     //
-    // One name per job would let a second crash overwrite what the first one preserved, which is
+    // One name per task would let a second crash overwrite what the first one preserved, which is
     // the failure this whole path exists to prevent.
-    async fn salvage_branch(&self, place: In, job: i64) -> Result<String, Error> {
-        let stem = format!("{}/salvage/{job}", self.branches());
+    async fn salvage_branch(&self, place: In, task: i64) -> Result<String, Error> {
+        let stem = format!("{}/salvage/{task}", self.branches());
         let taken = self
             .capture(
                 place,
@@ -514,8 +518,8 @@ impl Workspaces {
         branches(self.member)
     }
 
-    fn branch(&self, job: i64) -> String {
-        format!("{}/job-{job}", self.branches())
+    fn branch(&self, task: i64) -> String {
+        format!("{}/task-{task}", self.branches())
     }
 
     async fn head(&self, source: Source) -> Result<String, Error> {
@@ -705,8 +709,8 @@ pub enum Error {
     /// A blocking workspace task failed.
     #[error("workspace task failed: {0}")]
     Task(String),
-    /// Reading the member's work queue failed.
-    #[error("workspace could not read the work queue: {0}")]
+    /// Reading the member's task queue failed.
+    #[error("workspace could not read the task queue: {0}")]
     Queue(String),
     /// Git is too old to create relocatable working copies.
     #[error(
@@ -741,7 +745,7 @@ mod tests {
         home::MemberHome,
         manifest::QueuePosition,
         member::Member,
-        queue::{Job, WorkQueue},
+        queue::{Task, TaskQueue},
         watcher::Subject,
         workspace::Workspaces,
     };
@@ -755,7 +759,7 @@ mod tests {
         profile: Profile,
         repository: radicle::identity::RepoId,
         workspaces: Workspaces,
-        queue: WorkQueue,
+        queue: TaskQueue,
         home: MemberHome,
         patch: radicle::cob::ObjectId,
         issue: radicle::cob::ObjectId,
@@ -763,15 +767,20 @@ mod tests {
     }
 
     impl Fixture {
-        // Records a job for `source` and starts it, the way the builder would.
-        async fn start(&self, source: impl Into<Source>) -> Job {
+        // Records a task for `source` and starts it, the way the builder would.
+        async fn start(&self, source: impl Into<Source>) -> Task {
             let _id = self
                 .queue
-                .push("do it".to_owned(), source.into(), QueuePosition::End)
+                .push(crate::queue::TaskRequest::new(
+                    "do it".to_owned(),
+                    source.into(),
+                    QueuePosition::End,
+                ))
                 .await
-                .expect("job should be recorded");
+                .expect("task should be recorded")
+                .task;
 
-            self.queue.next().await.expect("job should be taken")
+            self.queue.next().await.expect("task should be taken")
         }
     }
 
@@ -875,7 +884,7 @@ mod tests {
         };
         let home = MemberHome::at(root.join("member"));
         home.create().expect("member directory should be created");
-        let queue = WorkQueue::memory(repository, Member::Nico)
+        let queue = TaskQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open");
         let workspaces = Workspaces::new(
@@ -976,16 +985,16 @@ mod tests {
             .await
             .expect("working copies should be created");
         let coder = home.worktree(Role::Coder);
-        let job = fixture.start(Subject::Patch(fixture.patch)).await;
+        let task = fixture.start(Subject::Patch(fixture.patch)).await;
 
         workspaces
-            .prepare_job(&job)
+            .prepare_task(&task)
             .await
             .expect("coder should take the patch");
         fs::write(coder.join("half-done.rs"), "unfinished").expect("file should be written");
 
         workspaces
-            .prepare_job(&job)
+            .prepare_task(&task)
             .await
             .expect("coder should take it again");
 
@@ -1172,7 +1181,7 @@ mod tests {
             .initialize()
             .await
             .expect("working copies should be created");
-        let job = fixture.start(Subject::Patch(fixture.patch)).await;
+        let task = fixture.start(Subject::Patch(fixture.patch)).await;
         // Somewhere the runtime is about to move its own branch away from: the reference below
         // stands for this one, so following it would carry this one along.
         let base = git(&coder, &["rev-parse", &format!("{}~1", fixture.head)]);
@@ -1181,14 +1190,14 @@ mod tests {
             &coder,
             &[
                 "symbolic-ref",
-                &format!("refs/heads/{NAMESPACE}/job-{}", job.id),
+                &format!("refs/heads/{NAMESPACE}/task-{}", task.id),
                 "refs/heads/victim",
             ],
         );
 
         fixture
             .workspaces
-            .prepare_job(&job)
+            .prepare_task(&task)
             .await
             .expect("coder should take the patch");
 
@@ -1200,11 +1209,11 @@ mod tests {
         );
     }
 
-    // Two jobs from one issue, or one chat channel, are two separate pieces of work. Naming a
+    // Two tasks from one issue, or one chat channel, are two separate pieces of work. Naming a
     // branch after where the request came from would put both on the same branch, where the second
     // silently continues from whatever the first left.
     #[tokio::test]
-    async fn gives_two_jobs_from_one_source_a_branch_each() {
+    async fn gives_two_tasks_from_one_source_a_branch_each() {
         let fixture = repository().await;
         let coder = fixture.home.worktree(Role::Coder);
         fixture
@@ -1215,32 +1224,32 @@ mod tests {
         let first = fixture.start(Subject::Issue(fixture.issue)).await;
         fixture
             .workspaces
-            .prepare_job(&first)
+            .prepare_task(&first)
             .await
-            .expect("coder should take the first job");
+            .expect("coder should take the first task");
         fixture
             .queue
             .finish()
             .await
-            .expect("the first job should finish");
+            .expect("the first task should finish");
         let second = fixture.start(Subject::Issue(fixture.issue)).await;
 
         fixture
             .workspaces
-            .prepare_job(&second)
+            .prepare_task(&second)
             .await
-            .expect("coder should take the second job");
+            .expect("coder should take the second task");
 
         assert_ne!(first.id, second.id);
         assert_eq!(
             git(&coder, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            format!("{NAMESPACE}/job-{}", second.id),
-            "the second job must stand on a branch of its own"
+            format!("{NAMESPACE}/task-{}", second.id),
+            "the second task must stand on a branch of its own"
         );
     }
 
-    // The patch a job produces does not exist when the job starts, so a branch named after the
-    // patch could only ever be reached by renaming one. Naming it after the job means the name is
+    // The patch a task produces does not exist when the task starts, so a branch named after the
+    // patch could only ever be reached by renaming one. Naming it after the task means the name is
     // right from the first commit and never has to move.
     #[tokio::test]
     async fn keeps_one_branch_name_from_the_first_commit_to_the_patch() {
@@ -1251,44 +1260,45 @@ mod tests {
             .initialize()
             .await
             .expect("working copies should be created");
-        let job = fixture.start(Subject::Issue(fixture.issue)).await;
+        let task = fixture.start(Subject::Issue(fixture.issue)).await;
         fixture
             .workspaces
-            .prepare_job(&job)
+            .prepare_task(&task)
             .await
             .expect("coder should take the issue");
         let branch = git(&coder, &["rev-parse", "--abbrev-ref", "HEAD"]);
 
-        // What the agent does when it publishes: the job is now answering a patch instead of the
+        // What the agent does when it publishes: the task is now answering a patch instead of the
         // issue it came from.
         fixture
             .queue
-            .retarget(job.id, Subject::Patch(fixture.patch).into())
+            .produced(task.id, Subject::Patch(fixture.patch))
             .await
-            .expect("the job should retarget");
-        let job = fixture
+            .expect("the task should retarget");
+        let task = fixture
             .queue
             .running()
             .await
-            .expect("the job should still be running");
+            .expect("the task should still be running");
         fixture
             .workspaces
-            .prepare_job(&job)
+            .prepare_task(&task)
             .await
             .expect("coder should carry on");
 
         assert_eq!(
             git(&coder, &["rev-parse", "--abbrev-ref", "HEAD"]),
             branch,
-            "producing a patch must not move the job onto another branch"
+            "producing a patch must not move the task onto another branch"
         );
-        assert_eq!(branch, format!("{NAMESPACE}/job-{}", job.id));
+        assert_eq!(branch, format!("{NAMESPACE}/task-{}", task.id));
     }
 
-    // A branch is the working copy of one job and means nothing once that job is over. The queue is
-    // what says so: a job which finished has had its row removed, and one which failed has not.
+    // A branch is the working copy of one task and means nothing once that task is over. The queue
+    // is what says so: a task which finished has had its row removed, and one which failed has
+    // not.
     #[tokio::test]
-    async fn removes_the_branch_of_a_job_which_finished() {
+    async fn removes_the_branch_of_a_task_which_finished() {
         let fixture = repository().await;
         let coder = fixture.home.worktree(Role::Coder);
         fixture
@@ -1296,33 +1306,37 @@ mod tests {
             .initialize()
             .await
             .expect("working copies should be created");
-        let job = fixture.start(Subject::Issue(fixture.issue)).await;
-        let branch = format!("{NAMESPACE}/job-{}", job.id);
+        let task = fixture.start(Subject::Issue(fixture.issue)).await;
+        let branch = format!("{NAMESPACE}/task-{}", task.id);
         fixture
             .workspaces
-            .prepare_job(&job)
+            .prepare_task(&task)
             .await
             .expect("coder should take the issue");
-        fixture.queue.finish().await.expect("the job should finish");
+        fixture
+            .queue
+            .finish()
+            .await
+            .expect("the task should finish");
         assert!(!git(&coder, &["branch", "--list", &branch]).is_empty());
 
         let next = fixture.start(Subject::Patch(fixture.patch)).await;
         fixture
             .workspaces
-            .prepare_job(&next)
+            .prepare_task(&next)
             .await
             .expect("coder should move to other work");
 
         assert!(
             git(&coder, &["branch", "--list", &branch]).is_empty(),
-            "the branch of a job which is over must be removed"
+            "the branch of a task which is over must be removed"
         );
     }
 
-    // A job which stalled, failed, or was interrupted keeps its row, and its branch holds commits
+    // A task which stalled, failed, or was interrupted keeps its row, and its branch holds commits
     // nobody published. Removing it would throw that work away with nothing to recover it from.
     #[tokio::test]
-    async fn keeps_the_branch_of_a_job_which_did_not_finish() {
+    async fn keeps_the_branch_of_a_task_which_did_not_finish() {
         let fixture = repository().await;
         let coder = fixture.home.worktree(Role::Coder);
         fixture
@@ -1331,31 +1345,31 @@ mod tests {
             .await
             .expect("working copies should be created");
         let failed = fixture.start(Subject::Issue(fixture.issue)).await;
-        let branch = format!("{NAMESPACE}/job-{}", failed.id);
+        let branch = format!("{NAMESPACE}/task-{}", failed.id);
         fixture
             .workspaces
-            .prepare_job(&failed)
+            .prepare_task(&failed)
             .await
             .expect("coder should take the issue");
 
-        // No `finish`, which is what the builder skips when a job fails.
+        // No `finish`, which is what the builder skips when a task fails.
         let next = fixture.start(Subject::Patch(fixture.patch)).await;
         fixture
             .workspaces
-            .prepare_job(&next)
+            .prepare_task(&next)
             .await
             .expect("coder should move to other work");
 
         assert!(
             !git(&coder, &["branch", "--list", &branch]).is_empty(),
-            "work a failed job left behind must survive until that job is actually carried out"
+            "work a failed task left behind must survive until that task is actually carried out"
         );
     }
 
-    // A job finishing while its branch is checked out is noticed nowhere but in memory, so a
+    // A task finishing while its branch is checked out is noticed nowhere but in memory, so a
     // restart would otherwise leave that branch behind forever.
     #[tokio::test]
-    async fn removes_the_branch_of_a_finished_job_after_a_restart() {
+    async fn removes_the_branch_of_a_finished_task_after_a_restart() {
         let fixture = repository().await;
         let coder = fixture.home.worktree(Role::Coder);
         fixture
@@ -1363,14 +1377,18 @@ mod tests {
             .initialize()
             .await
             .expect("working copies should be created");
-        let job = fixture.start(Subject::Patch(fixture.patch)).await;
-        let branch = format!("{NAMESPACE}/job-{}", job.id);
+        let task = fixture.start(Subject::Patch(fixture.patch)).await;
+        let branch = format!("{NAMESPACE}/task-{}", task.id);
         fixture
             .workspaces
-            .prepare_job(&job)
+            .prepare_task(&task)
             .await
             .expect("coder should take the patch");
-        fixture.queue.finish().await.expect("the job should finish");
+        fixture
+            .queue
+            .finish()
+            .await
+            .expect("the task should finish");
         assert!(!git(&coder, &["branch", "--list", &branch]).is_empty());
 
         // A different value, holding nothing of what the run before it was waiting to remove.
@@ -1389,7 +1407,7 @@ mod tests {
 
         assert!(
             git(&coder, &["branch", "--list", &branch]).is_empty(),
-            "the branch of a job which is over must be removed at the next start"
+            "the branch of a task which is over must be removed at the next start"
         );
     }
 
@@ -1402,17 +1420,21 @@ mod tests {
             .initialize()
             .await
             .expect("working copies should be created");
-        let job = fixture.start(Subject::Patch(fixture.patch)).await;
-        let branch = format!("{NAMESPACE}/job-{}", job.id);
+        let task = fixture.start(Subject::Patch(fixture.patch)).await;
+        let branch = format!("{NAMESPACE}/task-{}", task.id);
         fixture
             .workspaces
-            .prepare_job(&job)
+            .prepare_task(&task)
             .await
             .expect("coder should take the patch");
         assert_eq!(git(&coder, &["rev-parse", "--abbrev-ref", "HEAD"]), branch);
 
         // Finishing does not move the copy off the branch, and the sweep runs anyway.
-        fixture.queue.finish().await.expect("the job should finish");
+        fixture
+            .queue
+            .finish()
+            .await
+            .expect("the task should finish");
         fixture
             .workspaces
             .prepare(Role::Talker, Subject::Patch(fixture.patch).into())
@@ -1427,7 +1449,7 @@ mod tests {
         let next = fixture.start(Subject::Issue(fixture.issue)).await;
         fixture
             .workspaces
-            .prepare_job(&next)
+            .prepare_task(&next)
             .await
             .expect("coder should move to other work");
 
@@ -1446,10 +1468,10 @@ mod tests {
             .await
             .expect("working copies should be created");
         let coder = home.worktree(Role::Coder);
-        let job = fixture.start(Subject::Patch(fixture.patch)).await;
+        let task = fixture.start(Subject::Patch(fixture.patch)).await;
 
         workspaces
-            .prepare_job(&job)
+            .prepare_task(&task)
             .await
             .expect("coder should take the patch");
         fs::write(coder.join("README.md"), "agent's work\n").expect("README should be written");
@@ -1469,7 +1491,7 @@ mod tests {
         let committed = git(&coder, &["rev-parse", "HEAD"]);
 
         workspaces
-            .prepare_job(&job)
+            .prepare_task(&task)
             .await
             .expect("coder should take it again");
 

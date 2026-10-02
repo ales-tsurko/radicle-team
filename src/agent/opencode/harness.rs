@@ -25,7 +25,7 @@ use crate::{
     },
     member::Profile,
     provider::{Credentials, Provider},
-    queue::Job,
+    queue::Task,
     sandbox::{AgentCommand, AgentSandbox, Output},
 };
 
@@ -177,23 +177,23 @@ impl OpenCode {
         }
     }
 
-    // Asks a fresh run to commit whatever the stopped job left in the working copy.
-    async fn preserve(&self, job: &Job, workspace: &Path) -> Result<(), Error> {
+    // Asks a fresh run to commit whatever the stopped task left in the working copy.
+    async fn preserve(&self, task: &Task, workspace: &Path) -> Result<(), Error> {
         tracing::info!(
-            job = job.id,
-            "asking the stopped job to commit what it reached"
+            task = task.id,
+            "asking the stopped task to commit what it reached"
         );
         match self
-            .deliver(prompt::stopping(job), workspace, &title(job))
+            .deliver(prompt::stopping(task), workspace, &title(task))
             .await?
         {
             Outcome::Finished => Ok(()),
             // The runtime ran out of patience with the second run too. What is in the tree is still
-            // there, and preparing the next job commits it to a salvage branch.
+            // there, and preparing the next task commits it to a salvage branch.
             Outcome::Stopped => {
                 tracing::warn!(
-                    job = job.id,
-                    "the stopped job was ended before it committed; its work stays in the tree"
+                    task = task.id,
+                    "the stopped task was ended before it committed; its work stays in the tree"
                 );
 
                 Ok(())
@@ -386,16 +386,16 @@ impl Coder for OpenCode {
             .map_err(agent::Error::new)
     }
 
-    async fn work(&self, job: Job, workspace: PathBuf) -> Result<(), agent::Error> {
+    async fn work(&self, task: Task, workspace: PathBuf) -> Result<(), agent::Error> {
         let carried = self
-            .deliver(prompt::job(&job), &workspace, &title(&job))
+            .deliver(prompt::task(&task), &workspace, &title(&task))
             .await
             .map_err(agent::Error::new)?;
         match carried {
             Outcome::Finished => Ok(()),
-            // End the CLI delivery, then ask a fresh run to commit what the stopped job reached.
+            // End the CLI delivery, then ask a fresh run to commit what the stopped task reached.
             Outcome::Stopped if self.session.was_interrupted() => self
-                .preserve(&job, &workspace)
+                .preserve(&task, &workspace)
                 .await
                 .map_err(agent::Error::new),
             Outcome::Stopped => Err(agent::Error::new(Error::Stopped(self.role))),
@@ -523,9 +523,9 @@ pub(crate) enum Error {
     Sandbox(#[from] crate::sandbox::Error),
 }
 
-// Returns the name a job's runs are recorded under, so a transcript can be found again.
-fn title(job: &Job) -> String {
-    format!("job:{}", job.id)
+// Returns the name a task's runs are recorded under, so a transcript can be found again.
+fn title(task: &Task) -> String {
+    format!("task:{}", task.id)
 }
 
 fn path(path: &Path) -> String {

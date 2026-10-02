@@ -20,7 +20,7 @@ use crate::{
     agent::session::Session,
     chat::{AuthenticatedSender, ChannelId, MessageId as ChatMessageId},
     member::Profile,
-    queue::Job,
+    queue::Task,
     sandbox::AgentSandbox,
     watcher::{Change, Comment, Subject, Target},
 };
@@ -277,7 +277,7 @@ pub(crate) trait Chatter: Supervised {
 ///
 /// A member answers messages and builds at the same time, which one conversation cannot do: a
 /// half-written patch has no safe point to pause at. The two run as separate roles under one
-/// identity, so this interface receives jobs rather than activity. Deciding what should be built
+/// identity, so this interface receives tasks rather than activity. Deciding what should be built
 /// belongs to [`Talker`]. Deciding how belongs here.
 #[async_trait]
 pub(crate) trait Coder: Supervised + Sync {
@@ -290,16 +290,16 @@ pub(crate) trait Coder: Supervised + Sync {
         layout: Layout,
     ) -> Result<(), Error>;
 
-    /// Carries out one queued job in `workspace`.
+    /// Carries out one queued task in `workspace`.
     ///
-    /// The job's brief states what was decided and its source addresses the discussion behind it. A
-    /// job may arrive from a conversation this role never saw.
+    /// The task's brief states what was decided and its source addresses the discussion behind it.
+    /// A task may arrive from a conversation this role never saw.
     ///
     /// This takes a shared reference so that [`interrupt`](Self::interrupt) can reach the role
-    /// while the job is still running.
-    async fn work(&self, job: Job, workspace: PathBuf) -> Result<(), Error>;
+    /// while the task is still running.
+    async fn work(&self, task: Task, workspace: PathBuf) -> Result<(), Error>;
 
-    /// Asks the role to stop the running job and preserve what it has.
+    /// Asks the role to stop the running task and preserve what it has.
     ///
     /// Work in progress is committed to a branch rather than discarded, because the request to stop
     /// usually means priorities moved, not that the work was worthless. The interrupted
@@ -461,47 +461,57 @@ impl fmt::Display for DeliveryId {
     }
 }
 
-/// One unit of work a member's repository writes belong to.
+/// An agent activity that owns a member's repository writes.
 ///
 /// The talker handles one classified delivery or chat message at a time and the coder one queued
-/// job, so the two run under separate scopes even though they publish under a single identity.
+/// task, so the two run under separate scopes even though they publish under a single identity.
 /// Recovering an interrupted write means asking which scope it belonged to, which is why chat and
-/// jobs need identities the delivery key cannot express.
+/// tasks need identities the delivery key cannot express.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum WorkId {
+pub enum ActivityId {
     /// One classified action delivered to the talker.
     Delivery(DeliveryId),
     /// One authenticated chat message.
     Chat(ChatMessageId),
-    /// One queued job carried out by the coder.
-    Job(i64),
+    /// One queued task carried out by the coder.
+    Task(i64),
 }
 
-impl WorkId {
-    /// Returns a name for this work usable as a directory on every supported platform.
+impl ActivityId {
+    /// Identifies an accepted request, joining assignment and mention actions from one operation.
+    #[must_use]
+    pub fn request(&self) -> String {
+        match self {
+            Self::Delivery(delivery) => format!("operation:{}", delivery.operation),
+            Self::Chat(message) => format!("chat:{message}"),
+            Self::Task(task) => format!("task:{task}"),
+        }
+    }
+
+    /// Returns a name for this activity usable as a directory on every supported platform.
     #[must_use]
     pub fn directory(&self) -> String {
         self.to_string().replace(':', "-")
     }
 }
 
-impl fmt::Display for WorkId {
+impl fmt::Display for ActivityId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Delivery(delivery) => write!(formatter, "{delivery}"),
             Self::Chat(message) => write!(formatter, "chat:{message}"),
-            Self::Job(job) => write!(formatter, "job:{job}"),
+            Self::Task(task) => write!(formatter, "task:{task}"),
         }
     }
 }
 
-impl From<DeliveryId> for WorkId {
+impl From<DeliveryId> for ActivityId {
     fn from(delivery: DeliveryId) -> Self {
         Self::Delivery(delivery)
     }
 }
 
-impl From<ChatMessageId> for WorkId {
+impl From<ChatMessageId> for ActivityId {
     fn from(message: ChatMessageId) -> Self {
         Self::Chat(message)
     }
@@ -562,30 +572,30 @@ mod tests {
     use url::Url;
 
     use crate::{
-        agent::{DeliveryId, McpEndpoint, Source, WorkId},
+        agent::{ActivityId, DeliveryId, McpEndpoint, Source},
         chat::MessageId,
         watcher::Subject,
     };
 
     #[test]
-    fn work_directory_names_avoid_characters_a_path_cannot_hold() {
-        let delivery = WorkId::Delivery(DeliveryId {
+    fn activity_directory_names_avoid_characters_a_path_cannot_hold() {
+        let delivery = ActivityId::Delivery(DeliveryId {
             operation: EntryId::from_str("1111111111111111111111111111111111111111")
                 .expect("operation should be valid"),
             action: 2,
         });
 
-        for work in [
+        for activity in [
             delivery,
-            WorkId::Chat(MessageId::new(3).expect("message should be valid")),
-            WorkId::Job(7),
+            ActivityId::Chat(MessageId::new(3).expect("message should be valid")),
+            ActivityId::Task(7),
         ] {
-            let directory = work.directory();
+            let directory = activity.directory();
             assert!(
                 !directory.contains(':'),
                 "Windows rejects a colon in a path, so '{directory}' would fail there"
             );
-            assert!(directory.contains(&work.to_string().replace(':', "-")));
+            assert!(directory.contains(&activity.to_string().replace(':', "-")));
         }
     }
 

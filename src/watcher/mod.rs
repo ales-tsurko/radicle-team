@@ -4,7 +4,7 @@
 //! interactions requiring that member's attention, and emits deliveries to the member's serialized
 //! conversation dispatcher. The dispatcher invokes the `Talker` and acknowledges successful
 //! handling before the watcher checkpoints the activity. Assignments are the exception: they are
-//! work rather than conversation, so they join the member's [`WorkQueue`](crate::queue::WorkQueue)
+//! work rather than conversation, so they join the member's [`TaskQueue`](crate::queue::TaskQueue)
 //! and reach the building role through [`Builder`](crate::builder::Builder).
 //!
 //! # Lifecycle

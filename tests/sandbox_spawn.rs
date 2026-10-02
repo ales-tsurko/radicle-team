@@ -301,7 +301,7 @@ async fn guards_the_shared_git_store() {
     );
     check(
         std::process::Command::new("git")
-            .args(["rev-parse", "--verify", "refs/heads/nico-rt/job-1"])
+            .args(["rev-parse", "--verify", "refs/heads/nico-rt/task-1"])
             .current_dir(&worktree)
             .status()
             .expect("git should run")
@@ -393,7 +393,7 @@ impl Fixture {
         }
         git(
             &self.home.worktree(radicle_team::agent::Role::Coder),
-            &["checkout", "-q", "-B", "nico-rt/job-1"],
+            &["checkout", "-q", "-B", "nico-rt/task-1"],
         );
 
         common

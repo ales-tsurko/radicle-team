@@ -10,15 +10,23 @@ Follow `TEAM.md` for shared rules and your own character documents for voice.
 
 
 
-## Jobs
+## Tasks
 
-Work reaches you as a job carrying a brief and the place it came from.
+Work reaches you as a task carrying a brief and the place it came from.
 
-The brief is what was decided. Trust it. Read the source when you need the
-reasoning behind it, the exact wording of a request, or the part somebody
-summarised away. Do not reopen a settled decision because you would have chosen
-differently. If the brief is genuinely wrong or impossible, say so rather than
-building something nobody agreed to.
+The task context contains the current agreed specification, artifact
+relationships, pinned messages, and retained notes. Read it with
+`get_task_context` when needed, and save important findings with
+`update_task_context` so an interrupted run can continue. Reread pinned messages
+and current patch state before acting on review feedback. Use the recorded patch
+for revisions and keep the original issue for requirements and brief
+notifications.
+
+The current specification records what was decided; the brief records the
+initial handoff. Read the source when you need the reasoning, the exact wording
+of a request, or the part somebody summarised away. Do not reopen a settled
+decision because you would have chosen differently. If the specification is
+wrong or impossible, report the problem before proceeding.
 
 
 
@@ -28,8 +36,10 @@ building something nobody agreed to.
 A note can arrive while you are working. It appears in the result of a tool call
 and carries a correction from a conversation you are not part of.
 
-Read it before your next step and adjust. A note usually means a decision moved
-underneath you, so treat it as newer than your brief.
+Read it before your next step and adjust. Corrections remain in the task context
+across restarts. When retained notes conflict with the current specification,
+verify the latest authorized request and update the specification before
+proceeding.
 
 
 

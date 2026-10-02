@@ -22,7 +22,7 @@ use crate::{
     conversation::{self, Triggers},
     manifest::{PriorityLabels, QueuePosition, RepositoryPolicy},
     member::Member,
-    queue::WorkQueue,
+    queue::TaskQueue,
     watcher::{
         activity::{Activity, Delivery, Kind, Subject},
         classification::{ActionEnvelope, Context as ClassificationContext, NormalizedAction},
@@ -476,7 +476,7 @@ impl Watcher {
 #[derive(Debug, Clone)]
 pub(crate) struct DeliveryRuntime {
     storage: Storage,
-    queue: WorkQueue,
+    queue: TaskQueue,
     priority: PriorityLabels,
     conversations: conversation::Handle,
 }
@@ -485,7 +485,7 @@ impl DeliveryRuntime {
     // Pairs classified deliveries with the conversation dispatcher and assignment queue.
     pub(crate) const fn new(
         storage: Storage,
-        queue: WorkQueue,
+        queue: TaskQueue,
         priority: PriorityLabels,
         conversations: conversation::Handle,
     ) -> Self {
@@ -497,7 +497,7 @@ impl DeliveryRuntime {
         }
     }
 
-    // Reads the assigned subject as a job the building role can start from.
+    // Reads the assigned subject as a task the building role can start from.
     async fn assignment(&self, repository: RepoId, subject: Subject) -> Result<Assignment, Error> {
         let storage = self.storage.clone();
         let priority = self.priority.clone();
@@ -681,15 +681,24 @@ impl PendingActivities {
         let subject = activity.subject;
         let assignment = runtime.assignment(scope.repository, subject).await?;
         let position = assignment.position;
-        let job = runtime
-            .queue
-            .push(assignment.brief, subject.into(), position)
-            .await?;
+        let mut request =
+            crate::queue::TaskRequest::new(assignment.brief, subject.into(), position);
+        request.request = Some(crate::agent::ActivityId::from(activity.delivery_id()).request());
+        request
+            .context
+            .messages
+            .push(crate::queue::MessageReference {
+                subject: subject.to_string(),
+                entry: activity.operation.to_string(),
+                revision: None,
+                purpose: "Original assignment".to_owned(),
+            });
+        let receipt = runtime.queue.push(request).await?;
         tracing::info!(
             member = %scope.member,
             repository = %scope.repository,
             %subject,
-            job,
+            task = receipt.task,
             ?position,
             "assignment recorded as queued work"
         );
@@ -792,7 +801,7 @@ pub enum Error {
     #[error("watcher database error: {0}")]
     Database(String),
     /// Recording assigned work failed.
-    #[error("work queue error: {0}")]
+    #[error("task queue error: {0}")]
     Queue(#[from] crate::queue::Error),
     /// An assignment names an issue or patch the repository does not contain.
     #[error("assigned {0} was not found")]
@@ -806,9 +815,9 @@ pub enum Error {
     /// Preparing or cleaning the agent workspace failed.
     #[error("agent workspace failed: {0}")]
     Workspace(String),
-    /// Activating the work-scoped MCP capability failed.
-    #[error("work scope failed: {0}")]
-    WorkScope(String),
+    /// Activating the activity-scoped MCP capability failed.
+    #[error("activity scope failed: {0}")]
+    ActivityScope(String),
     /// Recovering durable MCP publications before checkpointing failed.
     #[error("MCP publication recovery failed: {0}")]
     PublicationRecovery(String),
@@ -843,7 +852,7 @@ impl From<conversation::Error> for Error {
         match error {
             conversation::Error::Talker(error) => Self::Talker(error),
             conversation::Error::Workspace(error) => Self::Workspace(error),
-            conversation::Error::WorkScope(error) => Self::WorkScope(error),
+            conversation::Error::ActivityScope(error) => Self::ActivityScope(error),
             conversation::Error::PublicationRecovery(error) => Self::PublicationRecovery(error),
             conversation::Error::Unavailable => Self::ConversationUnavailable,
             conversation::Error::Stalled => Self::Stalled,
@@ -869,7 +878,7 @@ mod tests {
         conversation::Dispatcher,
         manifest::{PriorityLabels, QueuePosition},
         member::{Member, Profile as MemberProfile},
-        queue::WorkQueue,
+        queue::TaskQueue,
         watcher::{
             Change, Comment, Subject, Target,
             activity::{Activity, Delivery, Kind},
@@ -921,7 +930,7 @@ mod tests {
         let state = ProcessedActivities::memory()
             .await
             .expect("state should initialize");
-        let queue = WorkQueue::memory(repository, Member::Nico)
+        let queue = TaskQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open");
         let (conversations, dispatcher) = Dispatcher::new(
@@ -934,7 +943,7 @@ mod tests {
                 profile.info(),
                 queue.clone(),
             ),
-            crate::mcp::WorkScope::default(),
+            crate::mcp::ActivityScope::default(),
         );
         let runtime = DeliveryRuntime::new(
             profile.storage.clone(),
@@ -1059,7 +1068,7 @@ mod tests {
             ));
             pending
         };
-        let queue = WorkQueue::memory(repository, Member::Nico)
+        let queue = TaskQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open");
         let home = crate::home::MemberHome::at(root.path().join("member"));
@@ -1080,7 +1089,7 @@ mod tests {
             let (conversations, dispatcher) = Dispatcher::new(
                 Member::Nico,
                 workspaces.clone(),
-                crate::mcp::WorkScope::default(),
+                crate::mcp::ActivityScope::default(),
             );
             let runtime = DeliveryRuntime::new(
                 profile.storage.clone(),
@@ -1144,7 +1153,7 @@ mod tests {
         );
     }
 
-    async fn enqueue_assignment(labels: &[Label]) -> (WorkQueue, tempfile::TempDir) {
+    async fn enqueue_assignment(labels: &[Label]) -> (TaskQueue, tempfile::TempDir) {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let (profile, repository, issue) = assigned_issue(root.path(), labels);
         let operation = EntryId::from_str("2222222222222222222222222222222222222222")
@@ -1158,7 +1167,7 @@ mod tests {
             profile.did(),
             Kind::Assigned,
         ));
-        let queue = WorkQueue::memory(repository, Member::Nico)
+        let queue = TaskQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open");
         let (conversations, dispatcher) = Dispatcher::new(
@@ -1171,7 +1180,7 @@ mod tests {
                 profile.info(),
                 queue.clone(),
             ),
-            crate::mcp::WorkScope::default(),
+            crate::mcp::ActivityScope::default(),
         );
         let runtime = DeliveryRuntime::new(
             profile.storage.clone(),

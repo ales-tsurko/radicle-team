@@ -1,7 +1,7 @@
 //! Loopback HTTP transport for the MCP endpoint.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     sync::Arc,
@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-    agent::{ChatContext, Context as AgentContext, McpEndpoint, Publisher, Role, Source, WorkId},
+    agent::{
+        ActivityId, ChatContext, Context as AgentContext, McpEndpoint, Publisher, Role, Source,
+    },
     manifest::McpAllowlist,
     mcp::{
         protocol::{SubjectKind, SubjectRequest},
@@ -31,7 +33,7 @@ pub(crate) struct Server {
     endpoint: McpEndpoint,
     cancellation: CancellationToken,
     task: Option<tokio::task::JoinHandle<Result<(), Error>>>,
-    scope: WorkScope,
+    scope: ActivityScope,
 }
 
 impl std::fmt::Debug for Server {
@@ -56,7 +58,7 @@ impl Server {
         let endpoint = McpEndpoint::new(Url::parse(&format!("http://{address}{route}"))?);
         let cancellation = CancellationToken::new();
         let server_cancellation = cancellation.child_token();
-        let scope = WorkScope::new(publisher.clone());
+        let scope = ActivityScope::new(publisher.clone());
         let task = tokio::spawn(Self::serve(
             listener,
             route,
@@ -91,7 +93,7 @@ impl Server {
         }
     }
 
-    pub(crate) fn scope(&self) -> WorkScope {
+    pub(crate) fn scope(&self) -> ActivityScope {
         self.scope.clone()
     }
 
@@ -139,45 +141,45 @@ impl Drop for Server {
     }
 }
 
-// Repository the member is addressing while one unit of work runs.
+// Repository the member is addressing while one agent activity runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkContext {
+pub(crate) struct ActivityContext {
     pub(crate) repository: RepoId,
     pub(crate) source: Source,
-    pub(crate) work: WorkId,
+    pub(crate) activity: ActivityId,
     pub(crate) workspace: PathBuf,
 }
 
-impl From<AgentContext> for WorkContext {
+impl From<AgentContext> for ActivityContext {
     fn from(context: AgentContext) -> Self {
         Self {
             repository: context.repository,
             source: context.subject.into(),
-            work: context.delivery.into(),
+            activity: context.delivery.into(),
             workspace: context.workspace,
         }
     }
 }
 
-impl From<ChatContext> for WorkContext {
+impl From<ChatContext> for ActivityContext {
     fn from(context: ChatContext) -> Self {
         Self {
             repository: context.repository(),
             source: Source::Chat(context.channel().clone()),
-            work: context.message().into(),
+            activity: context.message().into(),
             workspace: context.workspace().to_owned(),
         }
     }
 }
 
-// Activates MCP access for exactly one delivery, authenticated chat message, or job.
+// Activates MCP access for exactly one delivery, authenticated chat message, or task.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct WorkScope {
-    active: Arc<tokio::sync::RwLock<Option<Arc<ActiveWork>>>>,
+pub(crate) struct ActivityScope {
+    active: Arc<tokio::sync::RwLock<Option<Arc<ActiveActivity>>>>,
     publisher: Option<Publisher>,
 }
 
-impl WorkScope {
+impl ActivityScope {
     pub(super) fn new(publisher: Publisher) -> Self {
         Self {
             active: Arc::default(),
@@ -185,14 +187,15 @@ impl WorkScope {
         }
     }
 
-    pub(crate) async fn activate(&self, context: impl Into<WorkContext>) -> Result<(), String> {
+    pub(crate) async fn activate(&self, context: impl Into<ActivityContext>) -> Result<(), String> {
         let mut active = self.active.write().await;
         if active.is_some() {
-            return Err("another unit of work is already active".to_owned());
+            return Err("another activity is already active".to_owned());
         }
-        *active = Some(Arc::new(ActiveWork {
+        *active = Some(Arc::new(ActiveActivity {
             context: context.into(),
             invocations: Arc::default(),
+            related: tokio::sync::Mutex::default(),
         }));
         Ok(())
     }
@@ -201,18 +204,61 @@ impl WorkScope {
         *self.active.write().await = None;
     }
 
-    pub(crate) async fn reconcile(&self, work: WorkId) -> Result<(), String> {
+    pub(crate) async fn reconcile(&self, activity: ActivityId) -> Result<(), String> {
         if let Some(publisher) = &self.publisher {
-            Box::pin(publisher.reconcile(work))
+            Box::pin(publisher.reconcile(activity))
                 .await
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
 
-    pub(super) async fn access(&self, request: &SubjectRequest) -> Result<WorkAccess, String> {
-        let access = self.access_current().await?;
-        let context = access.context();
+    pub(super) async fn access_current(&self) -> Result<ActivityAccess, String> {
+        let guard = Arc::clone(&self.active).read_owned().await;
+        let activity = guard
+            .as_ref()
+            .ok_or_else(|| "no activity is active".to_owned())?;
+        let context = activity.context.clone();
+        let activity = Arc::clone(activity);
+        Ok(ActivityAccess {
+            guard,
+            context,
+            activity,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ActiveActivity {
+    context: ActivityContext,
+    invocations: Arc<tokio::sync::Mutex<BTreeMap<String, usize>>>,
+    related: tokio::sync::Mutex<BTreeSet<String>>,
+}
+
+#[derive(Debug)]
+pub(super) struct ActivityAccess {
+    guard: tokio::sync::OwnedRwLockReadGuard<Option<Arc<ActiveActivity>>>,
+    context: ActivityContext,
+    activity: Arc<ActiveActivity>,
+}
+
+impl ActivityAccess {
+    pub(super) fn task_id(&self, requested: Option<i64>) -> Result<i64, String> {
+        if let Some(task) = requested {
+            return Ok(task);
+        }
+        match self.context.activity {
+            ActivityId::Task(task) => Ok(task),
+            _ => Err(
+                "provide the task ID from task_status; only the building role has an implicit \
+                 active task"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    pub(super) async fn require_subject(&self, request: &SubjectRequest) -> Result<(), String> {
+        let context = self.context();
         let matches = match &context.source {
             // Chat senders are authenticated and mapped to a DID before ChatContext exists, so
             // they may address any subject in this member's already-fixed repository.
@@ -225,48 +271,41 @@ impl WorkScope {
             }
             Source::Subject(_) => false,
         };
-        if !matches {
-            return Err("subject is outside the active unit of work".to_owned());
+        let reference = format!(
+            "{}:{}",
+            match request.kind {
+                SubjectKind::Issue => "issue",
+                SubjectKind::Patch => "patch",
+            },
+            request.subject
+        );
+        if !matches && !self.activity.related.lock().await.contains(&reference) {
+            return Err(format!(
+                "activity from {} cannot write to {reference}: no task relationship was verified; \
+                 use get_subject to inspect it and link the requested task in the originating \
+                 discussion",
+                context.source
+            ));
         }
-        Ok(access)
+        Ok(())
     }
 
-    pub(super) async fn access_current(&self) -> Result<WorkAccess, String> {
-        let guard = Arc::clone(&self.active).read_owned().await;
-        let work = guard
-            .as_ref()
-            .ok_or_else(|| "no unit of work is active".to_owned())?;
-        let context = work.context.clone();
-        let work = Arc::clone(work);
-        Ok(WorkAccess {
-            guard,
-            context,
-            work,
-        })
+    pub(super) async fn relate(&self, subject: Subject) {
+        let _previous = self
+            .activity
+            .related
+            .lock()
+            .await
+            .insert(subject.to_string());
     }
-}
 
-#[derive(Debug)]
-struct ActiveWork {
-    context: WorkContext,
-    invocations: Arc<tokio::sync::Mutex<BTreeMap<String, usize>>>,
-}
-
-#[derive(Debug)]
-pub(super) struct WorkAccess {
-    guard: tokio::sync::OwnedRwLockReadGuard<Option<Arc<ActiveWork>>>,
-    context: WorkContext,
-    work: Arc<ActiveWork>,
-}
-
-impl WorkAccess {
-    pub(super) fn context(&self) -> &WorkContext {
+    pub(super) fn context(&self) -> &ActivityContext {
         let _keep_active = &self.guard;
         &self.context
     }
 
     pub(super) fn invocations(&self) -> &Arc<tokio::sync::Mutex<BTreeMap<String, usize>>> {
-        &self.work.invocations
+        &self.activity.invocations
     }
 }
 
@@ -322,6 +361,15 @@ pub(super) enum ServiceError {
     /// Publishing an authorized Radicle write failed.
     #[error(transparent)]
     Publish(#[from] crate::agent::PublishError),
+    /// Radicle reserves issue assignment and labels to repository delegates.
+    #[error(
+        "Radicle requires a repository delegate to change issue {0}; ask a delegate to apply this \
+         change"
+    )]
+    IssueDelegate(&'static str),
+    /// Loading the policy used to verify task references failed.
+    #[error("cannot verify task relationships: {0}")]
+    Manifest(#[from] crate::manifest::Error),
 }
 
 impl From<String> for ServiceError {

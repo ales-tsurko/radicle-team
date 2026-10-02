@@ -27,7 +27,7 @@ use radicle::{
 };
 
 use crate::{
-    agent::Role,
+    agent::{PublishError, Role},
     manifest::QueuePosition,
     mcp::{
         protocol::{
@@ -47,7 +47,7 @@ use crate::{
         tools::{ToolService, ToolState},
     },
     member::Member,
-    queue::WorkQueue,
+    queue::TaskQueue,
     watcher::Subject,
 };
 
@@ -153,8 +153,8 @@ impl RepositoryFixture {
         repository
     }
 
-    async fn queue(&self) -> WorkQueue {
-        WorkQueue::memory(self.repository, Member::Nico)
+    async fn queue(&self) -> TaskQueue {
+        TaskQueue::memory(self.repository, Member::Nico)
             .await
             .expect("queue should open")
     }
@@ -170,7 +170,7 @@ impl RepositoryFixture {
         ToolService::new(
             self.profile.storage.clone(),
             self.repository,
-            super::WorkScope::default(),
+            super::ActivityScope::default(),
             publisher,
             crate::manifest::McpAllowlist::default(),
             Role::Talker,
@@ -180,7 +180,7 @@ impl RepositoryFixture {
 
     async fn journaled_service(
         &self,
-        scope: super::WorkScope,
+        scope: super::ActivityScope,
         announcer: impl crate::agent::Announcer,
     ) -> ToolService {
         let publisher = crate::agent::Publisher::new(
@@ -204,11 +204,11 @@ impl RepositoryFixture {
         )
     }
 
-    // Working copies created for real, so the branch a job works on exists.
+    // Working copies created for real, so the branch a task works on exists.
     async fn prepared_workspaces(
         &self,
         name: &str,
-        queue: WorkQueue,
+        queue: TaskQueue,
     ) -> crate::workspace::Workspaces {
         let workspaces = crate::workspace::Workspaces::memory(
             name,
@@ -226,7 +226,7 @@ impl RepositoryFixture {
         workspaces
     }
 
-    async fn service_with(&self, role: Role, queue: WorkQueue) -> ToolService {
+    async fn service_with(&self, role: Role, queue: TaskQueue) -> ToolService {
         let publisher = crate::agent::Publisher::new(
             self.profile.clone(),
             self.repository,
@@ -237,12 +237,57 @@ impl RepositoryFixture {
         ToolService::new(
             self.profile.storage.clone(),
             self.repository,
-            super::WorkScope::new(publisher.clone()),
+            super::ActivityScope::new(publisher.clone()),
             publisher,
             crate::manifest::McpAllowlist::everything(),
             role,
             ToolState::new(queue, chat_state().await),
         )
+    }
+
+    async fn service_as(&self, member: Member, role: Role, queue: TaskQueue) -> ToolService {
+        let home = Home::new(self._root.path().join(format!("{}-{role:?}", member.id())))
+            .expect("member home should open");
+        let mut profile = Profile::init(home, Alias::new(member.id()), None, Seed::generate())
+            .expect("member identity should initialize");
+        profile.storage = self.profile.storage.clone();
+        let publisher = crate::agent::Publisher::new(
+            profile,
+            self.repository,
+            None,
+            TestAnnouncer,
+            TestAuthorizer(self.repository),
+        )
+        .with_memory_journal()
+        .await
+        .expect("journal should open");
+        ToolService::new(
+            self.profile.storage.clone(),
+            self.repository,
+            super::ActivityScope::new(publisher.clone()),
+            publisher,
+            crate::manifest::McpAllowlist::everything(),
+            role,
+            ToolState::new(queue, chat_state().await),
+        )
+    }
+
+    async fn activate(
+        &self,
+        service: &ToolService,
+        source: Subject,
+        activity: crate::agent::ActivityId,
+    ) {
+        service
+            .scope
+            .activate(super::ActivityContext {
+                repository: self.repository,
+                source: source.into(),
+                activity,
+                workspace: self.working.clone(),
+            })
+            .await
+            .expect("work should activate");
     }
 
     fn subject(kind: SubjectKind, id: impl ToString) -> SubjectRequest {
@@ -386,7 +431,7 @@ async fn starts_on_a_loopback_capability_url_and_stops() {
         crate::manifest::McpAllowlist::default(),
         Role::Talker,
         ToolState::new(
-            WorkQueue::memory(repository, Member::Nico)
+            TaskQueue::memory(repository, Member::Nico)
                 .await
                 .expect("queue should open"),
             chat_state().await,
@@ -412,7 +457,7 @@ async fn starts_on_a_loopback_capability_url_and_stops() {
 
 #[tokio::test]
 async fn limits_tools_to_the_active_delivery_subject() {
-    let scope = super::WorkScope::default();
+    let scope = super::ActivityScope::default();
     let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
     let subject = radicle::cob::ObjectId::from_str("1111111111111111111111111111111111111111")
         .expect("subject should be valid");
@@ -438,21 +483,22 @@ async fn limits_tools_to_the_active_delivery_subject() {
         })
         .await
         .expect("delivery should activate");
-    let access = scope
-        .access(&SubjectRequest {
+    let access = scope.access_current().await.expect("work should be active");
+    access
+        .require_subject(&SubjectRequest {
             kind: SubjectKind::Issue,
             subject: subject.to_string(),
         })
         .await
         .expect("active issue should be accessible");
-    drop(access);
-    let _wrong_subject = scope
-        .access(&SubjectRequest {
+    let _wrong_subject = access
+        .require_subject(&SubjectRequest {
             kind: SubjectKind::Patch,
             subject: subject.to_string(),
         })
         .await
         .expect_err("different subject kind should be rejected");
+    drop(access);
     scope.deactivate().await;
     let _inactive = scope
         .access_current()
@@ -462,7 +508,7 @@ async fn limits_tools_to_the_active_delivery_subject() {
 
 #[tokio::test]
 async fn authenticated_chat_can_address_the_active_repository() {
-    let scope = super::WorkScope::default();
+    let scope = super::ActivityScope::default();
     let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
     scope
         .activate(crate::agent::ChatContext::authenticated(
@@ -478,8 +524,9 @@ async fn authenticated_chat_can_address_the_active_repository() {
         .expect("chat message should activate");
 
     for kind in [SubjectKind::Issue, SubjectKind::Patch] {
-        let access = scope
-            .access(&SubjectRequest {
+        let access = scope.access_current().await.expect("chat should be active");
+        access
+            .require_subject(&SubjectRequest {
                 kind,
                 subject: "1111111111111111111111111111111111111111".to_owned(),
             })
@@ -517,7 +564,7 @@ async fn chat_reply_targets_only_the_active_channel_and_message() {
         TestAnnouncer,
         TestAuthorizer(fixture.repository),
     );
-    let scope = super::WorkScope::new(publisher.clone());
+    let scope = super::ActivityScope::new(publisher.clone());
     let service = ToolService::new(
         fixture.profile.storage.clone(),
         fixture.repository,
@@ -643,7 +690,7 @@ impl crate::agent::Announcer for FlakyAnnouncer {
 #[tokio::test]
 async fn recovers_a_completed_write_when_the_delivery_is_replayed() {
     let fixture = RepositoryFixture::new();
-    let scope = super::WorkScope::default();
+    let scope = super::ActivityScope::default();
     let announcements = Arc::new(AtomicUsize::new(0));
     let service = fixture
         .journaled_service(scope.clone(), FlakyAnnouncer(Arc::clone(&announcements)))
@@ -669,7 +716,7 @@ async fn recovers_a_completed_write_when_the_delivery_is_replayed() {
     };
     let mutation = crate::agent::MutationKey {
         repository: fixture.repository,
-        work: context.delivery.into(),
+        activity: context.delivery.into(),
         invocation: 0,
         request: mutation_identity("create_issue", &request()).expect("request should serialize"),
     };
@@ -751,7 +798,7 @@ async fn reconciles_security_writes_from_the_delivery_journal() {
     .with_memory_journal()
     .await
     .expect("mutation journal should initialize");
-    let scope = super::WorkScope::new(publisher.clone());
+    let scope = super::ActivityScope::new(publisher.clone());
     let reporting = SecurityReporting::new(&publisher);
     let service = ToolService::new(
         fixture.profile.storage.clone(),
@@ -820,7 +867,7 @@ async fn reconciles_security_writes_from_the_delivery_journal() {
 #[tokio::test]
 async fn recovers_an_unsigned_local_write_without_duplication() {
     let fixture = RepositoryFixture::new();
-    let scope = super::WorkScope::default();
+    let scope = super::ActivityScope::default();
     let service = fixture
         .journaled_service(scope.clone(), TestAnnouncer)
         .await;
@@ -846,7 +893,7 @@ async fn recovers_an_unsigned_local_write_without_duplication() {
     };
     let mutation = crate::agent::MutationKey {
         repository: fixture.repository,
-        work: context.delivery.into(),
+        activity: context.delivery.into(),
         invocation: 0,
         request: mutation_identity("create_issue", &request()).expect("request should serialize"),
     };
@@ -924,7 +971,7 @@ async fn recovers_an_unsigned_local_write_without_duplication() {
 #[tokio::test]
 async fn recovers_created_comments_and_reviews_by_operation_id() {
     let fixture = RepositoryFixture::new();
-    let scope = super::WorkScope::default();
+    let scope = super::ActivityScope::default();
     let service = fixture
         .journaled_service(scope.clone(), TestAnnouncer)
         .await;
@@ -989,7 +1036,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
         .publisher
         .forget_completion(&crate::agent::MutationKey {
             repository: fixture.repository,
-            work: delivery.into(),
+            activity: delivery.into(),
             invocation: 0,
             request: mutation_identity("create_comment", &comment_request())
                 .expect("request should serialize"),
@@ -1064,7 +1111,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
         .publisher
         .forget_completion(&crate::agent::MutationKey {
             repository: fixture.repository,
-            work: delivery.into(),
+            activity: delivery.into(),
             invocation: 0,
             request: mutation_identity("create_review", &review_request())
                 .expect("request should serialize"),
@@ -1129,7 +1176,7 @@ async fn recovers_created_comments_and_reviews_by_operation_id() {
 #[tokio::test]
 async fn replays_stale_mutations_and_distinguishes_repeated_invocations() {
     let fixture = RepositoryFixture::new();
-    let scope = super::WorkScope::default();
+    let scope = super::ActivityScope::default();
     let service = fixture
         .journaled_service(scope.clone(), TestAnnouncer)
         .await;
@@ -1186,7 +1233,7 @@ async fn replays_stale_mutations_and_distinguishes_repeated_invocations() {
         .publisher
         .forget_completion(&crate::agent::MutationKey {
             repository: fixture.repository,
-            work: delivery.into(),
+            activity: delivery.into(),
             invocation: 0,
             request: mutation_identity("edit_issue", &stale()).expect("request should serialize"),
         })
@@ -1264,7 +1311,7 @@ async fn replays_stale_mutations_and_distinguishes_repeated_invocations() {
 #[tokio::test]
 async fn distinguishes_identical_mutations_and_replays_concurrent_writes() {
     let fixture = RepositoryFixture::new();
-    let scope = super::WorkScope::default();
+    let scope = super::ActivityScope::default();
     let service = fixture
         .journaled_service(scope.clone(), TestAnnouncer)
         .await;
@@ -1893,7 +1940,7 @@ async fn reloads_the_security_policy_before_reporting() {
     let service = ToolService::new(
         fixture.profile.storage.clone(),
         fixture.repository,
-        super::WorkScope::default(),
+        super::ActivityScope::default(),
         publisher,
         crate::manifest::McpAllowlist::default(),
         Role::Talker,
@@ -2647,7 +2694,7 @@ async fn each_role_offers_only_the_tools_it_can_use() {
     let chatter = fixture.service_with(Role::Chatter, queue.clone()).await;
     let coder = fixture.service_with(Role::Coder, queue).await;
 
-    for tool in ["add_job", "cancel", "note", "work_status"] {
+    for tool in ["add_task", "cancel", "note", "task_status"] {
         assert!(
             talker.offers(tool),
             "the talking role records work, so '{tool}' must reach it"
@@ -2679,7 +2726,13 @@ async fn each_role_offers_only_the_tools_it_can_use() {
     );
     assert!(!talker.offers("reply_chat"));
     assert!(!coder.offers("reply_chat"));
-    for tool in ["get_subject", "create_comment", "merge_patch"] {
+    for tool in [
+        "get_subject",
+        "create_comment",
+        "merge_patch",
+        "get_task_context",
+        "update_task_context",
+    ] {
         for role in [&talker, &chatter, &coder] {
             assert!(
                 role.offers(tool),
@@ -2697,16 +2750,34 @@ async fn carries_a_note_on_the_next_result_the_building_half_receives() {
         ObjectId::from_str("1111111111111111111111111111111111111111")
             .expect("subject should be valid"),
     );
-    let job = queue
-        .push("write it".to_owned(), issue.into(), QueuePosition::End)
+    let task = queue
+        .push(crate::queue::TaskRequest::new(
+            "write it".to_owned(),
+            issue.into(),
+            QueuePosition::End,
+        ))
         .await
-        .expect("job should be recorded");
+        .expect("task should be recorded")
+        .task;
     let taken = queue.next().await.expect("queue should be readable");
-    assert_eq!(taken.id, job);
+    assert_eq!(taken.id, task);
 
     let talker = fixture.service_with(Role::Talker, queue.clone()).await;
     let coder = fixture.service_with(Role::Coder, queue.clone()).await;
-    queue.note("use the existing parser".to_owned()).await;
+    coder
+        .scope
+        .activate(super::ActivityContext {
+            repository: fixture.repository,
+            source: issue.into(),
+            activity: crate::agent::ActivityId::Task(task),
+            workspace: fixture.working.clone(),
+        })
+        .await
+        .expect("task should activate");
+    queue
+        .note(task, "use the existing parser".to_owned())
+        .await
+        .expect("note should save");
 
     assert!(
         talker.pending_notes().await.is_empty(),
@@ -2723,40 +2794,45 @@ async fn carries_a_note_on_the_next_result_the_building_half_receives() {
     );
 }
 
-// The patch exists the moment this call returns, and the job can still crash afterwards. If the
-// queue only learned about it when the job ended, a run picking that job up again would start
+// The patch exists the moment this call returns, and the task can still crash afterwards. If the
+// queue only learned about it when the task ended, a run picking that task up again would start
 // over on the issue it came from and leave the patch behind.
 #[tokio::test]
-async fn records_the_patch_a_job_produced_before_the_job_can_fail() {
+async fn records_the_patch_a_task_produced_before_the_task_can_fail() {
     let fixture = RepositoryFixture::new();
     let queue = fixture.queue().await;
     let issue = Subject::Issue(
         ObjectId::from_str("1111111111111111111111111111111111111111")
             .expect("subject should be valid"),
     );
-    let job = queue
-        .push("answer it".to_owned(), issue.into(), QueuePosition::End)
+    let task = queue
+        .push(crate::queue::TaskRequest::new(
+            "answer it".to_owned(),
+            issue.into(),
+            QueuePosition::End,
+        ))
         .await
-        .expect("job should be recorded");
+        .expect("task should be recorded")
+        .task;
     let taken = queue.next().await.expect("queue should be readable");
     let workspaces = fixture
         .prepared_workspaces("mcp-produced", queue.clone())
         .await;
     workspaces
-        .prepare_job(&taken)
+        .prepare_task(&taken)
         .await
         .expect("the coder should take the issue");
     let coder = fixture.service_with(Role::Coder, queue.clone()).await;
     coder
         .scope
-        .activate(super::WorkContext {
+        .activate(super::ActivityContext {
             repository: fixture.repository,
             source: issue.into(),
-            work: crate::agent::WorkId::Job(job),
+            activity: crate::agent::ActivityId::Task(task),
             workspace: fixture.working.clone(),
         })
         .await
-        .expect("the job should become the active work");
+        .expect("the task should become the active activity");
 
     let created = coder
         .create_patch(rmcp::handler::server::wrapper::Parameters(
@@ -2776,19 +2852,19 @@ async fn records_the_patch_a_job_produced_before_the_job_can_fail() {
     assert_eq!(
         queue.recover().await.expect("queue should be readable"),
         1,
-        "the job is still running, so the next start must put it back"
+        "the task is still running, so the next start must put it back"
     );
     let recovered = queue.next().await.expect("queue should be readable");
 
     assert_eq!(
         recovered.source,
-        Subject::Patch(patch).into(),
-        "the job must come back as the patch it produced, not the issue it started on"
+        issue.into(),
+        "the original request remains available after publication"
     );
     assert_eq!(
         branches(&workspaces),
-        [format!("nico-rt/job-{}", taken.id)],
-        "the branch is named after the job, so producing a patch leaves it exactly where it was"
+        [format!("nico-rt/task-{}", taken.id)],
+        "the branch is named after the task, so producing a patch leaves it exactly where it was"
     );
 
     let second = coder
@@ -2804,17 +2880,30 @@ async fn records_the_patch_a_job_produced_before_the_job_can_fail() {
         ))
         .await;
 
-    if second.is_ok() {
-        assert_eq!(
-            queue
-                .running()
-                .await
-                .map(|running| running.source)
-                .or_else(|| Some(recovered.source.clone())),
-            Some(Subject::Patch(patch).into()),
-            "a job which publishes a second patch stays with the first"
-        );
-    }
+    let second = second.expect("repeated creation should return the existing patch");
+    assert_eq!(result_id(second), patch.to_string());
+    assert_eq!(
+        queue
+            .get(task)
+            .await
+            .expect("task should remain")
+            .context
+            .patch(),
+        Some(Subject::Patch(patch))
+    );
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("repository should open");
+    assert_eq!(
+        Patches::open(&stored, ReadOnly)
+            .expect("patches should open")
+            .all()
+            .expect("patches should list")
+            .count(),
+        1
+    );
 }
 
 // Returns the branches the runtime made, in order.
@@ -2831,43 +2920,47 @@ fn branches(workspaces: &crate::workspace::Workspaces) -> Vec<String> {
         .collect()
 }
 
-// A patch the runtime could not write down must not be reported as a success. The agent would
-// carry on believing the job had become that patch, while a restart would begin the issue again.
+// Missing task storage must fail before creating an artifact the runtime cannot track.
 #[tokio::test]
-async fn refuses_to_report_a_patch_it_could_not_record() {
+async fn refuses_to_publish_when_the_task_record_is_unavailable() {
     let fixture = RepositoryFixture::new();
     let queue = fixture.queue().await;
     let issue = Subject::Issue(
         ObjectId::from_str("1111111111111111111111111111111111111111")
             .expect("subject should be valid"),
     );
-    let job = queue
-        .push("answer it".to_owned(), issue.into(), QueuePosition::End)
+    let task = queue
+        .push(crate::queue::TaskRequest::new(
+            "answer it".to_owned(),
+            issue.into(),
+            QueuePosition::End,
+        ))
         .await
-        .expect("job should be recorded");
+        .expect("task should be recorded")
+        .task;
     let taken = queue.next().await.expect("queue should be readable");
     let workspaces = fixture
         .prepared_workspaces("mcp-unrecorded", queue.clone())
         .await;
     workspaces
-        .prepare_job(&taken)
+        .prepare_task(&taken)
         .await
         .expect("the coder should take the issue");
     let coder = fixture.service_with(Role::Coder, queue.clone()).await;
     coder
         .scope
-        .activate(super::WorkContext {
+        .activate(super::ActivityContext {
             repository: fixture.repository,
             source: issue.into(),
-            work: crate::agent::WorkId::Job(job),
+            activity: crate::agent::ActivityId::Task(task),
             workspace: fixture.working.clone(),
         })
         .await
-        .expect("the job should become the active work");
-    // Taken away underneath the running job, which keeps what it is working on in memory.
+        .expect("the task should become the active activity");
+    // Taken away underneath the running task, which keeps what it is working on in memory.
     queue
         .database()
-        .execute("DROP TABLE work_queue")
+        .execute("DROP TABLE task_queue")
         .await
         .expect("the queue's storage should be removable");
 
@@ -2886,7 +2979,7 @@ async fn refuses_to_report_a_patch_it_could_not_record() {
 
     assert!(
         created.is_err(),
-        "publishing succeeded but the runtime could not record it, so the agent must be told"
+        "the task is unavailable, so publication must fail before creating an orphan"
     );
     let stored = fixture
         .profile
@@ -2899,12 +2992,1175 @@ async fn refuses_to_report_a_patch_it_could_not_record() {
             .all()
             .expect("patches should list")
             .count(),
-        1,
-        "the failure must be the recording rather than the publication, or this proves nothing"
+        0,
+        "unavailable task context must prevent creating an untracked artifact"
     );
     assert_eq!(
         branches(&workspaces),
-        [format!("nico-rt/job-{}", taken.id)],
-        "and the branch is still the job's, which is the one thing a failed write cannot desync"
+        [format!("nico-rt/task-{}", taken.id)],
+        "and the branch is still the task's, which is the one thing a failed write cannot desync"
     );
+}
+
+#[tokio::test]
+async fn maya_and_nico_revise_one_patch_and_review_it_from_the_issue() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{agent::ActivityId, mcp::protocol::UpdatePatchRequest, queue::TaskRequest};
+
+    let fixture = RepositoryFixture::new();
+    let maya_queue = TaskQueue::memory(fixture.repository, Member::Maya)
+        .await
+        .expect("queue should open");
+    let nico_queue = TaskQueue::memory(fixture.repository, Member::Nico)
+        .await
+        .expect("queue should open");
+    let maya = fixture
+        .service_as(Member::Maya, Role::Talker, maya_queue)
+        .await;
+    let nico = fixture
+        .service_as(Member::Nico, Role::Coder, nico_queue.clone())
+        .await;
+    let operator = fixture.service().await;
+    let planning = result_id(
+        operator
+            .create_issue_write(CreateIssueRequest {
+                title: "Plan scaffold".to_owned(),
+                description: "Create a focused scaffold task".to_owned(),
+                labels: Vec::new(),
+                assignees: Vec::new(),
+            })
+            .await
+            .expect("planning issue should create"),
+    );
+    let planning = Subject::Issue(ObjectId::from_str(&planning).expect("issue should parse"));
+    let operation = EntryId::from_str(&planning.id().to_string()).expect("operation should parse");
+    fixture
+        .activate(
+            &maya,
+            planning,
+            crate::agent::DeliveryId {
+                operation,
+                action: 0,
+            }
+            .into(),
+        )
+        .await;
+    let issue_request = || CreateIssueRequest {
+        title: "Scaffold CLI".to_owned(),
+        description: "Scaffold only; no feature commands".to_owned(),
+        labels: Vec::new(),
+        assignees: Vec::new(),
+    };
+    let issue_id = result_id(
+        maya.create_issue(Parameters(issue_request()))
+            .await
+            .expect("issue should create"),
+    );
+    assert_eq!(
+        result_id(
+            maya.create_issue(Parameters(issue_request()))
+                .await
+                .expect("repeated issue creation should reuse")
+        ),
+        issue_id
+    );
+    let issue = Subject::Issue(ObjectId::from_str(&issue_id).expect("issue should parse"));
+    assert!(
+        maya.access_subject(&SubjectRequest::from(issue))
+            .await
+            .is_ok(),
+        "a newly created issue must be usable immediately"
+    );
+    let mut request =
+        TaskRequest::new("Scaffold only".to_owned(), issue.into(), QueuePosition::End);
+    request.request = Some("operation:scaffold".to_owned());
+    let task = nico_queue
+        .push(request)
+        .await
+        .expect("task should record")
+        .task;
+    nico_queue.next().await.expect("task should start");
+    fixture.activate(&nico, issue, ActivityId::Task(task)).await;
+
+    let checkout = git2::Repository::open(&fixture.working).expect("checkout should open");
+    fs::write(fixture.working.join("README.md"), "# Scaffold\n").expect("scaffold should write");
+    let parent = checkout
+        .find_commit(fixture.head)
+        .expect("parent should exist");
+    let signature =
+        git2::Signature::now("Nico Test", "nico@example.com").expect("signature should create");
+    let head = commit(&checkout, &signature, "Scaffold", &[&parent]);
+    let patch_request = || CreatePatchRequest {
+        title: "Scaffold".to_owned(),
+        description: format!("Implements {issue}"),
+        base: fixture.base.to_string(),
+        head: head.to_string(),
+        labels: Vec::new(),
+        draft: false,
+    };
+    let patch_id = result_id(
+        nico.create_patch(Parameters(patch_request()))
+            .await
+            .expect("patch should publish"),
+    );
+    assert_eq!(
+        result_id(
+            nico.create_patch(Parameters(patch_request()))
+                .await
+                .expect("repeated patch creation should reuse")
+        ),
+        patch_id
+    );
+    let patch = Subject::Patch(ObjectId::from_str(&patch_id).expect("patch should parse"));
+    nico.scope.deactivate().await;
+    fixture.activate(&nico, issue, ActivityId::Task(task)).await;
+    let revision = result_id(
+        nico.update_patch(Parameters(UpdatePatchRequest {
+            subject: SubjectRequest::from(patch),
+            description: "Correct base only".to_owned(),
+            base: fixture.head.to_string(),
+            head: head.to_string(),
+        }))
+        .await
+        .expect("the issue task should revise its recorded patch after reactivation"),
+    );
+    operator
+        .comment_issue_write(CommentIssueRequest {
+            issue: issue_id.clone(),
+            body: format!("Please review {patch}"),
+            reply_to: None,
+            embeds: Vec::new(),
+        })
+        .await
+        .expect("delegate should link the requested review");
+    maya.scope.deactivate().await;
+    fixture
+        .activate(
+            &maya,
+            issue,
+            crate::agent::DeliveryId {
+                operation: EntryId::from_str(&issue.id().to_string())
+                    .expect("operation should parse"),
+                action: 0,
+            }
+            .into(),
+        )
+        .await;
+    maya.get_subject(Parameters(SubjectRequest::from(patch)))
+        .await
+        .expect("Maya should read the patch from the issue");
+    maya.create_review(Parameters(ReviewWriteRequest {
+        subject: SubjectRequest::from(patch),
+        revision: Some(revision.clone()),
+        review: None,
+        verdict: Some("accept".to_owned()),
+        summary: Some("The focused scaffold meets the agreed scope".to_owned()),
+        labels: Vec::new(),
+        embeds: Vec::new(),
+        comments: Vec::new(),
+    }))
+    .await
+    .expect("Maya should publish the review on the patch from this issue task");
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("repository should open");
+    let patches = Patches::open(&stored, ReadOnly).expect("patches should open");
+    assert_eq!(patches.all().expect("patches should list").count(), 1);
+    let published = patches
+        .get(&patch.id())
+        .expect("patch should read")
+        .expect("patch should exist");
+    assert_eq!(published.head().to_string(), head.to_string());
+    assert_eq!(published.base().to_string(), fixture.head.to_string());
+    assert_eq!(published.author().public_key(), &nico.publisher.author());
+    assert!(
+        published
+            .reviews_of(patch::RevisionId::from(
+                EntryId::from_str(&revision).expect("revision should parse")
+            ))
+            .any(|(_, review)| review.author().public_key() == &maya.publisher.author())
+    );
+}
+
+#[tokio::test]
+async fn saved_supporting_references_do_not_authorize_unrelated_writes() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{
+        agent::ActivityId,
+        queue::{Artifact, ArtifactRole, ContextUpdate, TaskRequest},
+    };
+
+    let fixture = RepositoryFixture::new();
+    let service = fixture.service().await;
+    let issue = |title: &str| CreateIssueRequest {
+        title: title.to_owned(),
+        description: "Unrelated task".to_owned(),
+        labels: Vec::new(),
+        assignees: Vec::new(),
+    };
+    let origin = Subject::Issue(
+        ObjectId::from_str(&result_id(
+            service
+                .create_issue_write(issue("Original"))
+                .await
+                .expect("issue should create"),
+        ))
+        .expect("issue should parse"),
+    );
+    let other = Subject::Issue(
+        ObjectId::from_str(&result_id(
+            service
+                .create_issue_write(issue("Other"))
+                .await
+                .expect("issue should create"),
+        ))
+        .expect("issue should parse"),
+    );
+    let queue = fixture.queue().await;
+    let task = queue
+        .push(TaskRequest::new(
+            "work".to_owned(),
+            origin.into(),
+            QueuePosition::End,
+        ))
+        .await
+        .expect("task should record")
+        .task;
+    queue.next().await.expect("task should start");
+    let coder = fixture.service_with(Role::Coder, queue.clone()).await;
+    fixture
+        .activate(&coder, origin, ActivityId::Task(task))
+        .await;
+    coder
+        .update_task_context(Parameters(super::protocol::ContextUpdateRequest {
+            task: None,
+            update: ContextUpdate {
+                artifacts: vec![Artifact {
+                    subject: other.to_string(),
+                    role: ArtifactRole::Supporting,
+                    purpose: "Useful information".to_owned(),
+                }],
+                ..ContextUpdate::default()
+            },
+        }))
+        .await
+        .expect("supporting reference should save");
+    coder
+        .get_subject(Parameters(SubjectRequest::from(other)))
+        .await
+        .expect("repository reads should work");
+    assert!(
+        coder
+            .access_subject(&SubjectRequest::from(other))
+            .await
+            .is_err(),
+        "saved references must not invent task write access"
+    );
+    let document = coder
+        .get_task_context(Parameters(super::protocol::ContextRequest { task: None }))
+        .await
+        .expect("context should read");
+    assert_eq!(document.0.context.artifacts.len(), 2);
+}
+
+#[tokio::test]
+async fn assignment_and_mention_from_one_operation_record_one_task() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{
+        agent::{ActivityId, DeliveryId},
+        queue::TaskRequest,
+    };
+
+    let fixture = RepositoryFixture::new();
+    let queue = fixture.queue().await;
+    let subject = Subject::Issue(
+        ObjectId::from_str("1111111111111111111111111111111111111111")
+            .expect("subject should parse"),
+    );
+    let operation = EntryId::from_str("2222222222222222222222222222222222222222")
+        .expect("operation should parse");
+    let mut assignment = TaskRequest::new(
+        "assigned scaffold".to_owned(),
+        subject.into(),
+        QueuePosition::End,
+    );
+    assignment.request = Some(
+        ActivityId::from(DeliveryId {
+            operation,
+            action: 1,
+        })
+        .request(),
+    );
+    let first = queue
+        .push(assignment)
+        .await
+        .expect("assignment should record");
+    let talker = fixture.service_with(Role::Talker, queue.clone()).await;
+    fixture
+        .activate(
+            &talker,
+            subject,
+            DeliveryId {
+                operation,
+                action: 0,
+            }
+            .into(),
+        )
+        .await;
+    let recorded = talker
+        .add_task(Parameters(super::protocol::AddTaskRequest {
+            brief: "same scaffold requested by mention".to_owned(),
+            position: QueuePosition::End,
+            context: crate::queue::ContextUpdate::default(),
+            distinct: false,
+        }))
+        .await
+        .expect("mention should reuse assigned work");
+    assert_eq!(recorded.0.task, first.task);
+    assert_eq!(queue.waiting().await.expect("queue should read"), 1);
+}
+
+#[tokio::test]
+async fn native_issue_assignment_reports_delegate_requirement_without_creating_an_issue() {
+    let fixture = RepositoryFixture::new();
+    let queue = TaskQueue::memory(fixture.repository, Member::Maya)
+        .await
+        .expect("queue should open");
+    let maya = fixture.service_as(Member::Maya, Role::Talker, queue).await;
+    let failure = maya
+        .create_issue_write(CreateIssueRequest {
+            title: "Assign scaffold".to_owned(),
+            description: "Task".to_owned(),
+            labels: Vec::new(),
+            assignees: vec![format!("did:key:{AUTHOR}")],
+        })
+        .await
+        .map(|_| ())
+        .expect_err("non-delegate assignment should fail before creating an issue");
+    assert!(matches!(failure, ServiceError::IssueDelegate(_)));
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("repository should open");
+    assert_eq!(
+        Issues::open(&stored, ReadOnly)
+            .expect("issues should open")
+            .all()
+            .expect("issues should list")
+            .count(),
+        0
+    );
+}
+
+#[derive(Debug)]
+struct FailedContextWriteAnnouncer {
+    database: std::path::PathBuf,
+    calls: AtomicUsize,
+}
+
+impl crate::agent::Announcer for FailedContextWriteAnnouncer {
+    fn announce(&self, _repository: RepoId, _namespace: PublicKey) -> Result<(), PublishError> {
+        if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            sqlite::open(&self.database)
+                .and_then(|database| {
+                    database.execute(
+                        "CREATE TRIGGER fail_task_context_write BEFORE INSERT ON task_contexts
+                         BEGIN SELECT RAISE(ABORT, 'task context write failed'); END",
+                    )
+                })
+                .map_err(|error| PublishError::Task(error.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn recovers_one_patch_when_recording_its_task_relationship_failed_after_publication() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{
+        agent::{ActivityId, Publisher},
+        queue::TaskRequest,
+    };
+
+    let fixture = RepositoryFixture::new();
+    let path = fixture._root.path().join("queue.db");
+    let queue = TaskQueue::open(&path, fixture.repository, Member::Nico)
+        .await
+        .expect("queue should open");
+    let source = Subject::Issue(
+        ObjectId::from_str("1111111111111111111111111111111111111111").expect("issue should parse"),
+    );
+    let task = queue
+        .push(TaskRequest::new(
+            "scaffold".to_owned(),
+            source.into(),
+            QueuePosition::End,
+        ))
+        .await
+        .expect("task should record")
+        .task;
+    queue.next().await.expect("task should start");
+    let saved_context = queue.get(task).await.expect("context should read").context;
+    let publisher = Publisher::new(
+        fixture.profile.clone(),
+        fixture.repository,
+        None,
+        FailedContextWriteAnnouncer {
+            database: path,
+            calls: AtomicUsize::new(0),
+        },
+        TestAuthorizer(fixture.repository),
+    )
+    .with_memory_journal()
+    .await
+    .expect("journal should open");
+    let coder = ToolService::new(
+        fixture.profile.storage.clone(),
+        fixture.repository,
+        super::ActivityScope::new(publisher.clone()),
+        publisher,
+        crate::manifest::McpAllowlist::everything(),
+        Role::Coder,
+        ToolState::new(queue.clone(), chat_state().await),
+    );
+    fixture
+        .activate(&coder, source, ActivityId::Task(task))
+        .await;
+    let request = || CreatePatchRequest {
+        title: "Scaffold".to_owned(),
+        description: "Focused scaffold".to_owned(),
+        base: fixture.base.to_string(),
+        head: fixture.head.to_string(),
+        labels: Vec::new(),
+        draft: false,
+    };
+    coder
+        .create_patch(Parameters(request()))
+        .await
+        .map(|_| ())
+        .expect_err("task recording must report its failure");
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("repository should open");
+    let patches = Patches::open(&stored, ReadOnly).expect("patches should open");
+    assert_eq!(patches.all().expect("patches should list").count(), 1);
+    assert_eq!(
+        queue
+            .get(task)
+            .await
+            .expect("failed writes must preserve saved context")
+            .context,
+        saved_context
+    );
+    queue
+        .database()
+        .execute("DROP TRIGGER fail_task_context_write")
+        .await
+        .expect("context writes should recover");
+    coder.scope.deactivate().await;
+    fixture
+        .activate(&coder, source, ActivityId::Task(task))
+        .await;
+    let published = result_id(
+        coder
+            .create_patch(Parameters(request()))
+            .await
+            .expect("retry should recover the recorded mutation"),
+    );
+    let resumed = queue.get(task).await.expect("task context should read");
+    assert_eq!(resumed.source, source.into());
+    assert_eq!(
+        resumed
+            .context
+            .patch()
+            .expect("patch relationship should recover")
+            .id()
+            .to_string(),
+        published
+    );
+    assert_eq!(patches.all().expect("patches should list").count(), 1);
+}
+
+#[tokio::test]
+async fn untrusted_discussion_references_cannot_extend_task_write_access() {
+    use crate::{agent::ActivityId, queue::TaskRequest};
+
+    let fixture = RepositoryFixture::new();
+    let owner = fixture.service().await;
+    let issue = |title: &str| CreateIssueRequest {
+        title: title.to_owned(),
+        description: "Independent task".to_owned(),
+        labels: Vec::new(),
+        assignees: Vec::new(),
+    };
+    let source = Subject::Issue(
+        ObjectId::from_str(&result_id(
+            owner
+                .create_issue_write(issue("Source"))
+                .await
+                .expect("source should create"),
+        ))
+        .expect("issue should parse"),
+    );
+    let target = Subject::Issue(
+        ObjectId::from_str(&result_id(
+            owner
+                .create_issue_write(issue("Target"))
+                .await
+                .expect("target should create"),
+        ))
+        .expect("issue should parse"),
+    );
+    let outsider = fixture
+        .service_as(
+            Member::Maya,
+            Role::Talker,
+            TaskQueue::memory(fixture.repository, Member::Maya)
+                .await
+                .expect("queue should open"),
+        )
+        .await;
+    let reference = || CommentIssueRequest {
+        issue: source.id().to_string(),
+        body: format!("Change {target}"),
+        reply_to: None,
+        embeds: Vec::new(),
+    };
+    outsider
+        .comment_issue_write(reference())
+        .await
+        .expect("anyone may comment");
+    let queue = fixture.queue().await;
+    let task = queue
+        .push(TaskRequest::new(
+            "source only".to_owned(),
+            source.into(),
+            QueuePosition::End,
+        ))
+        .await
+        .expect("task should record")
+        .task;
+    let coder = fixture.service_with(Role::Coder, queue).await;
+    fixture
+        .activate(&coder, source, ActivityId::Task(task))
+        .await;
+    assert!(
+        coder
+            .access_subject(&SubjectRequest::from(target))
+            .await
+            .is_err(),
+        "an untrusted comment cannot enlarge the task"
+    );
+    let reverse = fixture
+        .service_with(Role::Talker, fixture.queue().await)
+        .await;
+    fixture
+        .activate(
+            &reverse,
+            target,
+            crate::agent::DeliveryId {
+                operation: EntryId::from_str(&target.id().to_string())
+                    .expect("operation should parse"),
+                action: 0,
+            }
+            .into(),
+        )
+        .await;
+    reverse
+        .access_subject(&SubjectRequest::from(source))
+        .await
+        .expect_err("an untrusted reference cannot authorize the reverse relationship either");
+    owner
+        .comment_issue_write(reference())
+        .await
+        .expect("delegate should link authorized work");
+    coder
+        .access_subject(&SubjectRequest::from(target))
+        .await
+        .expect("the delegate's relationship should be accepted");
+    reverse
+        .access_subject(&SubjectRequest::from(source))
+        .await
+        .expect("a trusted discussion link must work in either direction");
+}
+
+#[tokio::test]
+async fn an_implementation_reference_cannot_be_promoted_to_a_produced_patch() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{
+        agent::ActivityId,
+        queue::{Artifact, ArtifactRole, ContextUpdate, TaskRequest},
+    };
+
+    let fixture = RepositoryFixture::new();
+    let owner = fixture.service().await;
+    let source = Subject::Issue(
+        ObjectId::from_str(&result_id(
+            owner
+                .create_issue_write(CreateIssueRequest {
+                    title: "Source".to_owned(),
+                    description: "Independent task".to_owned(),
+                    labels: Vec::new(),
+                    assignees: Vec::new(),
+                })
+                .await
+                .expect("source should create"),
+        ))
+        .expect("issue should parse"),
+    );
+    let request = || CreatePatchRequest {
+        title: "Other task".to_owned(),
+        description: "Unrelated implementation".to_owned(),
+        base: fixture.base.to_string(),
+        head: fixture.head.to_string(),
+        labels: Vec::new(),
+        draft: false,
+    };
+    let unrelated = result_id(
+        owner
+            .create_patch_write(request(), fixture.working.clone())
+            .await
+            .expect("patch should create"),
+    );
+    let queue = fixture.queue().await;
+    let task = queue
+        .push(TaskRequest::new(
+            "source only".to_owned(),
+            source.into(),
+            QueuePosition::End,
+        ))
+        .await
+        .expect("task should record")
+        .task;
+    let coder = fixture.service_with(Role::Coder, queue.clone()).await;
+    fixture
+        .activate(&coder, source, ActivityId::Task(task))
+        .await;
+    coder
+        .update_task_context(Parameters(super::protocol::ContextUpdateRequest {
+            task: None,
+            update: ContextUpdate {
+                artifacts: vec![Artifact {
+                    subject: format!("patch:{unrelated}"),
+                    role: ArtifactRole::Implementation,
+                    purpose: "Reference only".to_owned(),
+                }],
+                ..ContextUpdate::default()
+            },
+        }))
+        .await
+        .expect("saving context should work");
+    coder
+        .create_patch(Parameters(request()))
+        .await
+        .map(|_| ())
+        .expect_err("reuse must verify the relationship first");
+    assert!(
+        queue
+            .get(task)
+            .await
+            .expect("task should read")
+            .context
+            .patch()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_coder_task_cannot_publish_or_correct_another_task() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{
+        agent::ActivityId,
+        queue::{ContextUpdate, TaskRequest},
+    };
+
+    let fixture = RepositoryFixture::new();
+    let source = Subject::Issue(
+        ObjectId::from_str("1111111111111111111111111111111111111111")
+            .expect("source should parse"),
+    );
+    let queue = fixture.queue().await;
+    let request = || TaskRequest::new("work".to_owned(), source.into(), QueuePosition::End);
+    let active = queue
+        .push(request())
+        .await
+        .expect("task should record")
+        .task;
+    let other = queue
+        .push(request())
+        .await
+        .expect("another task should record")
+        .task;
+    queue.next().await.expect("first task should start");
+    let coder = fixture.service_with(Role::Coder, queue.clone()).await;
+    fixture
+        .activate(&coder, source, ActivityId::Task(active))
+        .await;
+    coder
+        .update_task_context(Parameters(super::protocol::ContextUpdateRequest {
+            task: Some(other),
+            update: ContextUpdate {
+                specification: Some("Replace unrelated work".to_owned()),
+                ..ContextUpdate::default()
+            },
+        }))
+        .await
+        .map(|_| ())
+        .expect_err("the coder cannot change a different task sharing its source");
+    queue.cancel(active).await.expect("task should stop");
+    assert!(
+        queue
+            .running()
+            .await
+            .expect("task should await preservation")
+            .context
+            .cancelled
+    );
+    coder
+        .access_subject(&SubjectRequest::from(source))
+        .await
+        .expect_err("cancelled work cannot write to its original subject");
+    coder
+        .create_issue(Parameters(CreateIssueRequest {
+            title: "Unwanted replacement".to_owned(),
+            description: "Stop should prevent publication".to_owned(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+        }))
+        .await
+        .map(|_| ())
+        .expect_err("cancelled work cannot create an issue");
+    assert!(
+        coder
+            .get_task_context(Parameters(super::protocol::ContextRequest { task: None }))
+            .await
+            .expect("the stopped task can read its context")
+            .0
+            .context
+            .cancelled
+    );
+    assert_eq!(
+        queue
+            .get(other)
+            .await
+            .expect("unrelated work remains")
+            .context
+            .specification,
+        "work"
+    );
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("repository should open");
+    assert_eq!(
+        Issues::open(&stored, ReadOnly)
+            .expect("issues should open")
+            .all()
+            .expect("issues should list")
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn pins_real_specifications_and_revisions_and_rejects_missing_evidence_atomically() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{
+        agent::ActivityId,
+        queue::{ContextUpdate, MessageReference, TaskRequest},
+    };
+
+    let fixture = RepositoryFixture::new();
+    let owner = fixture.service().await;
+    let specification = result_id(
+        owner
+            .create_issue_write(CreateIssueRequest {
+                title: "Agreed scope".to_owned(),
+                description: "Scaffold only".to_owned(),
+                labels: Vec::new(),
+                assignees: Vec::new(),
+            })
+            .await
+            .expect("specification should create"),
+    );
+    let source = Subject::Issue(ObjectId::from_str(&specification).expect("issue should parse"));
+    let revision = result_id(
+        owner
+            .create_patch_write(
+                CreatePatchRequest {
+                    title: "Scaffold".to_owned(),
+                    description: format!("Implements {source}"),
+                    base: fixture.base.to_string(),
+                    head: fixture.head.to_string(),
+                    labels: Vec::new(),
+                    draft: false,
+                },
+                fixture.working.clone(),
+            )
+            .await
+            .expect("revision should create"),
+    );
+    let patch = Subject::Patch(ObjectId::from_str(&revision).expect("patch should parse"));
+    let queue = fixture.queue().await;
+    let task = queue
+        .push(TaskRequest::new(
+            "scaffold".to_owned(),
+            source.into(),
+            QueuePosition::End,
+        ))
+        .await
+        .expect("task should record")
+        .task;
+    let coder = fixture.service_with(Role::Coder, queue.clone()).await;
+    fixture
+        .activate(&coder, source, ActivityId::Task(task))
+        .await;
+    let messages = vec![
+        MessageReference {
+            subject: source.to_string(),
+            entry: specification.clone(),
+            revision: None,
+            purpose: "Agreed scope".to_owned(),
+        },
+        MessageReference {
+            subject: patch.to_string(),
+            entry: revision.clone(),
+            revision: Some(revision.clone()),
+            purpose: "Reviewed implementation".to_owned(),
+        },
+    ];
+    coder
+        .update_task_context(Parameters(super::protocol::ContextUpdateRequest {
+            task: None,
+            update: ContextUpdate {
+                messages: messages.clone(),
+                ..ContextUpdate::default()
+            },
+        }))
+        .await
+        .expect("existing evidence should pin");
+    let before = queue.get(task).await.expect("context should read").context;
+    for invalid in [
+        MessageReference {
+            entry: "3333333333333333333333333333333333333333".to_owned(),
+            ..messages[0].clone()
+        },
+        MessageReference {
+            revision: Some(specification.clone()),
+            ..messages[1].clone()
+        },
+        MessageReference {
+            revision: Some(specification.clone()),
+            ..messages[0].clone()
+        },
+    ] {
+        coder
+            .update_task_context(Parameters(super::protocol::ContextUpdateRequest {
+                task: None,
+                update: ContextUpdate {
+                    specification: Some("Unverified replacement".to_owned()),
+                    messages: vec![invalid],
+                    ..ContextUpdate::default()
+                },
+            }))
+            .await
+            .map(|_| ())
+            .expect_err("missing or mismatched evidence must be refused");
+        assert_eq!(
+            queue
+                .get(task)
+                .await
+                .expect("context should remain")
+                .context,
+            before
+        );
+    }
+    coder
+        .update_task_context(Parameters(super::protocol::ContextUpdateRequest {
+            task: None,
+            update: ContextUpdate {
+                messages,
+                ..ContextUpdate::default()
+            },
+        }))
+        .await
+        .expect("saving the same evidence should reuse it");
+    assert_eq!(
+        queue
+            .get(task)
+            .await
+            .expect("context should read")
+            .context
+            .messages
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn conversation_corrections_target_waiting_work_and_preserve_unrelated_tasks() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{
+        agent::{ActivityId, DeliveryId},
+        queue::TaskRequest,
+    };
+
+    let fixture = RepositoryFixture::new();
+    let source = Subject::Issue(
+        ObjectId::from_str("1111111111111111111111111111111111111111")
+            .expect("source should parse"),
+    );
+    let other = Subject::Issue(
+        ObjectId::from_str("2222222222222222222222222222222222222222")
+            .expect("other issue should parse"),
+    );
+    let queue = fixture.queue().await;
+    let first_request = || {
+        let mut request =
+            TaskRequest::new("first task".to_owned(), source.into(), QueuePosition::End);
+        request.request = Some("operation:first".to_owned());
+        request
+    };
+    let first = queue
+        .push(first_request())
+        .await
+        .expect("first task should record")
+        .task;
+    let second = queue
+        .push(TaskRequest::new(
+            "other task".to_owned(),
+            other.into(),
+            QueuePosition::End,
+        ))
+        .await
+        .expect("other task should record")
+        .task;
+    let talker = fixture.service_with(Role::Talker, queue.clone()).await;
+    fixture
+        .activate(
+            &talker,
+            source,
+            ActivityId::from(DeliveryId {
+                operation: EntryId::from_str(&source.id().to_string())
+                    .expect("operation should parse"),
+                action: 0,
+            }),
+        )
+        .await;
+    talker
+        .note(Parameters(super::protocol::NoteRequest {
+            task: first,
+            note: "Keep the reviewed head".to_owned(),
+        }))
+        .await
+        .expect("waiting correction should save");
+    talker
+        .note(Parameters(super::protocol::NoteRequest {
+            task: second,
+            note: "Replace its scope".to_owned(),
+        }))
+        .await
+        .map(|_| ())
+        .expect_err("another issue cannot correct unrelated work");
+    talker
+        .cancel(Parameters(super::protocol::TaskRequest { task: second }))
+        .await
+        .map(|_| ())
+        .expect_err("another issue cannot cancel unrelated work");
+    let cancelled = talker
+        .cancel(Parameters(super::protocol::TaskRequest { task: first }))
+        .await
+        .expect("explanation-only correction should cancel waiting work");
+    assert_eq!(cancelled.0.task.task, first);
+    assert!(cancelled.0.task.context.cancelled);
+    assert_eq!(cancelled.0.task.context.notes, ["Keep the reviewed head"]);
+    assert_eq!(
+        queue
+            .push(first_request())
+            .await
+            .expect("replay should retain cancellation")
+            .state,
+        crate::queue::TaskState::Cancelled
+    );
+    assert_eq!(
+        queue
+            .get(second)
+            .await
+            .expect("unrelated work remains")
+            .context
+            .specification,
+        "other task"
+    );
+    assert!(
+        queue
+            .get(second)
+            .await
+            .expect("unrelated work remains")
+            .context
+            .notes
+            .is_empty()
+    );
+    assert_eq!(queue.waiting().await.expect("queue should read"), 1);
+}
+
+#[tokio::test]
+async fn concurrent_roles_reuse_one_issue_for_the_same_finding() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::agent::{ActivityId, DeliveryId};
+
+    let fixture = RepositoryFixture::new();
+    let queue = fixture.queue().await;
+    let talker = fixture.service_with(Role::Talker, queue.clone()).await;
+    let chatter = fixture.service_with(Role::Chatter, queue).await;
+    let source = Subject::Issue(
+        ObjectId::from_str("1111111111111111111111111111111111111111")
+            .expect("source should parse"),
+    );
+    let operation = EntryId::from_str(&source.id().to_string()).expect("operation should parse");
+    fixture
+        .activate(
+            &talker,
+            source,
+            ActivityId::from(DeliveryId {
+                operation,
+                action: 0,
+            }),
+        )
+        .await;
+    fixture
+        .activate(
+            &chatter,
+            source,
+            ActivityId::from(DeliveryId {
+                operation,
+                action: 1,
+            }),
+        )
+        .await;
+    let request = || {
+        Parameters(CreateIssueRequest {
+            title: "One confirmed finding".to_owned(),
+            description: "Independent evidence".to_owned(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+        })
+    };
+    let (first, second) = tokio::join!(
+        talker.create_issue(request()),
+        chatter.create_issue(request())
+    );
+    assert_eq!(
+        result_id(first.expect("talker publication should succeed")),
+        result_id(second.expect("chatter publication should reuse the issue"))
+    );
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("repository should open");
+    assert_eq!(
+        Issues::open(&stored, ReadOnly)
+            .expect("issues should open")
+            .all()
+            .expect("issues should list")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn keeps_an_active_tool_request_usable_while_deactivation_waits() {
+    use crate::{agent::ActivityId, queue::TaskRequest};
+
+    let fixture = RepositoryFixture::new();
+    let source = Subject::Issue(
+        ObjectId::from_str("1111111111111111111111111111111111111111")
+            .expect("source should parse"),
+    );
+    let patch = Subject::Patch(
+        ObjectId::from_str("2222222222222222222222222222222222222222").expect("patch should parse"),
+    );
+    let queue = fixture.queue().await;
+    let task = queue
+        .push(TaskRequest::new(
+            "work".to_owned(),
+            source.into(),
+            QueuePosition::End,
+        ))
+        .await
+        .expect("task should record")
+        .task;
+    queue
+        .produced(task, patch)
+        .await
+        .expect("runtime artifact should record");
+    let coder = fixture.service_with(Role::Coder, queue).await;
+    fixture
+        .activate(&coder, source, ActivityId::Task(task))
+        .await;
+    let access = coder
+        .active()
+        .await
+        .expect("tool should acquire its active lease");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let shutdown_started = Arc::clone(&started);
+    let scope = coder.scope.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_started.notify_one();
+        scope.deactivate().await;
+    });
+    started.notified().await;
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        coder
+            .verify_subject(&access, &SubjectRequest::from(source))
+            .await
+            .expect("the original subject remains usable");
+        assert_eq!(
+            coder
+                .existing_patch(&access)
+                .await
+                .expect("existing artifact verification must reuse the lease"),
+            Some(patch.id())
+        );
+        assert_eq!(
+            access
+                .task_id(None)
+                .expect("task selection must use the existing lease"),
+            task
+        );
+        assert_eq!(
+            coder
+                .task_access(&access, task)
+                .await
+                .expect("context validation must use the existing lease")
+                .id,
+            task
+        );
+    })
+    .await;
+    drop(access);
+    finished.expect("a queued scope writer must not deadlock an already active tool call");
+    tokio::time::timeout(std::time::Duration::from_secs(1), shutdown)
+        .await
+        .expect("deactivation should finish when the lease is released")
+        .expect("shutdown task should finish");
+    coder
+        .active()
+        .await
+        .expect_err("the deactivated scope rejects new tool requests");
 }

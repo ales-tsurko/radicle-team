@@ -9,8 +9,8 @@ pub use crate::{
     agent::{
         adapter::{ADAPTERS, Unknown as UnknownAdapter},
         interface::{
-            ChatContext, ChatMessage, Context, DeliveryId, Error, InvalidSource, Layout,
-            McpEndpoint, Role, Source, WorkId,
+            ActivityId, ChatContext, ChatMessage, Context, DeliveryId, Error, InvalidSource,
+            Layout, McpEndpoint, Role, Source,
         },
     },
     sandbox::{AgentChild, AgentCommand, AgentSandbox},

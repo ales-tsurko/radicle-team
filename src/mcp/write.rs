@@ -9,7 +9,7 @@ use radicle::{
         patch::{self, Patches},
         store::access::ReadOnly,
     },
-    storage::ReadRepository as _,
+    storage::{ReadRepository as _, ReadStorage as _},
 };
 use rmcp::Json;
 
@@ -40,6 +40,22 @@ use crate::{
 };
 
 impl ToolService {
+    async fn require_issue_delegate(&self, operation: &'static str) -> Result<(), ServiceError> {
+        let delegate = self
+            .blocking(|service| {
+                let repository = service.storage.repository(service.repository)?;
+                Ok(repository
+                    .identity_doc()?
+                    .is_delegate(&service.publisher.author().into()))
+            })
+            .await?;
+        if delegate {
+            Ok(())
+        } else {
+            Err(ServiceError::IssueDelegate(operation))
+        }
+    }
+
     async fn mutate<T, F, V>(
         &self,
         method: &'static str,
@@ -65,18 +81,18 @@ impl ToolService {
             + Send
             + 'static,
     {
-        let mutation = if let Some(work) = self.mutation_work {
+        let mutation = if let Some(activity) = self.mutation_activity {
             let invocations = self
                 .mutation_invocations
                 .as_ref()
-                .expect("work invocation counters should be configured");
+                .expect("activity invocation counters should be configured");
             let mut invocations = invocations.lock().await;
             let invocation = invocations.entry(request.clone()).or_default();
             let key = crate::agent::MutationKey {
                 repository: self
                     .mutation_repository
-                    .expect("work repository should be configured"),
-                work,
+                    .expect("activity repository should be configured"),
+                activity,
                 invocation: *invocation,
                 request,
             };
@@ -578,6 +594,9 @@ impl ToolService {
         let labels = parse_labels(request.labels)?;
         let assignees = parse_dids(request.assignees)?;
         let description = request.description;
+        if !assignees.is_empty() || !labels.is_empty() {
+            self.require_issue_delegate("assignees or labels").await?;
+        }
         let expected_title = title.clone();
         let expected_labels = labels.clone();
         let expected_assignees = assignees.clone();
@@ -1058,6 +1077,13 @@ impl ToolService {
             (SubjectKind::Patch, StringUpdate::Labels) => "set_patch_labels",
             (SubjectKind::Patch, StringUpdate::Assignees) => "set_patch_assignees",
         };
+        if kind == SubjectKind::Issue {
+            self.require_issue_delegate(match change {
+                StringUpdate::Labels => "labels",
+                StringUpdate::Assignees => "assignees",
+            })
+            .await?;
+        }
         let request_id = mutation_identity(method, &request)?;
         let update = match (kind, change) {
             (SubjectKind::Issue, StringUpdate::Labels) => {

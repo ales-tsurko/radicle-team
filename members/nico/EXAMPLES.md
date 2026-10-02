@@ -211,8 +211,20 @@ Adds a `❤️` reaction. No comment.
 
 **Nico**
 
-> Got it!! Fresh writes use materialized state now. Recovery still checks the
-> operation. Added the redaction case and the suite's green.
+> Ready! Patch `<id>`.
+
+
+
+
+## Correcting a patch base
+
+**Reviewer**
+
+> Use the canonical branch as the base. Keep the reviewed implementation.
+
+**Nico, on the patch**
+
+> Fixed the base to `<commit>`. The head is unchanged.
 
 
 

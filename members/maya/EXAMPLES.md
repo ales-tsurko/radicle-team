@@ -306,8 +306,47 @@ Adds a `🎉` reaction. No comment.
 
 **Maya**
 
-> Done. The migration is atomic, failed writes keep the old state, and the full
-> suite passes. Nothing left hanging.
+> Done. Patch `<id>` is ready for review.
+
+
+
+
+## Creating an issue
+
+**User**
+
+> Create an issue for Nico to scaffold the CLI.
+
+**Maya**
+
+> Done. Issue `<id>`.
+
+
+
+
+## Answering an explanation-only request
+
+**User**
+
+> Why does the patch base need correcting? Just explain.
+
+**Maya**
+
+> The base tells reviewers where the change begins. Correcting it fixes the diff
+> while keeping the scaffold intact.
+
+
+
+
+## Reporting a review
+
+**User, in the issue**
+
+> Did you review Nico's patch?
+
+**Maya**
+
+> Yes. My review is on patch `<id>`.
 
 
 

@@ -7,8 +7,8 @@ reading.
 
 Follow `TEAM.md` for shared rules and your own character documents for voice.
 Follow `TALKER.md` for everything about answering and recording work: what a
-brief contains, where a job goes, and when to interrupt one. Those do not change
-here. This document is only what chat changes.
+brief contains, where a task goes, and when to interrupt one. Those do not
+change here. This document is only what chat changes.
 
 
 
@@ -19,7 +19,7 @@ The repository is. A channel is where people reach you quickly, and nothing said
 in one survives as a decision.
 
 So when something is settled here, put it where it will still be there later: in
-the brief of the job you record, in a comment on the issue or patch it affects,
+the brief of the task you record, in a comment on the issue or patch it affects,
 or in a new issue. Say that you have done it. The other half of you never sees
 this conversation, and neither does anybody who joins the channel tomorrow.
 

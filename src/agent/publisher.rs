@@ -18,21 +18,21 @@ use radicle::{
 };
 use sqlite::State;
 
-use crate::{agent::WorkId, database::Database, manifest::SecurityPolicy};
+use crate::{agent::ActivityId, database::Database, manifest::SecurityPolicy};
 
 const JOURNAL_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS mcp_mutations (
         repository TEXT NOT NULL,
-        work_repository TEXT NOT NULL,
-        work TEXT NOT NULL,
+        activity_repository TEXT NOT NULL,
+        activity TEXT NOT NULL,
         invocation TEXT NOT NULL,
         method TEXT NOT NULL,
         author TEXT NOT NULL,
         result TEXT,
         PRIMARY KEY (
             repository,
-            work_repository,
-            work,
+            activity_repository,
+            activity,
             invocation
         )
     ) STRICT;
@@ -60,6 +60,24 @@ impl fmt::Debug for Publisher {
 }
 
 impl Publisher {
+    /// Returns artifacts already created by this activity, even if announcing them was interrupted.
+    pub(crate) async fn created(
+        &self,
+        activity: ActivityId,
+        method: &'static str,
+    ) -> Result<Vec<String>, Error> {
+        let Some(journal) = &self.journal else {
+            return Ok(Vec::new());
+        };
+        Ok(journal
+            .entries(self.repository, self.repository, activity)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.method == method)
+            .filter_map(|entry| entry.result)
+            .collect())
+    }
+
     pub(crate) fn new(
         profile: Profile,
         repository: RepoId,
@@ -116,13 +134,13 @@ impl Publisher {
         self.authorizer.security_policy().await
     }
 
-    pub(crate) async fn reconcile(&self, work: WorkId) -> Result<(), Error> {
+    pub(crate) async fn reconcile(&self, activity: ActivityId) -> Result<(), Error> {
         let Some(journal) = &self.journal else {
             return Ok(());
         };
-        for repository in journal.repositories(self.repository, work).await? {
+        for repository in journal.repositories(self.repository, activity).await? {
             self.for_repository(repository)
-                .reconcile_repository(self.repository, work)
+                .reconcile_repository(self.repository, activity)
                 .await?;
         }
         Ok(())
@@ -130,18 +148,18 @@ impl Publisher {
 
     async fn reconcile_repository(
         &self,
-        work_repository: RepoId,
-        work: WorkId,
+        activity_repository: RepoId,
+        activity: ActivityId,
     ) -> Result<(), Error> {
         let Some(journal) = &self.journal else {
             return Ok(());
         };
         let _mutation_guard = self.mutation_lock.lock().await;
-        // Signing refs and announcing is per author, not per write, and a job's scope holds one
+        // Signing refs and announcing is per author, not per write, and a task's scope holds one
         // row for every write it made.
         let mut recovered = BTreeSet::new();
         for entry in journal
-            .entries(self.repository, work_repository, work)
+            .entries(self.repository, activity_repository, activity)
             .await?
         {
             if entry.result.is_some() {
@@ -325,11 +343,11 @@ impl Publisher {
 
     fn marker(key: &MutationKey) -> String {
         if key.invocation == 0 {
-            format!("radicle-team mcp {}:{}", key.work, key.request)
+            format!("radicle-team mcp {}:{}", key.activity, key.request)
         } else {
             format!(
                 "radicle-team mcp {}:{}:{}",
-                key.work, key.invocation, key.request
+                key.activity, key.invocation, key.request
             )
         }
     }
@@ -458,7 +476,7 @@ impl Publisher {
 #[derive(Debug, Clone)]
 pub(crate) struct MutationKey {
     pub(crate) repository: RepoId,
-    pub(crate) work: WorkId,
+    pub(crate) activity: ActivityId,
     pub(crate) invocation: usize,
     pub(crate) request: String,
 }
@@ -521,7 +539,7 @@ impl MutationJournal {
             .call(move |connection| {
                 let mut insert = connection.prepare(
                     "INSERT OR IGNORE INTO mcp_mutations
-                         (repository, work_repository, work, invocation, method, author)
+                         (repository, activity_repository, activity, invocation, method, author)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )?;
                 bind_mutation(&mut insert, &values)?;
@@ -532,8 +550,8 @@ impl MutationJournal {
 
                 let mut select = connection.prepare(
                     "SELECT method, author, result FROM mcp_mutations
-                     WHERE repository = ?1 AND work_repository = ?2
-                       AND work = ?3 AND invocation = ?4",
+                     WHERE repository = ?1 AND activity_repository = ?2
+                       AND activity = ?3 AND invocation = ?4",
                 )?;
                 bind_mutation(&mut select, &values)?;
                 if select.next()? != State::Row {
@@ -614,23 +632,23 @@ impl MutationJournal {
     async fn entries(
         &self,
         repository: RepoId,
-        work_repository: RepoId,
-        work: WorkId,
-    ) -> Result<Vec<WorkJournalEntry>, Error> {
+        activity_repository: RepoId,
+        activity: ActivityId,
+    ) -> Result<Vec<ActivityJournalEntry>, Error> {
         self.select(
             "SELECT invocation, method, author, result FROM mcp_mutations
-             WHERE repository = ?1 AND work_repository = ?2 AND work = ?3",
+             WHERE repository = ?1 AND activity_repository = ?2 AND activity = ?3",
             vec![
                 repository.to_string(),
-                work_repository.to_string(),
-                work.to_string(),
+                activity_repository.to_string(),
+                activity.to_string(),
             ],
             move |row| {
                 let (invocation, request) = decode_invocation(row.read::<String, _>(0)?)?;
-                Ok(WorkJournalEntry {
+                Ok(ActivityJournalEntry {
                     key: MutationKey {
-                        repository: work_repository,
-                        work,
+                        repository: activity_repository,
+                        activity,
                         invocation,
                         request,
                     },
@@ -645,13 +663,13 @@ impl MutationJournal {
 
     async fn repositories(
         &self,
-        work_repository: RepoId,
-        work: WorkId,
+        activity_repository: RepoId,
+        activity: ActivityId,
     ) -> Result<Vec<RepoId>, Error> {
         self.select(
             "SELECT DISTINCT repository FROM mcp_mutations
-             WHERE work_repository = ?1 AND work = ?2",
-            vec![work_repository.to_string(), work.to_string()],
+             WHERE activity_repository = ?1 AND activity = ?2",
+            vec![activity_repository.to_string(), activity.to_string()],
             |row| stored(&row.read::<String, _>(0)?),
         )
         .await
@@ -662,8 +680,8 @@ impl MutationJournal {
             repository,
             key,
             "DELETE FROM mcp_mutations
-             WHERE repository = ?1 AND work_repository = ?2
-               AND work = ?3 AND invocation = ?4 AND result IS NULL",
+             WHERE repository = ?1 AND activity_repository = ?2
+               AND activity = ?3 AND invocation = ?4 AND result IS NULL",
         )
         .await
     }
@@ -674,8 +692,8 @@ impl MutationJournal {
             repository,
             key,
             "UPDATE mcp_mutations SET result = NULL
-             WHERE repository = ?1 AND work_repository = ?2
-               AND work = ?3 AND invocation = ?4",
+             WHERE repository = ?1 AND activity_repository = ?2
+               AND activity = ?3 AND invocation = ?4",
         )
         .await
     }
@@ -705,7 +723,7 @@ struct JournalEntry {
     result: Option<String>,
 }
 
-struct WorkJournalEntry {
+struct ActivityJournalEntry {
     key: MutationKey,
     method: String,
     author: PublicKey,
@@ -735,8 +753,8 @@ fn complete_mutation(
 ) -> sqlite::Result<()> {
     let mut update = connection.prepare(
         "UPDATE mcp_mutations SET author = ?6, result = ?7
-         WHERE repository = ?1 AND work_repository = ?2
-           AND work = ?3 AND invocation = ?4 AND method = ?5",
+         WHERE repository = ?1 AND activity_repository = ?2
+           AND activity = ?3 AND invocation = ?4 AND method = ?5",
     )?;
     bind_mutation(&mut update, values)?;
     update.bind((5, method))?;
@@ -750,7 +768,7 @@ fn mutation_values(repository: RepoId, key: &MutationKey) -> [String; 4] {
     [
         repository.to_string(),
         key.repository.to_string(),
-        key.work.to_string(),
+        key.activity.to_string(),
         encode_invocation(key),
     ]
 }

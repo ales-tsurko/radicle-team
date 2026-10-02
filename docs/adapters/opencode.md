@@ -109,9 +109,9 @@ The plugin is how a stalled permission prompt becomes visible too. It writes a
 line when OpenCode asks for one, which from outside the process is
 indistinguishable from an agent thinking.
 
-A cancelled job is stopped and then preserved by a second, short run in the same
-working copy, told to commit what the first one reached. If that second run is
-stopped too, the changes stay in the tree and preparing the next job commits
+A cancelled task is stopped and then preserved by a second, short run in the
+same working copy, told to commit what the first one reached. If that second run
+is stopped too, the changes stay in the tree and preparing the next task commits
 them to a salvage branch.
 
 `rad-team run --log debug` adds every event a run emits, which is the quickest

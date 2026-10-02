@@ -12,7 +12,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{manifest::QueuePosition, mcp::server::ServiceError, queue::Job};
+use crate::{
+    manifest::QueuePosition,
+    mcp::server::ServiceError,
+    queue::{ContextUpdate, Task, TaskContext, TaskState},
+    watcher::Subject,
+};
 
 pub(super) const MAX_EMBED_BYTES: usize = 10_000_000;
 const MAX_EMBEDS: usize = 16;
@@ -32,6 +37,28 @@ pub(super) struct ChatReplyRecord {
 pub(super) struct SubjectRequest {
     pub(super) kind: SubjectKind,
     pub(super) subject: String,
+}
+
+impl SubjectRequest {
+    pub(super) fn target(&self) -> Result<Subject, String> {
+        let kind = match self.kind {
+            SubjectKind::Issue => "issue",
+            SubjectKind::Patch => "patch",
+        };
+        Subject::from_str(&format!("{kind}:{}", self.subject)).map_err(|error| error.to_string())
+    }
+}
+
+impl From<Subject> for SubjectRequest {
+    fn from(subject: Subject) -> Self {
+        Self {
+            kind: match subject {
+                Subject::Issue(_) => SubjectKind::Issue,
+                Subject::Patch(_) => SubjectKind::Patch,
+            },
+            subject: subject.id().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -168,55 +195,88 @@ pub(super) struct IssuePage {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub(super) struct AddJobRequest {
+pub(super) struct AddTaskRequest {
     /// What was decided, in enough detail to begin without rereading the discussion.
     pub(super) brief: String,
     /// Where the work joins the queue. Ask before putting anything ahead of it.
     #[serde(default)]
     pub(super) position: QueuePosition,
+    /// Additional specification, related artifacts, pinned messages, and notes.
+    #[serde(default)]
+    pub(super) context: ContextUpdate,
+    /// Explicitly separate work on the same artifact. Repeated delivery is still idempotent.
+    #[serde(default)]
+    pub(super) distinct: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(super) struct NoteRequest {
-    /// Correction for the running job to read before its next step.
+    /// Task to correct; use task_status to select the relevant running or waiting task.
+    pub(super) task: i64,
+    /// Correction to retain and read before the next step.
     pub(super) note: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct TaskRequest {
+    /// Specific running or waiting task.
+    pub(super) task: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct ContextRequest {
+    /// Task to inspect; omitted uses the building role's active task.
+    pub(super) task: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct ContextUpdateRequest {
+    /// Task to update; omitted uses the building role's active task.
+    pub(super) task: Option<i64>,
+    /// Incremental update preserving origin, produced artifacts, and earlier notes.
+    #[serde(flatten)]
+    pub(super) update: ContextUpdate,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
-pub(super) struct JobRecord {
-    pub(super) job: i64,
+pub(super) struct TaskRecord {
+    pub(super) task: i64,
     pub(super) position: QueuePosition,
     pub(super) waiting: usize,
+    pub(super) state: TaskState,
+    pub(super) result: Option<String>,
 }
 
-/// Outcome of a request aimed at whatever is running.
+/// Outcome of a request aimed at a specific running or waiting task.
 #[derive(Debug, Serialize, JsonSchema)]
-pub(super) struct JobAction {
-    /// Job the request reached, absent when nothing was running.
-    pub(super) job: Option<JobSummary>,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-pub(super) struct WorkStatus {
-    pub(super) running: Option<JobSummary>,
-    pub(super) waiting: Vec<JobSummary>,
+pub(super) struct TaskAction {
+    /// Task the request reached.
+    pub(super) task: TaskSummary,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
-pub(super) struct JobSummary {
-    pub(super) job: i64,
+pub(super) struct TaskStatus {
+    pub(super) running: Option<TaskSummary>,
+    pub(super) waiting: Vec<TaskSummary>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct TaskSummary {
+    pub(super) task: i64,
     pub(super) brief: String,
     pub(super) source: String,
     pub(super) position: QueuePosition,
+    pub(super) context: TaskContext,
 }
 
-impl From<Job> for JobSummary {
-    fn from(job: Job) -> Self {
+impl From<Task> for TaskSummary {
+    fn from(task: Task) -> Self {
         Self {
-            job: job.id,
-            source: job.source.to_string(),
-            brief: job.brief,
-            position: job.position,
+            task: task.id,
+            source: task.source.to_string(),
+            brief: task.brief,
+            position: task.position,
+            context: task.context,
         }
     }
 }
@@ -229,6 +289,14 @@ pub(super) struct IssueRequest {
 #[derive(Debug, Serialize, JsonSchema)]
 pub(super) struct Document {
     pub(super) data: Value,
+}
+
+impl Document {
+    pub(super) fn reused(id: String, next_step: &str) -> Json<Self> {
+        Json(Self {
+            data: serde_json::json!({ "id": id, "reused": true, "next_step": next_step }),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

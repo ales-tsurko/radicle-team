@@ -105,7 +105,7 @@ impl Session {
     /// Runs `command` to completion, unless it is stopped first.
     ///
     /// One run at a time, which is what the runtime gives a role: each agent serialises its own
-    /// work, so a role is at most one delivery or one job at once.
+    /// work, so a role is at most one delivery or one task at once.
     ///
     /// # Errors
     ///
@@ -684,7 +684,7 @@ mod tests {
     // Being aborted for silence and being asked to stop end the same process, and only the second
     // is followed by asking the agent to commit what it reached.
     #[tokio::test]
-    async fn separates_a_job_asked_to_stop_from_one_which_was_abandoned() {
+    async fn separates_a_task_asked_to_stop_from_one_which_was_abandoned() {
         let session = Session::new(Role::Coder);
         let _stop = session.begin();
 
@@ -701,7 +701,7 @@ mod tests {
         let _next = session.begin();
         assert!(
             !session.was_interrupted(),
-            "a stop asked for during one job must not follow the next one"
+            "a stop asked for during one task must not follow the next one"
         );
     }
 

@@ -7,7 +7,7 @@ use crate::{
     agent::{ChatContext, ChatMessage, Chatter, Role, Source},
     chat::{MessageId, classification::IncomingMessage},
     conversation::{Error, Scoped},
-    mcp::WorkScope,
+    mcp::ActivityScope,
     member::Member,
     workspace::Workspaces,
 };
@@ -51,7 +51,11 @@ pub(crate) struct Dispatcher {
 
 impl Dispatcher {
     // Creates the dispatcher and its clonable ingress handle.
-    pub(crate) fn new(member: Member, workspaces: Workspaces, scope: WorkScope) -> (Handle, Self) {
+    pub(crate) fn new(
+        member: Member,
+        workspaces: Workspaces,
+        scope: ActivityScope,
+    ) -> (Handle, Self) {
         let (sender, receiver) = mpsc::channel(BUFFER);
         (
             Handle { sender },
@@ -92,7 +96,7 @@ impl Dispatcher {
             .scope
             .activate(context.clone())
             .await
-            .map_err(Error::WorkScope)?;
+            .map_err(Error::ActivityScope)?;
         tracing::info!(
             member = %self.scoped.member,
             %repository,
@@ -134,7 +138,7 @@ mod tests {
     use crate::{
         agent::{ChatContext, ChatMessage, Chatter, Error as AgentError, McpEndpoint},
         chat::dispatcher::Dispatcher,
-        mcp::WorkScope,
+        mcp::ActivityScope,
         member::{Member, Profile},
         workspace::Workspaces,
     };
@@ -180,7 +184,7 @@ mod tests {
         let (handle, dispatcher) = Dispatcher::new(
             Member::Nico,
             workspaces("chat-dispatcher-held").await,
-            WorkScope::default(),
+            ActivityScope::default(),
         );
         let mut chatter = SilentChatter;
 
@@ -199,7 +203,7 @@ mod tests {
         let (handle, dispatcher) = Dispatcher::new(
             Member::Nico,
             workspaces("chat-dispatcher-gone").await,
-            WorkScope::default(),
+            ActivityScope::default(),
         );
         let mut chatter = SilentChatter;
         drop(handle);
@@ -218,7 +222,7 @@ mod tests {
     // clearing the other's would fail whichever lost the race.
     async fn workspaces(name: &str) -> Workspaces {
         let repository = RepoId::from_str(REPOSITORY).expect("repository should parse");
-        let queue = crate::queue::WorkQueue::memory(repository, Member::Nico)
+        let queue = crate::queue::TaskQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open");
         let info = UserInfo {

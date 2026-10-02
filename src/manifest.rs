@@ -224,6 +224,11 @@ impl Manifest {
             .collect()
     }
 
+    /// Applies the trigger policy to an author supplying task relationships.
+    pub(crate) fn allows_request(&self, author: Did, delegates: &[Did]) -> bool {
+        self.triggered_by.allows(author, delegates) || self.active_member_dids().contains(&author)
+    }
+
     fn parse(contents: &str, revision: Revision) -> Result<Self, Error> {
         let document = ConfigLoader::builder()
             .add_source(File::from_str(contents, FileFormat::Toml))
@@ -785,7 +790,7 @@ impl PriorityLabels {
 pub enum QueuePosition {
     /// Ahead of everything already waiting.
     Front,
-    /// After the running job, ahead of everything else waiting.
+    /// After the running task, ahead of everything else waiting.
     Next,
     /// Behind everything already waiting.
     #[default]

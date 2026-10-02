@@ -9,7 +9,7 @@ use radicle::cob::EntryId;
 
 use crate::{
     agent::interface::{ChatContext, ChatMessage, Context},
-    queue::Job,
+    queue::Task,
     watcher::{Change, Comment, Target},
 };
 
@@ -57,26 +57,37 @@ pub(crate) fn messaged(context: &ChatContext, message: &ChatMessage) -> String {
     )
 }
 
-/// Describes one queued job.
-pub(crate) fn job(job: &Job) -> String {
+/// Describes one queued task.
+pub(crate) fn task(task: &Task) -> String {
+    if task.context.cancelled {
+        return stopping(task);
+    }
     format!(
-        "Job {} came from {}, and its brief is:\n\n{}",
-        job.id, job.source, job.brief
+        "Task {} came from {}, and its agreed specification is:\n\n{}\n\nRelated artifacts: \
+         {:?}\nPinned messages: {:?}\nRetained notes: {:?}\n\nReread pinned messages and current \
+         artifact state before acting on earlier feedback. Save important findings with \
+         update_task_context. Use the existing patch for revisions.",
+        task.id,
+        task.source,
+        task.context.specification,
+        task.context.artifacts,
+        task.context.messages,
+        task.context.notes
     )
 }
 
-/// Asks a stopped job to preserve what it reached.
+/// Asks a stopped task to preserve what it reached.
 ///
-/// Its own run, because an agent turn cannot be interrupted: the run carrying out the job is ended
+/// Its own run, because an agent turn cannot be interrupted: the run carrying out the task is ended
 /// first, and this one is what commits whatever that left in the working copy. A fresh run has no
 /// memory of the work, which is why it is told to look at the tree rather than to recall it.
-pub(crate) fn stopping(job: &Job) -> String {
+pub(crate) fn stopping(task: &Task) -> String {
     format!(
-        "You were asked to stop job {} before it was finished, and this run is the one that \
+        "You were asked to stop task {} before it was finished, and this run is the one that \
          preserves it: the run doing the work has already been ended, so read the tree to find \
          out where it got to. Commit what is uncommitted to the branch this copy is standing on, \
          with a message saying what remains. Start nothing new.",
-        job.id
+        task.id
     )
 }
 
@@ -165,7 +176,7 @@ mod tests {
             prompt,
         },
         manifest::QueuePosition,
-        queue::Job,
+        queue::Task,
         watcher::{Change, Comment, Subject, Target},
     };
 
@@ -235,23 +246,27 @@ mod tests {
 
     #[test]
     fn hands_the_building_role_its_brief_and_asks_a_stopped_one_to_commit() {
-        let job = Job {
+        let task = Task {
             id: 17,
             brief: "replace the parser".to_owned(),
+            context: crate::queue::TaskContext {
+                specification: "replace the parser".to_owned(),
+                ..crate::queue::TaskContext::default()
+            },
             source: Subject::Issue(object()).into(),
             position: QueuePosition::End,
         };
 
-        let carrying = prompt::job(&job);
+        let carrying = prompt::task(&task);
         assert!(carrying.contains("replace the parser"));
         assert!(carrying.contains("17"));
-        assert!(carrying.contains(&job.source.to_string()));
+        assert!(carrying.contains(&task.source.to_string()));
 
-        let stopping = prompt::stopping(&job);
+        let stopping = prompt::stopping(&task);
         assert!(stopping.contains("Commit"), "{stopping}");
         assert!(
             stopping.contains("Start nothing new"),
-            "a stopped job which starts something else has not stopped"
+            "a stopped task which starts something else has not stopped"
         );
     }
 

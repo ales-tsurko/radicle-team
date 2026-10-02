@@ -261,7 +261,7 @@ pub enum Change {
 impl Change {
     /// Returns whether this change delivers work to whoever owns the subject.
     #[must_use]
-    pub const fn is_work_submission(&self) -> bool {
+    pub const fn is_task_submission(&self) -> bool {
         matches!(
             self,
             Self::ReviewSubmitted { .. } | Self::RevisionCreated(_)
@@ -405,7 +405,7 @@ mod tests {
             assert_eq!(
                 Subject::from_str(&subject.to_string()),
                 Ok(subject),
-                "a queued job is only traceable if its stored source survives a round trip"
+                "a queued task is only traceable if its stored source survives a round trip"
             );
         }
         for malformed in [SUBJECT.to_owned(), format!("review:{SUBJECT}")] {

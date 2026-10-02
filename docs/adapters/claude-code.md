@@ -120,11 +120,11 @@ just did, and the runtime reads silence the same way it does for OpenCode, only
 without the plugin that harness needs. A failure explains itself in the final
 event, which the runtime relays when a delivery ends badly.
 
-A cancelled job works the way it does under OpenCode, because the reason it does
-is the same: an agent turn cannot be interrupted. The stopped job is ended, and
-a second, short run in the same working copy commits what the first reached. If
-that second run is stopped too, the changes are still in the tree and preparing
-the next job commits them to a salvage branch.
+A cancelled task works the way it does under OpenCode, because the reason it
+does is the same: an agent turn cannot be interrupted. The stopped task is
+ended, and a second, short run in the same working copy commits what the first
+reached. If that second run is stopped too, the changes are still in the tree
+and preparing the next task commits them to a salvage branch.
 
 `rad-team run --log debug` adds every event a run emits, which is the quickest
 way to see what a member is doing without reading Claude Code's own logs.

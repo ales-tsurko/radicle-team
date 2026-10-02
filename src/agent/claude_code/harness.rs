@@ -24,7 +24,7 @@ use crate::{
     },
     member::Profile,
     provider::{Credentials, Provider, Way},
-    queue::Job,
+    queue::Task,
     sandbox::{AgentCommand, AgentSandbox},
 };
 
@@ -204,20 +204,20 @@ impl ClaudeCode {
         }
     }
 
-    // Asks a fresh run to commit whatever the stopped job left in the working copy.
-    async fn preserve(&self, job: &Job, workspace: &Path) -> Result<(), Error> {
+    // Asks a fresh run to commit whatever the stopped task left in the working copy.
+    async fn preserve(&self, task: &Task, workspace: &Path) -> Result<(), Error> {
         tracing::info!(
-            job = job.id,
-            "asking the stopped job to commit what it reached"
+            task = task.id,
+            "asking the stopped task to commit what it reached"
         );
-        match self.deliver(prompt::stopping(job), workspace).await? {
+        match self.deliver(prompt::stopping(task), workspace).await? {
             Outcome::Finished => Ok(()),
             // The runtime ran out of patience with the second run too. What is in the tree is still
-            // there, and preparing the next job commits it to a salvage branch.
+            // there, and preparing the next task commits it to a salvage branch.
             Outcome::Stopped => {
                 tracing::warn!(
-                    job = job.id,
-                    "the stopped job was ended before it committed; its work stays in the tree"
+                    task = task.id,
+                    "the stopped task was ended before it committed; its work stays in the tree"
                 );
 
                 Ok(())
@@ -376,17 +376,17 @@ impl Coder for ClaudeCode {
             .map_err(agent::Error::new)
     }
 
-    async fn work(&self, job: Job, workspace: PathBuf) -> Result<(), agent::Error> {
+    async fn work(&self, task: Task, workspace: PathBuf) -> Result<(), agent::Error> {
         let carried = self
-            .deliver(prompt::job(&job), &workspace)
+            .deliver(prompt::task(&task), &workspace)
             .await
             .map_err(agent::Error::new)?;
         match carried {
             Outcome::Finished => Ok(()),
-            // An agent turn cannot be interrupted, so a job which was asked to stop is ended and
+            // An agent turn cannot be interrupted, so a task which was asked to stop is ended and
             // then asked, in a run of its own, to commit what it had reached.
             Outcome::Stopped if self.session.was_interrupted() => self
-                .preserve(&job, &workspace)
+                .preserve(&task, &workspace)
                 .await
                 .map_err(agent::Error::new),
             Outcome::Stopped => Err(agent::Error::new(Error::Stopped(self.role))),

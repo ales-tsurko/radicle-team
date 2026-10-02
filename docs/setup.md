@@ -119,7 +119,7 @@ Nico needs goes inside it:
 ~/Desktop/nico-z3cyot.../
 ├── radicle-team-member.toml   marks the folder, records which member owns it
 ├── identity/            nico's key, storage, and node
-├── state.db             deliveries, job queue, chat messages
+├── state.db             deliveries, task queue, chat messages
 ├── sandbox.toml         what nico's agents may read, write, and reach
 ├── irc-identity.pem
 ├── node.log
@@ -145,18 +145,18 @@ answering copies are simply cleaned: what they hold is what they looked at on
 the way to an answer, and the answer itself is already in the issue or the
 channel.
 
-The building role uses one branch per job, named after that job:
+The building role uses one branch per task, named after that task:
 
 ```text
-nico-rt/job-17
+nico-rt/task-17
 ```
 
-A job branch is removed once its job is over. The queue is what says so: a job
-which was carried out has had its row removed, and a job which stalled, failed,
-or was interrupted still has one, along with whatever it committed. A branch the
-agent is still standing on is left alone and removed when it next moves to other
-work, so tidying up never pulls the ground out from under a job which is still
-running.
+A task branch is removed once its task is over. The queue is what says so: a
+task which was carried out has had its row removed, and a task which stalled,
+failed, or was interrupted still has one, along with whatever it committed. A
+branch the agent is still standing on is left alone and removed when it next
+moves to other work, so tidying up never pulls the ground out from under a task
+which is still running.
 
 Setup also asks which models the member runs on, and signs you in if that
 provider needs it. Answer "decide later" to leave it unset.
@@ -336,7 +336,7 @@ The wizard saves the proposed `radicle-team.toml` in the coder worktree and asks
 before committing and publishing. Rerunning an interrupted setup resumes from
 the working manifest or detached commit and reuses an existing Radicle patch.
 The member lock prevents the runtime from using the worktree during setup. Once
-published, the patch preserves the commit when the coder moves to job branches.
+published, the patch preserves the commit when the coder moves to task branches.
 Setup refuses to replace unrelated uncommitted work.
 
 Setup keeps the member's node running until at least one repository seed

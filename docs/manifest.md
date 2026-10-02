@@ -219,9 +219,9 @@ pin to match before an `account-tag` can produce a sender DID.
 
 ## Where new work goes
 
-An assignment becomes a job in the member's queue. New work joins the end of
+An assignment becomes a task in the member's queue. New work joins the end of
 that queue, an assignment labelled `urgent` goes to the front, and one labelled
-`next` goes after the running job.
+`next` goes after the running task.
 
 ```toml
 [priority]

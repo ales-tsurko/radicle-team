@@ -16,34 +16,36 @@ use rmcp::{
 use serde::Serialize;
 
 use crate::{
-    agent::{Publisher, Role, Source, WorkId},
+    agent::{ActivityId, Publisher, Role, Source},
     chat::State as ChatState,
     manifest::McpAllowlist,
     mcp::{
         protocol::{
-            AddJobRequest, ChatReplyRecord, CommentIssueRequest, CommentOperation,
-            CommentWriteRequest, CreateIssueRequest, CreatePatchRequest, DiffRequest, Document,
-            EditIssueRequest, EditPatchRequest, EmbedReadRequest, EntityRequest, EntryRequest,
-            IssuePage, IssueRequest, JobAction, JobRecord, JobSummary, ListIssuesRequest,
-            MergePatchRequest, NoteRequest, PatchEntity, PatchEntityRequest, ReactionWriteRequest,
-            ReplyChatRequest, ResolveCommentRequest, ReviewWriteRequest, SecurityIssueRequest,
-            SecurityIssueResult, SetStateRequest, SetStringsRequest, StringUpdate, SubjectKind,
-            SubjectRequest, TimelinePage, TimelineRequest, UpdatePatchRequest, WorkStatus,
+            AddTaskRequest, ChatReplyRecord, CommentIssueRequest, CommentOperation,
+            CommentWriteRequest, ContextRequest, ContextUpdateRequest, CreateIssueRequest,
+            CreatePatchRequest, DiffRequest, Document, EditIssueRequest, EditPatchRequest,
+            EmbedReadRequest, EntityRequest, EntryRequest, IssuePage, IssueRequest,
+            ListIssuesRequest, MergePatchRequest, NoteRequest, PatchEntity, PatchEntityRequest,
+            ReactionWriteRequest, ReplyChatRequest, ResolveCommentRequest, ReviewWriteRequest,
+            SecurityIssueRequest, SecurityIssueResult, SetStateRequest, SetStringsRequest,
+            StringUpdate, SubjectKind, SubjectRequest, TaskAction, TaskRecord, TaskRequest,
+            TaskStatus, TaskSummary, TimelinePage, TimelineRequest, UpdatePatchRequest,
         },
         read::serialize,
         security::SecurityReporting,
-        server::{ServiceError, WorkAccess, WorkScope},
+        server::{ActivityAccess, ActivityScope, ServiceError},
     },
-    queue::WorkQueue,
+    queue::{ArtifactRole, TaskQueue},
 };
 
 // Tools which coordinate the member's roles rather than write to the repository.
-const QUEUE_TOOLS: [&str; 4] = ["add_job", "cancel", "note", "work_status"];
+const QUEUE_TOOLS: [&str; 4] = ["add_task", "cancel", "note", "task_status"];
 // Tools which need commits that only the building role can make.
 const BUILDING_TOOLS: [&str; 2] = ["create_patch", "update_patch"];
 // Tool which only the chatting role can use, while handling an authenticated message.
 const CHAT_TOOLS: [&str; 1] = ["reply_chat"];
 // Tool which every member may always reach, whatever the manifest allows.
+const CONTEXT_TOOLS: [&str; 2] = ["get_task_context", "update_task_context"];
 const SECURITY_TOOL: &str = "report_security_issue";
 
 impl Role {
@@ -62,25 +64,26 @@ pub(crate) struct ToolService {
     pub(super) storage: Storage,
     pub(super) repository: RepoId,
     tool_router: ToolRouter<Self>,
-    pub(super) scope: WorkScope,
+    pub(super) scope: ActivityScope,
     pub(super) publisher: Publisher,
     security: SecurityReporting,
     role: Role,
-    queue: WorkQueue,
+    pub(super) queue: TaskQueue,
     chat: ChatState,
+    pub(super) creations: Arc<tokio::sync::Mutex<()>>,
     pub(super) mutation_repository: Option<RepoId>,
-    pub(super) mutation_work: Option<crate::agent::WorkId>,
+    pub(super) mutation_activity: Option<crate::agent::ActivityId>,
     pub(super) mutation_invocations: Option<Arc<tokio::sync::Mutex<BTreeMap<String, usize>>>>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolState {
-    queue: WorkQueue,
+    queue: TaskQueue,
     chat: ChatState,
 }
 
 impl ToolState {
-    pub(crate) const fn new(queue: WorkQueue, chat: ChatState) -> Self {
+    pub(crate) const fn new(queue: TaskQueue, chat: ChatState) -> Self {
         Self { queue, chat }
     }
 }
@@ -107,19 +110,20 @@ impl ToolService {
     /// These reach the member's own queue, or the security policy, and never ordinary repository
     /// state, so naming one in an allowlist is a mistake rather than a grant.
     pub(crate) fn is_unrestricted(method: &str) -> bool {
-        QUEUE_TOOLS.contains(&method) || method == SECURITY_TOOL
+        QUEUE_TOOLS.contains(&method) || CONTEXT_TOOLS.contains(&method) || method == SECURITY_TOOL
     }
 
     pub(super) fn new(
         storage: Storage,
         repository: RepoId,
-        scope: WorkScope,
+        scope: ActivityScope,
         publisher: Publisher,
         allowlist: McpAllowlist,
         role: Role,
         state: ToolState,
     ) -> Self {
         let ToolState { queue, chat } = state;
+        let creations = Arc::clone(&queue.creations);
         let security = SecurityReporting::new(&publisher);
         let mut tool_router = Self::tool_router();
         for method in Self::registered_tools() {
@@ -137,8 +141,9 @@ impl ToolService {
             role,
             queue,
             chat,
+            creations,
             mutation_repository: None,
-            mutation_work: None,
+            mutation_activity: None,
             mutation_invocations: None,
         }
     }
@@ -149,7 +154,7 @@ impl ToolService {
         Parameters(request): Parameters<ListIssuesRequest>,
     ) -> Result<Json<IssuePage>, String> {
         self.authorize("list_issues").await?;
-        let _active = self.scope.access_current().await?;
+        let _active = self.active().await?;
         self.blocking(move |service| service.issues(request))
             .await
             .map(Json)
@@ -162,7 +167,7 @@ impl ToolService {
         Parameters(request): Parameters<IssueRequest>,
     ) -> Result<Json<Document>, String> {
         self.authorize("get_issue").await?;
-        let _active = self.scope.access_current().await?;
+        let _active = self.active().await?;
         self.blocking(move |service| service.issue(request))
             .await
             .map(|data| Json(Document { data }))
@@ -183,10 +188,10 @@ impl ToolService {
         self.tool_router.has_route(method)
     }
 
-    pub(super) fn for_work(&self, access: &WorkAccess) -> Self {
+    pub(super) fn for_work(&self, access: &ActivityAccess) -> Self {
         let mut service = self.clone();
         service.mutation_repository = Some(access.context().repository);
-        service.mutation_work = Some(access.context().work);
+        service.mutation_activity = Some(access.context().activity);
         service.mutation_invocations = Some(Arc::clone(access.invocations()));
         service
     }
@@ -212,12 +217,12 @@ impl ToolService {
 
     /// Return the current materialized state of an issue or patch.
     #[tool(description = "Return the current state of a Radicle issue or patch")]
-    async fn get_subject(
+    pub(super) async fn get_subject(
         &self,
         Parameters(request): Parameters<SubjectRequest>,
     ) -> Result<Json<Document>, String> {
         self.authorize("get_subject").await?;
-        let _active = self.scope.access(&request).await?;
+        let _active = self.active().await?;
         self.blocking(move |service| service.subject(request))
             .await
             .map(|data| Json(Document { data }))
@@ -231,7 +236,7 @@ impl ToolService {
         Parameters(request): Parameters<EntryRequest>,
     ) -> Result<Json<Document>, String> {
         self.authorize("get_entry").await?;
-        let _active = self.scope.access(&request.subject).await?;
+        let _active = self.active().await?;
         self.blocking(move |service| service.entry(request))
             .await
             .map(|data| Json(Document { data }))
@@ -245,7 +250,7 @@ impl ToolService {
         Parameters(request): Parameters<TimelineRequest>,
     ) -> Result<Json<TimelinePage>, String> {
         self.authorize("list_timeline").await?;
-        let _active = self.scope.access(&request.subject).await?;
+        let _active = self.active().await?;
         self.blocking(move |service| service.timeline(request))
             .await
             .map(Json)
@@ -259,7 +264,7 @@ impl ToolService {
         Parameters(request): Parameters<EntityRequest>,
     ) -> Result<Json<TimelinePage>, String> {
         self.authorize("get_thread").await?;
-        let _active = self.scope.access(&request.subject).await?;
+        let _active = self.active().await?;
         self.blocking(move |service| service.thread(request))
             .await
             .map(Json)
@@ -273,7 +278,7 @@ impl ToolService {
         Parameters(request): Parameters<PatchEntityRequest>,
     ) -> Result<Json<TimelinePage>, String> {
         self.authorize("get_review").await?;
-        let _active = self.scope.access(&request.subject).await?;
+        let _active = self.active().await?;
         self.blocking(move |service| service.patch_entity(request, PatchEntity::Review))
             .await
             .map(Json)
@@ -287,7 +292,7 @@ impl ToolService {
         Parameters(request): Parameters<PatchEntityRequest>,
     ) -> Result<Json<TimelinePage>, String> {
         self.authorize("get_revision").await?;
-        let _active = self.scope.access(&request.subject).await?;
+        let _active = self.active().await?;
         self.blocking(move |service| service.patch_entity(request, PatchEntity::Revision))
             .await
             .map(Json)
@@ -300,7 +305,7 @@ impl ToolService {
         Parameters(request): Parameters<DiffRequest>,
     ) -> Result<Json<Document>, String> {
         self.authorize("get_diff").await?;
-        let _active = self.scope.access(&request.subject).await?;
+        let _active = self.active().await?;
         self.document(move |service| service.diff(request)).await
     }
 
@@ -311,7 +316,7 @@ impl ToolService {
         Parameters(request): Parameters<EmbedReadRequest>,
     ) -> Result<Json<Document>, String> {
         self.authorize("get_embed").await?;
-        let _active = self.scope.access(&request.subject).await?;
+        let _active = self.active().await?;
         self.document(move |service| service.embed(request)).await
     }
 
@@ -320,7 +325,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<CommentWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .write_comment(request, CommentOperation::Create)
             .await
@@ -332,7 +337,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<CommentWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .write_comment(request, CommentOperation::Edit)
             .await
@@ -344,7 +349,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<CommentWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .write_comment(request, CommentOperation::Redact)
             .await
@@ -356,7 +361,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<ResolveCommentRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .resolve_review_comment(request)
             .await
@@ -369,7 +374,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<ReactionWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .reaction_write(request)
             .await
@@ -377,15 +382,31 @@ impl ToolService {
     }
 
     #[tool(description = "Create an issue in the active repository")]
-    async fn create_issue(
+    pub(super) async fn create_issue(
         &self,
         Parameters(request): Parameters<CreateIssueRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access_current().await?;
-        self.for_work(&active)
-            .create_issue_write(request)
-            .await
-            .map_err(|error| error.to_string())
+        let active = self.active().await?;
+        self.building_may_write(&active).await?;
+        self.authorize("create_issue").await?;
+        let _creation = self.creations.lock().await;
+        let created = if let Some(id) = self.existing_issue(&request.title).await? {
+            Document::reused(id, "Use the existing issue; add only new information")
+        } else {
+            self.for_work(&active)
+                .create_issue_write(request)
+                .await
+                .map_err(|error| error.to_string())?
+        };
+        if let Some(issue) = crate::mcp::protocol::written_id(&created) {
+            self.record_relation(
+                &active,
+                crate::watcher::Subject::Issue(issue),
+                ArtifactRole::Produced,
+            )
+            .await?;
+        }
+        Ok(created)
     }
 
     #[tool(description = "Comment on an issue in the active repository")]
@@ -393,7 +414,12 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<CommentIssueRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access_current().await?;
+        let active = self
+            .access_subject(&SubjectRequest {
+                kind: SubjectKind::Issue,
+                subject: request.issue.clone(),
+            })
+            .await?;
         self.for_work(&active)
             .comment_issue_write(request)
             .await
@@ -405,7 +431,8 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SecurityIssueRequest>,
     ) -> Result<Json<SecurityIssueResult>, String> {
-        let active = self.scope.access_current().await?;
+        let active = self.active().await?;
+        self.building_may_write(&active).await?;
         let service = self.for_work(&active);
         self.security.report(&service, request).await.map(Json)
     }
@@ -415,7 +442,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<EditIssueRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .edit_issue_write(request)
             .await
@@ -427,7 +454,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStateRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .set_state_write(request, SubjectKind::Issue)
             .await
@@ -439,7 +466,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStringsRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .set_strings_write(request, SubjectKind::Issue, StringUpdate::Labels)
             .await
@@ -451,7 +478,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStringsRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .set_strings_write(request, SubjectKind::Issue, StringUpdate::Assignees)
             .await
@@ -463,58 +490,45 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<CreatePatchRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access_current().await?;
+        let active = self.active().await?;
+        self.authorize("create_patch").await?;
+        let _creation = self.creations.lock().await;
+        if let Some(patch) = self.existing_patch(&active).await? {
+            self.scope.reconcile(active.context().activity).await?;
+            self.record_relation(
+                &active,
+                crate::watcher::Subject::Patch(patch),
+                ArtifactRole::Produced,
+            )
+            .await?;
+            return Ok(Document::reused(
+                patch.to_string(),
+                "This task already has a patch; use update_patch for a revision or edit_patch for \
+                 metadata",
+            ));
+        }
         let created = self
             .for_work(&active)
             .create_patch_write(request, active.context().workspace.clone())
             .await
             .map_err(|error| error.to_string())?;
         if let Some(patch) = crate::mcp::protocol::written_id(&created) {
-            self.produced(&active, patch).await?;
+            self.record_relation(
+                &active,
+                crate::watcher::Subject::Patch(patch),
+                ArtifactRole::Produced,
+            )
+            .await?;
         }
-
         Ok(created)
     }
 
-    /// Records that the running job produced `patch`.
-    ///
-    /// Done here rather than when the job ends, because the patch exists from this moment and the
-    /// job may still crash. A run picking the job up again would otherwise start over on the issue
-    /// it came from and leave the patch behind.
-    ///
-    /// The queue is the only record of which patch a job became, so a job which publishes a second
-    /// one stays with the first. Failing to write it fails this call rather than reporting a
-    /// success the runtime has not recorded: the write is journaled, so the agent's retry recovers
-    /// the patch it already published instead of publishing another.
-    ///
-    /// The job's branch is not touched: it carries the job's name for its whole life.
-    async fn produced(
-        &self,
-        active: &WorkAccess,
-        patch: radicle::cob::ObjectId,
-    ) -> Result<(), String> {
-        let WorkId::Job(job) = active.context().work else {
-            return Ok(());
-        };
-        let Some(worked) = self.queue.running().await.map(|running| running.source) else {
-            return Ok(());
-        };
-        if matches!(worked, Source::Subject(crate::watcher::Subject::Patch(_))) {
-            return Ok(());
-        }
-
-        self.queue
-            .retarget(job, crate::watcher::Subject::Patch(patch).into())
-            .await
-            .map_err(|error| error.to_string())
-    }
-
     #[tool(description = "Add a revision from commits in the active workspace")]
-    async fn update_patch(
+    pub(super) async fn update_patch(
         &self,
         Parameters(request): Parameters<UpdatePatchRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .update_patch_write(request, active.context().workspace.clone())
             .await
@@ -526,7 +540,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<EditPatchRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .edit_patch_write(request)
             .await
@@ -538,7 +552,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStateRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .set_state_write(request, SubjectKind::Patch)
             .await
@@ -550,7 +564,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStringsRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .set_strings_write(request, SubjectKind::Patch, StringUpdate::Labels)
             .await
@@ -562,7 +576,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<SetStringsRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .set_strings_write(request, SubjectKind::Patch, StringUpdate::Assignees)
             .await
@@ -570,11 +584,11 @@ impl ToolService {
     }
 
     #[tool(description = "Create a review for an active patch revision")]
-    async fn create_review(
+    pub(super) async fn create_review(
         &self,
         Parameters(request): Parameters<ReviewWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .review_write(request, false)
             .await
@@ -586,7 +600,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<ReviewWriteRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .review_write(request, true)
             .await
@@ -598,7 +612,7 @@ impl ToolService {
         &self,
         Parameters(request): Parameters<MergePatchRequest>,
     ) -> Result<Json<Document>, String> {
-        let active = self.scope.access(&request.subject).await?;
+        let active = self.access_subject(&request.subject).await?;
         self.for_work(&active)
             .merge_patch_write(request)
             .await
@@ -615,10 +629,10 @@ impl ToolService {
     }
 
     pub(super) async fn enqueue_chat_reply(&self, text: String) -> Result<ChatReplyRecord, String> {
-        let active = self.scope.access_current().await?;
+        let active = self.active().await?;
         let context = active.context();
-        let (channel, message) = match (&context.source, context.work) {
-            (Source::Chat(channel), WorkId::Chat(message)) => (channel, message),
+        let (channel, message) = match (&context.source, context.activity) {
+            (Source::Chat(channel), ActivityId::Chat(message)) => (channel, message),
             _ => return Err("reply_chat is available only for the active chat message".to_owned()),
         };
         let reply = self
@@ -633,16 +647,47 @@ impl ToolService {
         description = "Record work for the building role of this member, which carries it out \
                        under the same identity"
     )]
-    async fn add_job(
+    pub(super) async fn add_task(
         &self,
-        Parameters(request): Parameters<AddJobRequest>,
-    ) -> Result<Json<JobRecord>, String> {
-        let active = self.scope.access_current().await?;
-        let source = active.context().source.clone();
+        Parameters(request): Parameters<AddTaskRequest>,
+    ) -> Result<Json<TaskRecord>, String> {
+        let active = self.active().await?;
+        self.validate_context(&request.context).await?;
         let position = request.position;
-        let job = self
+        let mut submission = crate::queue::TaskRequest::new(
+            request.brief,
+            active.context().source.clone(),
+            position,
+        );
+        let mut key = active.context().activity.request();
+        if request.distinct {
+            key.push_str(
+                &crate::mcp::protocol::mutation_identity("add_task", &submission.brief)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        submission.request = Some(key);
+        submission.distinct = request.distinct;
+        submission
+            .context
+            .update(request.context)
+            .map_err(|error| error.to_string())?;
+        if let (Source::Subject(subject), ActivityId::Delivery(delivery)) =
+            (&active.context().source, active.context().activity)
+        {
+            submission
+                .context
+                .messages
+                .push(crate::queue::MessageReference {
+                    subject: subject.to_string(),
+                    entry: delivery.operation.to_string(),
+                    revision: None,
+                    purpose: "Request accepting this work".to_owned(),
+                });
+        }
+        let receipt = self
             .queue
-            .push(request.brief, source, position)
+            .push(submission)
             .await
             .map_err(|error| error.to_string())?;
         let waiting = self
@@ -650,53 +695,98 @@ impl ToolService {
             .waiting()
             .await
             .map_err(|error| error.to_string())?;
-
-        Ok(Json(JobRecord {
-            job,
+        Ok(Json(TaskRecord {
+            task: receipt.task,
             position,
             waiting,
+            state: receipt.state,
+            result: receipt.result,
         }))
     }
 
-    #[tool(description = "Ask the running job to stop and commit what it has to a branch")]
-    async fn cancel(&self) -> Result<Json<JobAction>, String> {
-        let _active = self.scope.access_current().await?;
-
-        Ok(Json(JobAction {
-            job: self.queue.cancel().await.map(JobSummary::from),
-        }))
+    #[tool(
+        description = "Cancel the specified waiting task or ask that running task to preserve its \
+                       work and stop"
+    )]
+    pub(super) async fn cancel(
+        &self,
+        Parameters(request): Parameters<TaskRequest>,
+    ) -> Result<Json<TaskAction>, String> {
+        self.task_action(request.task, self.queue.cancel(request.task))
+            .await
     }
 
-    #[tool(description = "Send a correction to the running job without stopping it")]
-    async fn note(
+    #[tool(description = "Save a correction for the specified running or waiting task")]
+    pub(super) async fn note(
         &self,
         Parameters(request): Parameters<NoteRequest>,
-    ) -> Result<Json<JobAction>, String> {
-        let _active = self.scope.access_current().await?;
+    ) -> Result<Json<TaskAction>, String> {
+        self.task_action(request.task, self.queue.note(request.task, request.note))
+            .await
+    }
 
-        Ok(Json(JobAction {
-            job: self.queue.note(request.note).await.map(JobSummary::from),
-        }))
+    #[tool(
+        description = "Read a task's durable specification, related artifacts, pinned messages, \
+                       and notes"
+    )]
+    pub(super) async fn get_task_context(
+        &self,
+        Parameters(request): Parameters<ContextRequest>,
+    ) -> Result<Json<TaskSummary>, String> {
+        let active = self.active().await?;
+        let id = active.task_id(request.task)?;
+        self.queue
+            .get(id)
+            .await
+            .map(TaskSummary::from)
+            .map(Json)
+            .map_err(|error| error.to_string())
+    }
+
+    #[tool(
+        description = "Save specification corrections, artifact references, pinned messages, and \
+                       notes for a task; references do not grant write permission"
+    )]
+    pub(super) async fn update_task_context(
+        &self,
+        Parameters(request): Parameters<ContextUpdateRequest>,
+    ) -> Result<Json<TaskSummary>, String> {
+        let active = self.active().await?;
+        let id = active.task_id(request.task)?;
+        self.task_access(&active, id).await?;
+        self.validate_context(&request.update).await?;
+        self.queue
+            .update_context(id, request.update)
+            .await
+            .map(TaskSummary::from)
+            .map(Json)
+            .map_err(|error| error.to_string())
     }
 
     #[tool(description = "Report what this member is building and what is waiting")]
-    async fn work_status(&self) -> Result<Json<WorkStatus>, String> {
-        let _active = self.scope.access_current().await?;
+    async fn task_status(&self) -> Result<Json<TaskStatus>, String> {
+        let _active = self.active().await?;
         let waiting = self
             .queue
             .pending()
             .await
             .map_err(|error| error.to_string())?;
 
-        Ok(Json(WorkStatus {
-            running: self.queue.running().await.map(JobSummary::from),
-            waiting: waiting.into_iter().map(JobSummary::from).collect(),
+        Ok(Json(TaskStatus {
+            running: self.queue.running().await.map(TaskSummary::from),
+            waiting: waiting.into_iter().map(TaskSummary::from).collect(),
         }))
     }
 
     pub(super) async fn pending_notes(&self) -> Vec<String> {
         match self.role {
-            Role::Coder => self.queue.notes().await,
+            Role::Coder => match self.scope.access_current().await {
+                Ok(active) => match active.context().activity {
+                    ActivityId::Task(task) => self.queue.notes(task).await,
+                    _ => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            },
             Role::Talker | Role::Chatter => Vec::new(),
         }
     }
