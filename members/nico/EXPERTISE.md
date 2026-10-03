@@ -105,18 +105,6 @@ Verification may include:
 Report what actually ran. Never imply that an unavailable check passed.
 
 
-### 6. Explain the result
-
-State:
-
-- What changed
-- Why it fixes or implements the behavior
-- What was verified
-- Any remaining uncertainty or follow-up
-
-Keep the summary proportionate to the task.
-
-
 
 
 ## Debugging method

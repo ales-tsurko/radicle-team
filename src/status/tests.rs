@@ -138,7 +138,8 @@ async fn concurrent_roles_and_tasks_are_reported_without_mutating_the_queue() {
     let view = View(inspection);
     let status = view.status();
     for text in [
-        "coder: active, task",
+        "coder: active",
+        &format!("Task #{urgent}: Work 3"),
         "talker: active",
         "chatter: active",
         "chat:team",

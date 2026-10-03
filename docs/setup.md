@@ -454,6 +454,14 @@ reviews, revisions, reactions, resolutions, lifecycle changes, and merges until
 stopped. `SIGINT` and `SIGTERM` trigger graceful node shutdown before the child
 is reaped.
 
+The member can react only to activity received by its node. If a review saved in
+Radicle Desktop has not reached the member, announce it from the reviewer's
+Radicle profile:
+
+```sh
+rad sync --announce --replicas 1 rad:...
+```
+
 With fresh state, `run` fixes the conversation cutoff when it starts the
 member's node. It skips replies and mentions created before that cutoff,
 including older history fetched afterward. Replies and mentions created from

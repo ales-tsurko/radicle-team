@@ -404,6 +404,76 @@ fn classifies_patch_assignment_and_review() {
 }
 
 #[test]
+fn reviews_obey_trigger_policy_and_delegates_need_no_mention() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let person = PublicKey::from_str(AUTHOR).expect("person key should be valid");
+    let delegate = PublicKey::from_str(DELEGATE).expect("delegate key should be valid");
+    let revision = RevisionId::from(EntryId::from_str(ISSUE).expect("revision should be valid"));
+
+    for (access, person_allowed) in [
+        (TriggerAccess::Delegates, false),
+        (TriggerAccess::Dids(BTreeSet::new()), false),
+        (
+            TriggerAccess::Dids(BTreeSet::from([Did::from(person)])),
+            true,
+        ),
+        (TriggerAccess::Anyone, true),
+    ] {
+        let triggers = Fixture::triggers_for(access, vec![Did::from(delegate)], Vec::new());
+        let mut context = Context::default();
+        assert!(
+            Fixture::classify_patch_with(
+                ISSUE,
+                Fixture::revision("Initial revision"),
+                member,
+                &mut context,
+                &triggers,
+            )
+            .is_empty()
+        );
+        let unlisted_review = Fixture::classify_patch_with(
+            COMMENT,
+            PatchAction::Review {
+                revision,
+                summary: Some("@nico please fix this".to_owned()),
+                verdict: Some(Verdict::Reject),
+                labels: Vec::new(),
+            },
+            person,
+            &mut context,
+            &triggers,
+        );
+        assert_eq!(
+            !unlisted_review.is_empty(),
+            person_allowed,
+            "a review or mention must not bypass the repository's trigger policy"
+        );
+        let delegate_review = Fixture::classify_patch_with(
+            CHANGE,
+            PatchAction::Review {
+                revision,
+                summary: None,
+                verdict: Some(Verdict::Reject),
+                labels: Vec::new(),
+            },
+            delegate,
+            &mut context,
+            &triggers,
+        );
+        assert!(
+            matches!(
+                delegate_review.as_slice(),
+                [Activity {
+                    kind: Kind::Delivered(Delivery::Changed(Change::ReviewSubmitted { .. })),
+                    ..
+                }]
+            ),
+            "a delegate's review must reach the patch owner without a mention or summary"
+        );
+    }
+}
+
+#[test]
 fn classifies_patch_mentions_and_replies() {
     let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
     let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");

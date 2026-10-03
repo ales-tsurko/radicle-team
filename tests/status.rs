@@ -82,8 +82,11 @@ fn status_and_tasks_discover_current_home_and_honor_explicit_precedence() {
         let output = fixture.run(cwd, &["status"], explicit);
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "{output:?}");
-        assert!(text.contains(&format!("Member: {member}")), "{text}");
-        assert!(text.contains("Status: stopped"), "{text}");
+        assert!(text.contains(&format!("╭─ {member} · ○ stopped")), "{text}");
+        assert!(
+            !text.contains('\u{1b}'),
+            "redirected status must have no ANSI codes: {text}"
+        );
         assert!(text.contains("Waiting tasks: 0"), "{text}");
         let output = fixture.run(cwd, &["task", "ls"], explicit);
         assert!(output.status.success(), "{output:?}");

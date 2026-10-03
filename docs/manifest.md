@@ -66,6 +66,10 @@ editing it. `"anyone"` suits a private repository, where Radicle's own access
 list already decides who can write. On a public repository it lets any seeding
 peer spend the operator's agent budget.
 
+A delegate's review reaches the member who owns the patch without a mention,
+including a verdict with no summary. Reviews from other people follow
+`triggered_by`; with the default, unauthorized reviews never run an agent.
+
 The setup wizard asks for the value when it creates a manifest and leaves it
 alone when it later adds a member, so editing it by hand is safe.
 

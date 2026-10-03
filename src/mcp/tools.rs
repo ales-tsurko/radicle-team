@@ -320,7 +320,12 @@ impl ToolService {
         self.document(move |service| service.embed(request)).await
     }
 
-    #[tool(description = "Create a comment on the active issue, patch revision, or review")]
+    #[tool(
+        description = "Create a comment on the active issue, patch revision, or review. Keep \
+                       patch discussion and review requests on the patch. An issue handoff needs \
+                       only the patch ID and any new blocker or decision; do not repeat patch \
+                       details or reviewer mentions."
+    )]
     async fn create_comment(
         &self,
         Parameters(request): Parameters<CommentWriteRequest>,
@@ -409,7 +414,12 @@ impl ToolService {
         Ok(created)
     }
 
-    #[tool(description = "Comment on an issue in the active repository")]
+    #[tool(
+        description = "Comment on an issue in the active repository. A patch-ready notification \
+                       needs only its ID and any new blocker or decision. Keep implementation \
+                       details, validation, and review requests on the patch; do not repeat \
+                       reviewer mentions."
+    )]
     async fn comment_issue(
         &self,
         Parameters(request): Parameters<CommentIssueRequest>,
@@ -485,7 +495,13 @@ impl ToolService {
             .map_err(|error| error.to_string())
     }
 
-    #[tool(description = "Create a patch from commits in the active workspace")]
+    #[tool(
+        description = "Create a patch from commits in the active workspace. Describe the reason, \
+                       consequential decisions, and brief validation; let the diff explain the \
+                       code. Omit lists of implementation details and reminders about unchanged \
+                       files. Request review here once, without repeating the request in the \
+                       issue."
+    )]
     pub(super) async fn create_patch(
         &self,
         Parameters(request): Parameters<CreatePatchRequest>,

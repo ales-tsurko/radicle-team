@@ -772,9 +772,10 @@ impl Application {
             }
             // A fresh node can spend longer than the control timeout validating the initial network
             // announcements. Keep it running so the next fetch can use that work.
-            tracing::debug!(
+            tracing::info!(
                 attempts,
-                "Radicle control request timed out; retrying synchronization"
+                "Radicle control request timed out; keeping the node running and retrying \
+                 synchronization"
             );
             tokio::time::sleep(SYNC_RETRY_DELAY).await;
         }
@@ -782,8 +783,9 @@ impl Application {
 
     fn sync_node_busy(output: &std::process::Output) -> bool {
         !output.status.success()
-            && String::from_utf8_lossy(&output.stderr)
-                .contains("timed out reading from control socket")
+            && [&output.stdout, &output.stderr].into_iter().any(|stream| {
+                String::from_utf8_lossy(stream).contains("timed out reading from control socket")
+            })
     }
 
     fn sync_command(
@@ -2534,16 +2536,17 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn retries_sync_while_a_new_node_processes_network_announcements() {
+    async fn retries_sync_control_timeouts_on_either_output_stream() {
         let (repository, did) = sync_target();
         let mut attempts = 0;
         let command = || {
             attempts += 1;
             let mut command = tokio::process::Command::new("/bin/sh");
-            let script = if attempts == 1 {
-                "echo 'node: timed out reading from control socket' >&2; exit 1"
-            } else {
-                "echo synchronized"
+            let script = match attempts {
+                // `rad` prints its errors to stdout, even with redirected output.
+                1 => "echo '✗ Error: timed out reading from control socket'; exit 1",
+                2 => "echo 'node: timed out reading from control socket' >&2; exit 1",
+                _ => "echo synchronized",
             };
             command.args(["-c", script]);
             Ok(command)
@@ -2555,7 +2558,7 @@ mod tests {
                 .expect("sync should resume when the same node becomes responsive");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"synchronized\n");
-        assert_eq!(attempts, 2);
+        assert_eq!(attempts, 3);
     }
 
     #[cfg(unix)]

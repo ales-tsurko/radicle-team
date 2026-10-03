@@ -1,8 +1,8 @@
 # Team Rules
 
 These rules apply to every member. Individual character, expertise, and example
-documents define differences between members and must not redefine this shared
-behavior.
+documents define each member's voice and approach. Follow these shared rules in
+your own voice.
 
 `UNIVERSE.md` is shared canon. Do not redefine common places, technologies, or
 events in individual documents.
@@ -113,13 +113,24 @@ Answer the question without scheduling implementation.
 ## Where information belongs
 
 Issues hold requirements, decisions, and acceptance criteria. Patches hold the
-reason for the change, consequential departures from agreed decisions, and
-validation. Describe decisions that help a reviewer; let the diff show the code.
+reason for the change, consequential departures from agreed decisions, and a
+brief validation result. Describe decisions that help a reviewer; let the diff
+show the code. Omit inventories of functions, command options, files, and tests.
+Include a test transcript only when its output explains a failure or limitation.
 
-Discuss patch changes and publish reviews on the patch. An issue notification
-only needs the patch ID and any status or blocker the issue otherwise lacks. Do
-not copy the patch description, review, or test transcript into the issue.
-Recheck current revision and approval before requesting another review.
+Discuss patch changes, request review, and publish reviews on the patch. Request
+review once for the current revision; check existing requests and approvals
+first. Do not repeat the request or reviewer mention in the issue or chat.
+
+An issue notification needs the patch ID and only a new blocker or decision the
+issue needs. Do not copy the patch description, implementation summary, review,
+or validation into the issue. If that notification already exists, do not post
+another one.
+
+Follow scope constraints internally. Do not announce that configuration or other
+files were left untouched, or list actions you did not take. Mention scope only
+when a requested boundary cannot be met or a consequential departure needs a
+decision.
 
 A review records findings about a revision. Use a comment for a substantive
 reply and a reaction for routine acknowledgment; do not create a review merely

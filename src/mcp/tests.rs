@@ -1981,6 +1981,94 @@ async fn reloads_the_security_policy_before_reporting() {
 }
 
 #[tokio::test]
+async fn rejects_incomplete_or_incompatible_review_requests_before_publication() {
+    let fixture = RepositoryFixture::new();
+    let service = fixture.service().await;
+    let request = || ReviewWriteRequest {
+        subject: RepositoryFixture::subject(
+            SubjectKind::Patch,
+            "1111111111111111111111111111111111111111",
+        ),
+        revision: Some("2222222222222222222222222222222222222222".to_owned()),
+        review: Some("3333333333333333333333333333333333333333".to_owned()),
+        verdict: Some("reject".to_owned()),
+        summary: Some("Storage errors need handling".to_owned()),
+        labels: Vec::new(),
+        embeds: Vec::new(),
+        comments: Vec::new(),
+    };
+    for (request, edit, expected) in [
+        (
+            ReviewWriteRequest {
+                review: None,
+                ..request()
+            },
+            true,
+            "review is required",
+        ),
+        (
+            ReviewWriteRequest {
+                summary: None,
+                ..request()
+            },
+            true,
+            "summary is required",
+        ),
+        (
+            ReviewWriteRequest {
+                revision: None,
+                ..request()
+            },
+            false,
+            "revision is required",
+        ),
+        (
+            ReviewWriteRequest {
+                embeds: vec![EmbedWriteRequest {
+                    name: "review.png".to_owned(),
+                    content_base64: "cHJldmlldw==".to_owned(),
+                }],
+                ..request()
+            },
+            false,
+            "create_review cannot include embeds",
+        ),
+        (
+            ReviewWriteRequest {
+                comments: vec![ReviewCommentRequest {
+                    body: "Fix storage errors".to_owned(),
+                    location: None,
+                }],
+                ..request()
+            },
+            true,
+            "edit_review cannot include line comments",
+        ),
+        (
+            ReviewWriteRequest {
+                comments: vec![ReviewCommentRequest {
+                    body: " \n\t".to_owned(),
+                    location: None,
+                }],
+                ..request()
+            },
+            false,
+            "a review comment body cannot be empty",
+        ),
+    ] {
+        let error = service
+            .review_write(request, edit)
+            .await
+            .err()
+            .expect("invalid review requests must fail before trying to publish an operation");
+        assert!(
+            matches!(error, ServiceError::Request(ref reason) if reason.contains(expected)),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn manages_patch_reviews_and_inline_comments() {
     let fixture = RepositoryFixture::new();
     let service = fixture.service().await;
