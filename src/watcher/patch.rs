@@ -1,6 +1,6 @@
 //! Conversion from Radicle patch actions into the shared watcher action model.
 
-use radicle::cob::patch::{Action, ReviewId, RevisionId};
+use radicle::cob::patch::{Action, Lifecycle, ReviewId, RevisionId};
 
 use crate::watcher::{
     Change, Comment, Target,
@@ -20,9 +20,14 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
             Action::Label { .. } => {
                 NormalizedAction::new().change(Audience::involved(), Change::LabelsChanged)
             }
-            Action::Lifecycle { .. } => {
-                NormalizedAction::new().change(Audience::involved(), Change::LifecycleChanged)
-            }
+            Action::Lifecycle {
+                state: Lifecycle::Open,
+            } => NormalizedAction::new()
+                .draft(false)
+                .change(Audience::involved(), Change::PatchReady),
+            Action::Lifecycle { state } => NormalizedAction::new()
+                .draft(matches!(state, Lifecycle::Draft))
+                .change(Audience::involved(), Change::LifecycleChanged),
             Action::Merge { .. } => {
                 NormalizedAction::new().change(Audience::involved(), Change::Merged)
             }

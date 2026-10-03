@@ -75,7 +75,10 @@ alone when it later adds a member, so editing it by hand is safe.
 
 Reactions never trigger anyone, whoever adds them. Approving an idea and asking
 for it to be carried out look identical, so acting on a reaction risks work
-nobody asked for. Request work in a comment.
+nobody asked for. Request work in a comment. Members acknowledge assignments,
+relevant messages, and reviews during their own turns, choosing reactions that
+fit their character and role. These use the `set_reaction` permission; disabling
+reactions disables reaction acknowledgments too.
 
 A member's own activity never triggers itself.
 
@@ -94,12 +97,14 @@ itself while nobody is watching:
 - replying to a comment that member owns.
 
 `@team` is not among them, so no member can summon the whole cast, and neither
-are ambient changes such as an edited title. A submitted review and a new
+are ambient changes such as an edited title. A submitted review and a new ready
 revision are the exceptions: those carry work to whoever owns the subject, and
 without them delegated work would stall once it was reviewed.
 
-New revisions also reach members who already reviewed that patch, so they can
-recheck affected findings without another mention or follow-up comment.
+Ready revisions also reach members who already reviewed that patch, so they can
+recheck affected findings without another mention or follow-up comment. Draft
+revisions wait until the patch is opened for review. Explicit mentions and
+discussion remain available on drafts.
 
 Two members also stop talking to each other after a while. A conversation
 between them runs for a fixed number of turns on one issue, patch, or channel,

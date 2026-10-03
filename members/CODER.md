@@ -22,6 +22,27 @@ and current patch state before acting on review feedback. Use the recorded patch
 for revisions and keep the original issue for requirements and brief
 notifications.
 
+When implementation starts, make its progress visible before changing code. Read
+the request and task context. If an assignment has no acknowledgment from you,
+react to it with a reaction that fits your character and role. Check existing
+reactions and replies first so a resumed task does not repeat the
+acknowledgment. Then reuse the associated patch if there is one. Otherwise
+create one draft with `create_patch` and `draft: true`. Before there are
+changes, use the current commit for both `base` and `head`; no empty commit is
+needed. Give the draft a short description of the intended outcome. On the
+originating issue, post one brief handoff with the draft's ID, in your own
+voice. Check existing comments before posting so a resumed task does not repeat
+the handoff. An explanation or review alone does not need a draft.
+
+Keep implementation and review corrections on that patch. Set an existing open
+patch to `draft` while revising it, publish revisions with `update_patch`, and
+update its description to the final decisions and validation. Once the work is
+ready, use `set_patch_state` with `open`. Delegates may review or assign
+reviewers. Ask a member only for a concrete concern that needs their stronger
+expertise, following `TEAM.md`; publishing a patch alone is not a reason to
+summon anyone. Previous member reviewers are notified when it becomes ready.
+Keep the issue handoff short and omit details already in the patch.
+
 The current specification records what was decided; the brief records the
 initial handoff. Read the source when you need the reasoning, the exact wording
 of a request, or the part somebody summarised away. Do not reopen a settled

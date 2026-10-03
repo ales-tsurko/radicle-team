@@ -378,7 +378,10 @@ impl ToolService {
     }
 
     /// Add or remove an emoji reaction.
-    #[tool(description = "Add or remove a reaction on an issue, revision, review, or comment")]
+    #[tool(
+        description = "Add or remove a reaction on an issue, revision, review, or comment. Choose \
+                       the emoji to fit your character, role, and the message being acknowledged."
+    )]
     async fn set_reaction(
         &self,
         Parameters(request): Parameters<ReactionWriteRequest>,
@@ -500,11 +503,13 @@ impl ToolService {
     }
 
     #[tool(
-        description = "Create a patch from commits in the active workspace. Describe the reason, \
-                       consequential decisions, and brief validation; let the diff explain the \
-                       code. Omit lists of implementation details and reminders about unchanged \
-                       files. Request review here once, without repeating the request in the \
-                       issue."
+        description = "Start implementation with one draft patch (draft: true) and link its ID \
+                       briefly from the originating issue. Before changes, base and head may both \
+                       be the current commit. Reuses the task's existing patch; continue it with \
+                       update_patch. Describe decisions and validation in the patch, not again in \
+                       the issue. Open the patch when ready. Request member review only for a \
+                       specific concern needing that member's stronger expertise or when a \
+                       delegate requests it; delegates otherwise review or assign reviewers."
     )]
     pub(super) async fn create_patch(
         &self,
@@ -544,9 +549,9 @@ impl ToolService {
     }
 
     #[tool(
-        description = "Add a revision from commits in the active workspace. Previous member \
-                       reviewers receive revision activity automatically; do not post another \
-                       review request or mention solely to notify them."
+        description = "Add a revision to the existing patch from commits in the active workspace. \
+                       Keep it in draft while implementing; set_patch_state to open when ready. \
+                       Previous member reviewers are notified then without another mention."
     )]
     pub(super) async fn update_patch(
         &self,
@@ -608,9 +613,11 @@ impl ToolService {
     }
 
     #[tool(
-        description = "Create a review for an active patch revision. Keep the summary brief. Send \
-                       each finding about specific code as a separate comment with its diff \
-                       location; do not repeat those findings in the summary."
+        description = "Create a review for an active patch revision. Reject when changes are \
+                       required before readiness; accept may include clearly optional nits. Keep \
+                       the summary brief. Send each finding about specific code as a separate \
+                       comment with its diff location; do not repeat those findings in the \
+                       summary."
     )]
     pub(super) async fn create_review(
         &self,

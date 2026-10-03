@@ -1050,6 +1050,145 @@ fn delivers_peer_reviews_and_revisions_to_owners_and_reviewers() {
 }
 
 #[test]
+fn draft_revisions_wait_for_readiness_but_explicit_messages_and_assignments_arrive() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
+    let triggers = Fixture::triggers(vec![Did::from(peer)]);
+    let revision = RevisionId::from(EntryId::from_str(ISSUE).expect("revision should parse"));
+    let mut reviewer = Context::default();
+    let _initial = Fixture::classify_patch_with(
+        ISSUE,
+        Fixture::revision("Initial"),
+        peer,
+        &mut reviewer,
+        &triggers,
+    );
+    let _review = Fixture::classify_patch_with(
+        OPERATION,
+        PatchAction::Review {
+            revision,
+            summary: Some("Fix the parser".to_owned()),
+            verdict: Some(Verdict::Reject),
+            labels: Vec::new(),
+        },
+        member,
+        &mut reviewer,
+        &triggers,
+    );
+    let transaction = Op::new(
+        EntryId::from_str(CHANGE).expect("operation should parse"),
+        (
+            Fixture::revision("Work started"),
+            vec![PatchAction::Lifecycle {
+                state: Lifecycle::Draft,
+            }],
+        ),
+        peer,
+        Timestamp::from_secs(0),
+        None,
+        Manifest::new(PATCH_TYPENAME.clone(), Version::default()),
+    );
+    assert!(
+        reviewer
+            .classify(
+                &transaction,
+                Member::Nico,
+                member,
+                RepoId::from_str(REPOSITORY).expect("repository should parse"),
+                Fixture::patch(),
+                &triggers,
+            )
+            .is_empty(),
+        "a revision and draft state in one transaction must not request review"
+    );
+
+    for action in [
+        Fixture::revision("Still implementing"),
+        PatchAction::RevisionEdit {
+            revision,
+            description: "Progress".to_owned(),
+            embeds: Vec::new(),
+        },
+    ] {
+        assert!(
+            Fixture::classify_patch_with(CHANGE, action, peer, &mut reviewer, &triggers,)
+                .is_empty(),
+            "intermediate draft changes must not start another review"
+        );
+    }
+    assert!(
+        matches!(
+            Fixture::classify_patch_with(
+                COMMENT,
+                Fixture::revision("@nico which input did you test?"),
+                peer,
+                &mut reviewer,
+                &triggers,
+            )
+            .as_slice(),
+            [Activity {
+                kind: Kind::Delivered(Delivery::Mentioned(_)),
+                ..
+            }]
+        ),
+        "a draft must still support explicit questions"
+    );
+    assert!(
+        matches!(
+            Fixture::classify_patch_with(
+                REPLY,
+                PatchAction::Assign {
+                    assignees: [Did::from(member)].into()
+                },
+                peer,
+                &mut reviewer,
+                &triggers,
+            )
+            .as_slice(),
+            [Activity {
+                kind: Kind::Assigned,
+                ..
+            }]
+        ),
+        "an assignment to a draft still queues work"
+    );
+    assert!(
+        matches!(
+            Fixture::classify_patch_with(
+                REPLY,
+                PatchAction::Lifecycle {
+                    state: Lifecycle::Open
+                },
+                peer,
+                &mut reviewer,
+                &triggers,
+            )
+            .as_slice(),
+            [Activity {
+                kind: Kind::Delivered(Delivery::Changed(Change::PatchReady)),
+                ..
+            }]
+        ),
+        "opening the finished patch must notify a previous reviewer without a mention"
+    );
+
+    let mut uninvolved = Context::default();
+    assert!(
+        Fixture::classify_patch_with(
+            ISSUE,
+            PatchAction::Lifecycle {
+                state: Lifecycle::Open
+            },
+            peer,
+            &mut uninvolved,
+            &triggers,
+        )
+        .is_empty(),
+        "readiness must not summon members who never owned or reviewed this patch"
+    );
+}
+
+#[test]
 fn a_member_s_own_activity_never_spends_its_own_allowance() {
     let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
     let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");

@@ -2898,6 +2898,10 @@ async fn carries_a_note_on_the_next_result_the_building_half_receives() {
 // over on the issue it came from and leave the patch behind.
 #[tokio::test]
 async fn records_the_patch_a_task_produced_before_the_task_can_fail() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::mcp::protocol::UpdatePatchRequest;
+
     let fixture = RepositoryFixture::new();
     let queue = fixture.queue().await;
     let issue = Subject::Issue(
@@ -2938,15 +2942,31 @@ async fn records_the_patch_a_task_produced_before_the_task_can_fail() {
             CreatePatchRequest {
                 title: "Answer".to_owned(),
                 description: "Patch".to_owned(),
-                base: fixture.base.to_string(),
+                base: fixture.head.to_string(),
                 head: fixture.head.to_string(),
                 labels: Vec::new(),
-                draft: false,
+                draft: true,
             },
         ))
         .await
         .expect("patch should be created");
     let patch = ObjectId::from_str(&result_id(created)).expect("patch should parse");
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("repository should open");
+    let patches = Patches::open(&stored, ReadOnly).expect("patches should open");
+    let draft = patches
+        .get(&patch)
+        .expect("draft should read")
+        .expect("draft should exist before implementation");
+    assert_eq!(draft.state(), &patch::State::Draft);
+    assert_eq!(
+        draft.base(),
+        draft.head(),
+        "an early draft needs no fake commit"
+    );
 
     assert_eq!(
         queue.recover().await.expect("queue should be readable"),
@@ -2981,6 +3001,40 @@ async fn records_the_patch_a_task_produced_before_the_task_can_fail() {
 
     let second = second.expect("repeated creation should return the existing patch");
     assert_eq!(result_id(second), patch.to_string());
+    coder
+        .update_patch(Parameters(UpdatePatchRequest {
+            subject: Subject::Patch(patch).into(),
+            description: "Implemented and validated".to_owned(),
+            base: fixture.base.to_string(),
+            head: fixture.head.to_string(),
+        }))
+        .await
+        .expect("implementation should revise the same draft");
+    let updated = patches
+        .get(&patch)
+        .expect("patch should read")
+        .expect("patch should exist");
+    assert_eq!(updated.state(), &patch::State::Draft);
+    assert_eq!(*updated.base(), Oid::from(fixture.base));
+    assert_eq!(*updated.head(), Oid::from(fixture.head));
+    coder
+        .set_state_write(
+            SetStateRequest {
+                subject: Subject::Patch(patch).into(),
+                state: "open".to_owned(),
+            },
+            SubjectKind::Patch,
+        )
+        .await
+        .expect("the completed draft should become ready");
+    assert!(matches!(
+        patches
+            .get(&patch)
+            .expect("patch should read")
+            .expect("patch should exist")
+            .state(),
+        patch::State::Open { .. }
+    ));
     assert_eq!(
         queue
             .get(task)
@@ -2990,11 +3044,6 @@ async fn records_the_patch_a_task_produced_before_the_task_can_fail() {
             .patch(),
         Some(Subject::Patch(patch))
     );
-    let stored = fixture
-        .profile
-        .storage
-        .repository(fixture.repository)
-        .expect("repository should open");
     assert_eq!(
         Patches::open(&stored, ReadOnly)
             .expect("patches should open")

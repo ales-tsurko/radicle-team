@@ -31,6 +31,7 @@ pub(super) struct Context {
     assigned: bool,
     owned: bool,
     seen: bool,
+    draft: bool,
     entities: HashSet<Entity>,
     turn: Turn,
 }
@@ -76,9 +77,18 @@ impl Context {
         }
         self.turn.begin(author);
 
+        let actions: Vec<NormalizedAction<'_>> = operation
+            .actions
+            .iter()
+            .map(|action| ActionEnvelope::new(action, operation, member_id).into())
+            .collect();
+        // Lifecycle and revision actions can share one transaction. Apply its final draft state
+        // before emitting any signal, including the initial empty revision of a draft patch.
+        if let Some(draft) = actions.iter().rev().find_map(|action| action.draft) {
+            self.draft = draft;
+        }
         let mut activities = Vec::new();
-        for (action_index, action) in operation.actions.iter().enumerate() {
-            let normalized = ActionEnvelope::new(action, operation, member_id).into();
+        for (action_index, normalized) in actions.into_iter().enumerate() {
             if let Relevance::Relevant(kind) = self.reduce(normalized, member, origin) {
                 if let Err(reason) = self.turn.admit(author, origin) {
                     tracing::info!(
@@ -164,6 +174,7 @@ impl Context {
                 }
                 Signal::Change { audience, change }
                     if !change.is_reaction()
+                        && !(self.draft && change.requires_ready_patch())
                         && (origin != Author::Peer || change.is_task_submission())
                         && audience.matches(self) =>
                 {
@@ -205,6 +216,7 @@ pub(super) enum Entity {
 #[derive(Debug, Default)]
 pub(super) struct NormalizedAction<'a> {
     assignment: Option<bool>,
+    draft: Option<bool>,
     track: Option<Entity>,
     signals: Vec<Signal<'a>>,
 }
@@ -216,6 +228,11 @@ impl<'a> NormalizedAction<'a> {
 
     pub(super) fn assignment(mut self, assigned: bool) -> Self {
         self.assignment = Some(assigned);
+        self
+    }
+
+    pub(super) fn draft(mut self, draft: bool) -> Self {
+        self.draft = Some(draft);
         self
     }
 

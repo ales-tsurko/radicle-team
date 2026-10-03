@@ -201,6 +201,8 @@ pub enum Change {
     LabelsChanged,
     /// The issue or patch lifecycle changed.
     LifecycleChanged,
+    /// A patch is open and ready for review.
+    PatchReady,
     /// A patch was merged.
     Merged,
     /// A comment was created.
@@ -259,12 +261,22 @@ pub enum Change {
 }
 
 impl Change {
+    pub(crate) const fn requires_ready_patch(self) -> bool {
+        matches!(
+            self,
+            Self::RevisionCreated(_)
+                | Self::RevisionEdited(_)
+                | Self::ReviewCommentsResolved
+                | Self::PatchReady
+        )
+    }
+
     /// Returns whether this change delivers work to whoever owns the subject.
     #[must_use]
     pub const fn is_task_submission(&self) -> bool {
         matches!(
             self,
-            Self::ReviewSubmitted { .. } | Self::RevisionCreated(_)
+            Self::ReviewSubmitted { .. } | Self::RevisionCreated(_) | Self::PatchReady
         )
     }
 

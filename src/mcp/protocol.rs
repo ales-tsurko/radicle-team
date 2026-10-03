@@ -655,6 +655,7 @@ pub(super) struct CreatePatchRequest {
     #[serde(default)]
     pub(super) labels: Vec<String>,
     #[serde(default)]
+    /// Use true when starting implementation; open the patch when it is ready for review.
     pub(super) draft: bool,
 }
 
@@ -682,6 +683,7 @@ pub(super) struct ReviewWriteRequest {
     pub(super) subject: SubjectRequest,
     pub(super) revision: Option<String>,
     pub(super) review: Option<String>,
+    /// Reject for required changes; accept may include clearly optional, non-blocking suggestions.
     pub(super) verdict: Option<String>,
     /// Brief verdict rationale or concerns about the whole patch; findings belong in comments.
     pub(super) summary: Option<String>,

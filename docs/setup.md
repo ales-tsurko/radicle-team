@@ -456,6 +456,20 @@ reviews, revisions, reactions, resolutions, lifecycle changes, and merges until
 stopped. `SIGINT` and `SIGTERM` trigger graceful node shutdown before the child
 is reaped.
 
+Members acknowledge messages and reviews during their talking turn, and
+assignments when their building turn begins. They choose reactions that fit
+their character and role; no fixed emoji is added by the runtime. Messages and
+reviews wait while another talking turn is running. When implementation starts,
+the member creates a draft patch and posts one brief link on the originating
+issue. It updates that same patch and opens it when ready for review. Draft
+revisions do not automatically summon reviewers; previous member reviewers are
+notified when it becomes ready. Reactions, comments, and patch descriptions keep
+each member's own voice.
+
+Members request specialist review only for a specific concern that needs the
+other member's expertise, or when a delegate requests it. Routine patches are
+left for delegates to review or assign reviewers.
+
 The member can react only to activity received by its node. If a review saved in
 Radicle Desktop has not reached the member, announce it from the reviewer's
 Radicle profile:

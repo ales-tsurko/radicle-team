@@ -34,7 +34,7 @@ use crate::{
 const HISTORY_BUFFER: usize = 32;
 
 macro_rules! history_scanner {
-    ($name:ident, $action:ty, $store:ident, $stream:ident, $actionable:expr) => {
+    ($name:ident, $action:ty, $store:ident, $stream:ident) => {
         fn $name(&self, storage: Storage) -> tokio::sync::mpsc::Receiver<HistoryEvent<$action>> {
             self.stream_histories(storage, |repository, sender| {
                 let objects = $store::open(&repository, ReadOnly)?;
@@ -44,7 +44,7 @@ macro_rules! history_scanner {
                         sender,
                         HistoryEvent::Begin {
                             object: id,
-                            actionable: $actionable(&object),
+                            state: SubjectState::from(&object),
                         },
                     )?;
                     for operation in $stream::init(id, &repository).all()? {
@@ -67,24 +67,9 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    history_scanner!(
-        issue_histories,
-        IssueAction,
-        Issues,
-        IssueStream,
-        |issue: &radicle::cob::issue::Issue| matches!(issue.state(), IssueState::Open)
-    );
+    history_scanner!(issue_histories, IssueAction, Issues, IssueStream);
 
-    history_scanner!(
-        patch_histories,
-        PatchAction,
-        Patches,
-        PatchStream,
-        |patch: &radicle::cob::patch::Patch| matches!(
-            patch.state(),
-            PatchState::Open { .. } | PatchState::Draft
-        )
-    );
+    history_scanner!(patch_histories, PatchAction, Patches, PatchStream);
 
     /// Creates a watcher for `member` and `repository`.
     #[must_use]
@@ -275,8 +260,8 @@ impl Watcher {
         for<'a> NormalizedAction<'a>: From<ActionEnvelope<'a, A>>,
     {
         match event {
-            HistoryEvent::Begin { object, actionable } => {
-                self.begin_history(object, actionable, source.member_id, source.subject, active)
+            HistoryEvent::Begin { object, state } => {
+                self.begin_history(object, state, source.member_id, source.subject, active)
             }
             HistoryEvent::Operation(operation) => {
                 Self::scan_active(operation, active, state, source.triggers, source.mode).await
@@ -289,7 +274,7 @@ impl Watcher {
     fn begin_history(
         &self,
         object: ObjectId,
-        actionable: bool,
+        state: SubjectState,
         member_id: PublicKey,
         subject: fn(ObjectId) -> Subject,
         active: &mut Option<ActiveHistory>,
@@ -301,7 +286,7 @@ impl Watcher {
                 self.repository,
                 object,
                 subject(object),
-                actionable,
+                state,
             ),
             context: ClassificationContext::new(self.policy.limits().clone()),
             pending: PendingActivities::default(),
@@ -350,13 +335,7 @@ impl Watcher {
             .ok_or(Error::HistoryProtocol("history ended before it began"))?;
         active
             .pending
-            .dispatch(
-                active.context.assigned(),
-                active.scope.actionable,
-                active.scope,
-                state,
-                delivery,
-            )
+            .dispatch(active.context.assigned(), active.scope, state, delivery)
             .await
     }
 
@@ -543,7 +522,10 @@ impl ScanMode {
 }
 
 enum HistoryEvent<A> {
-    Begin { object: ObjectId, actionable: bool },
+    Begin {
+        object: ObjectId,
+        state: SubjectState,
+    },
     Operation(Op<A>),
     End,
     Failed(Error),
@@ -553,6 +535,45 @@ struct ActiveHistory {
     scope: ScanScope,
     context: ClassificationContext,
     pending: PendingActivities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectState {
+    Open,
+    Draft,
+    Inactive,
+}
+
+impl SubjectState {
+    const fn actionable(self) -> bool {
+        !matches!(self, Self::Inactive)
+    }
+
+    // Draft revisions are progress, not a request for another review. Explicit messages remain
+    // deliverable; opening the patch supplies a separate readiness notification.
+    const fn defers(self, delivery: Delivery) -> bool {
+        matches!(self, Self::Draft)
+            && matches!(delivery, Delivery::Changed(change) if change.requires_ready_patch())
+    }
+}
+
+impl From<&radicle::cob::issue::Issue> for SubjectState {
+    fn from(issue: &radicle::cob::issue::Issue) -> Self {
+        match issue.state() {
+            IssueState::Open => Self::Open,
+            IssueState::Closed { .. } => Self::Inactive,
+        }
+    }
+}
+
+impl From<&radicle::cob::patch::Patch> for SubjectState {
+    fn from(patch: &radicle::cob::patch::Patch) -> Self {
+        match patch.state() {
+            PatchState::Open { .. } => Self::Open,
+            PatchState::Draft => Self::Draft,
+            PatchState::Archived | PatchState::Merged { .. } => Self::Inactive,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -586,7 +607,7 @@ struct ScanScope {
     repository: RepoId,
     object: ObjectId,
     subject: Subject,
-    actionable: bool,
+    state: SubjectState,
 }
 
 impl ScanScope {
@@ -596,7 +617,7 @@ impl ScanScope {
         repository: RepoId,
         object: ObjectId,
         subject: Subject,
-        actionable: bool,
+        state: SubjectState,
     ) -> Self {
         Self {
             member,
@@ -604,7 +625,7 @@ impl ScanScope {
             repository,
             object,
             subject,
-            actionable,
+            state,
         }
     }
 }
@@ -631,7 +652,6 @@ impl PendingActivities {
     async fn dispatch(
         self,
         assigned: bool,
-        actionable: bool,
         scope: ScanScope,
         state: &ProcessedActivities,
         runtime: &DeliveryRuntime,
@@ -640,14 +660,18 @@ impl PendingActivities {
             Self::record_delivery(activity.delivery_id(), scope, state).await?;
         }
         if let Some(activity) = self.assignment {
-            if assigned && actionable {
+            if assigned && scope.state.actionable() {
                 Self::enqueue(activity, scope, state, runtime).await?;
             } else {
                 Self::record_delivery(activity.delivery_id(), scope, state).await?;
             }
         }
         for (activity, delivery) in self.activities {
-            Self::deliver(activity, delivery, scope, state, runtime).await?;
+            if scope.state.defers(delivery) {
+                Self::record_delivery(activity.delivery_id(), scope, state).await?;
+            } else {
+                Self::deliver(activity, delivery, scope, state, runtime).await?;
+            }
         }
         Ok(())
     }
@@ -852,7 +876,9 @@ mod tests {
             Change, Comment, Subject, Target,
             activity::{Activity, Delivery, Kind},
             classification::Context as ClassificationContext,
-            runtime::{DeliveryRuntime, PendingActivities, ScanMode, ScanScope, Watcher},
+            runtime::{
+                DeliveryRuntime, PendingActivities, ScanMode, ScanScope, SubjectState, Watcher,
+            },
             state::ProcessedActivities,
         },
         workspace::Workspaces,
@@ -895,7 +921,7 @@ mod tests {
             repository,
             object,
             Subject::Issue(object),
-            false,
+            SubjectState::Inactive,
         );
         let state = ProcessedActivities::memory()
             .await
@@ -922,17 +948,9 @@ mod tests {
             conversations,
         );
 
-        dispatch_pending(
-            pending,
-            (false, false),
-            scope,
-            &state,
-            &runtime,
-            dispatcher,
-            false,
-        )
-        .await
-        .expect("assignments should be checkpointed");
+        dispatch_pending(pending, false, scope, &state, &runtime, dispatcher, false)
+            .await
+            .expect("assignments should be checkpointed");
         for operation in [first, second] {
             assert!(
                 state
@@ -1078,20 +1096,12 @@ mod tests {
             repository,
             issue,
             Subject::Issue(issue),
-            true,
+            SubjectState::Open,
         );
 
         let (runtime, dispatcher) = delivery();
-        let failed = dispatch_pending(
-            pending(),
-            (false, true),
-            scope,
-            &state,
-            &runtime,
-            dispatcher,
-            true,
-        )
-        .await;
+        let failed =
+            dispatch_pending(pending(), false, scope, &state, &runtime, dispatcher, true).await;
         assert!(matches!(failed, Err(super::Error::Talker(_))));
         assert!(
             !state
@@ -1102,17 +1112,9 @@ mod tests {
         );
 
         let (runtime, dispatcher) = delivery();
-        dispatch_pending(
-            pending(),
-            (false, true),
-            scope,
-            &state,
-            &runtime,
-            dispatcher,
-            false,
-        )
-        .await
-        .expect("delivery should be handled");
+        dispatch_pending(pending(), false, scope, &state, &runtime, dispatcher, false)
+            .await
+            .expect("delivery should be handled");
 
         assert!(
             state
@@ -1167,19 +1169,11 @@ mod tests {
             repository,
             issue,
             Subject::Issue(issue),
-            true,
+            SubjectState::Open,
         );
-        dispatch_pending(
-            pending,
-            (true, true),
-            scope,
-            &state,
-            &runtime,
-            dispatcher,
-            false,
-        )
-        .await
-        .expect("an active assignment should become queued work");
+        dispatch_pending(pending, true, scope, &state, &runtime, dispatcher, false)
+            .await
+            .expect("an active assignment should become queued work");
         assert!(
             state
                 .contains(repository, issue, operation, 0)
@@ -1425,8 +1419,17 @@ mod tests {
             );
 
             let new_issue = fixture.create_assignment();
+            let later = fixture.comment("@nico another question while you are busy");
             updates.send(()).expect("scanners should be notified");
             fixture.wait_for_tasks(2).await;
+            assert!(
+                !fixture
+                    .state
+                    .contains(fixture.repository, fixture.issue, later, 0)
+                    .await
+                    .expect("checkpoint should read"),
+                "receiving a message must not checkpoint it before the talker handles it"
+            );
             let tasks = fixture
                 .queue
                 .pending()
@@ -1460,10 +1463,33 @@ mod tests {
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            reply_started.notified().await;
             assert_eq!(
                 calls.load(Ordering::SeqCst),
-                1,
-                "rescans must not duplicate a reply"
+                2,
+                "the later mention must run after the first reply finishes"
+            );
+            assert!(
+                !fixture
+                    .state
+                    .contains(fixture.repository, fixture.issue, later, 0)
+                    .await
+                    .expect("later reply checkpoint should be readable"),
+                "the second turn must also finish before its checkpoint is recorded"
+            );
+            release.notify_one();
+            while !fixture
+                .state
+                .contains(fixture.repository, fixture.issue, later, 0)
+                .await
+                .expect("later reply checkpoint should be readable")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "rescans must not start more than one reply per new mention"
             );
         };
         let watching = fixture.watcher.watch(
@@ -1498,7 +1524,7 @@ mod tests {
             fixture.repository,
             fixture.issue,
             Subject::Issue(fixture.issue),
-            true,
+            SubjectState::Open,
         );
         let triggers = Triggers::new(TriggerAccess::Anyone, Vec::new(), Vec::new());
         let cutoff = Timestamp::from_secs(100);
@@ -1566,7 +1592,7 @@ mod tests {
 
     async fn dispatch_pending(
         pending: PendingActivities,
-        state_flags: (bool, bool),
+        assigned: bool,
         scope: ScanScope,
         state: &ProcessedActivities,
         runtime: &DeliveryRuntime,
@@ -1577,8 +1603,7 @@ mod tests {
             fail_mentions,
             ..NoopAgent::default()
         };
-        let (assigned, actionable) = state_flags;
-        let pending = pending.dispatch(assigned, actionable, scope, state, runtime);
+        let pending = pending.dispatch(assigned, scope, state, runtime);
         let dispatching = dispatcher.run(&mut agent);
         tokio::pin!(pending);
         tokio::pin!(dispatching);

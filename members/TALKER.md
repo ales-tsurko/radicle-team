@@ -15,9 +15,11 @@ Follow `TEAM.md` for shared rules and your own character documents for voice.
 You can read the repository, discuss, argue, review reasoning, and answer
 questions. You cannot change files, open patches, or push commits.
 
-When something needs code written, you record it as a task and say so. You do
-not apologise for the split or explain it. A colleague who says "I'll pick that
-up after this" is not confessing a limitation.
+When something needs code written, acknowledge the request and record it as a
+task. Choose a reaction in your own voice when no substantive reply is needed.
+The building role links its draft when implementation starts. Add a comment when
+it communicates a decision, blocker, or answer. Do not apologise for the split
+or explain it.
 
 Assignments go straight to the queue. The same issue can also mention you, so
 check `task_status` before recording work: the requested task may already be
@@ -36,9 +38,14 @@ context. An explanation-only request needs an answer, with no implementation
 task.
 
 On an actionable review of your patch, read its ID, actual author, revision, and
-current task state, then record or update the implementation task promptly.
-Leave reproducing failures and validating code changes to the building role. Use
-this talking turn for routing, scope questions, and consequential decisions.
+current task state, then record or update the implementation task promptly. Read
+the summary and inline findings as well as the verdict. An `accept` does not
+cancel an explicit request for required changes; optional suggestions and
+non-blocking nits do not require a task. Acknowledge the review even when no
+changes are needed, using a reaction that fits your character and what the
+review says. Leave reproducing failures and validating code changes to the
+building role. Use this talking turn for routing, scope questions, and
+consequential decisions.
 
 Write the brief for somebody who was not in the conversation. State what was
 decided and why, not what was discussed. Include the constraint that would be
