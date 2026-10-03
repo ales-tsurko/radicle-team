@@ -8,7 +8,11 @@
 //! copies of the same private key on other machines, which the identity design declares
 //! unsupported.
 
-use std::{fs, io, path::Path};
+use std::{
+    fs,
+    io::{self, Read as _, Write as _},
+    path::Path,
+};
 
 use crate::home::MemberHome;
 
@@ -16,6 +20,7 @@ use crate::home::MemberHome;
 #[derive(Debug)]
 pub struct MemberLock {
     _file: fs::File,
+    session: String,
 }
 
 impl MemberLock {
@@ -29,7 +34,7 @@ impl MemberLock {
         home.create()
             .map_err(|error| Error::Home(error.to_string()))?;
         let path = home.process_lock();
-        let file = fs::OpenOptions::new()
+        let mut file = fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -41,8 +46,61 @@ impl MemberLock {
             })?;
 
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => {
+                let session = format!("{:032x}", rand::random::<u128>());
+                file.set_len(0)
+                    .and_then(|()| file.write_all(session.as_bytes()))
+                    .map_err(|source| Error::Io {
+                        path: path.into(),
+                        source,
+                    })?;
+                Ok(Self {
+                    _file: file,
+                    session,
+                })
+            }
             Err(fs::TryLockError::WouldBlock) => Err(Error::AlreadyRunning(home.path().into())),
+            Err(fs::TryLockError::Error(source)) => Err(Error::Io {
+                path: path.into(),
+                source,
+            }),
+        }
+    }
+
+    /// Returns the identifier of this acquisition, distinct from every previous owner.
+    #[must_use]
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    /// Reads the current lock owner's session without creating or changing the lock file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an existing lock cannot be read or probed.
+    pub fn owner(home: &MemberHome) -> Result<Option<String>, Error> {
+        let path = home.process_lock();
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(Error::Io {
+                    path: path.into(),
+                    source,
+                });
+            }
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(None),
+            Err(fs::TryLockError::WouldBlock) => {
+                let mut session = String::new();
+                file.read_to_string(&mut session)
+                    .map_err(|source| Error::Io {
+                        path: path.into(),
+                        source,
+                    })?;
+                Ok(Some(session))
+            }
             Err(fs::TryLockError::Error(source)) => Err(Error::Io {
                 path: path.into(),
                 source,
@@ -58,7 +116,7 @@ pub enum Error {
     #[error("failed to prepare the member directory: {0}")]
     Home(String),
     /// Creating the member directory or lock file failed.
-    #[error("failed to open member process lock '{path}': {source}")]
+    #[error("failed to access member process lock '{path}': {source}")]
     Io {
         /// Lock file path.
         path: Box<Path>,
@@ -106,5 +164,33 @@ mod tests {
         let _lock = MemberLock::acquire(&home).expect("first lock should be acquired");
 
         MemberLock::acquire(&home).expect_err("second lock should be rejected");
+    }
+
+    #[test]
+    fn observes_only_a_held_lock_and_distinguishes_each_acquisition() {
+        let directory = TestDirectory::new();
+        let home = MemberHome::at(&directory.0);
+        assert_eq!(
+            MemberLock::owner(&home).expect("missing lock should be readable"),
+            None
+        );
+        assert!(!home.process_lock().exists());
+        let first = MemberLock::acquire(&home).expect("lock should acquire");
+        let session = first.session().to_owned();
+        assert_eq!(
+            MemberLock::owner(&home).expect("owner should read"),
+            Some(session.clone())
+        );
+        drop(first);
+        assert_eq!(
+            MemberLock::owner(&home).expect("stale file should read"),
+            None
+        );
+        let second = MemberLock::acquire(&home).expect("lock should acquire again");
+        assert_ne!(second.session(), session);
+        assert_eq!(
+            MemberLock::owner(&home).expect("new owner should read"),
+            Some(second.session().into())
+        );
     }
 }

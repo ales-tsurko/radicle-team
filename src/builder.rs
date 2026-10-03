@@ -48,12 +48,15 @@ impl Builder {
         workspaces: &Workspaces,
         scope: &ActivityScope,
     ) -> Result<(), Error> {
+        let watch = agent::Supervised::supervisor(coder);
         loop {
             let task = queue.next().await?;
+            watch.handling(&task.source, Some(task.id)).await;
             // Only a task which actually finished is forgotten. One which stalled, was aborted,
             // or failed stays marked taken, so the next start puts it back rather than losing it.
             self.carry(coder, queue, workspaces, scope, task).await?;
             queue.finish().await?;
+            watch.handled().await;
         }
     }
 

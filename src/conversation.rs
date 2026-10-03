@@ -286,6 +286,8 @@ impl Dispatcher {
     ) -> Result<(), Error> {
         let identity = activity.delivery_id();
         let subject = activity.subject;
+        let watch = agent::Supervised::supervisor(agent);
+        watch.handling(&subject.into(), None).await;
         let path = self.scoped.prepare(subject.into()).await?;
         self.scoped
             .scope
@@ -301,10 +303,15 @@ impl Dispatcher {
             workspace = %path.display(),
             "dispatching activity to the agent"
         );
-        let watch = agent::Supervised::supervisor(agent);
-        let handled = supervise(delivery.dispatch(activity.context(path), agent), watch).await;
+        let handled = supervise(
+            delivery.dispatch(activity.context(path), agent),
+            watch.clone(),
+        )
+        .await;
 
-        self.scoped.finish(identity.into(), handled).await
+        self.scoped.finish(identity.into(), handled).await?;
+        watch.handled().await;
+        Ok(())
     }
 }
 

@@ -89,6 +89,8 @@ impl Dispatcher {
         agent: &mut (impl Chatter + ?Sized),
     ) -> Result<(), Error> {
         let source = Source::Chat(message.channel.clone());
+        let watch = crate::agent::Supervised::supervisor(agent);
+        watch.handling(&source, None).await;
         let path = self.scoped.prepare(source).await?;
         let context =
             ChatContext::authenticated(repository, message.channel, identity, message.sender, path);
@@ -104,7 +106,6 @@ impl Dispatcher {
             message = %identity,
             "dispatching chat message to the agent"
         );
-        let watch = crate::agent::Supervised::supervisor(agent);
         let handled = crate::conversation::supervise(
             agent.messaged(
                 context,
@@ -113,10 +114,12 @@ impl Dispatcher {
                     body: message.body,
                 },
             ),
-            watch,
+            watch.clone(),
         )
         .await;
-        self.scoped.finish(identity.into(), handled).await
+        self.scoped.finish(identity.into(), handled).await?;
+        watch.handled().await;
+        Ok(())
     }
 }
 

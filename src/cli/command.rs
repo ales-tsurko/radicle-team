@@ -12,7 +12,7 @@ use tracing::level_filters::LevelFilter;
 use crate::{
     Application,
     cli::{
-        provider as provider_command,
+        inspection, provider as provider_command,
         setup::{Error as SetupError, SetupWizard},
     },
     home::{ENVIRONMENT_VARIABLE, MemberHome},
@@ -52,6 +52,8 @@ impl Cli {
             Command::Setup(_) => Mode::Setup,
             Command::Run(_) => Mode::Run,
             Command::Provider(_) => Mode::Provider,
+            Command::Status(_) => Mode::Status,
+            Command::Task(_) => Mode::Task,
         }
     }
 
@@ -60,7 +62,7 @@ impl Cli {
     pub fn member(&self) -> Option<Member> {
         match &self.command {
             Command::Setup(options) => Some(options.member),
-            Command::Run(_) | Command::Provider(_) => None,
+            Command::Run(_) | Command::Provider(_) | Command::Status(_) | Command::Task(_) => None,
         }
     }
 
@@ -69,7 +71,7 @@ impl Cli {
     pub fn repository(&self) -> Option<RepoId> {
         match &self.command {
             Command::Setup(options) => options.repo,
-            Command::Run(_) | Command::Provider(_) => None,
+            Command::Run(_) | Command::Provider(_) | Command::Status(_) | Command::Task(_) => None,
         }
     }
 
@@ -78,6 +80,8 @@ impl Cli {
     pub fn home(&self) -> Option<&Path> {
         match &self.command {
             Command::Provider(options) => options.home.as_deref(),
+            Command::Status(options) => options.home.as_deref(),
+            Command::Task(options) => options.location.home.as_deref(),
             _ => self.options()?.home.as_deref(),
         }
     }
@@ -119,7 +123,9 @@ impl Cli {
                 options.home = Some(home.path().into());
                 options.application(member, repository)
             }
-            Command::Provider(_) => Err(Error::NotAMemberCommand),
+            Command::Provider(_) | Command::Status(_) | Command::Task(_) => {
+                Err(Error::NotAMemberCommand)
+            }
         }
     }
 
@@ -130,6 +136,25 @@ impl Cli {
     /// Returns an error when setup or member execution fails.
     pub async fn execute(self) -> Result<(), Error> {
         match self.command {
+            Command::Status(options) => {
+                let view = inspection::View(crate::status::Inspection::read(options.home).await?);
+                println!("{}", view.status());
+                Ok(())
+            }
+            Command::Task(options) => {
+                let view =
+                    inspection::View(crate::status::Inspection::read(options.location.home).await?);
+                match options.command {
+                    TaskCommand::Ls => {
+                        println!("{}", view.tasks());
+                        Ok(())
+                    }
+                    TaskCommand::Show { id } => {
+                        println!("{}", view.task(id)?);
+                        Ok(())
+                    }
+                }
+            }
             Command::Provider(options) => {
                 let context = provider_command::Context::load(options.home)?;
                 match options.command {
@@ -197,6 +222,9 @@ impl Cli {
 /// Error executing a CLI command.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Reading local runtime status or tasks failed.
+    #[error(transparent)]
+    Inspection(#[from] crate::status::Error),
     /// Application execution failed.
     #[error(transparent)]
     Application(Box<crate::Error>),
@@ -258,6 +286,10 @@ pub enum Mode {
     Run,
     /// List, authorize, or select this member's model provider.
     Provider,
+    /// Inspect the local runtime and its concurrent roles.
+    Status,
+    /// Inspect unfinished tasks and their saved context.
+    Task,
 }
 
 #[derive(Debug, Subcommand)]
@@ -268,6 +300,10 @@ enum Command {
     Run(Options),
     /// Show the configured provider or manage this member's providers.
     Provider(ProviderOptions),
+    /// Show this member's runtime, role activity, and queue length.
+    Status(Location),
+    /// Inspect this member's unfinished tasks.
+    Task(TaskOptions),
 }
 
 impl Command {
@@ -275,9 +311,32 @@ impl Command {
         match self {
             Self::Setup(options) => Some(&options.options),
             Self::Run(options) => Some(options),
-            Self::Provider(_) => None,
+            Self::Provider(_) | Self::Status(_) | Self::Task(_) => None,
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct Location {
+    /// Member directory; otherwise locate it from the current directory.
+    #[arg(long, global = true, value_name = "PATH")]
+    home: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct TaskOptions {
+    #[command(flatten)]
+    location: Location,
+    #[command(subcommand)]
+    command: TaskCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    /// List active and waiting tasks in execution order.
+    Ls,
+    /// Show an unfinished task's specification and related artifacts.
+    Show { id: i64 },
 }
 
 #[derive(Debug, Args)]

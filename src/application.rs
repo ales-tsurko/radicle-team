@@ -28,6 +28,7 @@ use crate::{
     queue::TaskQueue,
     sandbox::AgentSandbox,
     shutdown::Shutdown,
+    status::{Phase, Reporter},
     watcher,
 };
 
@@ -225,10 +226,10 @@ impl Application {
     /// Returns an error when identity provisioning, node startup, synchronization, repository
     /// access, or manifest validation fails.
     pub async fn setup(&self) -> Result<Setup, Error> {
-        let runtime = Runtime::start(self, Ownership::Claim).await?;
+        let runtime = Runtime::start(self, RuntimeOperation::Setup).await?;
         let setup = self.prepare_setup(&runtime).await;
         self.report_setup("Stopping setup's Radicle node");
-        let stopped = runtime.stop(&self.shutdown).await;
+        let stopped = runtime.stop(&self.shutdown, None).await;
 
         Self::finish_after_stop(setup, stopped)
     }
@@ -360,7 +361,6 @@ impl Application {
             Ok(roles) => roles,
             Err(error) => return self.abandon_run(runtime, error).await,
         };
-
         Box::pin(self.run_roles(
             runtime,
             &binding,
@@ -454,6 +454,9 @@ impl Application {
         coder: &mut (impl Coder + ?Sized),
     ) -> Result<(), Error> {
         let profile = self.member.profile();
+        agent::Supervised::supervisor(talker).report_status(runtime.status.clone());
+        agent::Supervised::supervisor(chatter).report_status(runtime.status.clone());
+        agent::Supervised::supervisor(coder).report_status(runtime.status.clone());
         tracing::info!(
             member = profile.name,
             title = profile.title,
@@ -493,7 +496,7 @@ impl Application {
     }
 
     async fn start_run(&self) -> Result<(Runtime, manifest::ValidatedBinding), Error> {
-        let runtime = Runtime::start(self, Ownership::Verify).await?;
+        let runtime = Runtime::start(self, RuntimeOperation::Run).await?;
         let prepared = async {
             let state = watcher::ProcessedActivities::open(&runtime.home.state_database()).await?;
             let _started = state
@@ -510,16 +513,20 @@ impl Application {
 
     // Stops a runtime whose preparation failed, keeping the original failure.
     async fn abandon_run<T>(&self, runtime: Runtime, error: Error) -> Result<T, Error> {
-        Self::finish_after_stop(Err(error), runtime.stop(&self.shutdown).await)
+        let failure = (!self.shutdown.is_requested()).then(|| error.to_string());
+        let stopped = runtime.stop(&self.shutdown, failure).await;
+        Self::finish_after_stop(Err(error), stopped)
     }
 
     async fn prepare_run(&self, runtime: &Runtime) -> Result<manifest::ValidatedBinding, Error> {
+        runtime.status.phase(Phase::Synchronizing).await;
         self.synchronize(&runtime.identity).await?;
         let binding = self
-            .wait_for_binding(&runtime.home, &runtime.identity)
+            .wait_for_binding(&runtime.home, &runtime.identity, &runtime.status)
             .await?;
         self.prepare_security_repository(runtime, binding.security())
             .await?;
+        runtime.status.phase(Phase::Initializing).await;
 
         Ok(binding)
     }
@@ -530,6 +537,7 @@ impl Application {
         &self,
         home: &MemberHome,
         identity: &identity::Identity,
+        status: &Reporter,
     ) -> Result<manifest::ValidatedBinding, Error> {
         if self.manifest_file.is_some() {
             return self
@@ -544,6 +552,7 @@ impl Application {
                 return Ok(*binding);
             }
             if !waiting {
+                status.phase(Phase::AwaitingApproval).await;
                 tracing::warn!(member = %self.member, repository = %self.repository,
                     "awaiting manifest approval on the canonical branch; agents have not started");
                 waiting = true;
@@ -561,7 +570,7 @@ impl Application {
     }
 
     pub(crate) async fn announce_manifest_patch(&self) -> Result<(), Error> {
-        let runtime = Runtime::start(self, Ownership::Verify).await?;
+        let runtime = Runtime::start(self, RuntimeOperation::Publish).await?;
         self.report_setup("Replicating manifest patch to a repository seed");
         // `announce_refs_for` only queues an announcement. Keep the node alive while the CLI
         // waits, then verify its acknowledgement: `rad sync` can succeed with no seeds.
@@ -583,7 +592,7 @@ impl Application {
                 .flatten()
         }
         .await;
-        Self::finish_after_stop(result, runtime.stop(&self.shutdown).await)
+        Self::finish_after_stop(result, runtime.stop(&self.shutdown, None).await)
     }
 
     fn announce_command(&self, identity: &identity::Identity) -> tokio::process::Command {
@@ -1033,56 +1042,75 @@ struct Runtime {
     _lock: MemberLock,
     identity: identity::Identity,
     node: NodeManager,
+    status: Reporter,
 }
 
 impl Runtime {
-    async fn start(application: &Application, ownership: Ownership) -> Result<Self, Error> {
+    async fn start(application: &Application, operation: RuntimeOperation) -> Result<Self, Error> {
         let home = application.member_home()?;
-        let (lock, identity, node) = Self::initialize(application, &home, ownership).await?;
+        let ownership = match operation {
+            RuntimeOperation::Setup => Ownership::Claim,
+            RuntimeOperation::Run | RuntimeOperation::Publish => Ownership::Verify,
+        };
+        let lock = Self::claim(application, &home, ownership).await?;
+        let status = match operation {
+            RuntimeOperation::Run => Reporter::start(&home, lock.session()).await?,
+            RuntimeOperation::Setup | RuntimeOperation::Publish => Reporter::default(),
+        };
+        let initialized = Self::initialize(application, &home).await;
+        let (identity, node) = match initialized {
+            Ok(initialized) => initialized,
+            Err(error) => {
+                status
+                    .finish((!application.shutdown.is_requested()).then(|| error.to_string()))
+                    .await;
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             home,
             _lock: lock,
             identity,
             node,
+            status,
         })
     }
 
-    // Acquires the process lock, then settles the directory and loads the identity behind it.
+    // Loads the identity and node only after the directory has been claimed.
     async fn initialize(
         application: &Application,
         home: &MemberHome,
-        ownership: Ownership,
-    ) -> Result<(MemberLock, identity::Identity, NodeManager), Error> {
-        let (lock, identity) = Self::prepare_identity(application, home, ownership).await?;
-        let node = Self::start_node(application, home, &identity).await?;
-
-        Ok((lock, identity, node))
-    }
-
-    async fn prepare_identity(
-        application: &Application,
-        home: &MemberHome,
-        ownership: Ownership,
-    ) -> Result<(MemberLock, identity::Identity), Error> {
+    ) -> Result<(identity::Identity, NodeManager), Error> {
         let worker_home = home.clone();
         let worker_application = application.clone();
-        let (lock, identity) = tokio::task::spawn_blocking(move || {
-            let lock = MemberLock::acquire(&worker_home)?;
-            worker_application.take_home(&worker_home, ownership)?;
+        let identity = tokio::task::spawn_blocking(move || {
             worker_application
                 .report_setup("Unlocking identity — approve keychain access if prompted");
-            let identity = worker_application.load_identity(&worker_home)?;
-            Ok::<_, Error>((lock, identity))
+            worker_application.load_identity(&worker_home)
         })
         .await
         .map_err(|error| Error::Task(error.to_string()))??;
-        tracing::info!(
-            member = %application.member,
-            did = %identity.did(),
-            "member identity loaded"
-        );
-        Ok((lock, identity))
+        tracing::info!(member = %application.member, did = %identity.did(), "member identity loaded");
+        let node = Self::start_node(application, home, &identity).await?;
+
+        Ok((identity, node))
+    }
+
+    async fn claim(
+        application: &Application,
+        home: &MemberHome,
+        ownership: Ownership,
+    ) -> Result<MemberLock, Error> {
+        let worker_home = home.clone();
+        let worker_application = application.clone();
+        tokio::task::spawn_blocking(move || {
+            let lock = MemberLock::acquire(&worker_home)?;
+            worker_application.take_home(&worker_home, ownership)?;
+            Ok::<_, Error>(lock)
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))?
     }
 
     async fn start_node(
@@ -1121,8 +1149,14 @@ impl Runtime {
         }
     }
 
-    async fn stop(self, shutdown: &Shutdown) -> Result<(), node::Error> {
-        Self::stop_node(self.node, shutdown).await
+    async fn stop(self, shutdown: &Shutdown, failure: Option<String>) -> Result<(), node::Error> {
+        self.status.phase(Phase::Stopping).await;
+        let stopped = Self::stop_node(self.node, shutdown).await;
+        self.status
+            .finish(failure.or_else(|| stopped.as_ref().err().map(ToString::to_string)))
+            .await;
+        // The member lock stays held until the final snapshot has been written.
+        stopped
     }
 
     async fn stop_node(node: NodeManager, shutdown: &Shutdown) -> Result<(), node::Error> {
@@ -1130,6 +1164,13 @@ impl Runtime {
         shutdown.release_supervision();
         result
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeOperation {
+    Setup,
+    Run,
+    Publish,
 }
 
 #[derive(Debug)]
@@ -1199,10 +1240,7 @@ impl AgentRuntime {
                 resources,
                 policy,
             }),
-            Err(error) => Application::finish_after_stop(
-                Err(error),
-                runtime.stop(&application.shutdown).await,
-            ),
+            Err(error) => application.abandon_run(runtime, error).await,
         }
     }
 
@@ -1528,6 +1566,10 @@ impl AgentRuntime {
         chatter: &mut (impl Chatter + ?Sized),
         coder: &mut (impl Coder + ?Sized),
     ) -> Result<(), Error> {
+        self.runtime
+            .status
+            .ready(self.policy.chat().is_some())
+            .await;
         let profile = self.runtime.identity.profile().clone();
         let workspaces = self.resources.workspaces.clone();
         let state_database = self.runtime.home.state_database();
@@ -1589,12 +1631,27 @@ impl AgentRuntime {
             never = chatting => match never {},
         };
         let interrupted = application.shutdown.is_requested();
+        let talker = talker.shutdown().await;
+        let chatter = chatter.shutdown().await;
+        let coder = coder.shutdown().await;
+        let mcp = self.resources.servers.stop().await;
+        let failure = if interrupted {
+            None
+        } else {
+            ran.as_ref()
+                .err()
+                .map(ToString::to_string)
+                .or_else(|| talker.as_ref().err().map(ToString::to_string))
+                .or_else(|| chatter.as_ref().err().map(ToString::to_string))
+                .or_else(|| coder.as_ref().err().map(ToString::to_string))
+                .or_else(|| mcp.as_ref().err().map(ToString::to_string))
+        };
         let cleanup = RunCleanup {
-            talker: talker.shutdown().await,
-            chatter: chatter.shutdown().await,
-            coder: coder.shutdown().await,
-            mcp: self.resources.servers.stop().await,
-            node: self.runtime.stop(&application.shutdown).await,
+            talker,
+            chatter,
+            coder,
+            mcp,
+            node: self.runtime.stop(&application.shutdown, failure).await,
         };
         cleanup.finish(ran, interrupted)
     }
@@ -1891,6 +1948,9 @@ impl SetupStatus {
 /// Error running a team member application.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Opening the runtime status store failed.
+    #[error(transparent)]
+    Status(#[from] crate::status::Error),
     /// Resolving the application home failed.
     #[error("failed to resolve team member home: {0}")]
     Home(#[from] home::Error),
@@ -2057,6 +2117,48 @@ pub enum Error {
 mod tests {
 
     #[tokio::test]
+    async fn failed_identity_loading_records_status_and_releases_ownership() {
+        let root = tempfile::tempdir().expect("test directory should create");
+        let home = crate::home::MemberHome::at(root.path().join("nico"));
+        home.create().expect("member home should create");
+        let repository = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc"
+            .parse()
+            .expect("RID should parse");
+        home.record(crate::member::Member::Nico, repository)
+            .expect("marker should write");
+        let missing = root.path().join("missing-identity");
+        let application = super::Application::new(crate::member::Member::Nico, repository)
+            .with_home(home.path())
+            .with_identity_provider(crate::identity::Provider::RadicleHome {
+                home: missing.clone(),
+                expected_did: None,
+            });
+        application
+            .start_run()
+            .await
+            .expect_err("a missing identity must prevent startup");
+        let status = crate::status::Inspection::read(Some(home.path().into()))
+            .await
+            .expect("failed status should read");
+        assert_eq!(status.phase(), crate::status::Phase::Failed);
+        assert!(!status.live);
+        assert!(
+            status
+                .snapshot
+                .expect("startup should record")
+                .failure
+                .is_some()
+        );
+        assert!(!home.identity().exists());
+        assert!(!home.node_log().exists());
+        assert!(!missing.exists());
+        drop(
+            crate::identity::MemberLock::acquire(&home)
+                .expect("failed startup must release ownership"),
+        );
+    }
+
+    #[tokio::test]
     async fn refuses_a_directory_belonging_to_another_member_or_repository() {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let repository =
@@ -2136,9 +2238,12 @@ mod tests {
             "run must refuse an identity without a repository binding"
         );
 
-        let (lock, identity) = Runtime::prepare_identity(&application, &home, Ownership::Claim)
+        let lock = Runtime::claim(&application, &home, Ownership::Claim)
             .await
             .expect("full setup's first stage should bind the prepared identity");
+        let identity = application
+            .load_identity(&home)
+            .expect("identity should load");
         assert_eq!(identity.did(), did);
         assert_eq!(
             home.marker()
@@ -2748,12 +2853,25 @@ mcp_allow = ["read"]
 
         // The pending local proposal never authorizes the member. Waiting succeeds only once
         // the repository delegates' canonical branch contains a valid binding.
+        home.record(Member::Maya, rid)
+            .expect("repository binding should record");
+        let lock = crate::identity::MemberLock::acquire(&home).expect("runtime should own member");
+        let status = crate::status::Reporter::start(&home, lock.session())
+            .await
+            .expect("status should start");
         tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            application.wait_for_binding(&home, &identity),
+            application.wait_for_binding(&home, &identity, &status),
         )
         .await
         .expect_err("an unapproved local proposal must keep waiting");
+        assert_eq!(
+            crate::status::Inspection::read(Some(home.path().into()))
+                .await
+                .expect("status should read")
+                .phase(),
+            crate::status::Phase::AwaitingApproval
+        );
         let stored = identity
             .profile()
             .storage
@@ -2801,7 +2919,7 @@ mcp_allow = ["read"]
             .sign_refs(&signer)
             .expect("delegate references should sign");
         let binding = application
-            .wait_for_binding(&home, &identity)
+            .wait_for_binding(&home, &identity, &crate::status::Reporter::default())
             .await
             .expect("approved member should activate");
         assert_eq!(binding.generation(), 1);
@@ -2837,7 +2955,9 @@ mcp_allow = ["read"]
             .expect("revocation should commit");
         stored.sign_refs(&signer).expect("references should sign");
         assert!(matches!(
-            application.wait_for_binding(&home, &identity).await,
+            application
+                .wait_for_binding(&home, &identity, &crate::status::Reporter::default())
+                .await,
             Err(super::Error::Manifest(crate::manifest::Error::Inactive(
                 Member::Maya
             )))

@@ -275,6 +275,51 @@ model settings in a provider's TOML file takes effect on the next start;
 rebuilding the executable is unnecessary.
 
 
+### Checking status and tasks
+
+From a member's directory, inspect its runtime and unfinished tasks:
+
+```sh
+rad-team status
+rad-team task ls
+rad-team task show 17
+```
+
+Or select the member directory explicitly:
+
+```sh
+rad-team status --home ../nico
+rad-team task ls --home ../nico
+rad-team task show 17 --home ../nico
+```
+
+These commands read local state without starting a node or loading signing keys.
+They work while the member is stopped. The selected directory must be a member
+home bound to a repository; an ordinary repository checkout is insufficient.
+`--home` takes precedence over the current directory. Without it, the commands
+search the current directory and its parents for the member marker.
+
+`status` shows the runtime phase, each role's current activity, the waiting task
+count, and the last observed activity. Startup phases include synchronization,
+waiting for manifest approval, and agent initialization. Coder, talker, and
+optional chatter activity is shown separately. Progress timestamps reflect
+observed agent activity, recorded on the existing supervision interval of ten
+seconds.
+
+`task ls` lists the current task followed by waiting tasks in execution order,
+with their IDs, briefs, priorities, and related issues or patches. Priority is
+shown as `first`, `next`, or `normal`; tasks within a priority run in arrival
+order. The running task is never interrupted by a higher priority arrival.
+`task show` includes the agreed specification, related artifacts, pinned message
+references, and working notes.
+
+A runtime that exited without recording its shutdown appears as `interrupted`.
+Taken tasks without a matching live runtime also appear as `interrupted`; the
+next `run` recovers them. Inspection does not recover or reorder tasks.
+Completed and cancelled task contexts are removed, so these commands show
+unfinished work.
+
+
 ### Looking inside a member's copies
 
 Read them freely. `git status`, `git log`, `git diff` and `git show` work as

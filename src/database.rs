@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use sqlite::{Connection, ConnectionThreadSafe};
+use sqlite::{Connection, ConnectionThreadSafe, OpenFlags};
 
 #[derive(Clone)]
 pub(crate) struct Database(Arc<Mutex<ConnectionThreadSafe>>);
@@ -17,12 +17,20 @@ pub(crate) struct Database(Arc<Mutex<ConnectionThreadSafe>>);
 impl Database {
     pub(crate) async fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref().to_owned();
-        Self::blocking(move || Self::open_connection(path)).await
+        Self::blocking(move || {
+            Self::open_connection(path, OpenFlags::new().with_create().with_read_write())
+        })
+        .await
+    }
+
+    pub(crate) async fn read_only(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref().to_owned();
+        Self::blocking(move || Self::open_connection(path, OpenFlags::new().with_read_only())).await
     }
 
     #[cfg(test)]
     pub(crate) async fn memory() -> Result<Self, Error> {
-        Self::blocking(|| Self::open_connection(":memory:")).await
+        Self::open(":memory:").await
     }
 
     pub(crate) async fn execute(&self, statement: &'static str) -> Result<(), Error> {
@@ -47,8 +55,15 @@ impl Database {
         Self(Arc::new(Mutex::new(connection)))
     }
 
-    fn open_connection(path: impl AsRef<Path>) -> sqlite::Result<Self> {
-        let mut connection = Connection::open_thread_safe(path)?;
+    pub(crate) fn has_table(connection: &ConnectionThreadSafe, name: &str) -> sqlite::Result<bool> {
+        let mut select =
+            connection.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1")?;
+        select.bind((1, name))?;
+        Ok(select.next()? == sqlite::State::Row)
+    }
+
+    fn open_connection(path: impl AsRef<Path>, flags: OpenFlags) -> sqlite::Result<Self> {
+        let mut connection = Connection::open_thread_safe_with_flags(path, flags)?;
         connection.set_busy_timeout(5_000)?;
         Ok(Self::new(connection))
     }
@@ -66,9 +81,12 @@ impl Database {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum Error {
+/// Failure performing an operation on the state database.
+pub enum Error {
+    /// The SQLite driver failed.
     #[error(transparent)]
     Sqlite(#[from] sqlite::Error),
+    /// The blocking database worker failed.
     #[error("SQLite task failed: {0}")]
     Task(String),
 }

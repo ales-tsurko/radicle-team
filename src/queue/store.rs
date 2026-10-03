@@ -85,6 +85,29 @@ impl std::fmt::Debug for TaskQueue {
 }
 
 impl TaskQueue {
+    /// Reads durable tasks in execution order without recovering or modifying the queue.
+    pub(crate) fn inspect(
+        connection: &sqlite::ConnectionThreadSafe,
+        repository: RepoId,
+        member: Member,
+    ) -> sqlite::Result<Vec<(Task, bool)>> {
+        if !Database::has_table(connection, "task_queue")? {
+            return Ok(Vec::new());
+        }
+        let mut select = connection.prepare(
+            "SELECT q.id, position, brief, source, taken, c.data AS context FROM task_queue q
+             LEFT JOIN task_contexts c ON c.task = q.id
+             WHERE repository = ?1 AND member = ?2 ORDER BY taken DESC, position, q.id",
+        )?;
+        select.bind((1, repository.to_string().as_str()))?;
+        select.bind((2, member.id()))?;
+        let mut tasks = Vec::new();
+        while select.next()? == State::Row {
+            tasks.push((Task::read(&select)?, select.read::<i64, _>("taken")? != 0));
+        }
+        Ok(tasks)
+    }
+
     /// Opens the queue for one member and repository.
     ///
     /// # Errors

@@ -104,5 +104,6 @@ pub mod provider;
 pub mod queue;
 pub mod sandbox;
 mod shutdown;
+mod status;
 pub mod watcher;
 mod workspace;

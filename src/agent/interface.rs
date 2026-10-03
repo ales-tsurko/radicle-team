@@ -38,7 +38,10 @@ pub(crate) const HEARTBEAT: Duration = Duration::from_secs(10);
 /// Each has its own MCP server, its own working copy, and its own harness state, so none can
 /// disturb another's checked-out branch or read another's transcripts. The build cache is the one
 /// thing they share, because build output is too large to keep three copies of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     /// Answers repository activity.
     Talker,
@@ -190,6 +193,7 @@ impl Stall {
     pub(crate) async fn silent(&mut self) -> bool {
         tokio::time::sleep(HEARTBEAT).await;
         if let Some(progress) = self.watch.last_progress() {
+            self.watch.checkpoint(progress).await;
             self.seen = self.seen.max(progress);
         }
 

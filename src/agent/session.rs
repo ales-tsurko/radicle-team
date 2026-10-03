@@ -29,8 +29,9 @@ use tokio::{
 };
 
 use crate::{
-    agent::Role,
+    agent::{Role, Source},
     sandbox::{AgentChild, AgentCommand},
+    status::{Activity, Reporter},
 };
 
 // How much of what a run wrote is kept to explain a failure with. Enough to see what went wrong,
@@ -74,6 +75,7 @@ pub(crate) trait Event: Sized {
 #[derive(Debug)]
 pub(crate) struct Session {
     role: Role,
+    status: OnceLock<Reporter>,
     // Where a plugin reports what the agent is doing, for adapters whose harness needs one to make
     // itself visible. Known once the role has been started; absent otherwise, and every read of it
     // then falls back to what was seen on the streams alone.
@@ -90,10 +92,45 @@ impl Session {
     pub(crate) fn new(role: Role) -> Self {
         Self {
             role,
+            status: OnceLock::new(),
             report: OnceLock::new(),
             progress: Mutex::new(Progress::default()),
             stop: Mutex::new(None),
             interrupted: AtomicBool::new(false),
+        }
+    }
+
+    /// Connects this role to the runtime-owned status snapshot.
+    pub(crate) fn report_status(&self, status: Reporter) {
+        let _first = self.status.set(status);
+    }
+
+    /// Records a delivery or task, including preparation and publication recovery.
+    pub(crate) async fn handling(&self, source: &Source, task: Option<i64>) {
+        if let Some(status) = self.status.get() {
+            status
+                .activity(
+                    self.role,
+                    Activity {
+                        task,
+                        source: source.to_string(),
+                    },
+                )
+                .await;
+        }
+    }
+
+    /// Clears successfully completed work. Failed work remains visible after interruption.
+    pub(crate) async fn handled(&self) {
+        if let Some(status) = self.status.get() {
+            status.idle(self.role).await;
+        }
+    }
+
+    /// Records actual observed progress on the existing supervision beat.
+    pub(crate) async fn checkpoint(&self, at: Instant) {
+        if let Some(status) = self.status.get() {
+            status.progress(self.role, at).await;
         }
     }
 
