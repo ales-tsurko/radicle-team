@@ -333,7 +333,7 @@ struct TaskOptions {
 
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
-    /// List active and waiting tasks in execution order.
+    /// List implementation tasks in execution order.
     Ls,
     /// Show an unfinished task's specification and related artifacts.
     Show { id: i64 },

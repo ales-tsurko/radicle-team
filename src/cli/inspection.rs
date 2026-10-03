@@ -58,45 +58,41 @@ impl View {
                     .to_string(),
             );
         }
+        lines.push(String::new());
+        if let Some(did) = inspection.did {
+            lines.push(dim.apply_to(format!("DID: {did}")).to_string());
+        }
         lines.extend([
-            String::new(),
             dim.apply_to(format!("Repository: {}", inspection.repository))
                 .to_string(),
             dim.apply_to(format!("Home: {}", inspection.home.path().display()))
                 .to_string(),
             String::new(),
         ]);
-        let mut rendered = vec![format!(
-            "{} {} · {}",
-            dim.apply_to("╭─"),
-            style.cyan().bold().apply_to(inspection.member),
-            self.phase_badge(),
-        )];
-        rendered.extend(lines.iter().flat_map(|line| line.split('\n')).map(|line| {
-            if line.is_empty() {
-                dim.apply_to("│").to_string()
-            } else {
-                format!("{}  {line}", dim.apply_to("│"))
-            }
-        }));
-        rendered.push(dim.apply_to("╰─ rad-team").to_string());
-        rendered.join("\n")
+        self.panel(&self.phase_badge(), lines)
     }
 
     pub(crate) fn tasks(&self) -> String {
+        let style = Self::style();
+        let dim = style.clone().dim();
+        let mut lines = vec![String::new()];
         if self.0.tasks.is_empty() {
-            return "No unfinished tasks.".to_owned();
+            lines.push(dim.apply_to("No unfinished tasks.").to_string());
+            lines.push(String::new());
+            return self.panel("task queue", lines);
         }
-        let mut lines = vec!["ID     STATE        PRIORITY  BRIEF".to_owned()];
         for (task, taken) in &self.0.tasks {
             lines.push(format!(
-                "{:<6} {:<12} {:<9} {}",
-                task.id,
-                self.0.task_state(task, *taken),
-                Self::priority(task.position),
-                Self::brief(&task.brief)
+                "{}  {} · {}",
+                Self::task_badge(self.0.task_state(task, *taken)),
+                style.clone().bold().apply_to(format!(
+                    "#{}: {}",
+                    task.id,
+                    Self::brief(&task.brief)
+                )),
+                dim.apply_to(format!("priority {}", Self::priority(task.position))),
             ));
-            lines.push(format!("       {}", task.source));
+            lines.push(dim.apply_to(format!("  {}", task.source)).to_string());
             let source = task.source.to_string();
             for subject in task
                 .context
@@ -106,10 +102,11 @@ impl View {
                 .filter(|subject| **subject != source)
                 .collect::<BTreeSet<_>>()
             {
-                lines.push(format!("       {subject}"));
+                lines.push(dim.apply_to(format!("  {subject}")).to_string());
             }
+            lines.push(String::new());
         }
-        lines.join("\n")
+        self.panel("task queue", lines)
     }
 
     pub(crate) fn task(&self, id: i64) -> Result<String, Error> {
@@ -119,13 +116,23 @@ impl View {
             .iter()
             .find(|(task, _)| task.id == id)
             .ok_or(Error::MissingTask(id))?;
+        let style = Self::style();
+        let dim = style.clone().dim();
         let mut lines = vec![
-            format!("Task {}: {}", task.id, self.0.task_state(task, *taken)),
-            format!("Priority: {}", Self::priority(task.position)),
-            format!("Source: {}", task.source),
+            String::new(),
+            style.clone().bold().apply_to(&task.brief).to_string(),
+            Self::task_badge(self.0.task_state(task, *taken)),
+            dim.apply_to(format!("Priority: {}", Self::priority(task.position)))
+                .to_string(),
+            dim.apply_to(format!("Source: {}", task.source)).to_string(),
         ];
         if task.context.cancelled {
-            lines.push("Cancellation requested".to_owned());
+            lines.push(
+                style
+                    .yellow()
+                    .apply_to("Cancellation requested")
+                    .to_string(),
+            );
         }
         lines.push(format!("\nSpecification:\n{}", task.context.specification));
         for artifact in &task.context.artifacts {
@@ -154,7 +161,37 @@ impl View {
             lines.push("\nNotes:".to_owned());
             lines.extend(task.context.notes.iter().cloned());
         }
-        Ok(lines.join("\n"))
+        lines.push(String::new());
+        Ok(self.panel(&format!("task #{}", task.id), lines))
+    }
+
+    fn panel(&self, heading: &str, lines: Vec<String>) -> String {
+        let style = Self::style();
+        let dim = style.clone().dim();
+        let mut rendered = vec![format!(
+            "{} {} · {heading}",
+            dim.apply_to("╭─"),
+            style.cyan().bold().apply_to(self.0.member),
+        )];
+        rendered.extend(lines.iter().flat_map(|line| line.split('\n')).map(|line| {
+            if line.is_empty() {
+                dim.apply_to("│").to_string()
+            } else {
+                format!("{}  {line}", dim.apply_to("│"))
+            }
+        }));
+        rendered.push(dim.apply_to("╰─ rad-team").to_string());
+        rendered.join("\n")
+    }
+
+    fn task_badge(state: &str) -> String {
+        let style = Self::style();
+        let (symbol, color) = match state {
+            "running" => ("●", style.green()),
+            "interrupted" => ("!", style.yellow()),
+            _ => ("○", style.cyan()),
+        };
+        color.apply_to(format!("{symbol} {state}")).to_string()
     }
 
     fn role(&self, role: Role) -> Vec<String> {

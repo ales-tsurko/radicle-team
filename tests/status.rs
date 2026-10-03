@@ -90,10 +90,22 @@ fn status_and_tasks_discover_current_home_and_honor_explicit_precedence() {
         assert!(text.contains("Waiting tasks: 0"), "{text}");
         let output = fixture.run(cwd, &["task", "ls"], explicit);
         assert!(output.status.success(), "{output:?}");
-        assert!(String::from_utf8_lossy(&output.stdout).contains("No unfinished tasks."));
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains(&format!("╭─ {member} · task queue")),
+            "{text}"
+        );
+        assert!(text.contains("No unfinished tasks."), "{text}");
+        assert!(
+            !text.contains('\u{1b}'),
+            "redirected tasks must have no ANSI codes: {text}"
+        );
         let output = fixture.run(cwd, &["task", "show", "1"], explicit);
         assert!(!output.status.success(), "{output:?}");
-        assert!(String::from_utf8_lossy(&output.stdout).contains("unfinished task 1 not found"));
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(text.contains("unfinished task 1 not found"), "{output:?}");
+        assert!(text.contains("rad-team task ls"), "{text}");
+        assert!(output.stdout.is_empty(), "{output:?}");
     }
     fixture.assert_untouched();
 }

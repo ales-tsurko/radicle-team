@@ -641,8 +641,13 @@ struct TestAuthorizer(RepoId);
 
 #[async_trait::async_trait]
 impl crate::agent::Authorizer for TestAuthorizer {
-    async fn authorize(&self, _method: &str) -> Result<(), crate::agent::PublishError> {
-        Ok(())
+    async fn authorize(&self, method: &str) -> Result<(), crate::agent::PublishError> {
+        crate::manifest::McpAllowlist::everything()
+            .allows(method)
+            .then_some(())
+            .ok_or_else(|| {
+                PublishError::Authorization(format!("MCP method '{method}' is not allowed"))
+            })
     }
 
     async fn security_policy(
@@ -2232,11 +2237,11 @@ async fn manages_patch_reviews_and_inline_comments() {
                             body: "This allocation is avoidable.".to_owned(),
                             location: Some(LocationRequest {
                                 commit: fixture.head.to_string(),
-                                path: "file".to_owned(),
+                                path: "README.md".to_owned(),
                                 old_start: None,
                                 old_end: None,
-                                new_start: Some(1),
-                                new_end: Some(2),
+                                new_start: Some(2),
+                                new_end: Some(3),
                             }),
                         },
                         ReviewCommentRequest {
@@ -2258,14 +2263,20 @@ async fn manages_patch_reviews_and_inline_comments() {
             .expect("patch should load")
             .expect("patch should exist");
         let review_id = patch::ReviewId::from(EntryId::from_str(&review).expect("id should parse"));
-        let comments = find_review(&published, review_id)
-            .expect("the review should exist")
-            .comments()
-            .count();
+        let review = find_review(&published, review_id).expect("the review should exist");
         assert_eq!(
-            comments, 2,
+            review.comments().count(),
+            2,
             "every line comment sent with a review must be published with it, so that a reviewer \
              never has to spend several turns saying one thing"
+        );
+        assert_eq!(
+            review
+                .comments()
+                .filter_map(|(_id, comment)| comment.location())
+                .collect::<Vec<_>>(),
+            vec![&parsed_location],
+            "inline findings must retain their diff location"
         );
     }
     let objects = object_count(&repository.backend);

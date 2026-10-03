@@ -2,7 +2,10 @@
 
 use std::{env, io, path::PathBuf};
 
-use radicle::identity::RepoId;
+use radicle::{
+    crypto::ssh::Keystore,
+    identity::{Did, RepoId},
+};
 
 use crate::{
     agent::Role,
@@ -19,6 +22,7 @@ pub(crate) struct Inspection {
     pub(crate) home: MemberHome,
     pub(crate) member: Member,
     pub(crate) repository: RepoId,
+    pub(crate) did: Option<Did>,
     pub(crate) snapshot: Option<Snapshot>,
     pub(crate) tasks: Vec<(Task, bool)>,
     pub(crate) live: bool,
@@ -37,6 +41,9 @@ impl Inspection {
         let repository = marker
             .repository()?
             .ok_or_else(|| Error::UnboundIdentity(home.path().into()))?;
+        let did = Keystore::new(&home.identity().join("keys"))
+            .public_key()?
+            .map(Did::from);
         let before = MemberLock::owner(&home)?;
         let (snapshot, tasks) = Self::stored(&home, repository, member).await?;
         let after = MemberLock::owner(&home)?;
@@ -48,6 +55,7 @@ impl Inspection {
             home,
             member,
             repository,
+            did,
             snapshot,
             tasks,
             live,

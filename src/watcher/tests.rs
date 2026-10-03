@@ -969,7 +969,7 @@ fn counts_turns_against_the_member_that_took_them_rather_than_the_subject() {
 }
 
 #[test]
-fn delivers_a_peer_review_to_the_patch_owner() {
+fn delivers_peer_reviews_and_revisions_to_owners_and_reviewers() {
     let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
     let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
     let triggers = Fixture::triggers(vec![Did::from(peer)]);
@@ -1004,6 +1004,48 @@ fn delivers_a_peer_review_to_the_patch_owner() {
         !reviewed.is_empty(),
         "a review by another member must reach the patch owner without a mention, or delegated \
          work would stall once it was reviewed"
+    );
+
+    let mut reviewer = Context::default();
+    assert!(
+        Fixture::classify_patch_with(
+            ISSUE,
+            Fixture::revision("Initial revision"),
+            peer,
+            &mut reviewer,
+            &triggers,
+        )
+        .is_empty(),
+        "a peer's revision must not summon an uninvolved member"
+    );
+    let _own_review = Fixture::classify_patch_with(
+        OPERATION,
+        PatchAction::Review {
+            revision,
+            summary: None,
+            verdict: Some(Verdict::Reject),
+            labels: Vec::new(),
+        },
+        member,
+        &mut reviewer,
+        &triggers,
+    );
+    assert!(
+        matches!(
+            Fixture::classify_patch_with(
+                CHANGE,
+                Fixture::revision("Addressed the feedback"),
+                peer,
+                &mut reviewer,
+                &triggers,
+            )
+            .as_slice(),
+            [Activity {
+                kind: Kind::Delivered(Delivery::Changed(Change::RevisionCreated(_))),
+                ..
+            }]
+        ),
+        "a new revision must reach a previous reviewer without another mention"
     );
 }
 

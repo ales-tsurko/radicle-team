@@ -272,7 +272,11 @@ impl ToolService {
     }
 
     /// Return a page of operations which define or modify a patch review.
-    #[tool(description = "List operations defining or modifying a patch review")]
+    #[tool(
+        description = "List operations defining or modifying a patch review, including the \
+                       operation IDs and authors. Verify the review's actual author here; a \
+                       requested reviewer or discussion order does not establish authorship."
+    )]
     async fn get_review(
         &self,
         Parameters(request): Parameters<PatchEntityRequest>,
@@ -539,7 +543,11 @@ impl ToolService {
         Ok(created)
     }
 
-    #[tool(description = "Add a revision from commits in the active workspace")]
+    #[tool(
+        description = "Add a revision from commits in the active workspace. Previous member \
+                       reviewers receive revision activity automatically; do not post another \
+                       review request or mention solely to notify them."
+    )]
     pub(super) async fn update_patch(
         &self,
         Parameters(request): Parameters<UpdatePatchRequest>,
@@ -599,7 +607,11 @@ impl ToolService {
             .map_err(|error| error.to_string())
     }
 
-    #[tool(description = "Create a review for an active patch revision")]
+    #[tool(
+        description = "Create a review for an active patch revision. Keep the summary brief. Send \
+                       each finding about specific code as a separate comment with its diff \
+                       location; do not repeat those findings in the summary."
+    )]
     pub(super) async fn create_review(
         &self,
         Parameters(request): Parameters<ReviewWriteRequest>,
@@ -661,7 +673,9 @@ impl ToolService {
 
     #[tool(
         description = "Record work for the building role of this member, which carries it out \
-                       under the same identity"
+                       under the same identity. For review follow-up, identify each review by its \
+                       ID and verified author, keep different authors' feedback separate, and pin \
+                       the source entries in the task context."
     )]
     pub(super) async fn add_task(
         &self,

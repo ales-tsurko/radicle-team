@@ -3,7 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use radicle::identity::RepoId;
+use radicle::{
+    crypto::{Seed, ssh::Keystore},
+    identity::{Did, RepoId},
+};
 
 use crate::{
     agent::{Role, Session, Source},
@@ -85,7 +88,7 @@ async fn inspection_of_a_never_started_member_creates_nothing() {
     disabled.finish(None).await;
     assert_eq!(view.0.phase(), Phase::Stopped);
     assert!(view.status().contains("coder: not started"));
-    assert_eq!(view.tasks(), "No unfinished tasks.");
+    assert!(view.tasks().contains("No unfinished tasks."));
     assert!(matches!(view.task(1), Err(Error::MissingTask(1))));
     assert!(!fixture.home.state_database().exists());
     assert!(!fixture.home.process_lock().exists());
@@ -95,6 +98,25 @@ async fn inspection_of_a_never_started_member_creates_nothing() {
         fs::read(fixture.home.path().join(crate::home::MARKER)).expect("marker should read"),
         marker
     );
+
+    let keystore = Keystore::new(&fixture.home.identity().join("keys"));
+    let key = keystore
+        .init("nico", None, Seed::generate())
+        .expect("test identity should create");
+    fs::remove_file(keystore.secret_key_path()).expect("secret key should remove");
+    let public_path = keystore.public_key_path().expect("public key has a path");
+    let public = fs::read(public_path).expect("public key should read");
+    let view = View(fixture.read().await);
+    assert_eq!(view.0.did, Some(Did::from(key)));
+    assert!(view.status().contains(&format!("DID: {}", Did::from(key))));
+    assert_eq!(
+        fs::read(public_path).expect("public key should read"),
+        public
+    );
+    assert!(!keystore.secret_key_path().exists());
+    assert!(!fixture.home.state_database().exists());
+    assert!(!fixture.home.process_lock().exists());
+    assert!(!fixture.home.node_log().exists());
 }
 
 #[tokio::test]

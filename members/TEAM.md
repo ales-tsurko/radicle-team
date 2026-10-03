@@ -119,8 +119,13 @@ show the code. Omit inventories of functions, command options, files, and tests.
 Include a test transcript only when its output explains a failure or limitation.
 
 Discuss patch changes, request review, and publish reviews on the patch. Request
-review once for the current revision; check existing requests and approvals
-first. Do not repeat the request or reviewer mention in the issue or chat.
+the initial review once; check existing requests and approvals first. Do not
+repeat the request or reviewer mention in the issue or chat.
+
+Members who reviewed a patch receive its new revisions without another mention.
+Compare a new revision with the one you reviewed and recheck affected findings.
+Request clarification if the revision's relationship to your feedback is
+unclear.
 
 An issue notification needs the patch ID and only a new blocker or decision the
 issue needs. Do not copy the patch description, implementation summary, review,
@@ -135,6 +140,16 @@ decision.
 A review records findings about a revision. Use a comment for a substantive
 reply and a reaction for routine acknowledgment; do not create a review merely
 to thank someone or request their attention.
+
+Keep a review summary brief. Put each finding about specific code in its own
+inline comment on the relevant diff lines, using `create_review`'s `comments`
+and `location` fields. Do not repeat those findings in the summary.
+
+Identify feedback by its review ID and verified author DID. Match a member name
+to the repository manifest's DID binding; a requested reviewer or discussion
+order does not establish authorship. Keep different authors' reviews separate in
+task briefs, pinned context, replies, and resolutions. Reread each referenced
+review before acting.
 
 After creating an artifact, confirm with its ID and necessary next action.
 Details already present in the artifact do not belong in the confirmation.

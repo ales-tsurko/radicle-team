@@ -564,6 +564,7 @@ pub(super) struct ResolveCommentRequest {
     pub(super) resolved: bool,
 }
 
+/// A diff anchor at the revision head. Line numbers start at 1; range ends are exclusive.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(super) struct LocationRequest {
     pub(super) commit: String,
@@ -682,12 +683,13 @@ pub(super) struct ReviewWriteRequest {
     pub(super) revision: Option<String>,
     pub(super) review: Option<String>,
     pub(super) verdict: Option<String>,
+    /// Brief verdict rationale or concerns about the whole patch; findings belong in comments.
     pub(super) summary: Option<String>,
     #[serde(default)]
     pub(super) labels: Vec<String>,
     #[serde(default)]
     pub(super) embeds: Vec<EmbedWriteRequest>,
-    /// Line comments published together with the review.
+    /// Findings published with the review; give each finding its own comment and diff location.
     #[serde(default)]
     pub(super) comments: Vec<ReviewCommentRequest>,
 }
@@ -696,6 +698,7 @@ pub(super) struct ReviewWriteRequest {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(super) struct ReviewCommentRequest {
     pub(super) body: String,
+    /// Diff anchor for this finding. Omit only for a concern about the whole patch.
     pub(super) location: Option<LocationRequest>,
 }
 

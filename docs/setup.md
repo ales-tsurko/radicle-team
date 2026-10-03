@@ -299,19 +299,21 @@ home bound to a repository; an ordinary repository checkout is insufficient.
 `--home` takes precedence over the current directory. Without it, the commands
 search the current directory and its parents for the member marker.
 
-`status` shows the runtime phase, each role's current activity, the waiting task
-count, and the last observed activity. Startup phases include synchronization,
-waiting for manifest approval, and agent initialization. Coder, talker, and
-optional chatter activity is shown separately. Progress timestamps reflect
-observed agent activity, recorded on the existing supervision interval of ten
-seconds.
+`status` shows the member's DID, runtime phase, each role's current activity,
+the waiting task count, and the last observed activity. It reads the public key
+without unlocking the identity. Startup phases include synchronization, waiting
+for manifest approval, and agent initialization. Coder, talker, and optional
+chatter activity is shown separately. Progress timestamps reflect observed agent
+activity, recorded on the existing supervision interval of ten seconds.
 
-`task ls` lists the current task followed by waiting tasks in execution order,
-with their IDs, briefs, priorities, and related issues or patches. Priority is
-shown as `first`, `next`, or `normal`; tasks within a priority run in arrival
-order. The running task is never interrupted by a higher priority arrival.
-`task show` includes the agreed specification, related artifacts, pinned message
-references, and working notes.
+`task ls` lists the coder's current implementation task followed by waiting
+tasks in execution order, with their IDs, briefs, priorities, and related issues
+or patches. Conversation work in talker or chatter appears in `status`; an empty
+task queue does not mean those roles are idle. Priority is shown as `first`,
+`next`, or `normal`; tasks within a priority run in arrival order. The running
+task is never interrupted by a higher priority arrival. `task show` includes the
+agreed specification, related artifacts, pinned message references, and working
+notes.
 
 A runtime that exited without recording its shutdown appears as `interrupted`.
 Taken tasks without a matching live runtime also appear as `interrupted`; the

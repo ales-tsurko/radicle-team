@@ -98,6 +98,9 @@ are ambient changes such as an edited title. A submitted review and a new
 revision are the exceptions: those carry work to whoever owns the subject, and
 without them delegated work would stall once it was reviewed.
 
+New revisions also reach members who already reviewed that patch, so they can
+recheck affected findings without another mention or follow-up comment.
+
 Two members also stop talking to each other after a while. A conversation
 between them runs for a fixed number of turns on one issue, patch, or channel,
 then waits for a person. Without it, two members can review and revise the same

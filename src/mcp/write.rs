@@ -1284,7 +1284,7 @@ impl ToolService {
             let expected = body.clone();
             let _id = self
                 .mutate(
-                    "create_review_comment",
+                    "create_review",
                     format!("create_review_comment:{review}:{index}"),
                     move |repository, signer, marker| {
                         let mut patches = patch::Cache::no_cache(repository, signer)?;

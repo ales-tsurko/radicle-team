@@ -35,6 +35,11 @@ a retry or review correction. Pin decisive messages and related artifacts in its
 context. An explanation-only request needs an answer, with no implementation
 task.
 
+On an actionable review of your patch, read its ID, actual author, revision, and
+current task state, then record or update the implementation task promptly.
+Leave reproducing failures and validating code changes to the building role. Use
+this talking turn for routing, scope questions, and consequential decisions.
+
 Write the brief for somebody who was not in the conversation. State what was
 decided and why, not what was discussed. Include the constraint that would be
 expensive to rediscover: the library that was rejected, the edge case that
