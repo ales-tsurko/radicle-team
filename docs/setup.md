@@ -489,6 +489,33 @@ rad-team run --home ./nico-z3cyot...
 neither a member argument nor `--repo`. An ordinary repository checkout does not
 contain the member's identity and state; run setup first.
 
+Interactive terminals open a live dashboard with status, tasks, notification
+delivery, and logs. Status, tasks, and inbox refresh every second. Narrow
+terminals show one panel at a time with tabs. Select a task, notification, or
+status and press `Enter` for its full context and IDs.
+
+Use `Tab` or `Shift+Tab` to switch panels, or `s`, `t`, `i`, and `l` to jump to
+status, tasks, inbox, and logs. `/` filters the focused list or logs; `Esc`
+clears the filter or closes details. `?` shows keyboard help.
+
+In logs, `↑` and `↓` scroll one line, `PgUp` and `PgDn` scroll one page, and
+`Home` jumps to the oldest retained entry. Scrolling pauses following and shows
+the number of new entries. `End` follows the newest entries; `Space` toggles
+following. The dashboard retains the latest 2,000 log lines.
+
+`q` or `Ctrl+C` gracefully stops the member. The dashboard remains visible
+during shutdown and restores the terminal on exit. Use plain logs for a service
+or terminal session without the dashboard:
+
+```sh
+rad-team run --plain
+rad-team run --plain --log info
+```
+
+Redirected output and terminals without interactive input use plain logs
+automatically. Logging still defaults to `warn`; `--log info` adds detail to
+either view. `NO_COLOR` disables dashboard colors.
+
 The process owns the member's node for its lifetime. If manifest approval is
 pending, it keeps synchronizing and waits for the canonical binding. Once
 approved, it classifies relevant assignments, mentions, replies, comments,

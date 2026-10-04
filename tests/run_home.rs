@@ -73,7 +73,7 @@ fn run_refuses_an_ordinary_checkout_without_creating_member_data() {
     let checkout = root.path().join("checkout");
     git2::Repository::init(&checkout).expect("ordinary checkout should be initialized");
 
-    for explicit in [false, true] {
+    for (explicit, plain) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rad-team"));
         command
             .current_dir(&checkout)
@@ -83,6 +83,9 @@ fn run_refuses_an_ordinary_checkout_without_creating_member_data() {
             .env("RUST_LOG", "warn");
         if explicit {
             command.arg("--home").arg(&checkout);
+        }
+        if plain {
+            command.arg("--plain");
         }
         let output = command.output().expect("run command should execute");
         let message = String::from_utf8_lossy(&output.stderr);

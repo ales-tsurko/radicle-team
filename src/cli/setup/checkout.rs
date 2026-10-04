@@ -1502,7 +1502,7 @@ mcp_allow = ["read"]
                 context.home.path().to_str().expect("member home path"),
             ])
             .expect("current provider command")
-            .execute()
+            .execute(None)
             .await
             .expect("print the configured provider without a subcommand");
             context

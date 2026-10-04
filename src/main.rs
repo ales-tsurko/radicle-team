@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use radicle_team::cli::Cli;
+use radicle_team::cli::{Cli, LogBuffer};
 
 use crate::logging::Logging;
 
@@ -27,13 +27,14 @@ fn main() -> ExitCode {
 
 async fn run() -> ExitCode {
     let cli = Cli::parse();
+    let logs = cli.interactive().then(LogBuffer::default);
 
-    if let Err(error) = Logging::init(cli.log_level()) {
+    if let Err(error) = Logging::init(cli.log_level(), logs.clone()) {
         eprintln!("failed to initialize logging: {error}");
         return ExitCode::FAILURE;
     }
 
-    match cli.execute().await {
+    match cli.execute(logs).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Error: {error}");

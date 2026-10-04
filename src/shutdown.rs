@@ -24,7 +24,7 @@ pub(crate) struct Shutdown {
 
 impl Shutdown {
     /// Installs the CLI signal handler.
-    pub(crate) fn install() -> Result<Self, ctrlc::Error> {
+    pub(crate) fn install(before_exit: Option<fn()>) -> Result<Self, ctrlc::Error> {
         let shutdown = Self {
             state: Arc::new(State {
                 runtime: Some(tokio::runtime::Handle::current()),
@@ -34,6 +34,9 @@ impl Shutdown {
         let handler = shutdown.clone();
         ctrlc::set_handler(move || {
             if !handler.request() {
+                if let Some(cleanup) = before_exit {
+                    cleanup();
+                }
                 std::process::exit(1);
             }
         })?;
@@ -84,7 +87,7 @@ impl Shutdown {
     }
 
     /// Returns whether the signal was handled without immediate process termination.
-    fn request(&self) -> bool {
+    pub(crate) fn request(&self) -> bool {
         let repeated = self.state.requested.swap(true, Ordering::AcqRel);
         if repeated || self.shutdown_started() {
             return match self.kill_child() {

@@ -91,6 +91,33 @@ impl Inspection {
         if running { "running" } else { "interrupted" }
     }
 
+    pub(crate) fn role_state(&self, role: Role) -> &'static str {
+        let Some(status) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.roles.get(&role))
+        else {
+            return "not started";
+        };
+        if status.enabled == Some(false) {
+            return "disabled";
+        }
+        if status.activity.is_some() {
+            return if self.live && self.phase().active() {
+                "active"
+            } else {
+                "interrupted"
+            };
+        }
+        if status.enabled.is_none() {
+            "not started"
+        } else if self.live && self.phase().active() {
+            "idle"
+        } else {
+            "stopped"
+        }
+    }
+
     async fn stored(
         home: &MemberHome,
         repository: RepoId,

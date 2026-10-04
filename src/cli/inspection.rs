@@ -242,11 +242,7 @@ impl View {
             return vec![Self::role_header(role, "disabled")];
         }
         if let Some(activity) = &status.activity {
-            let state = if self.0.live && self.0.phase().active() {
-                "active"
-            } else {
-                "interrupted"
-            };
+            let state = self.0.role_state(role);
             let mut lines = vec![Self::role_header(role, state)];
             if let Some(id) = activity.task {
                 let brief = self
@@ -283,14 +279,7 @@ impl View {
             lines.push(String::new());
             lines
         } else {
-            let state = if status.enabled.is_none() {
-                "not started"
-            } else if self.0.live && self.0.phase().active() {
-                "idle"
-            } else {
-                "stopped"
-            };
-            vec![Self::role_header(role, state)]
+            vec![Self::role_header(role, self.0.role_state(role))]
         }
     }
 

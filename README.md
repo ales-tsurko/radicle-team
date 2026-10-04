@@ -44,6 +44,10 @@ rad-team setup nico --repo rad:... --home ../nico
 rad-team run --home ../nico
 ```
 
+`run` opens a live dashboard with status, task and notification queues, and
+scrollable logs. Use `--plain` for log output. Redirected output selects it
+automatically. `Tab` switches panels, `Enter` opens details, and `?` shows keys.
+
 Replace `rad:...` with your repository ID and follow the setup prompts.
 
 

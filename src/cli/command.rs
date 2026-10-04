@@ -1,6 +1,9 @@
 //! Argument parsing and command dispatch.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::IsTerminal as _,
+    path::{Path, PathBuf},
+};
 
 use clap::{Args, Parser, Subcommand};
 use radicle::{
@@ -12,6 +15,7 @@ use tracing::level_filters::LevelFilter;
 use crate::{
     Application,
     cli::{
+        dashboard::{Dashboard, LogBuffer, Terminal},
         inspection, provider as provider_command,
         setup::{Error as SetupError, SetupWizard},
     },
@@ -43,6 +47,15 @@ impl Cli {
     #[must_use]
     pub const fn log_level(&self) -> Option<LevelFilter> {
         self.log
+    }
+
+    /// Returns whether `run` should use the live dashboard on this terminal.
+    #[must_use]
+    pub fn interactive(&self) -> bool {
+        matches!(&self.command, Command::Run(options) if !options.plain)
+            && std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && std::env::var_os("TERM").is_none_or(|term| term != "dumb")
     }
 
     /// Returns the requested operation.
@@ -120,7 +133,8 @@ impl Cli {
                 options.member,
                 options.repo.ok_or(Error::RepositoryRequired)?,
             ),
-            Command::Run(mut options) => {
+            Command::Run(mut run) => {
+                let options = &mut run.options;
                 let home = match &options.home {
                     Some(path) => MemberHome::at(path),
                     None => MemberHome::discover()?,
@@ -131,7 +145,7 @@ impl Cli {
                     .repository()?
                     .ok_or_else(|| Error::UnboundIdentity(home.path().into()))?;
                 options.home = Some(home.path().into());
-                options.application(member, repository)
+                run.options.application(member, repository)
             }
             Command::Provider(_) | Command::Status(_) | Command::Task(_) | Command::Inbox(_) => {
                 Err(Error::NotAMemberCommand)
@@ -144,7 +158,7 @@ impl Cli {
     /// # Errors
     ///
     /// Returns an error when setup or member execution fails.
-    pub async fn execute(self) -> Result<(), Error> {
+    pub async fn execute(self, logs: Option<LogBuffer>) -> Result<(), Error> {
         match self.command {
             Command::Inbox(options) => options.execute().await.map_err(Error::from),
             Command::Status(options) => {
@@ -185,7 +199,7 @@ impl Cli {
                         command,
                         log: self.log,
                     }
-                    .run_member(),
+                    .run_member(logs),
                 )
                 .await
             }
@@ -193,9 +207,9 @@ impl Cli {
     }
 
     // Runs the commands which need a member identity and a repository.
-    async fn run_member(self) -> Result<(), Error> {
+    async fn run_member(self, logs: Option<LogBuffer>) -> Result<(), Error> {
         let prepare = self.mode() == Mode::Setup;
-        let shutdown = Shutdown::install()?;
+        let shutdown = Shutdown::install(logs.as_ref().map(|_| Terminal::restore as fn()))?;
         if let Command::Setup(options) = &self.command
             && options.identity_only
         {
@@ -214,7 +228,7 @@ impl Cli {
             println!("{member} identity: {did}");
             return Ok(());
         }
-        let application = self.application()?.with_shutdown(shutdown);
+        let application = self.application()?.with_shutdown(shutdown.clone());
         if prepare {
             return SetupWizard::new(application)
                 .run()
@@ -222,6 +236,11 @@ impl Cli {
                 .map_err(Error::from);
         }
 
+        if let Some(logs) = logs {
+            return Dashboard::run(application, shutdown, logs)
+                .await
+                .map_err(Error::from);
+        }
         Box::pin(application.run()).await.map_err(Error::from)
     }
 
@@ -233,6 +252,9 @@ impl Cli {
 /// Error executing a CLI command.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Presenting the live terminal dashboard failed.
+    #[error(transparent)]
+    Dashboard(Box<crate::cli::dashboard::Error>),
     /// Reading local runtime status or tasks failed.
     #[error(transparent)]
     Inspection(#[from] crate::status::Error),
@@ -271,6 +293,12 @@ pub enum Error {
         "member home '{0}' has no repository binding; complete setup with --repo and --home first"
     )]
     UnboundIdentity(PathBuf),
+}
+
+impl From<crate::cli::dashboard::Error> for Error {
+    fn from(error: crate::cli::dashboard::Error) -> Self {
+        Self::Dashboard(Box::new(error))
+    }
 }
 
 impl From<crate::cli::inbox::Error> for Error {
@@ -319,7 +347,7 @@ enum Command {
     /// Prepare a member identity and repository.
     Setup(SetupOptions),
     /// Run the member configured in the current directory or --home.
-    Run(Options),
+    Run(RunOptions),
     /// Show the configured provider or manage this member's providers.
     Provider(ProviderOptions),
     /// Show this member's runtime, role activity, and queue length.
@@ -334,10 +362,19 @@ impl Command {
     const fn options(&self) -> Option<&Options> {
         match self {
             Self::Setup(options) => Some(&options.options),
-            Self::Run(options) => Some(options),
+            Self::Run(options) => Some(&options.options),
             Self::Provider(_) | Self::Status(_) | Self::Task(_) | Self::Inbox(_) => None,
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct RunOptions {
+    #[command(flatten)]
+    options: Options,
+    /// Print logs instead of the live dashboard; automatic when output is redirected.
+    #[arg(long)]
+    plain: bool,
 }
 
 #[derive(Debug, Args)]
@@ -475,6 +512,19 @@ mod tests {
     };
 
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
+
+    #[test]
+    fn plain_logs_are_specific_to_run_and_disable_the_dashboard() {
+        let cli = Cli::try_parse_from(["rad-team", "run", "--plain", "--log", "info"])
+            .expect("plain run");
+        assert!(!cli.interactive());
+        assert_eq!(cli.log_level(), Some(LevelFilter::INFO));
+        assert!(matches!(cli.command, super::Command::Run(options) if options.plain));
+        let error =
+            Cli::try_parse_from(["rad-team", "setup", "nico", "--identity-only", "--plain"])
+                .expect_err("plain is only a run option");
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
 
     #[test]
     fn log_level_is_optional_global_and_validated() {
