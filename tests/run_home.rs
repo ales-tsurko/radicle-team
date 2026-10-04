@@ -106,3 +106,41 @@ fn run_refuses_an_ordinary_checkout_without_creating_member_data() {
     }
     assert!(!MemberHome::at(checkout).code().exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn log_timestamps_follow_the_process_timezone_and_include_its_offset() {
+    let root = tempfile::tempdir().expect("temporary directory");
+    let home = MemberHome::at(root.path().join("maya"));
+    home.create().expect("create member directory");
+    home.record(
+        Member::Maya,
+        "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc".parse().expect("RID"),
+    )
+    .expect("record binding");
+    std::fs::create_dir_all(home.identity()).expect("identity directory");
+    std::fs::write(home.identity().join("config.json"), "{}").expect("partial identity fixture");
+    for (timezone, offset) in [("Etc/UTC", "+00:00"), ("Etc/GMT-3", "+03:00")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rad-team"))
+            .args(["run", "--plain", "--log", "info", "--home"])
+            .arg(home.path())
+            .env("TZ", timezone)
+            .env("NO_COLOR", "1")
+            .env("PATH", root.path().join("no-executables"))
+            .env_remove("RADICLE_TEAM_HOME")
+            .env_remove("RAD_PASSPHRASE")
+            .output()
+            .expect("run fixture");
+        assert!(
+            !output.status.success(),
+            "partial identity must stop startup"
+        );
+        let logs = String::from_utf8(output.stdout).expect("UTF-8 logs");
+        let timestamp = logs.split_whitespace().next().expect("startup timestamp");
+        assert!(
+            timestamp.contains('T') && timestamp.ends_with(offset),
+            "{timezone}: {logs}"
+        );
+        assert!(logs.contains("Unlocking identity"), "{logs}");
+    }
+}

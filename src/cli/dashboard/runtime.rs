@@ -2,7 +2,7 @@
 
 use std::{io, path::PathBuf, time::Duration};
 
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind};
 use futures_util::{Stream, StreamExt as _};
 use ratatui::backend::Backend;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -67,13 +67,15 @@ impl Dashboard {
             tokio::select! {
                 event = events.next() => {
                     let event = event.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "terminal input closed"))??;
-                    if let Event::Key(key) = event
-                        && key.kind != KeyEventKind::Release
-                        && screen.key(key)
-                        && !screen.stopping
-                    {
-                        screen.stopping = true;
-                        let _handled = shutdown.request();
+                    match event {
+                        Event::Key(key) if key.kind != KeyEventKind::Release => {
+                            if screen.key(key) && !screen.stopping {
+                                screen.stopping = true;
+                                let _handled = shutdown.request();
+                            }
+                        }
+                        Event::Mouse(mouse) => screen.mouse(mouse),
+                        _ => {}
                     }
                 }
                 update = updates.recv() => {
@@ -99,7 +101,16 @@ pub(crate) struct Terminal(ratatui::DefaultTerminal);
 impl Terminal {
     fn start() -> io::Result<Self> {
         match ratatui::try_init() {
-            Ok(terminal) => Ok(Self(terminal)),
+            Ok(terminal) => {
+                let terminal = Self(terminal);
+                crossterm::execute!(io::stdout(), EnableMouseCapture)?;
+                let hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    Self::restore();
+                    hook(info);
+                }));
+                Ok(terminal)
+            }
             Err(error) => {
                 Self::restore();
                 Err(error)
@@ -108,7 +119,8 @@ impl Terminal {
     }
 
     pub(crate) fn restore() {
-        let cursor = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
+        let cursor =
+            crossterm::execute!(io::stdout(), DisableMouseCapture, crossterm::cursor::Show);
         let screen = ratatui::try_restore();
         for result in [cursor, screen] {
             if let Err(error) = result {

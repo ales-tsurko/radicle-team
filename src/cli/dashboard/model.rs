@@ -1,9 +1,12 @@
-//! Keyboard navigation over the existing member inspection data.
+//! Keyboard and mouse navigation over the existing member inspection data.
 
 use std::{collections::BTreeMap, time::Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::widgets::ListState;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::{
+    layout::{Position, Rect},
+    widgets::ListState,
+};
 
 use crate::{
     cli::dashboard::logs::LogView,
@@ -28,6 +31,8 @@ pub(super) struct Screen {
     pub(super) refreshed: Instant,
     pub(super) refresh_error: Option<String>,
     pub(super) page: usize,
+    pub(super) areas: BTreeMap<Panel, Rect>,
+    pub(super) overlay: Option<Rect>,
     starting: bool,
 }
 
@@ -48,6 +53,8 @@ impl Screen {
             refreshed: Instant::now(),
             refresh_error: None,
             page: 1,
+            areas: Default::default(),
+            overlay: None,
             starting: true,
         };
         screen.sort_inbox();
@@ -214,6 +221,25 @@ impl Screen {
         }
         self.navigate(key.code);
         false
+    }
+
+    pub(super) fn mouse(&mut self, event: MouseEvent) {
+        let code = match event.kind {
+            MouseEventKind::ScrollUp => KeyCode::Up,
+            MouseEventKind::ScrollDown => KeyCode::Down,
+            _ => return,
+        };
+        let position = Position::new(event.column, event.row);
+        if let Some(area) = self.overlay {
+            if area.contains(position) {
+                self.scroll_detail(code);
+            }
+        } else if !self.editing
+            && let Some((&panel, _)) = self.areas.iter().find(|(_, area)| area.contains(position))
+        {
+            self.focus = panel;
+            self.scroll_panel(code);
+        }
     }
 
     fn navigate(&mut self, code: KeyCode) {

@@ -500,8 +500,9 @@ clears the filter or closes details. `?` shows keyboard help.
 
 In logs, `↑` and `↓` scroll one line, `PgUp` and `PgDn` scroll one page, and
 `Home` jumps to the oldest retained entry. Scrolling pauses following and shows
-the number of new entries. `End` follows the newest entries; `Space` toggles
-following. The dashboard retains the latest 2,000 log lines.
+the number of new entries. `End` follows the newest entries. `Space` toggles
+following. A mouse wheel or touchpad scrolls the panel under the pointer. The
+dashboard retains the latest 2,000 log lines and colors them by severity.
 
 `q` or `Ctrl+C` gracefully stops the member. The dashboard remains visible
 during shutdown and restores the terminal on exit. Use plain logs for a service
@@ -515,6 +516,10 @@ rad-team run --plain --log info
 Redirected output and terminals without interactive input use plain logs
 automatically. Logging still defaults to `warn`; `--log info` adds detail to
 either view. `NO_COLOR` disables dashboard colors.
+
+Log timestamps use the timezone of the machine running the member, with an
+explicit UTC offset. On Unix, `TZ` overrides that timezone. A server configured
+for UTC logs UTC. An SSH session uses the server's timezone.
 
 The process owns the member's node for its lifetime. If manifest approval is
 pending, it keeps synchronizing and waits for the canonical binding. Once

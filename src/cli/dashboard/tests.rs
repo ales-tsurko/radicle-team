@@ -3,8 +3,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{Terminal, backend::TestBackend};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::{Terminal, backend::TestBackend, style::Color};
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter as _;
 
@@ -303,6 +303,140 @@ fn log_bindings_scroll_lines_pages_and_resume_following() {
     assert!(screen.logs.following);
     Fixture::key(&mut screen, KeyCode::Char('x'));
     assert!(screen.logs.following, "unbound keys must not pause logs");
+}
+
+#[test]
+fn wheel_scrolling_targets_visible_panels_and_preserves_paused_logs() {
+    let mut screen = Screen::new(Fixture::inspection());
+    screen.logs.extend(Fixture::logs(40));
+    let _view = Fixture::render(&mut screen, 120, 32);
+    let logs = *screen.areas.get(&Panel::Logs).expect("log area");
+    let before = screen.logs.start(&screen.logs.visible());
+    let mut wheel = MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: logs.x + 1,
+        row: logs.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    screen.mouse(wheel);
+    assert_eq!(screen.focus, Panel::Logs);
+    assert!(!screen.logs.following);
+    assert_eq!(screen.logs.start(&screen.logs.visible()), before - 1);
+    screen.logs.extend(vec![LogLine {
+        id: 41,
+        level: Level::INFO,
+        text: "new entry during wheel scrolling".to_owned(),
+    }]);
+    assert_eq!(screen.logs.start(&screen.logs.visible()), before - 1);
+    assert_eq!(screen.logs.unseen(), 1);
+    wheel.kind = MouseEventKind::ScrollDown;
+    screen.mouse(wheel);
+    assert_eq!(screen.logs.start(&screen.logs.visible()), before);
+    wheel.kind = MouseEventKind::Down(MouseButton::Left);
+    screen.mouse(wheel);
+    assert_eq!(screen.logs.start(&screen.logs.visible()), before);
+
+    let tasks = *screen.areas.get(&Panel::Tasks).expect("task area");
+    wheel.kind = MouseEventKind::ScrollDown;
+    wheel.column = tasks.x + 1;
+    wheel.row = tasks.y + 1;
+    screen.mouse(wheel);
+    assert_eq!(screen.focus, Panel::Tasks);
+    assert_eq!(screen.tasks.id.as_deref(), Some("3"));
+    let _view = Fixture::render(&mut screen, 76, 20);
+    assert_eq!(
+        screen.areas.keys().copied().collect::<Vec<_>>(),
+        [Panel::Tasks]
+    );
+    let tasks = *screen.areas.get(&Panel::Tasks).expect("compact task area");
+    wheel.column = tasks.x + 1;
+    wheel.row = tasks.y + 1;
+    screen.mouse(wheel);
+    assert_eq!(screen.tasks.id.as_deref(), Some("4"));
+    assert_eq!(screen.logs.start(&screen.logs.visible()), before);
+
+    let (task, _) = screen.data.tasks.last_mut().expect("selected task");
+    task.context.notes = (0..40).map(|line| format!("Context line {line}")).collect();
+    Fixture::key(&mut screen, KeyCode::Enter);
+    let _view = Fixture::render(&mut screen, 76, 20);
+    let overlay = screen.overlay.expect("detail area");
+    wheel.column = overlay.x + 1;
+    wheel.row = overlay.y + 1;
+    screen.mouse(wheel);
+    assert_eq!(screen.detail_scroll, 1);
+    wheel.column = 0;
+    wheel.row = 0;
+    screen.mouse(wheel);
+    assert_eq!(screen.detail_scroll, 1, "wheel outside details is ignored");
+    Fixture::key(&mut screen, KeyCode::Esc);
+    Fixture::key(&mut screen, KeyCode::Char('/'));
+    let _view = Fixture::render(&mut screen, 76, 20);
+    wheel.column = tasks.x + 1;
+    wheel.row = tasks.y + 1;
+    wheel.kind = MouseEventKind::ScrollUp;
+    screen.mouse(wheel);
+    assert_eq!(
+        screen.tasks.id.as_deref(),
+        Some("4"),
+        "filter editing keeps its selection"
+    );
+}
+
+#[test]
+fn captured_log_severities_have_visible_colors_including_info() {
+    let logs = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_max_level(Level::TRACE)
+        .with_writer(logs.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::error!("error entry");
+        tracing::warn!("warn entry");
+        tracing::info!("info entry");
+        tracing::debug!("debug entry");
+        tracing::trace!("trace entry");
+    });
+    let mut screen = Screen::new(Fixture::inspection());
+    screen.focus = Panel::Logs;
+    screen.logs.extend(logs.since(0));
+    let mut terminal = Terminal::new(TestBackend::new(76, 20)).expect("test terminal");
+    terminal
+        .draw(|frame| View::new(&mut screen).draw(frame))
+        .expect("draw colored logs");
+    let colors = std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
+    for (message, expected) in [
+        ("error entry", Color::Red),
+        ("warn entry", Color::Yellow),
+        ("info entry", Color::Green),
+        ("debug entry", Color::Blue),
+        ("trace entry", Color::Magenta),
+    ] {
+        let row = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(76)
+            .find(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains(message)
+            })
+            .expect("rendered log entry");
+        let actual = row
+            .iter()
+            .find(|cell| cell.symbol() == "e")
+            .expect("entry text")
+            .fg;
+        assert_eq!(
+            actual,
+            if colors { expected } else { Color::Reset },
+            "{message}"
+        );
+    }
 }
 
 #[test]
@@ -611,6 +745,7 @@ async fn dashboard_keeps_updating_during_paused_logs_and_shutdown() {
     terminal
         .draw(|frame| View::new(&mut screen).draw(frame))
         .expect("initial frame");
+    let log_area = *screen.areas.get(&Panel::Logs).expect("log area");
     let shutdown = Shutdown::default();
     let (updates, mut receiver) = tokio::sync::mpsc::channel(2);
     updates
@@ -633,12 +768,14 @@ async fn dashboard_keeps_updating_during_paused_logs_and_shutdown() {
     ))))
     .await
     .expect("focus logs");
-    keys.send(Ok(Event::Key(KeyEvent::new(
-        KeyCode::PageUp,
-        KeyModifiers::NONE,
-    ))))
+    keys.send(Ok(Event::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: log_area.x + 1,
+        row: log_area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })))
     .await
-    .expect("scroll logs");
+    .expect("wheel scroll logs");
     let extra_logs = logs.clone();
     let arrival = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(120)).await;

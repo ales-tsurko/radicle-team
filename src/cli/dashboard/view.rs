@@ -33,6 +33,8 @@ impl<'a> View<'a> {
     }
 
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>) {
+        self.screen.areas.clear();
+        self.screen.overlay = None;
         let area = frame.area();
         let narrow = area.width < 100 || area.height < 24;
         let [header, body, footer] = Layout::vertical([
@@ -123,6 +125,9 @@ impl<'a> View<'a> {
         let [tasks, inbox] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(queues);
+        self.screen
+            .areas
+            .extend(Panel::ALL.into_iter().zip([status, tasks, inbox, logs]));
         self.status(frame, status);
         self.queue(frame, tasks, Panel::Tasks);
         self.queue(frame, inbox, Panel::Inbox);
@@ -132,6 +137,7 @@ impl<'a> View<'a> {
     fn compact(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let [tabs, body] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        self.screen.areas.insert(self.screen.focus, body);
         let labels = Panel::ALL.map(|panel| {
             let suffix = match panel {
                 Panel::Tasks => format!(" ({})", self.screen.data.tasks.len()),
@@ -411,6 +417,7 @@ impl<'a> View<'a> {
             width,
             height,
         );
+        self.screen.overlay = Some(popup);
         self.screen.page = usize::from(height.saturating_sub(2)).max(1);
         let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
         let maximum = paragraph
@@ -584,7 +591,7 @@ impl<'a> View<'a> {
     }
 
     fn help() -> String {
-        "Tab / Shift+Tab    Next / previous panel\ns / t / i / l      Status / tasks / inbox / logs\n↑↓ or j/k          Select a row or scroll a line\nPgUp / PgDn        Scroll one page\nHome / End         First / last row\nEnter              Inspect selected task, notification, or status\n/                  Filter the focused list or logs\nEsc                Clear filter or close details\n\nLogs\nHome               Oldest retained entry\nEnd                Latest entry and resume following\nSpace              Pause / resume following\nScrolling          Pause following; new entries remain buffered\n\n?                  Show / close this help\nq / Ctrl+C         Gracefully stop the member\n\nStatus, tasks, and inbox refresh every second.\nLogs retain the latest 2,000 lines."
+        "Tab / Shift+Tab    Next / previous panel\ns / t / i / l      Status / tasks / inbox / logs\n↑↓ or j/k          Select a row or scroll a line\nWheel / touchpad   Scroll the panel under the pointer\nPgUp / PgDn        Scroll one page\nHome / End         First / last row\nEnter              Inspect selected task, notification, or status\n/                  Filter the focused list or logs\nEsc                Clear filter or close details\n\nLogs\nHome               Oldest retained entry\nEnd                Latest entry and resume following\nSpace              Pause / resume following\nScrolling          Pause following; new entries remain buffered\n\n?                  Show / close this help\nq / Ctrl+C         Gracefully stop the member\n\nStatus, tasks, and inbox refresh every second.\nLogs retain the latest 2,000 lines."
             .to_owned()
     }
 
@@ -675,8 +682,9 @@ impl Theme {
         match level {
             tracing::Level::ERROR => self.color(Color::Red),
             tracing::Level::WARN => self.color(Color::Yellow),
-            tracing::Level::DEBUG | tracing::Level::TRACE => self.dim(),
-            tracing::Level::INFO => Style::new(),
+            tracing::Level::INFO => self.color(Color::Green),
+            tracing::Level::DEBUG => self.color(Color::Blue),
+            tracing::Level::TRACE => self.color(Color::Magenta).dim(),
         }
     }
 
