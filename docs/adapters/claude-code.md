@@ -74,7 +74,7 @@ Two files per role, both rewritten every time the role starts:
 - `mcp.json` in the role's harness folder, naming the one MCP server the member
   reaches. Its tools appear to the model prefixed with the server's name, so the
   reply tool for chat is `mcp__radicle__reply_chat`.
-- `instructions/ALL.md` inside the role's instructions directory — the six
+- `instructions/ALL.md` inside the role's instructions directory — the standing
   documents instructing the member combined into the single standing prompt one
   delivery takes, in the order the documents themselves establish. It lives
   beside them because that directory is the one thing in the harness home the

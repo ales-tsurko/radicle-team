@@ -18,8 +18,7 @@ use radicle::{
 };
 
 use crate::{
-    agent,
-    conversation::{self, Triggers},
+    conversation::Triggers,
     manifest::{PriorityLabels, QueuePosition, RepositoryPolicy},
     member::Member,
     queue::TaskQueue,
@@ -128,8 +127,11 @@ impl Watcher {
                 updates.borrow_and_update();
                 self.scan_all(storage, member_id, state, delivery, mode)
                     .await?;
-                if updates.changed().await.is_err() {
-                    return Err::<(), Error>(Error::EventStreamClosed);
+                tokio::select! {
+                    updated = updates.changed() => if updated.is_err() {
+                        return Err::<(), Error>(Error::EventStreamClosed);
+                    },
+                    () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
                 }
             }
         };
@@ -369,6 +371,23 @@ impl Watcher {
             scope.subject,
             triggers,
         );
+        for (activity, reason) in context.take_ignored() {
+            let historical =
+                matches!(mode, ScanMode::Conversations(started) if operation.timestamp < started);
+            if mode.accepts(activity.kind)
+                && !historical
+                && !state
+                    .contains(
+                        scope.repository,
+                        scope.object,
+                        operation.id,
+                        activity.action,
+                    )
+                    .await?
+            {
+                pending.ignored.push((activity, reason));
+            }
+        }
         if matches!(mode, ScanMode::Conversations(started) if operation.timestamp < started) {
             // The cutoff comes from node startup, not the time this scan encounters an operation.
             // Apply it on every rescan, including history fetched after initialization. Record
@@ -420,7 +439,7 @@ pub(crate) struct DeliveryRuntime {
     storage: Storage,
     queue: TaskQueue,
     priority: PriorityLabels,
-    conversations: conversation::Handle,
+    inbox: crate::delivery::Inbox,
 }
 
 impl DeliveryRuntime {
@@ -429,13 +448,13 @@ impl DeliveryRuntime {
         storage: Storage,
         queue: TaskQueue,
         priority: PriorityLabels,
-        conversations: conversation::Handle,
+        inbox: crate::delivery::Inbox,
     ) -> Self {
         Self {
             storage,
             queue,
             priority,
-            conversations,
+            inbox,
         }
     }
 
@@ -476,6 +495,56 @@ impl DeliveryRuntime {
         })
         .await
         .map_err(|error| Error::Task(error.to_string()))?
+    }
+
+    async fn admit(
+        &self,
+        activity: Activity,
+        assigned: bool,
+        scope: ScanScope,
+        state: &ProcessedActivities,
+    ) -> Result<(), Error> {
+        let identity = activity.delivery_id();
+        match activity.kind {
+            Kind::Assigned if assigned && scope.state.actionable() => {
+                self.enqueue(activity, scope).await?;
+            }
+            Kind::Delivered(delivery) if !scope.state.defers(delivery) => {
+                self.inbox.enqueue(activity, None).await?;
+            }
+            _ => {}
+        }
+        PendingActivities::record_delivery(identity, scope, state).await
+    }
+
+    // Records an assignment and its receipt atomically without waiting for the conversation.
+    async fn enqueue(&self, activity: Activity, scope: ScanScope) -> Result<(), Error> {
+        let subject = activity.subject;
+        let assignment = self.assignment(scope.repository, subject).await?;
+        let position = assignment.position;
+        let mut request =
+            crate::queue::TaskRequest::new(assignment.brief, subject.into(), position);
+        request.request = Some(crate::agent::ActivityId::from(activity.delivery_id()).request());
+        request
+            .context
+            .messages
+            .push(crate::queue::MessageReference {
+                subject: subject.to_string(),
+                entry: activity.operation.to_string(),
+                revision: None,
+                purpose: "Original assignment".to_owned(),
+            });
+        let receipt = self.queue.push_assignment(request, activity).await?;
+        self.inbox.wake();
+        tracing::info!(
+            member = %scope.member,
+            repository = %scope.repository,
+            %subject,
+            task = receipt.task,
+            ?position,
+            "assignment recorded as queued work"
+        );
+        Ok(())
     }
 }
 
@@ -633,8 +702,9 @@ impl ScanScope {
 #[derive(Default)]
 struct PendingActivities {
     assignment: Option<Activity>,
+    ignored: Vec<(Activity, crate::conversation::AdmissionError)>,
     skipped: Vec<Activity>,
-    activities: Vec<(Activity, Delivery)>,
+    activities: Vec<Activity>,
 }
 
 impl PendingActivities {
@@ -645,7 +715,7 @@ impl PendingActivities {
                     self.skipped.push(superseded);
                 }
             }
-            Kind::Delivered(delivery) => self.activities.push((activity, delivery)),
+            Kind::Delivered(_) => self.activities.push(activity),
         }
     }
 
@@ -656,76 +726,21 @@ impl PendingActivities {
         state: &ProcessedActivities,
         runtime: &DeliveryRuntime,
     ) -> Result<(), Error> {
+        for (activity, reason) in self.ignored {
+            tracing::info!(operation = %activity.operation, %reason, "ignored new relevant activity");
+            runtime
+                .inbox
+                .ignore(activity.clone(), reason.to_string())
+                .await?;
+            Self::record_delivery(activity.delivery_id(), scope, state).await?;
+        }
         for activity in self.skipped {
             Self::record_delivery(activity.delivery_id(), scope, state).await?;
         }
-        if let Some(activity) = self.assignment {
-            if assigned && scope.state.actionable() {
-                Self::enqueue(activity, scope, state, runtime).await?;
-            } else {
-                Self::record_delivery(activity.delivery_id(), scope, state).await?;
-            }
-        }
-        for (activity, delivery) in self.activities {
-            if scope.state.defers(delivery) {
-                Self::record_delivery(activity.delivery_id(), scope, state).await?;
-            } else {
-                Self::deliver(activity, delivery, scope, state, runtime).await?;
-            }
+        for activity in self.assignment.into_iter().chain(self.activities) {
+            runtime.admit(activity, assigned, scope, state).await?;
         }
         Ok(())
-    }
-
-    // Records an assignment as queued work rather than handing it to the conversation.
-    async fn enqueue(
-        activity: Activity,
-        scope: ScanScope,
-        state: &ProcessedActivities,
-        runtime: &DeliveryRuntime,
-    ) -> Result<(), Error> {
-        let subject = activity.subject;
-        let assignment = runtime.assignment(scope.repository, subject).await?;
-        let position = assignment.position;
-        let mut request =
-            crate::queue::TaskRequest::new(assignment.brief, subject.into(), position);
-        request.request = Some(crate::agent::ActivityId::from(activity.delivery_id()).request());
-        request
-            .context
-            .messages
-            .push(crate::queue::MessageReference {
-                subject: subject.to_string(),
-                entry: activity.operation.to_string(),
-                revision: None,
-                purpose: "Original assignment".to_owned(),
-            });
-        let receipt = runtime.queue.push(request).await?;
-        tracing::info!(
-            member = %scope.member,
-            repository = %scope.repository,
-            %subject,
-            task = receipt.task,
-            ?position,
-            "assignment recorded as queued work"
-        );
-        // Assignments do not publish under a talker delivery identity, so acknowledging the
-        // durable task must not wait behind a conversation.
-        Self::record_delivery(activity.delivery_id(), scope, state).await
-    }
-
-    async fn deliver(
-        activity: Activity,
-        delivery: Delivery,
-        scope: ScanScope,
-        state: &ProcessedActivities,
-        runtime: &DeliveryRuntime,
-    ) -> Result<(), Error> {
-        let identity = activity.delivery_id();
-        runtime
-            .conversations
-            .deliver(activity, delivery)
-            .await
-            .map_err(Error::from)?;
-        Self::record_delivery(identity, scope, state).await
     }
 
     async fn record_delivery(
@@ -757,6 +772,9 @@ fn send_history<A>(
 /// Error produced by the Radicle watcher.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Persisting notification admission failed.
+    #[error("delivery inbox error: {0}")]
+    Inbox(#[from] crate::delivery::Error),
     /// Communicating with the Radicle node failed.
     #[error("Radicle node error: {0}")]
     Node(#[from] radicle::node::Error),
@@ -789,27 +807,9 @@ pub enum Error {
     /// An assignment names an issue or patch the repository does not contain.
     #[error("assigned {0} was not found")]
     SubjectMissing(Subject),
-    /// An agent adapter failed while handling classified activity.
-    #[error(transparent)]
-    Talker(#[from] agent::Error),
     /// Preparing the local watcher database failed.
     #[error("watcher state I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// Preparing or cleaning the agent workspace failed.
-    #[error("agent workspace failed: {0}")]
-    Workspace(String),
-    /// Activating the activity-scoped MCP capability failed.
-    #[error("activity scope failed: {0}")]
-    ActivityScope(String),
-    /// Recovering durable MCP publications before checkpointing failed.
-    #[error("MCP publication recovery failed: {0}")]
-    PublicationRecovery(String),
-    /// The conversation dispatcher stopped accepting deliveries.
-    #[error("conversation dispatcher is not running")]
-    ConversationUnavailable,
-    /// The agent stopped making progress and was killed.
-    #[error("agent was killed after making no progress")]
-    Stalled,
     /// The node closed its event stream.
     #[error("Radicle node closed its event stream")]
     EventStreamClosed,
@@ -827,19 +827,6 @@ pub enum Error {
 impl From<crate::database::Error> for Error {
     fn from(error: crate::database::Error) -> Self {
         Self::Database(error.to_string())
-    }
-}
-
-impl From<conversation::Error> for Error {
-    fn from(error: conversation::Error) -> Self {
-        match error {
-            conversation::Error::Talker(error) => Self::Talker(error),
-            conversation::Error::Workspace(error) => Self::Workspace(error),
-            conversation::Error::ActivityScope(error) => Self::ActivityScope(error),
-            conversation::Error::PublicationRecovery(error) => Self::PublicationRecovery(error),
-            conversation::Error::Unavailable => Self::ConversationUnavailable,
-            conversation::Error::Stalled => Self::Stalled,
-        }
     }
 }
 
@@ -929,7 +916,8 @@ mod tests {
         let queue = TaskQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open");
-        let (conversations, dispatcher) = Dispatcher::new(
+        let inbox = queue.inbox().await.expect("inbox should open");
+        let dispatcher = Dispatcher::new(
             Member::Nico,
             Workspaces::new(
                 Member::Nico,
@@ -940,12 +928,13 @@ mod tests {
                 queue.clone(),
             ),
             crate::mcp::ActivityScope::default(),
+            inbox.clone(),
         );
         let runtime = DeliveryRuntime::new(
             profile.storage.clone(),
             queue.clone(),
             PriorityLabels::default(),
-            conversations,
+            inbox.clone(),
         );
 
         dispatch_pending(pending, false, scope, &state, &runtime, dispatcher, false)
@@ -1039,7 +1028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoints_a_delivery_only_after_the_dispatcher_handles_it() {
+    async fn checkpoints_durable_admission_without_waiting_for_the_dispatcher() {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let (profile, repository, issue) = assigned_issue(root.path(), &[]);
         let operation = EntryId::from_str("2222222222222222222222222222222222222222")
@@ -1073,17 +1062,19 @@ mod tests {
             .initialize()
             .await
             .expect("working copies should be prepared");
+        let inbox = queue.inbox().await.expect("inbox should open");
         let delivery = || {
-            let (conversations, dispatcher) = Dispatcher::new(
+            let dispatcher = Dispatcher::new(
                 Member::Nico,
                 workspaces.clone(),
                 crate::mcp::ActivityScope::default(),
+                inbox.clone(),
             );
             let runtime = DeliveryRuntime::new(
                 profile.storage.clone(),
                 queue.clone(),
                 PriorityLabels::default(),
-                conversations,
+                inbox.clone(),
             );
             (runtime, dispatcher)
         };
@@ -1099,30 +1090,26 @@ mod tests {
             SubjectState::Open,
         );
 
-        let (runtime, dispatcher) = delivery();
-        let failed =
-            dispatch_pending(pending(), false, scope, &state, &runtime, dispatcher, true).await;
-        assert!(matches!(failed, Err(super::Error::Talker(_))));
-        assert!(
-            !state
-                .contains(repository, issue, operation, 0)
-                .await
-                .expect("state should be readable"),
-            "a failed delivery must remain available for retry"
-        );
-
-        let (runtime, dispatcher) = delivery();
-        dispatch_pending(pending(), false, scope, &state, &runtime, dispatcher, false)
+        let (runtime, _dispatcher) = delivery();
+        pending()
+            .dispatch(false, scope, &state, &runtime)
             .await
-            .expect("delivery should be handled");
-
+            .expect("admission should persist");
         assert!(
             state
                 .contains(repository, issue, operation, 0)
                 .await
-                .expect("state should be readable"),
-            "the watcher must checkpoint the delivery after the dispatcher acknowledges it"
+                .expect("checkpoint should read")
         );
+        let records = inbox.list().await.expect("inbox should read");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, crate::delivery::State::Queued);
+        // Rescanning cannot repeat admission or bypass the unfinished delivery.
+        pending()
+            .dispatch(false, scope, &state, &runtime)
+            .await
+            .expect("duplicate should deduplicate");
+        assert_eq!(inbox.list().await.expect("inbox should read").len(), 1);
     }
 
     async fn enqueue_assignment(labels: &[Label]) -> (TaskQueue, tempfile::TempDir) {
@@ -1142,7 +1129,8 @@ mod tests {
         let queue = TaskQueue::memory(repository, Member::Nico)
             .await
             .expect("queue should open");
-        let (conversations, dispatcher) = Dispatcher::new(
+        let inbox = queue.inbox().await.expect("inbox should open");
+        let dispatcher = Dispatcher::new(
             Member::Nico,
             Workspaces::new(
                 Member::Nico,
@@ -1153,12 +1141,13 @@ mod tests {
                 queue.clone(),
             ),
             crate::mcp::ActivityScope::default(),
+            inbox.clone(),
         );
         let runtime = DeliveryRuntime::new(
             profile.storage.clone(),
             queue.clone(),
             PriorityLabels::default(),
-            conversations,
+            inbox.clone(),
         );
         let state = ProcessedActivities::memory()
             .await
@@ -1262,16 +1251,18 @@ mod tests {
                 .initialize()
                 .await
                 .expect("working copies should be prepared");
-            let (conversations, dispatcher) = Dispatcher::new(
+            let inbox = queue.inbox().await.expect("inbox should open");
+            let dispatcher = Dispatcher::new(
                 Member::Nico,
                 workspaces,
                 crate::mcp::ActivityScope::default(),
+                inbox.clone(),
             );
             let delivery = DeliveryRuntime::new(
                 profile.storage.clone(),
                 queue.clone(),
                 PriorityLabels::default(),
-                conversations,
+                inbox.clone(),
             );
             let watcher = Watcher::new(
                 Member::Nico,
@@ -1411,85 +1402,69 @@ mod tests {
             );
 
             assert!(
-                !fixture
+                fixture
                     .state
                     .contains(fixture.repository, fixture.issue, current, 0)
                     .await
-                    .expect("current checkpoint should be readable")
+                    .expect("admission should checkpoint")
             );
-
             let new_issue = fixture.create_assignment();
             let later = fixture.comment("@nico another question while you are busy");
             updates.send(()).expect("scanners should be notified");
             fixture.wait_for_tasks(2).await;
-            assert!(
-                !fixture
-                    .state
-                    .contains(fixture.repository, fixture.issue, later, 0)
+            let inbox = &fixture.delivery.inbox;
+            loop {
+                if inbox
+                    .list()
                     .await
-                    .expect("checkpoint should read"),
-                "receiving a message must not checkpoint it before the talker handles it"
-            );
-            let tasks = fixture
-                .queue
-                .pending()
-                .await
-                .expect("tasks should be readable");
-            assert!(
-                tasks
+                    .expect("inbox should read")
                     .iter()
-                    .any(|task| task.source == Subject::Issue(new_issue).into()
-                        && task.brief.contains("add, done, delete and edit"))
-            );
+                    .any(|record| {
+                        record.activity.operation == later
+                            && record.state == crate::delivery::State::Queued
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 1,
-                "the first reply must still be active"
+                "the active reply must not be interrupted"
             );
             assert!(
-                !fixture
-                    .state
-                    .contains(fixture.repository, fixture.issue, current, 0)
+                fixture
+                    .queue
+                    .pending()
                     .await
-                    .expect("a slow reply must remain unacknowledged")
+                    .expect("tasks should read")
+                    .iter()
+                    .any(|task| task.source == Subject::Issue(new_issue).into())
             );
-
             release.notify_one();
-            while !fixture
-                .state
-                .contains(fixture.repository, fixture.issue, current, 0)
-                .await
-                .expect("completed reply should be readable")
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
             reply_started.notified().await;
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 2,
-                "the later mention must run after the first reply finishes"
-            );
-            assert!(
-                !fixture
-                    .state
-                    .contains(fixture.repository, fixture.issue, later, 0)
-                    .await
-                    .expect("later reply checkpoint should be readable"),
-                "the second turn must also finish before its checkpoint is recorded"
+                "the queued reply must follow the active one"
             );
             release.notify_one();
-            while !fixture
-                .state
-                .contains(fixture.repository, fixture.issue, later, 0)
-                .await
-                .expect("later reply checkpoint should be readable")
-            {
+            loop {
+                let records = inbox.list().await.expect("inbox should read");
+                if records
+                    .iter()
+                    .filter(|record| record.task.is_none())
+                    .all(|record| record.state == crate::delivery::State::Handled)
+                {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 2,
-                "rescans must not start more than one reply per new mention"
+                "rescans must not repeat model handling"
             );
         };
         let watching = fixture.watcher.watch(
@@ -1506,13 +1481,108 @@ mod tests {
             tokio::select! {
                 () = exercise => Ok(()),
                 result = watching => result.and(Err(super::Error::EventStreamClosed)),
-                result = dispatching => Err(result.err().map(super::Error::from)
-                    .unwrap_or(super::Error::ConversationUnavailable)),
+                result = dispatching => panic!("dispatcher ended: {result:?}"),
             }
         })
         .await
         .expect("task discovery must not wait for the slow reply");
         outcome.expect("the watcher and dispatcher should stay running");
+    }
+
+    #[tokio::test]
+    async fn records_only_new_rejections_and_never_replays_them_after_access_changes() {
+        let fixture = RuntimeFixture::new().await;
+        let scope = ScanScope::new(
+            Member::Nico,
+            fixture.member_id,
+            fixture.repository,
+            fixture.issue,
+            Subject::Issue(fixture.issue),
+            SubjectState::Open,
+        );
+        let cutoff = Timestamp::from_secs(100);
+        let mut triggers = Triggers::new(TriggerAccess::Delegates, Vec::new(), Vec::new());
+        let operation = |id: &str, seconds| {
+            Op::new(
+                id.parse().expect("operation"),
+                (
+                    IssueAction::Comment {
+                        body: "@nico inspect this".into(),
+                        reply_to: None,
+                        embeds: Vec::new(),
+                    },
+                    Vec::new(),
+                ),
+                *fixture.profile.id(),
+                Timestamp::from_secs(seconds),
+                None,
+                Manifest::new(TYPENAME.clone(), Version::default()),
+            )
+        };
+        for scan in 0..3 {
+            let mut context = ClassificationContext::new(Limits::default());
+            let mut pending = PendingActivities::default();
+            for (id, seconds) in [
+                ("1111111111111111111111111111111111111111", 99),
+                ("2222222222222222222222222222222222222222", 101),
+            ] {
+                Watcher::scan_operation(
+                    operation(id, seconds),
+                    scope,
+                    &mut context,
+                    &mut pending,
+                    &fixture.state,
+                    &triggers,
+                    ScanMode::Conversations(cutoff),
+                )
+                .await
+                .expect("scan");
+            }
+            assert_eq!(pending.ignored.len(), usize::from(scan == 0));
+            assert!(
+                pending.activities.is_empty(),
+                "granting access cannot replay past messages"
+            );
+            pending
+                .dispatch(false, scope, &fixture.state, &fixture.delivery)
+                .await
+                .expect("checkpoint");
+            triggers.update_delegates(vec![fixture.profile.did()]);
+        }
+        let inbox = &fixture.delivery.inbox;
+        let records = inbox.list().await.expect("inbox");
+        assert_eq!(
+            records.len(),
+            1,
+            "historical rejection must not be reported"
+        );
+        assert_eq!(records[0].state, crate::delivery::State::Ignored);
+        assert!(
+            records[0]
+                .error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("author"))
+        );
+        let mut context = ClassificationContext::new(Limits::default());
+        let mut pending = PendingActivities::default();
+        Watcher::scan_operation(
+            operation("3333333333333333333333333333333333333333", 102),
+            scope,
+            &mut context,
+            &mut pending,
+            &fixture.state,
+            &triggers,
+            ScanMode::Conversations(cutoff),
+        )
+        .await
+        .expect("new authorized activity");
+        pending
+            .dispatch(false, scope, &fixture.state, &fixture.delivery)
+            .await
+            .expect("admit");
+        let records = inbox.list().await.expect("inbox");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].state, crate::delivery::State::Queued);
     }
 
     #[tokio::test]
@@ -1609,10 +1679,7 @@ mod tests {
         tokio::pin!(dispatching);
         tokio::select! {
             result = pending => result,
-            result = dispatching => match result {
-                Ok(()) => Err(super::Error::ConversationUnavailable),
-                Err(error) => Err(error.into()),
-            },
+            result = dispatching => panic!("dispatcher ended: {result:?}"),
         }
     }
 

@@ -61,6 +61,15 @@ operations created during initialization remain eligible. Restarts retain the
 cutoff and delivery checkpoints. Current open assignments still enter the task
 queue regardless of age.
 
+Notification admission and model execution are separate. The watcher saves a
+notification in the durable inbox and continues scanning while one talker turn
+runs. Reviews and direct addresses take priority over ambient changes; each
+priority retains arrival order. Assignment admission and its receipt share the
+task queue's transaction. Runtime reactions acknowledge admission without a
+model call. Signed `xyz.radicle.team.delivery` objects publish delivery state
+through Radicle replication, readable with `rad-team inbox --repo` commands. The
+runtime fetches periodically and rescans alongside node announcements.
+
 Agent integrations implement the provider-neutral
 [`Talker`](../src/agent/interface.rs), [`Chatter`](../src/agent/interface.rs),
 and [`Coder`](../src/agent/interface.rs) interfaces. The runtime calls `start`

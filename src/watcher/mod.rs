@@ -2,10 +2,11 @@
 //!
 //! A [`Watcher`] observes one repository as one [`Member`](crate::member::Member), classifies
 //! interactions requiring that member's attention, and emits deliveries to the member's serialized
-//! conversation dispatcher. The dispatcher invokes the `Talker` and acknowledges successful
-//! handling before the watcher checkpoints the activity. Assignments are the exception: they are
-//! work rather than conversation, so they join the member's [`TaskQueue`](crate::queue::TaskQueue)
-//! and reach the building role through [`Builder`](crate::builder::Builder).
+//! conversation dispatcher. Admission persists the notification before the watcher checkpoints it;
+//! the dispatcher invokes the `Talker` independently of scanning. Assignments are the exception:
+//! they are work rather than conversation, so they join the member's
+//! [`TaskQueue`](crate::queue::TaskQueue) and reach the building role through
+//! [`Builder`](crate::builder::Builder).
 //!
 //! # Lifecycle
 //!
@@ -25,7 +26,7 @@
 //! work.
 //!
 //! A slow conversation cannot hold up task discovery. Conversation handling remains serialized,
-//! and an unfinished delivery stays uncheckpointed so it can be retried after a restart.
+//! and unfinished deliveries stay in the durable inbox so they can be retried after a restart.
 //!
 //! # Classification architecture
 //!
@@ -54,7 +55,7 @@ pub use crate::watcher::{
     runtime::{Error, Watcher},
 };
 pub(crate) use crate::watcher::{
-    activity::{Activity, Delivery},
+    activity::{Activity, Delivery, Kind},
     runtime::DeliveryRuntime,
     state::ProcessedActivities,
 };

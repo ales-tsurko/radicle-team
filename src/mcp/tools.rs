@@ -551,7 +551,7 @@ impl ToolService {
     #[tool(
         description = "Add a revision to the existing patch from commits in the active workspace. \
                        Keep it in draft while implementing; set_patch_state to open when ready. \
-                       Previous member reviewers are notified then without another mention."
+                       Members with their own rejected review receive a follow-up then."
     )]
     pub(super) async fn update_patch(
         &self,

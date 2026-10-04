@@ -25,6 +25,8 @@ use crate::{
 // itself this is bounded, because committing takes seconds. Silence is bounded by [`agent::Stall`],
 // on the same terms as every other agent the runtime runs.
 const GRACE: Duration = Duration::from_secs(30);
+// A broken provider stream must not spin a fresh process or stop the member's other roles.
+const RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// Drives one member's building role through its queued work.
 #[derive(Debug, Clone)]
@@ -47,15 +49,47 @@ impl Builder {
         queue: &TaskQueue,
         workspaces: &Workspaces,
         scope: &ActivityScope,
+        inbox: &crate::delivery::Inbox,
     ) -> Result<(), Error> {
         let watch = agent::Supervised::supervisor(coder);
         loop {
-            let task = queue.next().await?;
+            let mut task = queue.next().await?;
             watch.handling(&task.source, Some(task.id)).await;
-            // Only a task which actually finished is forgotten. One which stalled, was aborted,
-            // or failed stays marked taken, so the next start puts it back rather than losing it.
-            self.carry(coder, queue, workspaces, scope, task).await?;
+            let identifier = task.id;
+            inbox
+                .task(identifier, crate::delivery::State::Processing, None)
+                .await?;
+            loop {
+                match self.carry(coder, queue, workspaces, scope, task).await {
+                    Ok(()) => break,
+                    Err(Error::Coder(error)) => {
+                        inbox
+                            .task(
+                                identifier,
+                                crate::delivery::State::Failed,
+                                Some(error.to_string()),
+                            )
+                            .await?;
+                        tracing::warn!(
+                            task = identifier,
+                            %error,
+                            retry_in_seconds = RETRY_DELAY.as_secs(),
+                            "retrying queued work; the member's other roles remain active"
+                        );
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        // Publications and notes from the failed attempt belong to this same task.
+                        task = queue.get(identifier).await?;
+                        inbox
+                            .task(identifier, crate::delivery::State::Processing, None)
+                            .await?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            // Only finished work is forgotten. Stalled or aborted work stays marked taken for
+            // the next start to recover.
             queue.finish().await?;
+            inbox.wake();
             watch.handled().await;
         }
     }
@@ -93,9 +127,11 @@ impl Builder {
         );
         let built = Self::build(coder, queue, task, path).await;
         scope.deactivate().await;
-        let reconciled = scope.reconcile(activity).await;
-        built?;
-        reconciled.map_err(Error::PublicationRecovery)
+        scope
+            .reconcile(activity)
+            .await
+            .map_err(Error::PublicationRecovery)?;
+        built
     }
 
     // Carries out one task, stopping it when it is cancelled or when it stops making progress.
@@ -146,6 +182,9 @@ impl Builder {
 /// Error carrying out queued work.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Recording delivery state failed.
+    #[error("delivery state failed: {0}")]
+    Delivery(#[from] crate::delivery::Error),
     /// Reading the task queue failed.
     #[error("task queue error: {0}")]
     Queue(#[from] crate::queue::Error),
@@ -181,6 +220,7 @@ mod tests {
     use crate::{
         agent::{Coder, Error as AgentError, McpEndpoint},
         builder::{Builder, Error},
+        home::MemberHome,
         manifest::QueuePosition,
         mcp::ActivityScope,
         member::{Member, Profile},
@@ -291,12 +331,14 @@ mod tests {
             .expect("task should be recorded")
             .task;
 
+        let inbox = queue.inbox().await.expect("inbox should open");
         let failed = Builder::new(Member::Nico, repository)
             .run(
                 &InterruptibleCoder::default(),
                 &queue,
                 &workspaces(repository, queue.clone()),
                 &ActivityScope::default(),
+                &inbox,
             )
             .await
             .expect_err("a task whose workspace cannot be prepared must fail");
@@ -307,6 +349,195 @@ mod tests {
             1,
             "a task which failed must still be there for the next start to pick up"
         );
+    }
+
+    #[derive(Debug)]
+    struct FailingOnceCoder {
+        queue: TaskQueue,
+        attempts: tokio::sync::Mutex<usize>,
+        started: tokio::sync::mpsc::UnboundedSender<Task>,
+    }
+
+    impl crate::agent::Supervised for FailingOnceCoder {
+        fn supervisor(&self) -> Arc<crate::agent::Session> {
+            Arc::new(crate::agent::Session::new(crate::agent::Role::Coder))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Coder for FailingOnceCoder {
+        async fn start(
+            &mut self,
+            _profile: Profile,
+            _mcp: &McpEndpoint,
+            _sandbox: crate::sandbox::AgentSandbox,
+            _layout: crate::agent::Layout,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn work(&self, task: Task, _workspace: PathBuf) -> Result<(), AgentError> {
+            let attempt = {
+                let mut attempts = self.attempts.lock().await;
+                *attempts += 1;
+                *attempts
+            };
+            self.started
+                .send(task.clone())
+                .expect("observer should remain open");
+            match attempt {
+                1 => {
+                    self.queue
+                        .note(task.id, "Retained before the stream failed".to_owned())
+                        .await
+                        .map_err(AgentError::new)?;
+                    Err(AgentError::new(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "provider stream ended prematurely",
+                    )))
+                }
+                2 => Ok(()),
+                _ => std::future::pending().await,
+            }
+        }
+
+        async fn interrupt(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_adapter_failure_with_retained_context_before_taking_the_next_task() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let (repository, queue, copies) = retry_workspaces(root.path()).await;
+        let source = Subject::Issue(ObjectId::from_str(SUBJECT).expect("subject should parse"));
+        let mut tasks = Vec::new();
+        for brief in ["first", "second"] {
+            tasks.push(
+                queue
+                    .push(crate::queue::TaskRequest::new(
+                        brief.to_owned(),
+                        source.into(),
+                        QueuePosition::End,
+                    ))
+                    .await
+                    .expect("task should be recorded")
+                    .task,
+            );
+        }
+        let [first, second]: [i64; 2] = tasks.try_into().expect("two tasks should be queued");
+        let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let coder = FailingOnceCoder {
+            queue: queue.clone(),
+            attempts: tokio::sync::Mutex::new(0),
+            started,
+        };
+        let builder = Builder::new(Member::Nico, repository);
+        let scope = ActivityScope::default();
+        let inbox = crate::delivery::Inbox::memory()
+            .await
+            .expect("inbox should open");
+        let running = builder.run(&coder, &queue, &copies, &scope, &inbox);
+        tokio::pin!(running);
+        let attempts = tokio::select! {
+            result = &mut running => {
+                result.expect("an adapter failure must not end the builder");
+                Vec::new()
+            }
+            attempts = tokio::time::timeout(
+                super::RETRY_DELAY + std::time::Duration::from_secs(10),
+                async {
+                    let mut attempts = Vec::new();
+                    for _ in 0..3 {
+                        attempts.push(observed.recv().await.expect("builder should stay active"));
+                    }
+                    attempts
+                },
+            ) => attempts.expect("the same task should retry after the delay"),
+        };
+        let [initial, retried, following]: [Task; 3] = attempts
+            .try_into()
+            .expect("three attempts should be observed");
+        assert_eq!(
+            [initial.id, retried.id, following.id],
+            [first, first, second]
+        );
+        assert_eq!(retried.context.notes, ["Retained before the stream failed"]);
+        assert!(matches!(
+            queue.get(first).await,
+            Err(crate::queue::Error::MissingTask(_))
+        ));
+    }
+
+    async fn retry_workspaces(root: &std::path::Path) -> (RepoId, TaskQueue, Workspaces) {
+        use radicle::{crypto::Seed, identity::doc::Visibility, profile::Home};
+
+        let profile = radicle::profile::Profile::init(
+            Home::new(root.join("identity")).expect("profile home should be created"),
+            Alias::new("builder-test"),
+            None,
+            Seed::generate(),
+        )
+        .expect("profile should initialize");
+        let repository = {
+            let checkout =
+                git2::Repository::init(root.join("repo")).expect("repository should initialize");
+            let signature = git2::Signature::now("Builder Test", "builder@example.com")
+                .expect("signature should be valid");
+            let tree = checkout
+                .index()
+                .expect("index should open")
+                .write_tree()
+                .expect("tree should be written");
+            let tree = checkout.find_tree(tree).expect("tree should exist");
+            checkout
+                .commit(
+                    Some("refs/heads/main"),
+                    &signature,
+                    &signature,
+                    "Initial",
+                    &tree,
+                    &[],
+                )
+                .expect("initial commit should be written");
+            checkout
+                .set_head("refs/heads/main")
+                .expect("main should be selected");
+            let signer = profile.signer().expect("signer should load");
+            radicle::rad::init(
+                &checkout,
+                "builder-test".try_into().expect("name should be valid"),
+                "Builder test",
+                "main".try_into().expect("branch should be valid"),
+                Visibility::default(),
+                &signer,
+                &profile.storage,
+            )
+            .expect("Radicle repository should initialize")
+            .0
+        };
+        let queue = TaskQueue::memory(repository, Member::Nico)
+            .await
+            .expect("queue should open");
+        let home = MemberHome::at(root.join("member"));
+        home.create().expect("member home should be created");
+        let info = UserInfo {
+            alias: Alias::new("builder-test"),
+            key: *profile.id(),
+        };
+        let copies = Workspaces::new(
+            Member::Nico,
+            home,
+            profile.storage,
+            repository,
+            info,
+            queue.clone(),
+        );
+        copies
+            .initialize()
+            .await
+            .expect("working copies should be created");
+        (repository, queue, copies)
     }
 
     /// Working copies over an empty storage, so preparing one fails the way a broken repository

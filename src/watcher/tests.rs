@@ -969,7 +969,7 @@ fn counts_turns_against_the_member_that_took_them_rather_than_the_subject() {
 }
 
 #[test]
-fn delivers_peer_reviews_and_revisions_to_owners_and_reviewers() {
+fn delivers_peer_reviews_to_owners_and_revision_followups_to_rejecting_reviewers() {
     let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
     let peer = PublicKey::from_str(AUTHOR).expect("peer key should be valid");
     let triggers = Fixture::triggers(vec![Did::from(peer)]);
@@ -1041,11 +1041,240 @@ fn delivers_peer_reviews_and_revisions_to_owners_and_reviewers() {
             )
             .as_slice(),
             [Activity {
-                kind: Kind::Delivered(Delivery::Changed(Change::RevisionCreated(_))),
+                kind: Kind::Delivered(Delivery::Changed(Change::ReviewFollowUp {
+                    review,
+                    revision: updated,
+                })),
+                ..
+            }] if *review == ReviewId::from(EntryId::from_str(OPERATION).expect("review should parse"))
+                && *updated == RevisionId::from(EntryId::from_str(CHANGE).expect("revision should parse"))
+        ),
+        "a new revision must identify the rejecting member's own review"
+    );
+}
+
+#[test]
+fn accepted_review_does_not_follow_another_reviewers_feedback() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let delegate = PublicKey::from_str(DELEGATE).expect("delegate key should be valid");
+    let revision = RevisionId::from(EntryId::from_str(ISSUE).expect("revision should parse"));
+    let own_review = ReviewId::from(EntryId::from_str(OPERATION).expect("review should parse"));
+    let other_review = ReviewId::from(EntryId::from_str(CHANGE).expect("review should parse"));
+    let triggers = Fixture::triggers(vec![Did::from(author)]);
+    let mut context = Context::default();
+    let _opened = Fixture::classify_patch(
+        ISSUE,
+        Fixture::revision("Initial revision"),
+        author,
+        &mut context,
+    );
+    let _accepted = Fixture::classify_patch(
+        OPERATION,
+        PatchAction::Review {
+            revision,
+            summary: Some("Ready; two optional suggestions".to_owned()),
+            verdict: Some(Verdict::Accept),
+            labels: Vec::new(),
+        },
+        member,
+        &mut context,
+    );
+
+    for action in [
+        PatchAction::Review {
+            revision,
+            summary: Some("Required changes".to_owned()),
+            verdict: Some(Verdict::Reject),
+            labels: Vec::new(),
+        },
+        PatchAction::ReviewComment {
+            review: other_review,
+            body: "Please shorten the README".to_owned(),
+            reply_to: None,
+            location: None,
+            embeds: Vec::new(),
+        },
+        Fixture::revision("Addressed the delegate's review"),
+        PatchAction::Lifecycle {
+            state: Lifecycle::Open,
+        },
+    ] {
+        assert!(
+            Fixture::classify_patch(CHANGE, action, delegate, &mut context).is_empty(),
+            "another review and its resulting revisions must not reopen an accepted review"
+        );
+    }
+
+    assert!(
+        !Fixture::classify_patch_with(
+            REPLY,
+            PatchAction::ReviewComment {
+                review: own_review,
+                body: "I addressed your optional suggestion".to_owned(),
+                reply_to: None,
+                location: None,
+                embeds: Vec::new(),
+            },
+            author,
+            &mut context,
+            &triggers,
+        )
+        .is_empty(),
+        "a peer's direct response on the member's own accepted review still needs attention"
+    );
+    assert!(
+        matches!(
+            Fixture::classify_patch(
+                COMMENT,
+                PatchAction::ReviewComment {
+                    review: other_review,
+                    body: "@nico please check the terminal requirement".to_owned(),
+                    reply_to: None,
+                    location: None,
+                    embeds: Vec::new(),
+                },
+                delegate,
+                &mut context,
+            )
+            .as_slice(),
+            [Activity {
+                kind: Kind::Delivered(Delivery::Mentioned(_)),
                 ..
             }]
         ),
-        "a new revision must reach a previous reviewer without another mention"
+        "an explicit mention can involve a reviewer in another review"
+    );
+}
+
+#[test]
+fn clearing_or_accepting_or_redacting_the_own_review_stops_revision_followups() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let revision = RevisionId::from(EntryId::from_str(ISSUE).expect("revision should parse"));
+    let review = ReviewId::from(EntryId::from_str(OPERATION).expect("review should parse"));
+    for close in [
+        PatchAction::ReviewEdit(ReviewEdit::new(
+            review,
+            "The findings are satisfied".to_owned(),
+            Some(Verdict::Accept),
+            Vec::new(),
+            Vec::new(),
+        )),
+        PatchAction::ReviewEdit(ReviewEdit::new(
+            review,
+            "The finding is only a suggestion".to_owned(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        )),
+        PatchAction::ReviewRedact { review },
+    ] {
+        let mut context = Context::default();
+        let _opened = Fixture::classify_patch(
+            ISSUE,
+            Fixture::revision("Initial revision"),
+            author,
+            &mut context,
+        );
+        let _rejected = Fixture::classify_patch(
+            OPERATION,
+            PatchAction::Review {
+                revision,
+                summary: Some("Required fixes".to_owned()),
+                verdict: Some(Verdict::Reject),
+                labels: Vec::new(),
+            },
+            member,
+            &mut context,
+        );
+        let _closed = Fixture::classify_patch(REPLY, close, member, &mut context);
+        assert!(
+            Fixture::classify_patch(
+                CHANGE,
+                Fixture::revision("Another revision"),
+                author,
+                &mut context,
+            )
+            .is_empty(),
+            "a completed review must not follow later revisions"
+        );
+    }
+}
+
+#[test]
+fn opening_a_draft_identifies_the_rejected_review_and_the_current_revision() {
+    let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
+    let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
+    let revision = RevisionId::from(EntryId::from_str(ISSUE).expect("revision should parse"));
+    let review = ReviewId::from(EntryId::from_str(OPERATION).expect("review should parse"));
+    let updated = RevisionId::from(EntryId::from_str(CHANGE).expect("revision should parse"));
+    let mut context = Context::default();
+    let _opened = Fixture::classify_patch(
+        ISSUE,
+        Fixture::revision("Initial revision"),
+        author,
+        &mut context,
+    );
+    let _rejected = Fixture::classify_patch(
+        OPERATION,
+        PatchAction::Review {
+            revision,
+            summary: Some("Required fixes".to_owned()),
+            verdict: Some(Verdict::Reject),
+            labels: Vec::new(),
+        },
+        member,
+        &mut context,
+    );
+    let _draft = Fixture::classify_patch(
+        REPLY,
+        PatchAction::Lifecycle {
+            state: Lifecycle::Draft,
+        },
+        author,
+        &mut context,
+    );
+    assert!(
+        Fixture::classify_patch(
+            CHANGE,
+            Fixture::revision("Addressed the findings"),
+            author,
+            &mut context,
+        )
+        .is_empty()
+    );
+    assert!(matches!(
+        Fixture::classify_patch(
+            COMMENT,
+            PatchAction::Lifecycle {
+                state: Lifecycle::Open,
+            },
+            author,
+            &mut context,
+        )
+        .as_slice(),
+        [Activity {
+            kind: Kind::Delivered(Delivery::Changed(Change::ReviewFollowUp {
+                review: own,
+                revision: current,
+            })),
+            ..
+        }] if *own == review && *current == updated
+    ));
+    assert!(
+        Fixture::classify_patch(
+            REPLY,
+            PatchAction::RevisionEdit {
+                revision: updated,
+                description: "Clarified the description".to_owned(),
+                embeds: Vec::new(),
+            },
+            author,
+            &mut context,
+        )
+        .is_empty(),
+        "editing a description must not request another review of unchanged code"
     );
 }
 
@@ -1169,7 +1398,7 @@ fn draft_revisions_wait_for_readiness_but_explicit_messages_and_assignments_arri
                 ..
             }]
         ),
-        "opening the finished patch must notify a previous reviewer without a mention"
+        "opening the finished patch must notify an assignee without a mention"
     );
 
     let mut uninvolved = Context::default();
@@ -1250,5 +1479,62 @@ fn caps_the_review_and_revision_cycle_between_two_members() {
         Fixture::classify_patch_with(CHANGE, review(), vera, &mut context, &triggers).is_empty(),
         "reviewing and revising cost nobody anything to repeat, so without this the two would \
          carry on without end and no person would be asked"
+    );
+}
+
+#[test]
+fn reactions_do_not_split_a_peers_turn_or_spend_an_exchange() {
+    let peer: PublicKey = AUTHOR.parse().expect("peer");
+    let member: PublicKey = MEMBER.parse().expect("member");
+    let triggers = Fixture::triggers(vec![peer.into()]);
+    let mut context = Context::default();
+    for _ in 0..(Fixture::exchanges() + 2) {
+        assert_eq!(
+            Fixture::classify_with(
+                Fixture::comment("@nico look at this"),
+                peer,
+                &mut context,
+                &triggers
+            )
+            .len(),
+            1
+        );
+        assert!(
+            Fixture::classify_with(
+                Action::CommentReact {
+                    id: OPERATION.parse().expect("comment"),
+                    reaction: Reaction::new('👍').expect("reaction"),
+                    active: true
+                },
+                member,
+                &mut context,
+                &triggers
+            )
+            .is_empty()
+        );
+    }
+    assert!(
+        context.take_ignored().is_empty(),
+        "acknowledgement alone cannot exhaust the quota"
+    );
+    for turn in 1..=Fixture::exchanges() {
+        Fixture::classify_with(
+            Fixture::comment("my reply"),
+            member,
+            &mut context,
+            &triggers,
+        );
+        let next = Fixture::classify_with(
+            Fixture::comment("@nico next point"),
+            peer,
+            &mut context,
+            &triggers,
+        );
+        assert_eq!(next.len(), usize::from(turn < Fixture::exchanges()));
+    }
+    assert_eq!(
+        context.take_ignored().len(),
+        1,
+        "real member exchanges remain bounded"
     );
 }

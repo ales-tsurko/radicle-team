@@ -174,174 +174,219 @@ impl ToolService {
         let target = request.target;
         let expected_body = body.clone();
         let expected_embeds = PreparedEmbed::references(&embeds);
+        let duplicate_embeds = expected_embeds.clone();
         let id = self
             .mutate(
                 method,
                 request_id,
-                move |repository, signer, marker| match (kind, target) {
-                    (SubjectKind::Issue, CommentTargetKind::Issue) => {
-                        let mut issues = issue::Cache::no_cache(repository, signer)?;
-                        let mut issue = issues.get_mut(&subject)?;
-                        if let Some(comment) = comment
-                            && !matches!(operation, CommentOperation::Create)
-                            && issue.thread().comment(&comment).is_none()
-                        {
-                            return Err(PublishError::Rejected("comment was not found".to_owned()));
-                        }
-                        if matches!(operation, CommentOperation::Create)
-                            && let Some(parent) = reply_to
-                            && issue.thread().comment(&parent).is_none()
-                        {
-                            return Err(PublishError::Rejected(
-                                "reply parent was not found".to_owned(),
-                            ));
-                        }
-                        let embeds = PreparedEmbed::store(&embeds, repository)
-                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
-                        issue
-                            .transaction(marker, |tx| match operation {
-                                CommentOperation::Create => tx.comment(
-                                    body.expect("body was validated"),
-                                    reply_to.unwrap_or(*subject),
-                                    embeds,
-                                ),
-                                CommentOperation::Edit => tx.edit_comment(
-                                    comment.expect("comment was validated"),
-                                    body.expect("body was validated"),
-                                    embeds,
-                                ),
-                                CommentOperation::Redact => {
-                                    tx.redact_comment(comment.expect("comment was validated"))
-                                }
-                            })
-                            .map_err(PublishError::from)
-                    }
-                    (SubjectKind::Patch, CommentTargetKind::Revision) => {
-                        let revision = parse_revision(entity.ok_or_else(|| {
-                            PublishError::Rejected("entity revision is required".to_owned())
-                        })?)
-                        .map_err(|error| PublishError::Rejected(error.to_string()))?;
-                        let mut patches = patch::Cache::no_cache(repository, signer)?;
-                        let mut patch = patches.get_mut(&subject)?;
-                        let revision_value = patch
-                            .revision(&revision)
-                            .ok_or_else(|| {
-                                ServiceError::Request("revision was not found".to_owned())
-                            })
-                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
-                        if let Some(comment) = comment
-                            && !matches!(operation, CommentOperation::Create)
-                            && revision_value.discussion().comment(&comment).is_none()
-                        {
-                            return Err(PublishError::Rejected("comment was not found".to_owned()));
-                        }
-                        if matches!(operation, CommentOperation::Create)
-                            && let Some(parent) = reply_to
-                            && revision_value.discussion().comment(&parent).is_none()
-                        {
-                            return Err(PublishError::Rejected(
-                                "reply parent was not found".to_owned(),
-                            ));
-                        }
-                        if let Some(location) = location.as_ref() {
-                            validate_code_location(repository, revision_value, location)
+                move |repository, signer, marker| {
+                    let duplicate = CommentRecovery {
+                        kind,
+                        target,
+                        subject,
+                        entity,
+                        comment: comment.unwrap_or(*subject),
+                        operation,
+                        body: body.as_deref(),
+                        embeds: &duplicate_embeds,
+                    };
+                    match (kind, target) {
+                        (SubjectKind::Issue, CommentTargetKind::Issue) => {
+                            let mut issues = issue::Cache::no_cache(repository, signer)?;
+                            let mut issue = issues.get_mut(&subject)?;
+                            if let Some(id) = duplicate.duplicate(
+                                issue.thread().comments(),
+                                *signer.public_key(),
+                                Some(reply_to.unwrap_or(*subject)),
+                                None,
+                            ) {
+                                return Ok(id);
+                            }
+                            if let Some(comment) = comment
+                                && !matches!(operation, CommentOperation::Create)
+                                && issue.thread().comment(&comment).is_none()
+                            {
+                                return Err(PublishError::Rejected(
+                                    "comment was not found".to_owned(),
+                                ));
+                            }
+                            if matches!(operation, CommentOperation::Create)
+                                && let Some(parent) = reply_to
+                                && issue.thread().comment(&parent).is_none()
+                            {
+                                return Err(PublishError::Rejected(
+                                    "reply parent was not found".to_owned(),
+                                ));
+                            }
+                            let embeds = PreparedEmbed::store(&embeds, repository)
                                 .map_err(|error| PublishError::Rejected(error.to_string()))?;
-                        }
-                        let embeds = PreparedEmbed::store(&embeds, repository)
-                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
-                        patch
-                            .transaction(marker, |tx| match operation {
-                                CommentOperation::Create => tx.comment(
-                                    revision,
-                                    body.expect("body was validated"),
-                                    reply_to,
-                                    location,
-                                    embeds,
-                                ),
-                                CommentOperation::Edit => tx.comment_edit(
-                                    revision,
-                                    comment.expect("comment was validated"),
-                                    body.expect("body was validated"),
-                                    embeds,
-                                ),
-                                CommentOperation::Redact => tx.comment_redact(
-                                    revision,
-                                    comment.expect("comment was validated"),
-                                ),
-                            })
-                            .map_err(PublishError::from)
-                    }
-                    (SubjectKind::Patch, CommentTargetKind::Review) => {
-                        let review = parse_review(entity.ok_or_else(|| {
-                            PublishError::Rejected("entity review is required".to_owned())
-                        })?)
-                        .map_err(|error| PublishError::Rejected(error.to_string()))?;
-                        let mut patches = patch::Cache::no_cache(repository, signer)?;
-                        let mut patch = patches.get_mut(&subject)?;
-                        let review_value = find_review(&patch, review)
-                            .ok_or_else(|| ServiceError::Request("review was not found".to_owned()))
-                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
-                        if let Some(comment) = comment
-                            && !matches!(operation, CommentOperation::Create)
-                            && !review_value
-                                .comments()
-                                .any(|(candidate, _value)| *candidate == comment)
-                        {
-                            return Err(PublishError::Rejected("comment was not found".to_owned()));
-                        }
-                        if matches!(operation, CommentOperation::Create)
-                            && let Some(parent) = reply_to
-                            && !review_value
-                                .comments()
-                                .any(|(candidate, _value)| *candidate == parent)
-                        {
-                            return Err(PublishError::Rejected(
-                                "reply parent was not found".to_owned(),
-                            ));
-                        }
-                        if let Some(location) = location.as_ref() {
-                            let revision = patch
-                                .revisions()
-                                .find_map(|(revision, value)| {
-                                    patch
-                                        .reviews_of(revision)
-                                        .any(|(candidate, _)| *candidate == review)
-                                        .then_some(value)
+                            issue
+                                .transaction(marker, |tx| match operation {
+                                    CommentOperation::Create => tx.comment(
+                                        body.expect("body was validated"),
+                                        reply_to.unwrap_or(*subject),
+                                        embeds,
+                                    ),
+                                    CommentOperation::Edit => tx.edit_comment(
+                                        comment.expect("comment was validated"),
+                                        body.expect("body was validated"),
+                                        embeds,
+                                    ),
+                                    CommentOperation::Redact => {
+                                        tx.redact_comment(comment.expect("comment was validated"))
+                                    }
                                 })
+                                .map_err(PublishError::from)
+                        }
+                        (SubjectKind::Patch, CommentTargetKind::Revision) => {
+                            let revision = parse_revision(entity.ok_or_else(|| {
+                                PublishError::Rejected("entity revision is required".to_owned())
+                            })?)
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                            let mut patches = patch::Cache::no_cache(repository, signer)?;
+                            let mut patch = patches.get_mut(&subject)?;
+                            let revision_value = patch
+                                .revision(&revision)
+                                .ok_or_else(|| {
+                                    ServiceError::Request("revision was not found".to_owned())
+                                })
+                                .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                            if let Some(id) = duplicate.duplicate(
+                                revision_value.discussion().comments(),
+                                *signer.public_key(),
+                                reply_to,
+                                location.as_ref(),
+                            ) {
+                                return Ok(id);
+                            }
+                            if let Some(comment) = comment
+                                && !matches!(operation, CommentOperation::Create)
+                                && revision_value.discussion().comment(&comment).is_none()
+                            {
+                                return Err(PublishError::Rejected(
+                                    "comment was not found".to_owned(),
+                                ));
+                            }
+                            if matches!(operation, CommentOperation::Create)
+                                && let Some(parent) = reply_to
+                                && revision_value.discussion().comment(&parent).is_none()
+                            {
+                                return Err(PublishError::Rejected(
+                                    "reply parent was not found".to_owned(),
+                                ));
+                            }
+                            if let Some(location) = location.as_ref() {
+                                validate_code_location(repository, revision_value, location)
+                                    .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                            }
+                            let embeds = PreparedEmbed::store(&embeds, repository)
+                                .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                            patch
+                                .transaction(marker, |tx| match operation {
+                                    CommentOperation::Create => tx.comment(
+                                        revision,
+                                        body.expect("body was validated"),
+                                        reply_to,
+                                        location,
+                                        embeds,
+                                    ),
+                                    CommentOperation::Edit => tx.comment_edit(
+                                        revision,
+                                        comment.expect("comment was validated"),
+                                        body.expect("body was validated"),
+                                        embeds,
+                                    ),
+                                    CommentOperation::Redact => tx.comment_redact(
+                                        revision,
+                                        comment.expect("comment was validated"),
+                                    ),
+                                })
+                                .map_err(PublishError::from)
+                        }
+                        (SubjectKind::Patch, CommentTargetKind::Review) => {
+                            let review = parse_review(entity.ok_or_else(|| {
+                                PublishError::Rejected("entity review is required".to_owned())
+                            })?)
+                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                            let mut patches = patch::Cache::no_cache(repository, signer)?;
+                            let mut patch = patches.get_mut(&subject)?;
+                            let review_value = find_review(&patch, review)
                                 .ok_or_else(|| {
                                     ServiceError::Request("review was not found".to_owned())
                                 })
                                 .map_err(|error| PublishError::Rejected(error.to_string()))?;
-                            validate_code_location(repository, revision, location)
+                            if let Some(id) = duplicate.duplicate(
+                                review_value.comments(),
+                                *signer.public_key(),
+                                reply_to,
+                                location.as_ref(),
+                            ) {
+                                return Ok(id);
+                            }
+                            if let Some(comment) = comment
+                                && !matches!(operation, CommentOperation::Create)
+                                && !review_value
+                                    .comments()
+                                    .any(|(candidate, _value)| *candidate == comment)
+                            {
+                                return Err(PublishError::Rejected(
+                                    "comment was not found".to_owned(),
+                                ));
+                            }
+                            if matches!(operation, CommentOperation::Create)
+                                && let Some(parent) = reply_to
+                                && !review_value
+                                    .comments()
+                                    .any(|(candidate, _value)| *candidate == parent)
+                            {
+                                return Err(PublishError::Rejected(
+                                    "reply parent was not found".to_owned(),
+                                ));
+                            }
+                            if let Some(location) = location.as_ref() {
+                                let revision = patch
+                                    .revisions()
+                                    .find_map(|(revision, value)| {
+                                        patch
+                                            .reviews_of(revision)
+                                            .any(|(candidate, _)| *candidate == review)
+                                            .then_some(value)
+                                    })
+                                    .ok_or_else(|| {
+                                        ServiceError::Request("review was not found".to_owned())
+                                    })
+                                    .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                                validate_code_location(repository, revision, location)
+                                    .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                            }
+                            let embeds = PreparedEmbed::store(&embeds, repository)
                                 .map_err(|error| PublishError::Rejected(error.to_string()))?;
+                            patch
+                                .transaction(marker, |tx| match operation {
+                                    CommentOperation::Create => tx.review_comment(
+                                        review,
+                                        body.expect("body was validated"),
+                                        location,
+                                        reply_to,
+                                        embeds,
+                                    ),
+                                    CommentOperation::Edit => tx.edit_review_comment(
+                                        review,
+                                        comment.expect("comment was validated"),
+                                        body.expect("body was validated"),
+                                        embeds,
+                                    ),
+                                    CommentOperation::Redact => tx.redact_review_comment(
+                                        review,
+                                        comment.expect("comment was validated"),
+                                    ),
+                                })
+                                .map_err(PublishError::from)
                         }
-                        let embeds = PreparedEmbed::store(&embeds, repository)
-                            .map_err(|error| PublishError::Rejected(error.to_string()))?;
-                        patch
-                            .transaction(marker, |tx| match operation {
-                                CommentOperation::Create => tx.review_comment(
-                                    review,
-                                    body.expect("body was validated"),
-                                    location,
-                                    reply_to,
-                                    embeds,
-                                ),
-                                CommentOperation::Edit => tx.edit_review_comment(
-                                    review,
-                                    comment.expect("comment was validated"),
-                                    body.expect("body was validated"),
-                                    embeds,
-                                ),
-                                CommentOperation::Redact => tx.redact_review_comment(
-                                    review,
-                                    comment.expect("comment was validated"),
-                                ),
-                            })
-                            .map_err(PublishError::from)
+                        _ => Err(PublishError::Rejected(
+                            "comment target does not match subject".to_owned(),
+                        )),
                     }
-                    _ => Err(PublishError::Rejected(
-                        "comment target does not match subject".to_owned(),
-                    )),
                 },
                 move |repository, _author, recovered, validation| {
                     let recovery = CommentRecovery {

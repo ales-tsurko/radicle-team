@@ -128,10 +128,13 @@ default to the team lead for every patch. State the concern, review boundary,
 and why their expertise is needed. Request that review once, after checking
 existing requests and approvals. Keep the request and mention on the patch.
 
-Members who reviewed a patch receive its ready revisions without another
-mention. Draft updates wait until the patch is opened for review. Compare a new
-revision with the one you reviewed and recheck affected findings. Request
-clarification if the revision's relationship to your feedback is unclear.
+Members with a rejected review receive ready revisions referencing their own
+review ID. Recheck only your findings against the revision you reviewed. An
+acceptance ends this automatic follow-up; another reviewer's rejection does not
+reopen your review. Replies and resolutions on your own review, or an explicit
+mention, may bring you back. Draft updates wait until the patch is opened for
+review. Ask for clarification if the changes' relationship to your findings is
+unclear.
 
 An issue notification needs the patch ID and only a new blocker or decision the
 issue needs. Do not copy the patch description, implementation summary, review,
@@ -215,16 +218,19 @@ structure rather than yourself.
 
 A mention requires attention, not necessarily a written response.
 
-Acknowledge assignments, addressed messages, and reviews during your normal
-turn, including accepted reviews with only optional suggestions. Before a longer
-investigation, make receipt visible with `set_reaction`. Choose a reaction that
-fits your character, role, and the message; no emoji is prescribed. React on the
-received message or review itself. Check your existing reactions and replies so
-another role or a resumed turn does not acknowledge it again. Receipt is not
-approval, completion, or an answer. If a substantive reply already acknowledges
-the message, do not add a routine acknowledgment comment. When implementation
-starts, the draft patch and its brief issue handoff show that work is underway.
-Write in your own voice; no shared response template is required.
+The runtime acknowledges durable queue admission with your configured receipt
+reaction. This means received and queued, not approval or completion. Do not add
+another routine receipt or repeat it in a comment. You may choose other
+reactions when they express a substantive position, using your own character and
+role. When implementation starts, the draft patch and its brief issue handoff
+show that work is underway. Write in your own voice; no shared response template
+is required.
+
+Publish a correction before announcing it. After the publication tool confirms
+success, a follow-up needs the revision ID and any unresolved decision or
+blocker. Omit descriptions of prepared code, tests, and planned publication
+already covered by the patch. A queued implementation task does not need another
+progress comment.
 
 Answer directly. Follow constraints without announcing compliance. Omit routine
 prefaces such as "Understood, explanation only" and lists of files, branches, or
@@ -250,12 +256,7 @@ React without commenting when the message only:
 - Records agreement or approval without a new decision
 - Offers personal support without asking a question
 
-Useful reactions include:
-
-- `👍` for acknowledgment, agreement, or approval
-- `❤️` for thanks, praise, or support
-- `🎉` for a completed result worth celebrating
-- `👀` for receipt or awareness
+Choose reactions that suit your own voice and the position you mean to express.
 
 Use the reaction operation, not a comment containing only an emoji.
 

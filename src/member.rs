@@ -2,13 +2,14 @@
 
 use std::{fmt, str::FromStr};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // Handle which mentions every member at once, for work with no obvious owner.
 const TEAM_MENTION: &str = "team";
 
 /// A fixed member of the team.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Member {
     /// Junior developer.
     Nico,
@@ -141,6 +142,19 @@ impl Member {
                     "reviews",
                 ],
             },
+        }
+    }
+
+    /// Default automatic queue receipt, kept distinct from model-selected reactions.
+    #[must_use]
+    pub const fn receipt(self) -> char {
+        match self {
+            Self::Nico => '🔧',
+            Self::Maya => '📋',
+            Self::Leon => '📐',
+            Self::Vera => '🔒',
+            Self::Nora => '🎨',
+            Self::Theo => '🔎',
         }
     }
 

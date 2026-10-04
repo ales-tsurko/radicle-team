@@ -48,7 +48,43 @@ impl View {
                 ))
                 .to_string(),
         );
+        lines.push(format!(
+            "Queued notifications: {}",
+            inspection
+                .deliveries
+                .iter()
+                .filter(|record| record.task.is_none()
+                    && record.state == crate::delivery::State::Queued)
+                .count()
+        ));
+        for record in inspection.deliveries.iter().filter(|record| {
+            record.task.is_none()
+                && matches!(
+                    record.state,
+                    crate::delivery::State::Processing | crate::delivery::State::Failed
+                )
+        }) {
+            lines.push(format!(
+                "  {}: {} · {}",
+                if inspection.live {
+                    record.state.to_string()
+                } else {
+                    "interrupted".into()
+                },
+                record.activity.subject,
+                record.activity.operation
+            ));
+            if let Some(error) = &record.error {
+                lines.push(format!("  {error}"));
+            }
+        }
         if let Some(snapshot) = &inspection.snapshot {
+            if let Some(fetched) = snapshot.fetched {
+                lines.push(format!("Last successful fetch: {}", Self::age(fetched)));
+            }
+            if let Some(error) = &snapshot.sync_error {
+                lines.push(format!("Sync error: {error}"));
+            }
             lines.push(
                 dim.apply_to(format!("Started: {}", Self::age(snapshot.started)))
                     .to_string(),

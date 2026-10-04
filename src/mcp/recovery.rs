@@ -212,6 +212,27 @@ impl CommentState {
 }
 
 impl<'a> CommentRecovery<'a> {
+    /// Reuses an identical comment by this signer on the same thread and reply target.
+    pub(super) fn duplicate<'b, L: Eq + 'b>(
+        &self,
+        mut comments: impl Iterator<Item = (&'b EntryId, &'b radicle::cob::thread::Comment<L>)>,
+        author: radicle::crypto::PublicKey,
+        reply_to: Option<EntryId>,
+        location: Option<&L>,
+    ) -> Option<EntryId> {
+        if !matches!(self.operation, CommentOperation::Create) {
+            return None;
+        }
+        comments.find_map(|(id, comment)| {
+            (comment.author() == author
+                && Some(comment.body()) == self.body
+                && comment.reply_to() == reply_to
+                && comment.location() == location
+                && comment.embeds() == self.embeds)
+                .then_some(*id)
+        })
+    }
+
     pub(super) fn applied(&self, repository: &CobRepository) -> Result<bool, PublishError> {
         let actual = match (self.kind, self.target) {
             (SubjectKind::Issue, CommentTargetKind::Issue) => self.issue_state(repository),

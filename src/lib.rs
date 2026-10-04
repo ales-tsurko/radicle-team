@@ -48,11 +48,11 @@
 //! activity. This keeps Radicle's low-level action variants out of consumers.
 //!
 //! The serialized conversation dispatcher maps each deliverable activity to the typed `mentioned`,
-//! `replied`, or `changed` method and acknowledges successful handling before the watcher
-//! checkpoints it. Runtime-specific adapters implement these interfaces, and the core does not
-//! depend on an agent vendor API. Each callback gets a fresh working copy and returns only success
-//! or failure. Repository actions are separate MCP calls, so an agent can perform any number of
-//! allowed actions while one unit of work is active.
+//! `replied`, or `changed` method after durable inbox admission. The watcher checkpoints queue
+//! admission independently of model handling. Runtime-specific adapters implement these interfaces,
+//! and the core does not depend on an agent vendor API. Each callback gets a fresh working copy and
+//! returns only success or failure. Repository actions are separate MCP calls, so an agent can
+//! perform any number of allowed actions while one unit of work is active.
 //!
 //! During `run`, the application starts one loopback-only MCP server per started role, scoped to
 //! the selected repository and member profile. `start` receives the provider-neutral member
@@ -66,10 +66,10 @@
 //! # State and delivery
 //!
 //! Full history replay is required because later operations depend on earlier assignment and
-//! ownership state. Successful action deliveries are stored in SQLite so rescans do not report them
-//! twice. Each delivery is recorded after its adapter call succeeds. Adapters receive a stable
-//! [`agent::DeliveryId`] in [`agent::Context`]. Its action position distinguishes multiple
-//! deliveries from one Radicle operation. Repository writes are journalled under an
+//! ownership state. Admission is stored in SQLite so rescans do not enqueue an activity twice.
+//! The durable inbox records model handling separately and retries unfinished deliveries. Adapters
+//! receive a stable [`agent::DeliveryId`] in [`agent::Context`]. Its action position distinguishes
+//! multiple deliveries from one Radicle operation. Repository writes are journalled under an
 //! [`agent::ActivityId`], which names a delivery, chat message, or task, so an interrupted write is
 //! recovered by whichever role issued it.
 //!
@@ -94,6 +94,7 @@ pub mod chat;
 pub mod cli;
 mod conversation;
 mod database;
+mod delivery;
 pub mod home;
 pub mod identity;
 pub mod manifest;

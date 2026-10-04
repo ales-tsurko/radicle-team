@@ -321,6 +321,12 @@ next `run` recovers them. Inspection does not recover or reorder tasks.
 Completed and cancelled task contexts are removed, so these commands show
 unfinished work.
 
+If the coder's adapter fails during a task, the runtime logs the error and
+retries the same task after ten seconds, retaining its context and work. The
+node and other roles keep running. The coder handles subsequent tasks after this
+task succeeds. Storage, workspace, and publication-recovery failures still stop
+the runtime.
+
 
 ### Looking inside a member's copies
 
@@ -428,6 +434,39 @@ temporary initial checkout is removed. Use `rad checkout <RID>` to create a
 working copy.
 
 
+### Checking notification delivery
+
+From the member directory:
+
+```sh
+rad-team inbox ls
+rad-team inbox show <review-id>
+```
+
+`--home` selects another member directory. Each notification records its author,
+operation and action, related review or revision, task ID when assigned, and
+`queued`, `processing`, `handled`, `ignored`, or `failed` state. Ignored and
+failed entries include a reason. `status` also shows queued notifications,
+processing operation IDs, the last successful periodic fetch, and
+synchronization errors.
+
+From your operator machine, inspect signed receipts replicated through Radicle:
+
+```sh
+rad sync --fetch rad:...
+rad-team inbox show <review-id> --repo rad:... --member maya
+rad-team inbox ls --repo rad:...
+```
+
+These commands read your node's stored observations. They require no connection
+to the member's server and perform no writes. An absent record says "Not
+observed locally"; it cannot establish whether the member has received it
+elsewhere. Receipts reach Radicle Desktop through normal synchronization. The
+configured reaction means queue admission; it never means approval or completed
+work. Delivery state is signed by the member and updated on state changes,
+without posting progress comments or spending model tokens.
+
+
 
 
 ## Run a member
@@ -456,15 +495,26 @@ reviews, revisions, reactions, resolutions, lifecycle changes, and merges until
 stopped. `SIGINT` and `SIGTERM` trigger graceful node shutdown before the child
 is reaped.
 
-Members acknowledge messages and reviews during their talking turn, and
-assignments when their building turn begins. They choose reactions that fit
-their character and role; no fixed emoji is added by the runtime. Messages and
-reviews wait while another talking turn is running. When implementation starts,
-the member creates a draft patch and posts one brief link on the originating
-issue. It updates that same patch and opens it when ready for review. Draft
-revisions do not automatically summon reviewers; previous member reviewers are
-notified when it becomes ready. Reactions, comments, and patch descriptions keep
-each member's own voice.
+Accepted assignments, messages, and reviews are saved before the model handles
+them. The runtime immediately publishes the member's configured receipt
+reaction, meaning received and queued. It requires no model call and works while
+the talker is busy. Disabling `set_reaction` disables these reactions. Members
+may choose additional reactions to express their own position.
+
+Talking turns remain serialized. Reviews, mentions, and replies precede ambient
+changes; arrivals within each priority stay in order. The active turn is never
+interrupted. Failed model calls remain queued for retry. The member also fetches
+every 30 seconds and retries failed fetches after 10 seconds, alongside node
+announcements.
+
+When implementation starts, the member creates a draft patch and posts one brief
+link on the originating issue. It updates that same patch and opens it when
+ready for review. Draft revisions do not automatically summon reviewers. Members
+with a rejected review receive ready revisions referencing their own review ID.
+An acceptance ends automatic follow-up; another person's review does not reopen
+it. Replies and resolutions on the member's own review, and explicit mentions,
+still reach them. Reactions, comments, and patch descriptions keep each member's
+own voice.
 
 Members request specialist review only for a specific concern that needs the
 other member's expertise, or when a delegate requests it. Routine patches are

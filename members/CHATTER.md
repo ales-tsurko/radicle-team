@@ -61,7 +61,8 @@ and nothing in this document changes it.
 
 You have your own checkout of the repository, reset before every message.
 
-It is there so you can look before you answer: read the code, run it, check a
-claim rather than recall it. Nothing you write in it is published and nothing
-you commit there reaches anybody, so use it to be sure rather than to build. Ask
-for the work to be done instead, the same way you would from an issue.
+Use it to read, run, or temporarily modify code to verify an answer. The runtime
+discards those edits before the next message. Save useful findings in the task
+context. Record implementation as queued work promptly, following `TALKER.md`;
+the building role carries out durable changes, final validation, and publication
+from its own checkout.

@@ -54,6 +54,7 @@ impl Cli {
             Command::Provider(_) => Mode::Provider,
             Command::Status(_) => Mode::Status,
             Command::Task(_) => Mode::Task,
+            Command::Inbox(_) => Mode::Inbox,
         }
     }
 
@@ -62,7 +63,11 @@ impl Cli {
     pub fn member(&self) -> Option<Member> {
         match &self.command {
             Command::Setup(options) => Some(options.member),
-            Command::Run(_) | Command::Provider(_) | Command::Status(_) | Command::Task(_) => None,
+            Command::Run(_)
+            | Command::Provider(_)
+            | Command::Status(_)
+            | Command::Task(_)
+            | Command::Inbox(_) => None,
         }
     }
 
@@ -71,7 +76,11 @@ impl Cli {
     pub fn repository(&self) -> Option<RepoId> {
         match &self.command {
             Command::Setup(options) => options.repo,
-            Command::Run(_) | Command::Provider(_) | Command::Status(_) | Command::Task(_) => None,
+            Command::Run(_)
+            | Command::Provider(_)
+            | Command::Status(_)
+            | Command::Task(_)
+            | Command::Inbox(_) => None,
         }
     }
 
@@ -79,6 +88,7 @@ impl Cli {
     #[must_use]
     pub fn home(&self) -> Option<&Path> {
         match &self.command {
+            Command::Inbox(options) => options.home.as_deref(),
             Command::Provider(options) => options.home.as_deref(),
             Command::Status(options) => options.home.as_deref(),
             Command::Task(options) => options.location.home.as_deref(),
@@ -123,7 +133,7 @@ impl Cli {
                 options.home = Some(home.path().into());
                 options.application(member, repository)
             }
-            Command::Provider(_) | Command::Status(_) | Command::Task(_) => {
+            Command::Provider(_) | Command::Status(_) | Command::Task(_) | Command::Inbox(_) => {
                 Err(Error::NotAMemberCommand)
             }
         }
@@ -136,6 +146,7 @@ impl Cli {
     /// Returns an error when setup or member execution fails.
     pub async fn execute(self) -> Result<(), Error> {
         match self.command {
+            Command::Inbox(options) => options.execute().await.map_err(Error::from),
             Command::Status(options) => {
                 let view = inspection::View(crate::status::Inspection::read(options.home).await?);
                 println!("{}", view.status());
@@ -225,6 +236,9 @@ pub enum Error {
     /// Reading local runtime status or tasks failed.
     #[error(transparent)]
     Inspection(#[from] crate::status::Error),
+    /// Reading local or replicated delivery receipts failed.
+    #[error(transparent)]
+    Inbox(Box<crate::cli::inbox::Error>),
     /// Application execution failed.
     #[error(transparent)]
     Application(Box<crate::Error>),
@@ -259,6 +273,12 @@ pub enum Error {
     UnboundIdentity(PathBuf),
 }
 
+impl From<crate::cli::inbox::Error> for Error {
+    fn from(error: crate::cli::inbox::Error) -> Self {
+        Self::Inbox(Box::new(error))
+    }
+}
+
 impl From<provider_command::Error> for Error {
     fn from(error: provider_command::Error) -> Self {
         Self::Provider(Box::new(error))
@@ -290,6 +310,8 @@ pub enum Mode {
     Status,
     /// Inspect unfinished tasks and their saved context.
     Task,
+    /// Inspect queued and handled notifications locally or from replicated receipts.
+    Inbox,
 }
 
 #[derive(Debug, Subcommand)]
@@ -304,6 +326,8 @@ enum Command {
     Status(Location),
     /// Inspect this member's unfinished tasks.
     Task(TaskOptions),
+    /// Inspect notification delivery, optionally from a remote member's signed receipts.
+    Inbox(crate::cli::inbox::Options),
 }
 
 impl Command {
@@ -311,7 +335,7 @@ impl Command {
         match self {
             Self::Setup(options) => Some(&options.options),
             Self::Run(options) => Some(options),
-            Self::Provider(_) | Self::Status(_) | Self::Task(_) => None,
+            Self::Provider(_) | Self::Status(_) | Self::Task(_) | Self::Inbox(_) => None,
         }
     }
 }

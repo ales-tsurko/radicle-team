@@ -463,18 +463,10 @@ impl Application {
             generation = binding.generation(),
             "team member initialized"
         );
-        AgentRuntime::start(
-            self,
-            runtime,
-            talker,
-            chatter,
-            coder,
-            binding.mcp_allow().clone(),
-            binding.policy().clone(),
-        )
-        .await?
-        .run(self, talker, chatter, coder)
-        .await
+        AgentRuntime::start(self, runtime, talker, chatter, coder, binding)
+            .await?
+            .run(self, talker, chatter, coder)
+            .await
     }
 
     fn warn_agent_shutdown(stopped: Result<(), agent::Error>) {
@@ -521,6 +513,7 @@ impl Application {
     async fn prepare_run(&self, runtime: &Runtime) -> Result<manifest::ValidatedBinding, Error> {
         runtime.status.phase(Phase::Synchronizing).await;
         self.synchronize(&runtime.identity).await?;
+        runtime.status.synchronized(None).await;
         let binding = self
             .wait_for_binding(&runtime.home, &runtime.identity, &runtime.status)
             .await?;
@@ -1190,6 +1183,9 @@ struct Resources {
     chat_state: chat::State,
     chat_identity: Option<chat::credentials::Credentials>,
     workspaces: crate::workspace::Workspaces,
+    publisher: agent::Publisher,
+    inbox: crate::delivery::Inbox,
+    receipt: char,
 }
 
 #[derive(Debug)]
@@ -1223,24 +1219,13 @@ impl AgentRuntime {
         talker: &mut (impl Talker + ?Sized),
         chatter: &mut (impl Chatter + ?Sized),
         coder: &mut (impl Coder + ?Sized),
-        allowlist: manifest::McpAllowlist,
-        policy: manifest::RepositoryPolicy,
+        binding: &manifest::ValidatedBinding,
     ) -> Result<Self, Error> {
-        match Self::initialize(
-            application,
-            &runtime,
-            talker,
-            chatter,
-            coder,
-            allowlist,
-            &policy,
-        )
-        .await
-        {
+        match Self::initialize(application, &runtime, talker, chatter, coder, binding).await {
             Ok(resources) => Ok(Self {
                 runtime,
                 resources,
-                policy,
+                policy: binding.policy().clone(),
             }),
             Err(error) => application.abandon_run(runtime, error).await,
         }
@@ -1252,10 +1237,10 @@ impl AgentRuntime {
         talker: &mut (impl Talker + ?Sized),
         chatter: &mut (impl Chatter + ?Sized),
         coder: &mut (impl Coder + ?Sized),
-        allowlist: manifest::McpAllowlist,
-        policy: &manifest::RepositoryPolicy,
+        binding: &manifest::ValidatedBinding,
     ) -> Result<Resources, Error> {
-        let (publisher, queue, chat_state, chat_identity) =
+        let policy = binding.policy();
+        let (publisher, queue, inbox, chat_state, chat_identity) =
             Self::initialize_resources(application, runtime, policy).await?;
         // Before any agent starts. The sandbox fences off the parts of the shared object store an
         // agent must never write, and a path which is not there yet cannot be fenced.
@@ -1263,8 +1248,8 @@ impl AgentRuntime {
         let servers = Self::start_mcp(
             application,
             runtime,
-            publisher,
-            allowlist,
+            publisher.clone(),
+            binding.mcp_allow().clone(),
             mcp::ToolState::new(queue.clone(), chat_state.clone()),
             policy.chat().is_some(),
         )
@@ -1280,6 +1265,9 @@ impl AgentRuntime {
         }
 
         Ok(Resources {
+            inbox,
+            publisher,
+            receipt: binding.receipt(),
             servers,
             queue,
             chat_state,
@@ -1319,6 +1307,7 @@ impl AgentRuntime {
         (
             agent::Publisher,
             TaskQueue,
+            crate::delivery::Inbox,
             chat::State,
             Option<chat::credentials::Credentials>,
         ),
@@ -1326,8 +1315,9 @@ impl AgentRuntime {
     > {
         let publisher = Self::initialize_publisher(application, runtime).await?;
         let (queue, chat_state) = Self::initialize_state(application, runtime).await?;
+        let inbox = queue.inbox().await?;
         let chat_identity = Self::initialize_chat(application, runtime, policy).await?;
-        Ok((publisher, queue, chat_state, chat_identity))
+        Ok((publisher, queue, inbox, chat_state, chat_identity))
     }
 
     async fn initialize_chat(
@@ -1582,10 +1572,11 @@ impl AgentRuntime {
         );
         let builder = builder::Builder::new(application.member, application.repository);
         let coder_scope = self.resources.servers.coder.scope();
-        let (conversations, dispatcher) = conversation::Dispatcher::new(
+        let dispatcher = conversation::Dispatcher::new(
             application.member,
             workspaces.clone(),
             self.resources.servers.talker.scope(),
+            self.resources.inbox.clone(),
         );
         let (messages, chat_dispatcher) = chat::dispatcher::Dispatcher::new(
             application.member,
@@ -1609,12 +1600,24 @@ impl AgentRuntime {
                 profile.storage.clone(),
                 self.resources.queue.clone(),
                 self.policy.priority().clone(),
-                conversations.clone(),
+                self.resources.inbox.clone(),
             ),
         );
+        let receipts = self.resources.inbox.publish(
+            &self.resources.publisher,
+            application.member,
+            self.resources.receipt,
+        );
+        let refreshing = self.refresh(application);
         let dispatching = dispatcher.run(talker);
         let messaging = chat_dispatcher.run(chatter);
-        let building = builder.run(&*coder, &self.resources.queue, &workspaces, &coder_scope);
+        let building = builder.run(
+            &*coder,
+            &self.resources.queue,
+            &workspaces,
+            &coder_scope,
+            &self.resources.inbox,
+        );
         let chatting = async move {
             if let Some(ingress) = chat
                 && let Err(error) = ingress.run().await
@@ -1624,11 +1627,11 @@ impl AgentRuntime {
             std::future::pending::<std::convert::Infallible>().await
         };
         let ran = tokio::select! {
+            receipt = receipts => receipt.map_err(Error::Inbox),
+            refreshed = refreshing => refreshed,
             watched = watching => watched.map_err(Error::from),
-            dispatched = dispatching => dispatched
-                .map_err(|error| Error::Conversation(error.to_string())),
-            messaged = messaging => messaged
-                .map_err(|error| Error::Conversation(error.to_string())),
+            dispatched = dispatching => dispatched.map_err(Error::Conversation),
+            messaged = messaging => messaged.map_err(Error::Conversation),
             built = building => built.map_err(Error::from),
             never = chatting => match never {},
         };
@@ -1656,6 +1659,30 @@ impl AgentRuntime {
             node: self.runtime.stop(&application.shutdown, failure).await,
         };
         cleanup.finish(ran, interrupted)
+    }
+
+    async fn refresh(&self, application: &Application) -> Result<(), Error> {
+        let mut delay = Duration::from_secs(30);
+        loop {
+            tokio::time::sleep(delay).await;
+            let result = application.synchronize(&self.runtime.identity).await;
+            self.runtime
+                .status
+                .synchronized(result.as_ref().err().map(ToString::to_string))
+                .await;
+            match result {
+                Ok(()) => {
+                    delay = Duration::from_secs(30);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "periodic repository fetch failed; retrying");
+                    delay = Duration::from_secs(10);
+                }
+            }
+            if application.shutdown.is_requested() {
+                return Ok(());
+            }
+        }
     }
 
     fn chat_ingress(
@@ -1694,6 +1721,9 @@ impl agent::Authorizer for WriteAuthorizer {
             .validate_profile_binding(&self.home, &self.profile, self.did)
             .await
             .and_then(|binding| {
+                if method == "delivery_status" {
+                    return Ok(());
+                }
                 binding
                     .mcp_allow()
                     .allows(method)
@@ -2049,7 +2079,10 @@ pub enum Error {
     },
     /// The conversation dispatcher stopped.
     #[error("conversation dispatcher error: {0}")]
-    Conversation(String),
+    Conversation(#[from] conversation::Error),
+    /// Persisting or publishing notification delivery failed.
+    #[error("delivery inbox error: {0}")]
+    Inbox(#[from] crate::delivery::Error),
     /// Preparing the member's working copies failed.
     #[error("workspace error: {0}")]
     Workspace(String),

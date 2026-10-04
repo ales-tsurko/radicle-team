@@ -1,6 +1,6 @@
 //! The documents an adapter gives its agent as standing context.
 //!
-//! Six per delivery: what the team shares, the world the members come from, what one role of a
+//! Standing context: what the team shares, the world the members come from, what one role of a
 //! member does, and the three which make this member that member rather than a competent stranger.
 //! They are compiled in, because the binary ships without the repository they were written in.
 
@@ -45,10 +45,15 @@ impl Document {
 /// member document contradicting a shared rule is a mistake in the member document, and the order
 /// says so.
 #[must_use]
-pub fn for_member(member: Member, role: Role) -> [Document; 6] {
+pub fn for_member(member: Member, role: Role) -> Vec<Document> {
     let [character, expertise, examples] = personal(member);
+    let mut documents = vec![TEAM, UNIVERSE];
+    if role == Role::Chatter {
+        documents.push(TALKER);
+    }
+    documents.extend([role.into(), character, expertise, examples]);
 
-    [TEAM, UNIVERSE, role.into(), character, expertise, examples]
+    documents
 }
 
 impl From<Role> for Document {
@@ -162,8 +167,7 @@ mod tests {
         }
     }
 
-    // The three roles are one person, so the only document which may differ between them is the
-    // one saying which role is speaking.
+    // Talking and building roles are one person, so only their role document differs.
     #[test]
     fn changes_only_the_role_document_between_one_members_roles() {
         let talking = documents::for_member(Member::Nico, Role::Talker);
@@ -182,6 +186,27 @@ mod tests {
             Document::from(Role::Talker).name(),
             "TALKER.md",
             "and it must be the role document which differs"
+        );
+    }
+
+    #[test]
+    fn installs_the_talking_rules_chatter_refers_to() {
+        let root = tempfile::tempdir().expect("temporary directory should be created");
+        let home = crate::home::MemberHome::at(root.path().join("member"));
+        home.create().expect("member directory should be created");
+        let written = documents::install(&home, Member::Nico, Role::Chatter)
+            .expect("chat instructions should be installed");
+
+        assert!(
+            written
+                .windows(2)
+                .any(|pair| { pair[0].ends_with("TALKER.md") && pair[1].ends_with("CHATTER.md") }),
+            "the talking rules must be loaded before the chat-specific rules"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.instructions(Role::Chatter).join("TALKER.md"))
+                .expect("the rules CHATTER.md refers to must be available"),
+            Document::from(Role::Talker).body()
         );
     }
 

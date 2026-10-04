@@ -102,6 +102,18 @@ impl Reporter {
         .await;
     }
 
+    pub(crate) async fn synchronized(&self, error: Option<String>) {
+        self.change(move |snapshot| {
+            if error.is_none() {
+                snapshot.fetched = Some(Snapshot::now());
+            }
+            snapshot.sync_error = error;
+            snapshot.updated = Snapshot::now();
+            true
+        })
+        .await;
+    }
+
     pub(crate) async fn finish(&self, failure: Option<String>) {
         self.change(move |snapshot| {
             snapshot.phase = if failure.is_some() {

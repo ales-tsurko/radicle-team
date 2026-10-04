@@ -143,6 +143,10 @@ fn described(change: Change) -> String {
         }
         Change::ReviewEdited(review) => format!("review {review} was edited"),
         Change::ReviewRedacted(review) => format!("review {review} was redacted"),
+        Change::ReviewFollowUp { review, revision } => format!(
+            "revision {revision} is ready to check against your rejected review {review}. Check \
+             your own findings; respond to another review only when addressed or mentioned"
+        ),
         Change::ReviewReaction { review, active } => {
             format!("a reaction on review {review} was {}", added(active))
         }
@@ -226,6 +230,10 @@ mod tests {
             },
             Change::ReviewEdited(entry().into()),
             Change::ReviewRedacted(entry().into()),
+            Change::ReviewFollowUp {
+                review: entry().into(),
+                revision: entry().into(),
+            },
             Change::ReviewReaction {
                 review: entry().into(),
                 active: false,

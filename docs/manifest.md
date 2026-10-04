@@ -33,7 +33,14 @@ generation = 1                           # required, monotonic
 state = "active"                         # required, "active" or "inactive"
 mcp_allow = ["read", "comments"]         # required, may be empty
 provider = "gpt"                         # optional, a name from `rad-team provider ls`
+receipt = "🔧"                          # optional, automatic queue acknowledgement
 ```
+
+`receipt` is one Radicle-supported emoji. Defaults differ by member: Nico `🔧`,
+Maya `📋`, Leon `📐`, Vera `🔒`, Nora `🎨`, and Theo `🔎`. It is published
+programmatically after durable queue admission. Model-selected reactions remain
+free to express the member's character. The `set_reaction` permission controls
+these receipts too. Signed delivery-state records remain available without it.
 
 `provider` names which models a member runs on, never a model itself: which
 model of that provider it gets is decided from the member's character sheet by
@@ -69,16 +76,20 @@ peer spend the operator's agent budget.
 A delegate's review reaches the member who owns the patch without a mention,
 including a verdict with no summary. Reviews from other people follow
 `triggered_by`; with the default, unauthorized reviews never run an agent.
+Previous reviewers receive activity on their own reviews and explicit mentions.
+Ready revisions trigger follow-up while their own review rejects the patch.
+Another reviewer's feedback does not reopen an accepted review.
 
 The setup wizard asks for the value when it creates a manifest and leaves it
 alone when it later adds a member, so editing it by hand is safe.
 
 Reactions never trigger anyone, whoever adds them. Approving an idea and asking
 for it to be carried out look identical, so acting on a reaction risks work
-nobody asked for. Request work in a comment. Members acknowledge assignments,
-relevant messages, and reviews during their own turns, choosing reactions that
-fit their character and role. These use the `set_reaction` permission; disabling
-reactions disables reaction acknowledgments too.
+nobody asked for. Request work in a comment. The runtime acknowledges accepted
+assignments, relevant messages, and reviews after saving them in the queue,
+using the member's configured `receipt`. These use the `set_reaction`
+permission; disabling reactions disables reaction acknowledgments too. Reactions
+neither spend exchanges nor split a peer's turn.
 
 A member's own activity never triggers itself.
 
@@ -94,17 +105,17 @@ itself while nobody is watching:
 
 - assigning work to a member,
 - naming one directly, as `@nico`,
-- replying to a comment that member owns.
+- addressing a comment or review that member owns.
 
 `@team` is not among them, so no member can summon the whole cast, and neither
 are ambient changes such as an edited title. A submitted review and a new ready
 revision are the exceptions: those carry work to whoever owns the subject, and
 without them delegated work would stall once it was reviewed.
 
-Ready revisions also reach members who already reviewed that patch, so they can
-recheck affected findings without another mention or follow-up comment. Draft
-revisions wait until the patch is opened for review. Explicit mentions and
-discussion remain available on drafts.
+Ready revisions also reach members whose own review rejects that patch. The
+delivery identifies that review and the new revision so they recheck their own
+findings without another mention. Draft revisions wait until the patch is opened
+for review. Explicit mentions and discussion remain available on drafts.
 
 Two members also stop talking to each other after a while. A conversation
 between them runs for a fixed number of turns on one issue, patch, or channel,

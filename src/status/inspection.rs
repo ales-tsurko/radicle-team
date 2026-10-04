@@ -25,6 +25,7 @@ pub(crate) struct Inspection {
     pub(crate) did: Option<Did>,
     pub(crate) snapshot: Option<Snapshot>,
     pub(crate) tasks: Vec<(Task, bool)>,
+    pub(crate) deliveries: Vec<crate::delivery::Record>,
     pub(crate) live: bool,
 }
 
@@ -45,7 +46,7 @@ impl Inspection {
             .public_key()?
             .map(Did::from);
         let before = MemberLock::owner(&home)?;
-        let (snapshot, tasks) = Self::stored(&home, repository, member).await?;
+        let (snapshot, tasks, deliveries) = Self::stored(&home, repository, member).await?;
         let after = MemberLock::owner(&home)?;
         let live = before == after
             && snapshot
@@ -58,6 +59,7 @@ impl Inspection {
             did,
             snapshot,
             tasks,
+            deliveries,
             live,
         })
     }
@@ -93,14 +95,23 @@ impl Inspection {
         home: &MemberHome,
         repository: RepoId,
         member: Member,
-    ) -> Result<(Option<Snapshot>, Vec<(Task, bool)>), Error> {
+    ) -> Result<
+        (
+            Option<Snapshot>,
+            Vec<(Task, bool)>,
+            Vec<crate::delivery::Record>,
+        ),
+        Error,
+    > {
         match tokio::fs::metadata(home.state_database()).await {
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((None, Vec::new())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok((None, Vec::new(), Vec::new()));
+            }
             Err(error) => return Err(error.into()),
         }
         let database = Database::read_only(home.state_database()).await?;
-        let (data, tasks) = database
+        let (data, tasks, deliveries) = database
             .call(move |connection| {
                 connection.execute("BEGIN")?;
                 let read = (|| {
@@ -115,7 +126,11 @@ impl Inspection {
                     } else {
                         None
                     };
-                    Ok((data, TaskQueue::inspect(connection, repository, member)?))
+                    Ok((
+                        data,
+                        TaskQueue::inspect(connection, repository, member)?,
+                        crate::delivery::Inbox::rows(connection)?,
+                    ))
                 })();
                 connection.execute("ROLLBACK")?;
                 read
@@ -124,6 +139,10 @@ impl Inspection {
         Ok((
             data.map(|data| serde_json::from_str(&data)).transpose()?,
             tasks,
+            deliveries
+                .into_iter()
+                .map(|data| serde_json::from_str(&data))
+                .collect::<Result<_, _>>()?,
         ))
     }
 }

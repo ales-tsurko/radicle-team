@@ -19,6 +19,8 @@ pub(crate) struct Snapshot {
     pub(crate) updated: u64,
     pub(crate) roles: BTreeMap<Role, RoleStatus>,
     pub(crate) failure: Option<String>,
+    pub(crate) fetched: Option<u64>,
+    pub(crate) sync_error: Option<String>,
 }
 
 impl Snapshot {
@@ -35,6 +37,8 @@ impl Snapshot {
                 .map(|role| (role, RoleStatus::default()))
                 .collect(),
             failure: None,
+            fetched: None,
+            sync_error: None,
         }
     }
 

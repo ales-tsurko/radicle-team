@@ -9,11 +9,12 @@ use radicle::{
     },
     identity::{Did, RepoId},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Context, DeliveryId, Talker};
 
 /// Activity addressed to or otherwise relevant to the selected member.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Activity {
     /// Repository containing the activity.
     pub repository: RepoId,
@@ -67,7 +68,7 @@ impl Activity {
 }
 
 /// Collaborative object receiving an interaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Subject {
     /// Radicle issue.
     Issue(ObjectId),
@@ -121,7 +122,7 @@ impl FromStr for Subject {
 pub struct InvalidSubject(String);
 
 // Reason an interaction requires the member's attention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Kind {
     Assigned,
     // Something happened that the talking role should answer.
@@ -129,7 +130,7 @@ pub(crate) enum Kind {
 }
 
 // An interaction the talking role handles itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Delivery {
     Mentioned(Target),
     Replied { comment: Comment, reply_to: EntryId },
@@ -151,7 +152,7 @@ impl Delivery {
 }
 
 /// Location containing a mention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Target {
     /// Issue or patch title or description.
     Subject,
@@ -164,7 +165,7 @@ pub enum Target {
 }
 
 /// Comment location within a collaborative object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Comment {
     /// Issue discussion comment.
     Issue(EntryId),
@@ -191,7 +192,7 @@ impl Comment {
 }
 
 /// Change relevant because the member owns, reviews, or is assigned to the subject.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Change {
     /// The member was removed from the assignee set.
     Unassigned,
@@ -238,6 +239,13 @@ pub enum Change {
     ReviewEdited(ReviewId),
     /// A review was redacted.
     ReviewRedacted(ReviewId),
+    /// A ready revision should be checked against the member's own rejected review.
+    ReviewFollowUp {
+        /// The member's review whose findings should be checked.
+        review: ReviewId,
+        /// The revision to check.
+        revision: RevisionId,
+    },
     /// A reaction on a review changed.
     ReviewReaction {
         /// Review receiving the reaction.
@@ -267,6 +275,7 @@ impl Change {
             Self::RevisionCreated(_)
                 | Self::RevisionEdited(_)
                 | Self::ReviewCommentsResolved
+                | Self::ReviewFollowUp { .. }
                 | Self::PatchReady
         )
     }
@@ -276,7 +285,10 @@ impl Change {
     pub const fn is_task_submission(&self) -> bool {
         matches!(
             self,
-            Self::ReviewSubmitted { .. } | Self::RevisionCreated(_) | Self::PatchReady
+            Self::ReviewSubmitted { .. }
+                | Self::ReviewFollowUp { .. }
+                | Self::RevisionCreated(_)
+                | Self::PatchReady
         )
     }
 

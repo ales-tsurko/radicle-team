@@ -112,6 +112,57 @@ impl RepositoryFixture {
         }
     }
 
+    fn bind_receipts(&self, did: radicle::identity::Did) {
+        use radicle::storage::SignRepository as _;
+        let repository = self
+            .profile
+            .storage
+            .repository(self.repository)
+            .expect("repository");
+        let (_, head) = repository.canonical_head().expect("canonical head");
+        let git = &repository.backend;
+        let parent = git.find_commit(head.into()).expect("canonical commit");
+        let mut tree = git
+            .treebuilder(Some(&parent.tree().expect("tree")))
+            .expect("tree builder");
+        let rid = self.repository;
+        let policy = format!(
+            r#"version = 1
+[security]
+repository = "{rid}"
+recipients = ["age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa"]
+[members.nico]
+signing_did = "{did}"
+generation = 1
+state = "active"
+mcp_allow = ["read", "reactions"]
+"#
+        );
+        let blob = git.blob(policy.as_bytes()).expect("manifest blob");
+        tree.insert(crate::manifest::FILE_NAME, blob, 0o100644)
+            .expect("manifest tree");
+        let tree = git
+            .find_tree(tree.write().expect("write tree"))
+            .expect("tree");
+        let signature =
+            git2::Signature::now("Receipt Test", "receipt@example.com").expect("signature");
+        git.commit(
+            Some(&format!(
+                "refs/namespaces/{}/refs/heads/main",
+                self.profile.id()
+            )),
+            &signature,
+            &signature,
+            "Bind receipt identity",
+            &tree,
+            &[&parent],
+        )
+        .expect("commit manifest");
+        repository
+            .sign_refs(&self.profile.signer().expect("signer"))
+            .expect("sign canonical refs");
+    }
+
     fn additional_repository(&self, name: &str) -> RepoId {
         let working = self._root.path().join(name);
         let checkout = git2::Repository::init(&working).expect("repository should initialize");
@@ -4311,4 +4362,408 @@ async fn keeps_an_active_tool_request_usable_while_deactivation_waits() {
         .active()
         .await
         .expect_err("the deactivated scope rejects new tool requests");
+}
+
+#[tokio::test]
+async fn queued_runtime_receipts_are_signed_and_retry_without_duplicate_reactions() {
+    use radicle::cob::stream::CobStream as _;
+
+    use crate::{
+        delivery::{State as DeliveryState, remote::Deliveries},
+        watcher::{Activity, Kind},
+    };
+    let fixture = RepositoryFixture::new();
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("repository");
+    let signer = fixture.profile.signer().expect("signer");
+    let issue = {
+        let mut issues = fixture
+            .profile
+            .issues_mut(&stored, &signer)
+            .expect("issue store");
+        *issues
+            .create(
+                "Queued".to_owned().try_into().expect("title"),
+                "Work",
+                &[],
+                &[],
+                [],
+            )
+            .expect("issue")
+            .id()
+    };
+    let queue = fixture.queue().await;
+    let inbox = queue.inbox().await.expect("inbox");
+    let activity = Activity {
+        repository: fixture.repository,
+        subject: Subject::Issue(issue),
+        operation: *issue,
+        action: 0,
+        author: fixture.profile.did(),
+        kind: Kind::Assigned,
+    };
+    let task = queue
+        .push_assignment(
+            crate::queue::TaskRequest::new(
+                "Work".into(),
+                activity.subject.into(),
+                crate::manifest::QueuePosition::End,
+            ),
+            activity.clone(),
+        )
+        .await
+        .expect("atomic admission");
+    assert_eq!(inbox.list().await.expect("inbox")[0].task, Some(task.task));
+    let announcements = Arc::new(AtomicUsize::new(0));
+    let publisher = crate::agent::Publisher::new(
+        fixture.profile.clone(),
+        fixture.repository,
+        None,
+        FlakyAnnouncer(announcements.clone()),
+        RotatingAuthorizer(Arc::new(tokio::sync::RwLock::new(
+            crate::manifest::SecurityPolicy::test(fixture.repository),
+        ))),
+    )
+    .with_memory_journal()
+    .await
+    .expect("journal");
+    publisher
+        .receipt(&activity, Member::Nico.receipt())
+        .await
+        .expect_err("first announcement fails");
+    publisher
+        .reconcile(activity.delivery_id().into())
+        .await
+        .expect("model publications recover independently");
+    assert_eq!(
+        announcements.load(Ordering::Relaxed),
+        1,
+        "a model's recovery must not handle runtime receipts"
+    );
+    publisher
+        .receipt(&activity, Member::Nico.receipt())
+        .await
+        .expect("retry signed receipt");
+    let operations = radicle::cob::issue::IssueStream::init(issue, &stored)
+        .all()
+        .expect("history")
+        .count();
+    assert_eq!(
+        operations, 2,
+        "receipt retry cannot append another reaction"
+    );
+    let publish = inbox.publish(&publisher, Member::Nico, Member::Nico.receipt());
+    tokio::pin!(publish);
+    let exercise = async {
+        while !inbox.pending().await.expect("outbox").is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let store = radicle::cob::store::Store::<Deliveries, _, _>::open(&stored, ReadOnly)
+            .expect("delivery store");
+        let records = store
+            .all()
+            .expect("records")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("signed COBs");
+        assert_eq!(records.len(), 1);
+        let record = inbox.list().await.expect("inbox").remove(0);
+        assert_eq!(records[0].1.author, *fixture.profile.id());
+        assert_eq!(
+            records[0].1.records[&record.id()].state,
+            DeliveryState::Queued
+        );
+        inbox
+            .set(&record.id(), DeliveryState::Handled, None)
+            .await
+            .expect("complete");
+        while !inbox.pending().await.expect("outbox").is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let records = store
+            .all()
+            .expect("records")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("updated COBs");
+        assert_eq!(
+            records.len(),
+            1,
+            "state changes update the member's existing COB"
+        );
+        assert_eq!(
+            records[0].1.records[&record.id()].state,
+            DeliveryState::Handled
+        );
+        fixture.bind_receipts(fixture.profile.did());
+        assert_eq!(
+            Deliveries::read(&stored)
+                .expect("verified remote read")
+                .len(),
+            1
+        );
+        fixture.bind_receipts(
+            "did:key:z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7"
+                .parse()
+                .expect("other DID"),
+        );
+        assert!(
+            Deliveries::read(&stored)
+                .expect("mismatched signing DID")
+                .is_empty(),
+            "only the canonical member binding may claim these receipts"
+        );
+        assert!(
+            radicle::storage::refs::SignedRefs::load(*fixture.profile.id(), &stored)
+                .expect("signed refs")
+                .expect("signature")
+                .iter()
+                .any(|(name, _)| name.to_string().contains("xyz.radicle.team.delivery"))
+        );
+    };
+    tokio::select! {
+        result = &mut publish => panic!("receipt worker ended: {result:?}"),
+        result = tokio::time::timeout(std::time::Duration::from_secs(5), exercise) => result.expect("publication should complete without a model"),
+    }
+}
+
+#[tokio::test]
+async fn a_missing_reaction_target_does_not_hide_signed_queue_admission() {
+    use crate::{
+        delivery::{State, remote::Deliveries},
+        watcher::{Activity, Delivery, Kind, Target},
+    };
+    let fixture = RepositoryFixture::new();
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("repository");
+    let inbox = fixture.queue().await.inbox().await.expect("inbox");
+    let missing = "1111111111111111111111111111111111111111"
+        .parse()
+        .expect("missing issue");
+    let activity = Activity {
+        repository: fixture.repository,
+        subject: Subject::Issue(missing),
+        operation: *missing,
+        action: 0,
+        author: fixture.profile.did(),
+        kind: Kind::Delivered(Delivery::Mentioned(Target::Subject)),
+    };
+    inbox.enqueue(activity, None).await.expect("admission");
+    let publisher = crate::agent::Publisher::new(
+        fixture.profile.clone(),
+        fixture.repository,
+        None,
+        TestAnnouncer,
+        RotatingAuthorizer(Arc::new(tokio::sync::RwLock::new(
+            crate::manifest::SecurityPolicy::test(fixture.repository),
+        ))),
+    )
+    .with_memory_journal()
+    .await
+    .expect("journal");
+    let publish = inbox.publish(&publisher, Member::Nico, Member::Nico.receipt());
+    let exercise = async {
+        let store = radicle::cob::store::Store::<Deliveries, _, _>::open(&stored, ReadOnly)
+            .expect("delivery store");
+        loop {
+            let records = store
+                .all()
+                .expect("records")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("signed records");
+            if let Some((_, delivery)) = records.first() {
+                assert_eq!(
+                    delivery.records.values().next().expect("record").state,
+                    State::Queued
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let pending = inbox.pending().await.expect("outbox");
+        assert_eq!(
+            pending.len(),
+            1,
+            "the unavailable native reaction remains retryable"
+        );
+        assert!(!pending[0].1);
+    };
+    tokio::select! {
+        result = publish => panic!("receipt worker ended: {result:?}"),
+        result = tokio::time::timeout(std::time::Duration::from_secs(5), exercise) => result.expect("signed delivery state must not wait for the reaction"),
+    }
+}
+
+#[tokio::test]
+async fn identical_comments_reuse_the_existing_entry_but_distinct_replies_stay_separate() {
+    let fixture = RepositoryFixture::new();
+    let service = fixture.service().await;
+    let issue = service
+        .create_issue_write(CreateIssueRequest {
+            title: "Do it".into(),
+            description: "Request".into(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+        })
+        .await
+        .expect("issue");
+    let issue_id = issue.0.data["id"].as_str().expect("issue ID");
+    let request = |reply: Option<&str>| CommentWriteRequest {
+        subject: RepositoryFixture::subject(SubjectKind::Issue, issue_id),
+        target: CommentTargetKind::Issue,
+        entity: None,
+        comment: None,
+        body: Some("Done".into()),
+        reply_to: reply.map(str::to_owned),
+        location: None,
+        embeds: Vec::new(),
+    };
+    let first = service
+        .write_comment(request(None), CommentOperation::Create)
+        .await
+        .expect("comment");
+    let repeated = service
+        .write_comment(request(None), CommentOperation::Create)
+        .await
+        .expect("reuse");
+    assert_eq!(first.0.data, repeated.0.data);
+    let different = service
+        .write_comment(
+            request(first.0.data["id"].as_str()),
+            CommentOperation::Create,
+        )
+        .await
+        .expect("distinct reply target");
+    assert_ne!(first.0.data, different.0.data);
+}
+
+#[tokio::test]
+async fn runtime_receipts_acknowledge_the_actual_review_and_comment_targets() {
+    use crate::watcher::{Activity, Change, Comment, Delivery, Kind};
+    let fixture = RepositoryFixture::new();
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("repository");
+    let signer = fixture.profile.signer().expect("signer");
+    let (id, revision, review, review_comment, revision_comment) = {
+        let mut patches = fixture
+            .profile
+            .patches_mut(&stored, &signer)
+            .expect("patch store");
+        let mut patch = patches
+            .create(
+                "Changes".to_owned().try_into().expect("title"),
+                "Changes",
+                patch::MergeTarget::Delegates,
+                Oid::from(fixture.base),
+                Oid::from(fixture.head),
+                &[],
+            )
+            .expect("patch");
+        let revision = patch.latest().0;
+        let review = patch
+            .review(
+                revision,
+                Some(patch::Verdict::Accept),
+                Some("An optional suggestion".into()),
+                Vec::new(),
+            )
+            .expect("review");
+        let review_comment = patch
+            .review_comment(review, "Suggestion", None, None, [])
+            .expect("review comment");
+        let revision_comment = patch
+            .comment(revision, "Question", None, None, [])
+            .expect("revision comment");
+        (
+            *patch.id(),
+            revision,
+            review,
+            review_comment,
+            revision_comment,
+        )
+    };
+    let publisher = fixture.service().await.publisher;
+    let emoji = Member::Maya.receipt();
+    let events = [
+        (review.into(), Change::ReviewSubmitted { review, revision }),
+        (
+            review_comment,
+            Change::CommentCreated(Comment::Review {
+                review,
+                comment: review_comment,
+            }),
+        ),
+        (
+            revision_comment,
+            Change::CommentCreated(Comment::Revision {
+                revision,
+                comment: revision_comment,
+            }),
+        ),
+        (revision.into(), Change::RevisionCreated(revision)),
+    ];
+    for (operation, change) in events {
+        let activity = Activity {
+            repository: fixture.repository,
+            subject: Subject::Patch(id),
+            operation,
+            action: 0,
+            author: fixture.profile.did(),
+            kind: Kind::Delivered(Delivery::Changed(change)),
+        };
+        publisher
+            .receipt(&activity, emoji)
+            .await
+            .expect("targeted receipt");
+        publisher
+            .receipt(&activity, emoji)
+            .await
+            .expect("idempotent receipt");
+    }
+    let patch = Patches::open(&stored, ReadOnly)
+        .expect("patches")
+        .get(&id)
+        .expect("read patch")
+        .expect("patch");
+    let reaction = radicle::cob::Reaction::new(emoji).expect("reaction");
+    let review = super::recovery::find_review(&patch, review).expect("review");
+    assert!(
+        review
+            .reactions()
+            .contains(&(*fixture.profile.id(), reaction))
+    );
+    assert!(
+        review
+            .comments()
+            .find(|(id, _)| **id == review_comment)
+            .expect("comment")
+            .1
+            .reactions()
+            .get(&reaction)
+            .is_some_and(|authors| authors.contains(&fixture.profile.id()))
+    );
+    let revision = patch.revision(&revision).expect("revision");
+    assert!(
+        revision
+            .reactions()
+            .get(&None)
+            .expect("revision receipt")
+            .contains(&(*fixture.profile.id(), reaction))
+    );
+    assert!(
+        revision
+            .discussion()
+            .comment(&revision_comment)
+            .expect("comment")
+            .reactions()
+            .get(&reaction)
+            .is_some_and(|authors| authors.contains(&fixture.profile.id()))
+    );
 }

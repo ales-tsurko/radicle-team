@@ -296,6 +296,8 @@ pub struct Binding {
     mcp_allow: McpAllowlist,
     #[serde(default)]
     provider: Option<String>,
+    #[serde(default)]
+    receipt: Option<radicle::cob::Reaction>,
 }
 
 impl Binding {
@@ -303,6 +305,13 @@ impl Binding {
     #[must_use]
     pub const fn signing_did(&self) -> Did {
         self.signing_did
+    }
+
+    /// Returns this member's automatic queued-delivery reaction.
+    #[must_use]
+    pub fn receipt(&self, member: Member) -> char {
+        self.receipt
+            .map_or_else(|| member.receipt(), |reaction| reaction.emoji())
     }
 
     /// Returns the binding generation.
@@ -332,6 +341,7 @@ impl Binding {
             state: BindingState::Active,
             mcp_allow: McpAllowlist::default(),
             provider: None,
+            receipt: None,
         }
     }
 
@@ -621,6 +631,7 @@ pub struct ValidatedBinding {
     mcp_allow: McpAllowlist,
     security: SecurityPolicy,
     triggers: RepositoryPolicy,
+    receipt: char,
 }
 
 impl ValidatedBinding {
@@ -640,6 +651,7 @@ impl ValidatedBinding {
             mcp_allow: binding.mcp_allow.clone(),
             security,
             triggers,
+            receipt: binding.receipt(member),
         }
     }
 
@@ -647,6 +659,12 @@ impl ValidatedBinding {
     #[must_use]
     pub fn provider(&self) -> Option<&str> {
         self.provider.as_deref()
+    }
+
+    /// Returns the configured automatic queue receipt.
+    #[must_use]
+    pub const fn receipt(&self) -> char {
+        self.receipt
     }
 
     /// Returns the repository-wide policy this binding was validated against.

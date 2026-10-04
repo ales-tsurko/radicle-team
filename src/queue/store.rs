@@ -158,7 +158,28 @@ impl TaskQueue {
     /// # Errors
     ///
     /// Returns an error when context validation or durable storage fails.
-    pub async fn push(&self, mut request: TaskRequest) -> Result<Receipt, Error> {
+    pub async fn push(&self, request: TaskRequest) -> Result<Receipt, Error> {
+        self.push_recorded(request, None).await
+    }
+
+    pub(crate) async fn inbox(&self) -> Result<crate::delivery::Inbox, crate::delivery::Error> {
+        crate::delivery::Inbox::new(self.database.clone()).await
+    }
+
+    /// Assignment admission and its receipt share the task's transaction.
+    pub(crate) async fn push_assignment(
+        &self,
+        request: TaskRequest,
+        activity: crate::watcher::Activity,
+    ) -> Result<Receipt, Error> {
+        self.push_recorded(request, Some(activity)).await
+    }
+
+    async fn push_recorded(
+        &self,
+        mut request: TaskRequest,
+        activity: Option<crate::watcher::Activity>,
+    ) -> Result<Receipt, Error> {
         request.context.request.clone_from(&request.request);
         request.context.validate()?;
         let repository = self.repository.to_string();
@@ -167,7 +188,20 @@ impl TaskQueue {
             .database
             .call(move |connection| {
                 Self::transaction(connection, |connection| {
-                    Self::record_request(connection, &repository, &member, request)
+                    let receipt = Self::record_request(connection, &repository, &member, request)?;
+                    if let Some(activity) = activity {
+                        let mut record = crate::delivery::Record::new(activity, Some(receipt.task));
+                        record.state = match receipt.state {
+                            TaskState::Waiting => crate::delivery::State::Queued,
+                            TaskState::Running => crate::delivery::State::Processing,
+                            TaskState::Completed => crate::delivery::State::Handled,
+                            TaskState::Cancelled => crate::delivery::State::Ignored,
+                        };
+                        record.error = (receipt.state == TaskState::Cancelled)
+                            .then(|| "Implementation task cancelled".to_owned());
+                        crate::delivery::Inbox::insert_row(connection, &record)?;
+                    }
+                    Ok(receipt)
                 })
             })
             .await?;
@@ -442,6 +476,7 @@ impl TaskQueue {
         update.bind((2, state))?;
         update.bind((3, result.as_deref()))?;
         update.next()?;
+        crate::delivery::Inbox::retire_task(connection, id, state == "cancelled")?;
         for table in ["task_contexts", "task_queue"] {
             let mut delete = connection.prepare(format!(
                 "DELETE FROM {table} WHERE {} = ?1",

@@ -673,3 +673,99 @@ async fn an_explicit_stop_survives_an_interrupted_process() {
             .cancelled
     );
 }
+
+#[tokio::test]
+async fn assignment_and_receipt_commit_together_and_follow_task_completion() {
+    use crate::{
+        delivery::State,
+        watcher::{Activity, Kind},
+    };
+    let queue = queue().await;
+    let inbox = queue.inbox().await.expect("inbox should open");
+    let activity = Activity {
+        repository: REPOSITORY.parse().expect("RID"),
+        subject: Subject::Issue(SUBJECT.parse().expect("issue")),
+        operation: PRODUCED.parse().expect("operation"),
+        action: 0,
+        author: "did:key:z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7"
+            .parse()
+            .expect("DID"),
+        kind: Kind::Assigned,
+    };
+    let request = || {
+        let mut request =
+            crate::queue::TaskRequest::new("assigned".into(), subject(), QueuePosition::End);
+        request.request = Some("assignment".into());
+        request
+    };
+    queue
+        .database()
+        .execute(
+            "CREATE TRIGGER refuse_receipt BEFORE INSERT ON delivery_inbox BEGIN SELECT \
+             RAISE(ABORT, 'test failure'); END;",
+        )
+        .await
+        .expect("failure trigger");
+    queue
+        .push_assignment(request(), activity.clone())
+        .await
+        .expect_err("receipt failure must reject admission");
+    assert!(
+        queue.pending().await.expect("queue").is_empty(),
+        "a task cannot exist without its admitted receipt"
+    );
+    queue
+        .database()
+        .execute("DROP TRIGGER refuse_receipt")
+        .await
+        .expect("allow admission");
+    let admitted = queue
+        .push_assignment(request(), activity.clone())
+        .await
+        .expect("admit");
+    assert_eq!(
+        inbox.list().await.expect("inbox")[0].task,
+        Some(admitted.task)
+    );
+    queue.next().await.expect("start task");
+    queue.finish().await.expect("finish task");
+    assert_eq!(inbox.list().await.expect("inbox")[0].state, State::Handled);
+    queue
+        .push_assignment(request(), activity.clone())
+        .await
+        .expect("restart scan");
+    assert!(
+        queue.pending().await.expect("queue").is_empty(),
+        "completed assignment cannot start again"
+    );
+    assert_eq!(inbox.list().await.expect("inbox").len(), 1);
+    let cancelled = || {
+        let mut request = request();
+        request.request = Some("cancelled-assignment".into());
+        request
+    };
+    let cancelled_id = queue.push(cancelled()).await.expect("record task").task;
+    queue.cancel(cancelled_id).await.expect("cancel task");
+    let mut activity = activity;
+    activity.operation = "4444444444444444444444444444444444444444"
+        .parse()
+        .expect("operation");
+    let receipt = queue
+        .push_assignment(cancelled(), activity)
+        .await
+        .expect("rescan cancelled assignment");
+    assert_eq!(receipt.state, crate::queue::TaskState::Cancelled);
+    let records = inbox.list().await.expect("inbox");
+    let record = records
+        .iter()
+        .find(|record| record.task == Some(cancelled_id))
+        .expect("cancelled receipt");
+    assert_eq!(record.state, State::Ignored);
+    assert!(
+        record
+            .error
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cancelled"))
+    );
+    assert!(queue.pending().await.expect("queue").is_empty());
+}

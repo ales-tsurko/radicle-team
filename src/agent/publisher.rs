@@ -814,7 +814,7 @@ fn bind_mutation(
 
 /// Error publishing an authorized Radicle write.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum Error {
+pub enum Error {
     /// The manifest no longer authorizes the requested method.
     #[error("MCP authorization failed: {0}")]
     Authorization(String),

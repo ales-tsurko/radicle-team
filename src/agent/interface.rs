@@ -475,6 +475,8 @@ impl fmt::Display for DeliveryId {
 pub enum ActivityId {
     /// One classified action delivered to the talker.
     Delivery(DeliveryId),
+    /// Programmatic delivery receipts, recovered independently of model publications.
+    Receipt(DeliveryId),
     /// One authenticated chat message.
     Chat(ChatMessageId),
     /// One queued task carried out by the coder.
@@ -487,6 +489,7 @@ impl ActivityId {
     pub fn request(&self) -> String {
         match self {
             Self::Delivery(delivery) => format!("operation:{}", delivery.operation),
+            Self::Receipt(delivery) => format!("receipt:{delivery}"),
             Self::Chat(message) => format!("chat:{message}"),
             Self::Task(task) => format!("task:{task}"),
         }
@@ -503,6 +506,7 @@ impl fmt::Display for ActivityId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Delivery(delivery) => write!(formatter, "{delivery}"),
+            Self::Receipt(delivery) => write!(formatter, "receipt:{delivery}"),
             Self::Chat(message) => write!(formatter, "chat:{message}"),
             Self::Task(task) => write!(formatter, "task:{task}"),
         }

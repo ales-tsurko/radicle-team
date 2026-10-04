@@ -176,7 +176,7 @@ pub(super) fn write_mcp(harness: &Path, mcp: &McpEndpoint) -> Result<PathBuf, Er
 
 /// Combines the documents instructing the role into the one file a delivery reads them from.
 ///
-/// A delivery takes a single standing prompt, so the six travel together, in the order they
+/// A delivery takes a single standing prompt, so the documents travel together, in the order they
 /// establish themselves: shared rules first, then who is speaking. The combination is rewritten on
 /// every start and lives in the instructions directory beside its sources, where the runtime's
 /// protection already covers it.

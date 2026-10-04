@@ -1,10 +1,10 @@
 //! Conversion from Radicle patch actions into the shared watcher action model.
 
-use radicle::cob::patch::{Action, Lifecycle, ReviewId, RevisionId};
+use radicle::cob::patch::{Action, Lifecycle, ReviewId, RevisionId, Verdict};
 
 use crate::watcher::{
     Change, Comment, Target,
-    classification::{ActionEnvelope, Audience, Entity, NormalizedAction},
+    classification::{ActionEnvelope, Audience, Entity, NormalizedAction, ReviewUpdate},
 };
 
 impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
@@ -24,7 +24,7 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
                 state: Lifecycle::Open,
             } => NormalizedAction::new()
                 .draft(false)
-                .change(Audience::involved(), Change::PatchReady),
+                .change(Audience::review_followup(), Change::PatchReady),
             Action::Lifecycle { state } => NormalizedAction::new()
                 .draft(matches!(state, Lifecycle::Draft))
                 .change(Audience::involved(), Change::LifecycleChanged),
@@ -32,11 +32,19 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
                 NormalizedAction::new().change(Audience::involved(), Change::Merged)
             }
             Action::Review {
-                revision, summary, ..
+                revision,
+                summary,
+                verdict,
+                ..
             } => {
                 let review = ReviewId::from(operation.id);
                 NormalizedAction::new()
                     .track(Entity::Review(review))
+                    .review(ReviewUpdate::Submitted {
+                        review,
+                        revision: *revision,
+                        rejected: *verdict == Some(Verdict::Reject),
+                    })
                     .mention_if(summary.as_deref(), Target::Review(review))
                     .change(
                         Audience::involved(),
@@ -49,16 +57,24 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
             Action::ReviewEdit(edit) => {
                 let review = *edit.review_id();
                 NormalizedAction::new()
+                    .review(ReviewUpdate::Edited {
+                        review,
+                        rejected: edit
+                            .verdict()
+                            .is_some_and(|verdict| *verdict == Verdict::Reject),
+                    })
                     .mention_if(edit.summary().map(String::as_str), Target::Review(review))
                     .change(
                         Audience::involved_or(Entity::Review(review)),
                         Change::ReviewEdited(review),
                     )
             }
-            Action::ReviewRedact { review } => NormalizedAction::new().change(
-                Audience::involved_or(Entity::Review(*review)),
-                Change::ReviewRedacted(*review),
-            ),
+            Action::ReviewRedact { review } => NormalizedAction::new()
+                .review(ReviewUpdate::Redacted(*review))
+                .change(
+                    Audience::involved_or(Entity::Review(*review)),
+                    Change::ReviewRedacted(*review),
+                ),
             Action::ReviewReact { review, active, .. } => NormalizedAction::new().change(
                 Audience::owned(Entity::Review(*review)),
                 Change::ReviewReaction {
@@ -151,7 +167,10 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
                         ),
                         Change::ReviewCommentsResolved,
                     )
-                    .change(Audience::involved(), Change::RevisionCreated(revision))
+                    .change(
+                        Audience::review_followup(),
+                        Change::RevisionCreated(revision),
+                    )
             }
             Action::RevisionEdit {
                 revision,
