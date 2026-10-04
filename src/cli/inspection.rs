@@ -1,14 +1,13 @@
 //! Human-readable member status and task context.
 
-use std::{collections::BTreeSet, io::IsTerminal as _};
-
-use console::Style;
+use std::collections::BTreeSet;
 
 use crate::{
     agent::Role,
+    cli::display::Display,
     manifest::QueuePosition,
     queue::ArtifactRole,
-    status::{Error, Inspection, Phase, Snapshot},
+    status::{Error, Inspection, Phase},
 };
 
 #[derive(Debug)]
@@ -17,7 +16,7 @@ pub(crate) struct View(pub(crate) Inspection);
 impl View {
     pub(crate) fn status(&self) -> String {
         let inspection = &self.0;
-        let style = Self::style();
+        let style = Display::style();
         let dim = style.clone().dim();
         let mut lines = vec![String::new()];
         if let Some(failure) = inspection
@@ -80,17 +79,17 @@ impl View {
         }
         if let Some(snapshot) = &inspection.snapshot {
             if let Some(fetched) = snapshot.fetched {
-                lines.push(format!("Last successful fetch: {}", Self::age(fetched)));
+                lines.push(format!("Last successful fetch: {}", Display::age(fetched)));
             }
             if let Some(error) = &snapshot.sync_error {
                 lines.push(format!("Sync error: {error}"));
             }
             lines.push(
-                dim.apply_to(format!("Started: {}", Self::age(snapshot.started)))
+                dim.apply_to(format!("Started: {}", Display::age(snapshot.started)))
                     .to_string(),
             );
             lines.push(
-                dim.apply_to(format!("Last activity: {}", Self::age(snapshot.updated)))
+                dim.apply_to(format!("Last activity: {}", Display::age(snapshot.updated)))
                     .to_string(),
             );
         }
@@ -109,7 +108,7 @@ impl View {
     }
 
     pub(crate) fn tasks(&self) -> String {
-        let style = Self::style();
+        let style = Display::style();
         let dim = style.clone().dim();
         let mut lines = vec![String::new()];
         if self.0.tasks.is_empty() {
@@ -152,7 +151,7 @@ impl View {
             .iter()
             .find(|(task, _)| task.id == id)
             .ok_or(Error::MissingTask(id))?;
-        let style = Self::style();
+        let style = Display::style();
         let dim = style.clone().dim();
         let mut lines = vec![
             String::new(),
@@ -202,7 +201,7 @@ impl View {
     }
 
     fn panel(&self, heading: &str, lines: Vec<String>) -> String {
-        let style = Self::style();
+        let style = Display::style();
         let dim = style.clone().dim();
         let mut rendered = vec![format!(
             "{} {} · {heading}",
@@ -221,7 +220,7 @@ impl View {
     }
 
     fn task_badge(state: &str) -> String {
-        let style = Self::style();
+        let style = Display::style();
         let (symbol, color) = match state {
             "running" => ("●", style.green()),
             "interrupted" => ("!", style.yellow()),
@@ -258,26 +257,26 @@ impl View {
                     .map(|(task, _)| Self::brief(&task.brief))
                     .unwrap_or_default();
                 lines.push(
-                    Self::style()
+                    Display::style()
                         .bold()
                         .apply_to(format!("  Task #{id}: {brief}"))
                         .to_string(),
                 );
             }
-            let dim = Self::style().dim();
+            let dim = Display::style().dim();
             lines.push(
                 dim.apply_to(format!("  Source: {}", activity.source))
                     .to_string(),
             );
             if let Some(started) = status.started {
                 lines.push(
-                    dim.apply_to(format!("  Started: {}", Self::age(started)))
+                    dim.apply_to(format!("  Started: {}", Display::age(started)))
                         .to_string(),
                 );
             }
             if let Some(progress) = status.progress {
                 lines.push(
-                    dim.apply_to(format!("  Last progress: {}", Self::age(progress)))
+                    dim.apply_to(format!("  Last progress: {}", Display::age(progress)))
                         .to_string(),
                 );
             }
@@ -296,7 +295,7 @@ impl View {
     }
 
     fn phase_badge(&self) -> String {
-        let style = Self::style();
+        let style = Display::style();
         let phase = self.0.phase();
         let (symbol, color) = match phase {
             Phase::Running => ("●", style.green()),
@@ -313,7 +312,7 @@ impl View {
     }
 
     fn role_header(role: Role, state: &str) -> String {
-        let style = Self::style();
+        let style = Display::style();
         let (symbol, color) = match state {
             "active" => ("●", style.clone().green()),
             "interrupted" => ("!", style.clone().yellow()),
@@ -325,13 +324,6 @@ impl View {
             color.apply_to(symbol),
             style.bold().apply_to(role),
             color.apply_to(state)
-        )
-    }
-
-    fn style() -> Style {
-        let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-        Style::new().force_styling(
-            std::io::stdout().is_terminal() && console::colors_enabled() && !no_color,
         )
     }
 
@@ -350,14 +342,5 @@ impl View {
             short.push('…');
         }
         short
-    }
-
-    fn age(at: u64) -> String {
-        let seconds = Snapshot::now().saturating_sub(at);
-        match seconds {
-            0..60 => format!("{seconds}s ago"),
-            60..3600 => format!("{}m {}s ago", seconds / 60, seconds % 60),
-            _ => format!("{}h {}m ago", seconds / 3600, (seconds % 3600) / 60),
-        }
     }
 }

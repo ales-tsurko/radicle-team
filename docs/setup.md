@@ -448,7 +448,8 @@ operation and action, related review or revision, task ID when assigned, and
 `queued`, `processing`, `handled`, `ignored`, or `failed` state. Ignored and
 failed entries include a reason. `status` also shows queued notifications,
 processing operation IDs, the last successful periodic fetch, and
-synchronization errors.
+synchronization errors. Temporary inbox storage contention is retried while the
+member keeps running.
 
 From your operator machine, inspect signed receipts replicated through Radicle:
 
@@ -550,6 +551,8 @@ rad-team run --log debug
 The flag also accepts `error`, `warn`, `trace`, and `off`, and works before or
 after any subcommand. Without `--log`, `RUST_LOG` still accepts levels and
 filters such as `radicle_team=debug`. An explicit `--log` overrides `RUST_LOG`.
+Command failures print `Error: ...` to stderr and exit unsuccessfully, even with
+`--log off`.
 
 At `info` the process reports what it decided and why:
 

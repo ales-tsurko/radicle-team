@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use radicle_team::cli::{Cli, Error, StatusError};
+use radicle_team::cli::Cli;
 
 use crate::logging::Logging;
 
@@ -35,12 +35,8 @@ async fn run() -> ExitCode {
 
     match cli.execute().await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error @ Error::Inspection(StatusError::MissingTask(_))) => {
-            eprintln!("Error: {error}");
-            ExitCode::FAILURE
-        }
         Err(error) => {
-            tracing::error!(target: "radicle_team", %error, "application stopped");
+            eprintln!("Error: {error}");
             ExitCode::FAILURE
         }
     }

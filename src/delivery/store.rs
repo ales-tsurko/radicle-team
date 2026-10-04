@@ -65,7 +65,7 @@ impl Inbox {
 
     async fn insert(&self, record: Record) -> Result<(), Error> {
         self.database
-            .call(move |connection| Self::insert_row(connection, &record))
+            .retry(move |connection| Self::insert_row(connection, &record))
             .await?;
         self.wake();
         Ok(())
@@ -116,7 +116,7 @@ impl Inbox {
             let now = Snapshot::now() as i64;
             let data = self
                 .database
-                .call(move |connection| {
+                .retry(move |connection| {
                     let mut select = connection.prepare(
                         "SELECT data FROM delivery_inbox
                     WHERE status IN ('queued', 'failed') AND retry_at <= ?1
@@ -147,43 +147,25 @@ impl Inbox {
         error: Option<String>,
     ) -> Result<(), Error> {
         let id = id.to_owned();
-        let retry = if state == State::Failed {
-            Snapshot::now() + 10
-        } else {
-            0
-        } as i64;
+        let status = state.to_string();
         self.database
-            .call(move |connection| {
-                let mut select =
-                    connection.prepare("SELECT data FROM delivery_inbox WHERE id = ?1")?;
-                select.bind((1, id.as_str()))?;
-                if select.next()? != Row::Row {
-                    return Ok(());
-                }
-                let mut record: Record = serde_json::from_str(&select.read::<String, _>(0)?)
-                    .map_err(|error| sqlite::Error {
-                        code: None,
-                        message: Some(error.to_string()),
-                    })?;
-                if record.state == state && record.error == error {
-                    return Ok(());
-                }
-                record.state = state;
-                record.updated = Snapshot::now();
-                record.revision += 1;
-                record.error = error;
-                let data = serde_json::to_string(&record).map_err(|error| sqlite::Error {
-                    code: None,
-                    message: Some(error.to_string()),
-                })?;
+            .retry(move |connection| {
+                let now = Snapshot::now() as i64;
+                let retry = if state == State::Failed { now + 10 } else { 0 };
+                // One statement avoids upgrading an open read cursor to a write lock.
                 let mut update = connection.prepare(
-                    "UPDATE delivery_inbox SET data = ?1,
-                status = ?2, retry_at = ?3 WHERE id = ?4",
+                    "UPDATE delivery_inbox SET
+                        data = json_set(data, '$.state', ?2, '$.updated', ?3,
+                            '$.error', ?4, '$.revision', json_extract(data, '$.revision') + 1),
+                        status = ?2, retry_at = ?5
+                     WHERE id = ?1 AND (status IS NOT ?2 OR json_extract(data, '$.error') IS NOT \
+                     ?4)",
                 )?;
-                update.bind((1, data.as_str()))?;
-                update.bind((2, state.to_string().as_str()))?;
-                update.bind((3, retry))?;
-                update.bind((4, id.as_str()))?;
+                update.bind((1, id.as_str()))?;
+                update.bind((2, status.as_str()))?;
+                update.bind((3, now))?;
+                update.bind((4, error.as_deref()))?;
+                update.bind((5, retry))?;
                 update.next()?;
                 Ok(())
             })
@@ -249,7 +231,7 @@ impl Inbox {
     }
 
     pub(crate) async fn inspect(database: &Database) -> Result<Vec<Record>, Error> {
-        let rows = database.call(Self::rows).await?;
+        let rows = database.retry(Self::rows).await?;
         rows.into_iter()
             .map(|data| serde_json::from_str(&data).map_err(Error::from))
             .collect()
@@ -270,7 +252,7 @@ impl Inbox {
     pub(crate) async fn pending(&self) -> Result<Vec<(Record, bool)>, Error> {
         let rows = self
             .database
-            .call(|connection| {
+            .retry(|connection| {
                 let mut select = connection.prepare(
                     "SELECT data, receipt FROM delivery_inbox
                 WHERE published < json_extract(data, '$.revision') OR
@@ -292,7 +274,7 @@ impl Inbox {
         let id = record.id();
         let revision = record.revision;
         self.database
-            .call(move |connection| {
+            .retry(move |connection| {
                 let mut update = connection.prepare(
                     "UPDATE delivery_inbox
                 SET published = max(published, ?1), receipt = max(receipt, ?2) WHERE id = ?3",
@@ -401,5 +383,37 @@ mod tests {
             pending[0].1,
             "the receipt remains recorded while its status update waits"
         );
+    }
+
+    #[tokio::test]
+    async fn delivery_transitions_wait_for_a_competing_writer() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let path = directory.path().join("state.db");
+        let inbox = Inbox::open(&path).await.expect("inbox");
+        inbox
+            .enqueue(
+                activity(
+                    "2222222222222222222222222222222222222222",
+                    Kind::Delivered(Delivery::Mentioned(Target::Subject)),
+                ),
+                None,
+            )
+            .await
+            .expect("admit");
+        let record = inbox.list().await.expect("records").remove(0);
+        let id = record.id();
+        let writer = crate::database::Database::open(&path)
+            .await
+            .expect("writer");
+        writer.execute("BEGIN IMMEDIATE").await.expect("write lock");
+        let release = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            writer.execute("COMMIT").await.expect("release write lock");
+        };
+        let (updated, ()) = tokio::join!(inbox.set(&id, State::Processing, None), release);
+        updated.expect("contention must delay the transition rather than fail it");
+        let stored = inbox.list().await.expect("records").remove(0);
+        assert_eq!(stored.state, State::Processing);
+        assert_eq!(stored.revision, record.revision + 1);
     }
 }

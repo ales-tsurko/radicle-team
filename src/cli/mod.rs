@@ -9,6 +9,7 @@ pub use crate::{
 };
 
 mod command;
+mod display;
 mod inbox;
 pub(crate) mod inspection;
 pub(crate) mod provider;

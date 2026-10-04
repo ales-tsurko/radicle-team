@@ -47,12 +47,14 @@ fn run_discovers_the_home_and_honors_explicit_path_precedence() {
             command.arg("--home").arg(explicit);
         }
         let output = command.output().expect("run command should execute");
-        let message = String::from_utf8_lossy(&output.stdout);
+        let message = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success(),
             "an unbound identity must be refused"
         );
         assert!(message.contains("has no repository binding"), "{output:?}");
+        assert!(message.starts_with("Error: "), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
         assert!(
             message.contains(&home.path().display().to_string()),
             "{output:?}"
@@ -83,7 +85,7 @@ fn run_refuses_an_ordinary_checkout_without_creating_member_data() {
             command.arg("--home").arg(&checkout);
         }
         let output = command.output().expect("run command should execute");
-        let message = String::from_utf8_lossy(&output.stdout);
+        let message = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success(),
             "a checkout alone cannot run a member"
@@ -96,6 +98,8 @@ fn run_refuses_an_ordinary_checkout_without_creating_member_data() {
             },
             "{output:?}"
         );
+        assert!(message.starts_with("Error: "), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
     }
     assert!(!MemberHome::at(checkout).code().exists());
 }

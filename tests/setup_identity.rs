@@ -133,7 +133,7 @@ fn provisions_a_stable_identity_without_repository_access_or_node_tools() {
     let wrong_member = provision(home.path(), "nico");
     assert!(!wrong_member.status.success());
     assert!(
-        String::from_utf8_lossy(&wrong_member.stdout).contains("belongs to maya"),
+        String::from_utf8_lossy(&wrong_member.stderr).contains("belongs to maya"),
         "{wrong_member:?}"
     );
 
@@ -184,7 +184,7 @@ fn provisions_a_stable_identity_without_repository_access_or_node_tools() {
     let busy = provision(home.path(), "maya");
     assert!(!busy.status.success());
     assert!(
-        String::from_utf8_lossy(&busy.stdout).contains("already in use"),
+        String::from_utf8_lossy(&busy.stderr).contains("already in use"),
         "{busy:?}"
     );
 }

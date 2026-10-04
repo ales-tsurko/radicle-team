@@ -103,6 +103,7 @@ fn status_and_tasks_discover_current_home_and_honor_explicit_precedence() {
         let output = fixture.run(cwd, &["task", "show", "1"], explicit);
         assert!(!output.status.success(), "{output:?}");
         let text = String::from_utf8_lossy(&output.stderr);
+        assert!(text.starts_with("Error: "), "{output:?}");
         assert!(text.contains("unfinished task 1 not found"), "{output:?}");
         assert!(text.contains("rad-team task ls"), "{text}");
         assert!(output.stdout.is_empty(), "{output:?}");
@@ -112,6 +113,7 @@ fn status_and_tasks_discover_current_home_and_honor_explicit_precedence() {
             let text = String::from_utf8_lossy(&output.stdout);
             assert!(text.contains("╭─ delivery inbox"), "{text}");
             assert!(text.contains("observed"), "{text}");
+            assert!(!text.contains('\u{1b}'), "{text}");
         }
     }
     fixture.assert_untouched();
@@ -135,21 +137,25 @@ fn inspection_rejects_invalid_and_identity_only_directories_without_fallback() {
         vec!["task", "show", "1"],
         vec!["inbox", "ls"],
     ] {
-        for (cwd, explicit, expected) in [
-            (ordinary.as_path(), None, "no member directory found"),
-            (
-                fixture.maya.path(),
-                Some(ordinary.as_path()),
-                "could not read",
-            ),
-            (unbound.path(), None, "has no repository binding"),
-        ] {
-            let output = fixture.run(cwd, &args, explicit);
-            assert!(!output.status.success(), "{output:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stdout).contains(expected),
-                "{output:?}"
-            );
+        for level in ["warn", "off"] {
+            let mut args = args.clone();
+            args.extend(["--log", level]);
+            for (cwd, explicit, expected) in [
+                (ordinary.as_path(), None, "no member directory found"),
+                (
+                    fixture.maya.path(),
+                    Some(ordinary.as_path()),
+                    "could not read",
+                ),
+                (unbound.path(), None, "has no repository binding"),
+            ] {
+                let output = fixture.run(cwd, &args, explicit);
+                assert!(!output.status.success(), "{output:?}");
+                let text = String::from_utf8_lossy(&output.stderr);
+                assert!(text.starts_with("Error: "), "{output:?}");
+                assert!(text.contains(expected), "{output:?}");
+                assert!(output.stdout.is_empty(), "{output:?}");
+            }
         }
     }
     fixture.assert_untouched();
@@ -201,7 +207,7 @@ fn inbox_finds_reviews_and_reports_saved_delivery_state_without_writing() {
         assert!(output.status.success(), "{output:?}");
         let text = String::from_utf8_lossy(&output.stdout);
         for expected in [
-            "maya · failed",
+            "! failed  maya",
             patch,
             review,
             revision,
@@ -212,6 +218,7 @@ fn inbox_finds_reviews_and_reports_saved_delivery_state_without_writing() {
         ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
         }
+        assert!(!text.contains('\u{1b}'), "{text}");
     }
     for explicit in [None, Some(fixture.nico.path())] {
         let output = fixture.run(fixture.maya.path(), &["inbox", "show", "unknown"], explicit);

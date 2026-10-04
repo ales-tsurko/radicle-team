@@ -3,15 +3,16 @@
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
+use console::Style;
 use radicle::{
     identity::{Did, RepoId},
     storage::ReadStorage as _,
 };
 
 use crate::{
-    delivery::{Record, remote::Deliveries},
+    cli::display::Display,
+    delivery::{Record, State, remote::Deliveries},
     member::Member,
-    status::Snapshot,
 };
 
 #[derive(Debug, Args)]
@@ -81,35 +82,51 @@ enum Command {
 
 impl Command {
     fn render(&self, entries: &[Entry], replicated: bool) -> String {
+        let style = Display::style();
+        let dim = style.clone().dim();
         let requested = match self {
             Self::Show { id } => Some(id.as_str()),
             Self::Ls => None,
         };
         let mut found = false;
-        let mut lines = vec!["╭─ delivery inbox".to_owned()];
+        let mut lines = vec![
+            format!(
+                "{} {}",
+                dim.apply_to("╭─"),
+                style.clone().bold().apply_to("delivery inbox")
+            ),
+            dim.apply_to("│").to_string(),
+        ];
         for entry in entries
             .iter()
             .filter(|entry| requested.is_none_or(|id| entry.record.matches(id)))
         {
             found = true;
-            lines.extend(entry.render(requested.is_some()));
+            lines.extend(entry.render(&style, requested.is_some()));
         }
         if !found {
-            lines.push(format!(
-                "│  {}",
-                if requested.is_some() {
-                    "Not observed locally."
-                } else {
-                    "No observed deliveries."
-                }
-            ));
+            lines.push(
+                dim.apply_to(format!(
+                    "│  {}",
+                    if requested.is_some() {
+                        "Not observed locally."
+                    } else {
+                        "No observed deliveries."
+                    }
+                ))
+                .to_string(),
+            );
+            lines.push(dim.apply_to("│").to_string());
         }
         if replicated {
             lines.push(
-                "│  Replicated observations; synchronize your node for newer receipts.".into(),
+                dim.apply_to(
+                    "│  Replicated observations; synchronize your node for newer receipts.",
+                )
+                .to_string(),
             );
         }
-        lines.push("╰─ rad-team".into());
+        lines.push(dim.apply_to("╰─ rad-team").to_string());
         lines.join("\n")
     }
 }
@@ -121,35 +138,82 @@ struct Entry {
 }
 
 impl Entry {
-    fn render(&self, identity: bool) -> Vec<String> {
+    fn render(&self, style: &Style, identity: bool) -> Vec<String> {
         let record = &self.record;
+        let dim = style.clone().dim();
         let mut lines = vec![
             format!(
-                "│  {} · {} · {}",
-                self.member, record.state, record.activity.subject
+                "{}  {}  {}",
+                dim.apply_to("│"),
+                self.badge(style),
+                style.clone().cyan().bold().apply_to(self.member),
             ),
-            format!(
+            dim.apply_to(format!("│    {}", record.activity.subject))
+                .to_string(),
+            dim.apply_to(format!(
                 "│    Operation: {} · action {}",
                 record.activity.operation, record.activity.action
-            ),
-            format!("│    Author: {}", record.activity.author),
-            format!("│    Event: {:?}", record.activity.kind),
+            ))
+            .to_string(),
+            dim.apply_to(format!("│    Author: {}", record.activity.author))
+                .to_string(),
+            dim.apply_to(format!("│    Event: {:?}", record.activity.kind))
+                .to_string(),
         ];
         if let Some(task) = record.task {
-            lines.push(format!("│    Task: #{task}"));
+            lines.push(format!(
+                "{}    {}",
+                dim.apply_to("│"),
+                style.clone().bold().apply_to(format!("Task: #{task}")),
+            ));
         }
         if identity && let Some(did) = self.did {
-            lines.push(format!("│    Member identity: {did}"));
+            lines.push(
+                dim.apply_to(format!("│    Member identity: {did}"))
+                    .to_string(),
+            );
         }
-        lines.push(format!(
-            "│    Last observed: {}s ago",
-            Snapshot::now().saturating_sub(record.updated)
-        ));
+        lines.push(
+            dim.apply_to(format!(
+                "│    Last observed: {}",
+                Display::age(record.updated)
+            ))
+            .to_string(),
+        );
         if let Some(error) = &record.error {
-            lines.push(format!("│    Reason: {error}"));
+            let color = if record.state == State::Failed {
+                style.clone().red()
+            } else {
+                style.clone().yellow()
+            };
+            lines.extend(error.lines().enumerate().map(|(index, line)| {
+                format!(
+                    "{}    {}",
+                    dim.apply_to("│"),
+                    color.apply_to(if index == 0 {
+                        format!("Reason: {line}")
+                    } else {
+                        line.to_owned()
+                    }),
+                )
+            }));
         }
-        lines.push("│".into());
+        lines.push(dim.apply_to("│").to_string());
         lines
+    }
+
+    fn badge(&self, style: &Style) -> String {
+        let (symbol, color) = match self.record.state {
+            State::Queued => ("○", style.clone().cyan()),
+            State::Processing => ("●", style.clone().green()),
+            State::Handled => ("✓", style.clone().green()),
+            State::Ignored => ("─", style.clone().dim()),
+            State::Failed => ("!", style.clone().red()),
+        };
+        color
+            .bold()
+            .apply_to(format!("{symbol} {}", self.record.state))
+            .to_string()
     }
 }
 
