@@ -179,6 +179,7 @@ impl ClaudeCode {
     // Runs one delivery and reports how it ended.
     async fn deliver(&self, prompt: String, workspace: &Path) -> Result<Outcome, Error> {
         let started = self.started.as_ref().ok_or(Error::NotStarted(self.role))?;
+        let prompt = self.role.prompt(&prompt);
 
         run::supervise(
             &self.session,

@@ -198,7 +198,10 @@ pub(super) struct IssuePage {
 pub(super) struct AddTaskRequest {
     /// What was decided, in enough detail to begin without rereading the discussion.
     pub(super) brief: String,
-    /// Where the work joins the queue. Ask before putting anything ahead of it.
+    /// Review another author's patch or implement changes. Omitted follows the source's role.
+    pub(super) kind: Option<crate::queue::TaskKind>,
+    /// Where the work joins the queue. Patch review work is at least next. Ask before raising
+    /// ordinary work above last or putting any work first.
     #[serde(default)]
     pub(super) position: QueuePosition,
     /// Additional specification, related artifacts, pinned messages, and notes.
@@ -221,6 +224,18 @@ pub(super) struct NoteRequest {
 pub(super) struct TaskRequest {
     /// Specific running or waiting task.
     pub(super) task: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct HandoffRequest {
+    /// Your related waiting task. Running work must be stopped and preserved separately.
+    pub(super) task: i64,
+    /// Member who has accepted the implementation request.
+    pub(super) member: String,
+    /// Your explicit handoff message's operation ID, shown in that member's signed receipt.
+    pub(super) operation: String,
+    /// Your remaining specification for a partial transfer. Omit to transfer the whole task.
+    pub(super) remaining: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -682,6 +697,7 @@ pub(super) struct ReviewWriteRequest {
     #[serde(flatten)]
     pub(super) subject: SubjectRequest,
     pub(super) revision: Option<String>,
+    /// Review to edit, or your own earlier review when checking a scoped follow-up.
     pub(super) review: Option<String>,
     /// Reject for required changes; accept may include clearly optional, non-blocking suggestions.
     pub(super) verdict: Option<String>,

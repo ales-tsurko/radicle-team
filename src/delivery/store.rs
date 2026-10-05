@@ -91,6 +91,49 @@ impl Inbox {
         Ok(())
     }
 
+    /// Links talker-admitted work to its existing receipt in the task's transaction.
+    pub(crate) fn attach_task_row(
+        connection: &sqlite::ConnectionThreadSafe,
+        record: Record,
+    ) -> sqlite::Result<()> {
+        let mut select = connection.prepare("SELECT data FROM delivery_inbox WHERE id = ?1")?;
+        select.bind((1, record.id().as_str()))?;
+        let saved = if select.next()? == Row::Row {
+            Some(select.read::<String, _>(0)?)
+        } else {
+            None
+        };
+        drop(select);
+        let Some(saved) = saved else {
+            return Self::insert_row(connection, &record);
+        };
+        let mut saved: Record = serde_json::from_str(&saved).map_err(|error| sqlite::Error {
+            code: None,
+            message: Some(error.to_string()),
+        })?;
+        if saved.task == record.task && saved.task_kind == record.task_kind {
+            return Ok(());
+        }
+        saved.task = record.task;
+        saved.task_kind = record.task_kind;
+        saved.state = record.state;
+        saved.error = record.error;
+        saved.updated = record.updated;
+        saved.revision += 1;
+        let data = serde_json::to_string(&saved).map_err(|error| sqlite::Error {
+            code: None,
+            message: Some(error.to_string()),
+        })?;
+        let mut update = connection.prepare(
+            "UPDATE delivery_inbox SET data = ?2, status = ?3, retry_at = 0 WHERE id = ?1",
+        )?;
+        update.bind((1, saved.id().as_str()))?;
+        update.bind((2, data.as_str()))?;
+        update.bind((3, saved.state.to_string().as_str()))?;
+        update.next()?;
+        Ok(())
+    }
+
     pub(crate) fn wake(&self) {
         self.changed.notify_waiters();
     }

@@ -7,7 +7,6 @@ mod export;
 mod logs;
 mod model;
 mod runtime;
-mod selection;
 mod view;
 
 #[cfg(test)]

@@ -222,7 +222,7 @@ impl View {
     fn task_badge(state: &str) -> String {
         let style = Display::style();
         let (symbol, color) = match state {
-            "running" => ("●", style.green()),
+            "running" => ("●", style.cyan()),
             "interrupted" => ("!", style.yellow()),
             _ => ("○", style.cyan()),
         };
@@ -276,6 +276,13 @@ impl View {
                         .to_string(),
                 );
             }
+            if let Some(observation) = &status.observation {
+                lines.extend(
+                    Display::observation(observation)
+                        .into_iter()
+                        .map(|line| format!("  {line}")),
+                );
+            }
             lines.push(String::new());
             lines
         } else {
@@ -287,7 +294,7 @@ impl View {
         let style = Display::style();
         let phase = self.0.phase();
         let (symbol, color) = match phase {
-            Phase::Running => ("●", style.green()),
+            Phase::Running => ("●", style.cyan()),
             Phase::Failed => ("✗", style.red()),
             Phase::Interrupted => ("!", style.yellow()),
             Phase::Stopped => ("○", style.dim()),
@@ -303,7 +310,9 @@ impl View {
     fn role_header(role: Role, state: &str) -> String {
         let style = Display::style();
         let (symbol, color) = match state {
-            "active" => ("●", style.clone().green()),
+            "active" | "tool running" => ("●", style.clone().cyan()),
+            "model output" | "waiting for model" => ("●", style.clone().yellow()),
+            "no recent output" | "retrying" | "tool failed" => ("!", style.clone().yellow()),
             "interrupted" => ("!", style.clone().yellow()),
             "disabled" => ("─", style.clone().dim()),
             _ => ("○", style.clone().dim()),

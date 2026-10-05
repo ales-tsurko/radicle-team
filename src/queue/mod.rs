@@ -10,5 +10,5 @@ mod tests;
 pub use crate::queue::{
     context::{Artifact, ArtifactRole, ContextUpdate, MessageReference, TaskContext},
     store::{Error, TaskQueue},
-    task::{Receipt, Task, TaskRequest, TaskState},
+    task::{Receipt, Task, TaskKind, TaskRequest, TaskState},
 };

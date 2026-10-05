@@ -28,6 +28,12 @@ pub struct Task {
 }
 
 impl Task {
+    /// Returns whether this task implements changes or reviews somebody else's patch.
+    #[must_use]
+    pub const fn kind(&self) -> TaskKind {
+        self.context.kind
+    }
+
     /// Returns the artifact whose checkout the implementation should continue from.
     #[must_use]
     pub fn target(&self) -> Source {
@@ -35,7 +41,9 @@ impl Task {
             .patch()
             .or_else(|| {
                 self.context.artifacts.iter().find_map(|artifact| {
-                    (artifact.role == ArtifactRole::Implementation)
+                    (artifact.role == ArtifactRole::Implementation
+                        || (self.kind() == TaskKind::Review
+                            && artifact.role == ArtifactRole::Review))
                         .then(|| artifact.target().ok())
                         .flatten()
                         .filter(|subject| matches!(subject, Subject::Patch(_)))
@@ -76,6 +84,17 @@ impl Task {
     }
 }
 
+/// The work authorized when a task enters the queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    /// Durable code changes and their publication.
+    #[default]
+    Implementation,
+    /// Review of an assigned or explicitly requested patch.
+    Review,
+}
+
 /// A request to record work, with a stable identity for replay and assignment/mention reuse.
 #[derive(Debug)]
 pub struct TaskRequest {
@@ -83,7 +102,7 @@ pub struct TaskRequest {
     pub brief: String,
     /// Immutable place the work originated.
     pub source: Source,
-    /// Requested queue position.
+    /// Requested queue position. Patch review work is at least `Next`.
     pub position: QueuePosition,
     /// Stable request identity, absent for a deliberately fresh local task.
     pub request: Option<String>,
@@ -97,6 +116,10 @@ impl TaskRequest {
     /// Creates a fresh local request. Runtime deliveries also set its stable request identity.
     #[must_use]
     pub fn new(brief: String, source: Source, position: QueuePosition) -> Self {
+        let position = match (&source, position) {
+            (Source::Subject(Subject::Patch(_)), QueuePosition::End) => QueuePosition::Next,
+            _ => position,
+        };
         Self {
             context: TaskContext::new(brief.clone(), &source, None),
             brief,

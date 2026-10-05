@@ -10,11 +10,14 @@ pub(crate) use crate::mcp::{
 
 mod artifacts;
 mod context;
+mod handoff;
 mod protocol;
 mod read;
 mod recovery;
+mod review;
 mod security;
 mod server;
+mod tasks;
 mod tools;
 mod write;
 

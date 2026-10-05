@@ -306,14 +306,21 @@ for manifest approval, and agent initialization. Coder, talker, and optional
 chatter activity is shown separately. Progress timestamps reflect observed agent
 activity, recorded on the existing supervision interval of ten seconds.
 
-`task ls` lists the coder's current implementation task followed by waiting
-tasks in execution order, with their IDs, briefs, priorities, and related issues
-or patches. Conversation work in talker or chatter appears in `status`; an empty
-task queue does not mean those roles are idle. Priority is shown as `first`,
-`next`, or `normal`; tasks within a priority run in arrival order. The running
-task is never interrupted by a higher priority arrival. `task show` includes the
-agreed specification, related artifacts, pinned message references, and working
-notes.
+`task ls` lists the coder's current task followed by waiting tasks in execution
+order, with their IDs, briefs, priorities, and related issues or patches.
+Conversation work in talker or chatter appears in `status`; an empty task queue
+does not mean those roles are idle. Priority is shown as `first`, `next`, or
+`normal`; tasks within a priority run in arrival order. The running task is
+never interrupted by a higher priority arrival. Patch review assignments and
+corrections use at least `next`, ahead of normal tickets. `first` remains
+highest. `task show` includes the agreed specification, related artifacts,
+pinned message references, and working notes.
+
+Patch assignments ask for a review, not implementation. A review task completes
+after the member publishes its review for the requested revision. Reactions
+acknowledge receipt and do not complete the task. A successful agent exit
+without the required publication leaves the task unfinished and retries it with
+the missing result explained in its context.
 
 A runtime that exited without recording its shutdown appears as `interrupted`.
 Taken tasks without a matching live runtime also appear as `interrupted`; the
@@ -451,6 +458,13 @@ processing operation IDs, the last successful periodic fetch, and
 synchronization errors. Temporary inbox storage contention is retried while the
 member keeps running.
 
+An active process is not evidence that its work is succeeding. With OpenCode,
+status distinguishes model output, waiting for the model, tool execution, and
+retries. It shows the last completed tool action separately from activity.
+Background harness events do not refresh progress. Two minutes without agent
+output is shown as "no recent output". That is an observation, not a timeout or
+proof that a long tool call is stuck.
+
 From your operator machine, inspect signed receipts replicated through Radicle:
 
 ```sh
@@ -498,24 +512,31 @@ Use `Tab` or `Shift+Tab` to switch panels, or `s`, `t`, `i`, and `l` to jump to
 status, tasks, inbox, and logs. `/` filters the focused list or logs; `Esc`
 clears the filter or closes details. `?` shows keyboard help.
 
-Click an ID to select it, or drag to select text in any panel or detail view.
-Press `y` (or `c`) to copy. Shortened IDs copy their complete value. `Esc`
-clears the selection; selected text stays stable while other panels update.
+Select text normally with your terminal and use its usual copy shortcut. Open
+details with `Enter` to copy complete IDs from abbreviated rows. Copying uses
+the text shown on screen; widen the terminal if an ID wraps or is clipped.
 
 In logs, `↑` and `↓` scroll one line, `PgUp` and `PgDn` scroll one page, and
 `Home` jumps to the oldest retained entry. Scrolling pauses following and shows
 the number of new entries. `End` follows the newest entries. `Space` toggles
-following. A mouse wheel or touchpad scrolls the panel under the pointer. The
-dashboard retains the latest 2,000 log lines.
+following. Where the terminal supports it, a mouse wheel or touchpad scrolls the
+focused panel. Otherwise use the keyboard controls. Pause logs before selecting
+text so new entries do not move it. The dashboard retains the latest 2,000 log
+lines.
 
-Drag across log lines to select them. `y` copies the selection, or all filtered
-log lines when nothing is selected. `w` saves the same text: edit the suggested
-path and press `Enter`. `Ctrl+U` clears the path; `Esc` cancels. Exports omit
-color codes; selecting entire log lines includes their full text. Saving keeps
-existing files.
+In the logs panel, `y` (or `c`) copies all filtered log lines, including text
+beyond the screen width. `w` saves the same text: edit the suggested path and
+press `Enter`. `Ctrl+U` clears the path; `q` or `Esc` cancels. Exports omit
+color codes. Saving keeps existing files.
 
-On macOS, local sessions use the system clipboard. Over SSH and on other
-platforms, copying requires your terminal's clipboard support to be enabled.
+Native selection and copying also work over SSH. The additional `y` shortcut
+uses the system clipboard in local macOS sessions. Over SSH and on other
+platforms, it requires the terminal's clipboard support to be enabled.
+
+`q` closes the current popup. At the top level, `q` or `Ctrl+C` asks before
+stopping the member and its node. The default is **Keep running**; choose
+**Stop** with `→` or `Tab`, then press `Enter` to confirm. `q` or `Esc` cancels.
+While entering a filter, `q` is filter text.
 
 To record every log entry, including those beyond the dashboard's retained
 history, append logs to a file while the member runs:
@@ -569,12 +590,27 @@ ready for review. Draft revisions do not automatically summon reviewers. Members
 with a rejected review receive ready revisions referencing their own review ID.
 An acceptance ends automatic follow-up; another person's review does not reopen
 it. Replies and resolutions on the member's own review, and explicit mentions,
-still reach them. Reactions, comments, and patch descriptions keep each member's
-own voice.
+still reach them. Being assigned to review a patch does not subscribe a member
+to other reviewers' feedback. Reactions, comments, and patch descriptions keep
+each member's own voice.
 
 Members request specialist review only for a specific concern that needs the
 other member's expertise, or when a delegate requests it. Routine patches are
 left for delegates to review or assign reviewers.
+
+Review and implementation tasks remain in the same queue, with separate
+authorization. Reading a linked patch does not authorize reviewing it. Reviews
+require an assignment or explicit request, and automatic follow-ups stay scoped
+to the member's own findings. A review task cannot publish implementation.
+Implementation remains unfinished while local changes are unpublished or its
+patch is still a draft. Failed provider runs retry the same task without
+stopping the member's other roles.
+
+An implementation handoff is confirmed by the receiving member's signed receipt
+of queued implementation. A comment, reaction, or review assignment alone does
+not transfer ownership. The sender then removes its related waiting task, or
+narrows the specification for a partial handoff. Running work is stopped and
+preserved separately.
 
 The member can react only to activity received by its node. If a review saved in
 Radicle Desktop has not reached the member, announce it from the reviewer's

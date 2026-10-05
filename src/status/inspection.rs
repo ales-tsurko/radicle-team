@@ -104,7 +104,7 @@ impl Inspection {
         }
         if status.activity.is_some() {
             return if self.live && self.phase().active() {
-                "active"
+                status.state()
             } else {
                 "interrupted"
             };

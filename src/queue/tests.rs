@@ -134,6 +134,104 @@ async fn keeps_the_brief_and_its_source_together() {
 }
 
 #[tokio::test]
+async fn patch_reviews_use_next_priority_without_interrupting_running_work() {
+    let queue = queue().await;
+    let active = queue
+        .push(crate::queue::TaskRequest::new(
+            "active".to_owned(),
+            subject(),
+            QueuePosition::End,
+        ))
+        .await
+        .expect("active task")
+        .task;
+    queue.next().await.expect("start current task");
+    for (brief, source, position) in [
+        ("ordinary", subject(), QueuePosition::End),
+        ("explicit next", subject(), QueuePosition::Next),
+        (
+            "review first",
+            Subject::Patch(ObjectId::from_str(PRODUCED).expect("patch")).into(),
+            QueuePosition::End,
+        ),
+        (
+            "review second",
+            Subject::Patch(ObjectId::from_str(PRODUCED).expect("patch")).into(),
+            QueuePosition::End,
+        ),
+        ("urgent", subject(), QueuePosition::Front),
+    ] {
+        queue
+            .push(crate::queue::TaskRequest::new(
+                brief.to_owned(),
+                source,
+                position,
+            ))
+            .await
+            .expect("record waiting work");
+    }
+    assert_eq!(queue.running().await.expect("still running").id, active);
+    let waiting = queue.pending().await.expect("waiting work");
+    assert_eq!(
+        waiting
+            .iter()
+            .map(|task| (task.brief.as_str(), task.position))
+            .collect::<Vec<_>>(),
+        [
+            ("urgent", QueuePosition::Front),
+            ("explicit next", QueuePosition::Next),
+            ("review first", QueuePosition::Next),
+            ("review second", QueuePosition::Next),
+            ("ordinary", QueuePosition::End),
+        ]
+    );
+    queue.finish().await.expect("finish current task");
+    for expected in [
+        "urgent",
+        "explicit next",
+        "review first",
+        "review second",
+        "ordinary",
+    ] {
+        assert_eq!(queue.next().await.expect("next task").brief, expected);
+        queue.finish().await.expect("finish task");
+    }
+}
+
+#[tokio::test]
+async fn review_followup_promotes_related_waiting_work_without_duplicating_or_downgrading_it() {
+    let queue = queue().await;
+    let mut initial =
+        crate::queue::TaskRequest::new("implementation".into(), subject(), QueuePosition::End);
+    initial.request = Some("original-assignment".into());
+    let first = queue.push(initial).await.expect("original work");
+    let patch = Subject::Patch(ObjectId::from_str(PRODUCED).expect("patch"));
+    queue
+        .produced(first.task, patch)
+        .await
+        .expect("existing deliverable");
+    for (key, requested, expected) in [
+        ("review", QueuePosition::End, QueuePosition::Next),
+        ("urgent-review", QueuePosition::Front, QueuePosition::Front),
+        ("followup", QueuePosition::End, QueuePosition::Front),
+    ] {
+        let mut review =
+            crate::queue::TaskRequest::new("address feedback".into(), patch.into(), requested);
+        review.request = Some(key.into());
+        let receipt = queue.push(review).await.expect("review followup");
+        assert_eq!(receipt.task, first.task);
+        let pending = queue.pending().await.expect("queue");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].position, expected);
+        assert_eq!(
+            pending[0].source,
+            subject(),
+            "origin remains the assigned issue"
+        );
+    }
+}
+
+#[tokio::test]
 async fn puts_work_interrupted_by_a_dead_run_back_at_the_front() {
     let queue = queue().await;
     queue
@@ -768,4 +866,166 @@ async fn assignment_and_receipt_commit_together_and_follow_task_completion() {
             .is_some_and(|reason| reason.contains("cancelled"))
     );
     assert!(queue.pending().await.expect("queue").is_empty());
+}
+
+#[tokio::test]
+async fn separates_review_work_and_keeps_new_feedback_on_reused_implementation() {
+    use crate::queue::{ContextUpdate, MessageReference, TaskKind, TaskRequest};
+    let queue = queue().await;
+    let source: Source = Subject::Patch(PRODUCED.parse().expect("patch")).into();
+    let request = |kind| {
+        let mut request =
+            TaskRequest::new("Initial scope".into(), source.clone(), QueuePosition::End);
+        request.request = Some("one-delivery".into());
+        request.context.kind = kind;
+        request
+    };
+    let implementation = queue
+        .push(request(TaskKind::Implementation))
+        .await
+        .expect("implementation");
+    let review = queue.push(request(TaskKind::Review)).await.expect("review");
+    assert_ne!(
+        implementation.task, review.task,
+        "a review cannot consume implementation's request"
+    );
+    assert_eq!(
+        queue
+            .push(request(TaskKind::Review))
+            .await
+            .expect("replay")
+            .task,
+        review.task
+    );
+    let mut correction = request(TaskKind::Implementation);
+    correction.request = Some("new-review".into());
+    correction.brief = "Address the delegate's correction".into();
+    correction
+        .context
+        .update(ContextUpdate {
+            specification: Some("Keep the original scope and correct the edge case".into()),
+            messages: vec![MessageReference {
+                subject: source.to_string(),
+                entry: SUBJECT.into(),
+                revision: Some(PRODUCED.into()),
+                purpose: "Delegate's requested change".into(),
+            }],
+            ..ContextUpdate::default()
+        })
+        .expect("correction context");
+    let reused = queue.push(correction).await.expect("reuse");
+    assert_eq!(reused.task, implementation.task);
+    let context = queue.get(reused.task).await.expect("task").context;
+    assert_eq!(
+        context.specification,
+        "Keep the original scope and correct the edge case"
+    );
+    assert_eq!(context.messages[0].purpose, "Delegate's requested change");
+    assert_eq!(queue.waiting().await.expect("waiting"), 2);
+}
+
+#[tokio::test]
+async fn handoff_narrows_only_waiting_work_and_cannot_cancel_a_running_task() {
+    use crate::queue::{Error, TaskRequest};
+    let queue = queue().await;
+    let running = queue
+        .push(TaskRequest::new(
+            "Unrelated".into(),
+            subject(),
+            QueuePosition::End,
+        ))
+        .await
+        .expect("unrelated")
+        .task;
+    queue.next().await.expect("start");
+    let waiting = queue
+        .push(TaskRequest::new(
+            "Two parts".into(),
+            subject(),
+            QueuePosition::End,
+        ))
+        .await
+        .expect("waiting")
+        .task;
+    assert!(
+        matches!(queue.handoff(running, None).await, Err(Error::HandoffRunning(id)) if id == running)
+    );
+    queue
+        .handoff(waiting, Some("Only the untransferred part".into()))
+        .await
+        .expect("partial handoff");
+    assert_eq!(
+        queue
+            .get(waiting)
+            .await
+            .expect("remaining")
+            .context
+            .specification,
+        "Only the untransferred part"
+    );
+    let transferred = queue
+        .handoff(waiting, None)
+        .await
+        .expect("complete handoff");
+    assert!(transferred.context.cancelled);
+    assert!(matches!(
+        queue.get(waiting).await,
+        Err(Error::MissingTask(_))
+    ));
+    assert!(
+        !queue
+            .get(running)
+            .await
+            .expect("unrelated remains")
+            .context
+            .cancelled
+    );
+}
+
+#[tokio::test]
+async fn a_completed_review_does_not_become_an_implementation_deliverable() {
+    use crate::queue::{Artifact, ArtifactRole, TaskKind, TaskRequest};
+    let queue = queue().await;
+    let review = || {
+        let mut request = TaskRequest::new(
+            "Review the related patch".into(),
+            subject(),
+            QueuePosition::Next,
+        );
+        request.request = Some("review-request".into());
+        request.context.kind = TaskKind::Review;
+        request.context.relate(Artifact {
+            subject: format!("patch:{PRODUCED}"),
+            role: ArtifactRole::Review,
+            purpose: "Requested review".into(),
+        });
+        request
+    };
+    let reviewed = queue.push(review()).await.expect("review queued");
+    assert_eq!(queue.next().await.expect("review starts").id, reviewed.task);
+    queue.finish().await.expect("review completed");
+    let receipt = queue.push(review()).await.expect("review replay");
+    assert_eq!(receipt.state, crate::queue::TaskState::Completed);
+    assert_eq!(
+        receipt.result, None,
+        "a reviewed patch is not a produced patch"
+    );
+    let mut implementation =
+        TaskRequest::new("Implement this issue".into(), subject(), QueuePosition::End);
+    implementation.request = Some("implementation-request".into());
+    let accepted = queue
+        .push(implementation)
+        .await
+        .expect("implementation queued");
+    let task = queue
+        .get(accepted.task)
+        .await
+        .expect("implementation context");
+    assert_eq!(task.kind(), TaskKind::Implementation);
+    assert_eq!(task.context.patch(), None);
+    assert_eq!(
+        task.target(),
+        subject(),
+        "implementation retains its own source"
+    );
 }

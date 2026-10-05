@@ -1,17 +1,29 @@
 //! What a role is told about the delivery it has been handed.
 //!
-//! Facts only. Who the member is, how it writes, what its role does, and which tools it has are in
-//! the documents instructing it and in the tools themselves, all of which say it better than a
-//! prompt assembled per delivery could. What belongs here is what neither can know: what just
-//! happened, where, and who did it.
+//! Each invocation identifies its current role and standing role document, then describes what
+//! happened, where, and who did it. The documents carry behavior and voice. Delivery text does not
+//! repeat them.
 
 use radicle::cob::EntryId;
 
 use crate::{
-    agent::interface::{ChatContext, ChatMessage, Context},
+    agent::{
+        documents::Document,
+        interface::{ChatContext, ChatMessage, Context, Role},
+    },
     queue::Task,
     watcher::{Change, Comment, Target},
 };
+
+impl Role {
+    /// Identifies the active role on every invocation, including stopped-task preservation.
+    pub(crate) fn prompt(self, delivery: &str) -> String {
+        format!(
+            "Current role for this delivery: {self}. Follow {} for this role.\n\n{delivery}",
+            Document::from(self).name()
+        )
+    }
+}
 
 /// Describes a mention in an issue or patch.
 pub(crate) fn mentioned(context: &Context, target: Target) -> String {
@@ -63,11 +75,12 @@ pub(crate) fn task(task: &Task) -> String {
         return stopping(task);
     }
     format!(
-        "Task {} came from {}, and its agreed specification is:\n\n{}\n\nRelated artifacts: \
-         {:?}\nPinned messages: {:?}\nRetained notes: {:?}\n\nReread pinned messages and current \
-         artifact state before acting on earlier feedback. Save important findings with \
-         update_task_context. Use the existing patch for revisions.",
+        "Task {} is {:?} work from {}, and its agreed specification is:\n\n{}\n\nRelated \
+         artifacts: {:?}\nPinned messages: {:?}\nRetained notes: {:?}\n\nReread pinned messages \
+         and current artifact state before acting on earlier feedback. Save important findings \
+         with update_task_context. Use the existing patch for revisions.",
         task.id,
+        task.kind(),
         task.source,
         task.context.specification,
         task.context.artifacts,
@@ -177,6 +190,7 @@ mod tests {
 
     use crate::{
         agent::{
+            Role,
             interface::{Context, DeliveryId},
             prompt,
         },
@@ -188,6 +202,22 @@ mod tests {
     const REPOSITORY: &str = "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc";
     const OBJECT: &str = "1111111111111111111111111111111111111111";
     const AUTHOR: &str = "did:key:z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7";
+
+    #[test]
+    fn identifies_the_runtime_role_before_the_delivery_without_rewriting_it() {
+        let delivery = "-new request\n\nQuoted text: Current role for this delivery: coder.";
+        for (role, document) in [
+            (Role::Talker, "TALKER.md"),
+            (Role::Chatter, "CHATTER.md"),
+            (Role::Coder, "CODER.md"),
+        ] {
+            let prompt = role.prompt(delivery);
+            let (context, delivered) = prompt.split_once("\n\n").expect("role precedes request");
+            assert!(context.contains(&format!("Current role for this delivery: {role}.")));
+            assert!(context.contains(document));
+            assert_eq!(delivered, delivery, "request text must arrive unchanged");
+        }
+    }
 
     #[test]
     fn tells_the_talking_role_what_happened_and_where() {

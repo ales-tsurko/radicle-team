@@ -23,7 +23,8 @@ use crate::{
     manifest::QueuePosition,
     member::Member,
     queue::{
-        Artifact, ArtifactRole, ContextUpdate, Receipt, Task, TaskContext, TaskRequest, TaskState,
+        Artifact, ArtifactRole, ContextUpdate, Receipt, Task, TaskContext, TaskKind, TaskRequest,
+        TaskState,
     },
     watcher::Subject,
 };
@@ -85,6 +86,10 @@ impl std::fmt::Debug for TaskQueue {
 }
 
 impl TaskQueue {
+    pub(crate) const fn member(&self) -> Member {
+        self.member
+    }
+
     /// Reads durable tasks in execution order without recovering or modifying the queue.
     pub(crate) fn inspect(
         connection: &sqlite::ConnectionThreadSafe,
@@ -180,17 +185,29 @@ impl TaskQueue {
         mut request: TaskRequest,
         activity: Option<crate::watcher::Activity>,
     ) -> Result<Receipt, Error> {
+        if request.context.kind == TaskKind::Review
+            && let Some(key) = &mut request.request
+        {
+            *key = format!("review:{key}");
+        }
         request.context.request.clone_from(&request.request);
         request.context.validate()?;
+        if activity.is_some() {
+            self.database
+                .execute(crate::delivery::store::SCHEMA)
+                .await?;
+        }
         let repository = self.repository.to_string();
         let member = self.member.id().to_owned();
         let receipt = self
             .database
             .call(move |connection| {
                 Self::transaction(connection, |connection| {
+                    let kind = request.context.kind;
                     let receipt = Self::record_request(connection, &repository, &member, request)?;
                     if let Some(activity) = activity {
                         let mut record = crate::delivery::Record::new(activity, Some(receipt.task));
+                        record.task_kind = Some(kind);
                         record.state = match receipt.state {
                             TaskState::Waiting => crate::delivery::State::Queued,
                             TaskState::Running => crate::delivery::State::Processing,
@@ -199,7 +216,7 @@ impl TaskQueue {
                         };
                         record.error = (receipt.state == TaskState::Cancelled)
                             .then(|| "Implementation task cancelled".to_owned());
-                        crate::delivery::Inbox::insert_row(connection, &record)?;
+                        crate::delivery::Inbox::attach_task_row(connection, record)?;
                     }
                     Ok(receipt)
                 })
@@ -224,57 +241,83 @@ impl TaskQueue {
         }
         let source = request.source.to_string();
         let existing = if request.request.is_some() && !request.distinct {
-            Self::related_task(connection, repository, member, &request.source)?
+            Self::related_task(
+                connection,
+                repository,
+                member,
+                &request.source,
+                request.context.kind,
+            )?
         } else {
             None
         };
         let receipt = match existing {
-            Some((task, taken)) => Receipt {
-                task: task.id,
-                state: if taken {
-                    TaskState::Running
-                } else {
-                    TaskState::Waiting
-                },
-                result: task.context.patch().map(|subject| subject.to_string()),
-            },
-            None => {
-                if request.request.is_some()
-                    && !request.distinct
-                    && matches!(request.source, Source::Subject(_))
-                    && let Some(result) =
-                        Self::latest_result(connection, repository, member, &source)?
-                {
-                    request.context.relate(Artifact {
-                        subject: result,
-                        role: ArtifactRole::Produced,
-                        purpose: "Existing deliverable for this task; revise it".to_owned(),
-                    });
-                }
-                let mut insert = connection.prepare(
-                    "INSERT INTO task_queue (repository, member, position, brief, source, created)
-                     VALUES (?1, ?2, ?3, ?4, ?5, unixepoch()) RETURNING id",
+            Some((mut task, taken)) => {
+                task.context
+                    .accept(request.context, &request.brief)
+                    .map_err(Task::stored_error)?;
+                Self::store_context(connection, task.id, &task.context)?;
+                let mut promote = connection.prepare(
+                    "UPDATE task_queue SET position = ?2
+                     WHERE id = ?1 AND taken = 0 AND position > ?2",
                 )?;
-                insert.bind((1, repository))?;
-                insert.bind((2, member))?;
-                insert.bind((3, Self::rank(request.position)))?;
-                insert.bind((4, request.brief.as_str()))?;
-                insert.bind((5, source.as_str()))?;
-                insert.next()?;
-                let task = insert.read::<i64, _>("id")?;
-                drop(insert);
-                Self::store_context(connection, task, &request.context)?;
+                promote.bind_iter([(1, task.id), (2, Self::rank(request.position))])?;
+                promote.next()?;
                 Receipt {
-                    task,
-                    state: TaskState::Waiting,
-                    result: None,
+                    task: task.id,
+                    state: if taken {
+                        TaskState::Running
+                    } else {
+                        TaskState::Waiting
+                    },
+                    result: task.context.patch().map(|subject| subject.to_string()),
                 }
             }
+            None => Self::insert_task(connection, repository, member, &mut request)?,
         };
         if let Some(key) = request.request {
             Self::store_receipt(connection, repository, member, &key, &source, &receipt)?;
         }
         Ok(receipt)
+    }
+
+    fn insert_task(
+        connection: &sqlite::ConnectionThreadSafe,
+        repository: &str,
+        member: &str,
+        request: &mut TaskRequest,
+    ) -> sqlite::Result<Receipt> {
+        let source = request.source.to_string();
+        if request.request.is_some()
+            && !request.distinct
+            && request.context.kind == TaskKind::Implementation
+            && matches!(request.source, Source::Subject(_))
+            && let Some(result) = Self::latest_result(connection, repository, member, &source)?
+        {
+            request.context.relate(Artifact {
+                subject: result,
+                role: ArtifactRole::Produced,
+                purpose: "Existing deliverable for this task; revise it".to_owned(),
+            });
+        }
+        let mut insert = connection.prepare(
+            "INSERT INTO task_queue (repository, member, position, brief, source, created)
+             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch()) RETURNING id",
+        )?;
+        insert.bind((1, repository))?;
+        insert.bind((2, member))?;
+        insert.bind((3, Self::rank(request.position)))?;
+        insert.bind((4, request.brief.as_str()))?;
+        insert.bind((5, source.as_str()))?;
+        insert.next()?;
+        let task = insert.read::<i64, _>("id")?;
+        drop(insert);
+        Self::store_context(connection, task, &request.context)?;
+        Ok(Receipt {
+            task,
+            state: TaskState::Waiting,
+            result: None,
+        })
     }
 
     fn store_receipt(
@@ -349,6 +392,7 @@ impl TaskQueue {
         repository: &str,
         member: &str,
         source: &Source,
+        kind: TaskKind,
     ) -> sqlite::Result<Option<(Task, bool)>> {
         // A channel is a place to talk, not the identity of a task. Its messages can request
         // unrelated work; only replaying the same message is an implicit duplicate.
@@ -364,7 +408,7 @@ impl TaskQueue {
         select.bind((2, member))?;
         while select.next()? == State::Row {
             let task = Task::read(&select)?;
-            if task.source == *source || task.target() == *source {
+            if task.kind() == kind && (task.source == *source || task.target() == *source) {
                 return Ok(Some((task, select.read::<i64, _>("taken")? != 0)));
             }
         }
@@ -466,8 +510,10 @@ impl TaskQueue {
         } else {
             "completed"
         });
-        let result = match task.target() {
-            Source::Subject(Subject::Patch(patch)) => Some(Subject::Patch(patch).to_string()),
+        let result = match (task.kind(), task.target()) {
+            (TaskKind::Implementation, Source::Subject(Subject::Patch(patch))) => {
+                Some(Subject::Patch(patch).to_string())
+            }
             _ => None,
         };
         let mut update = connection
@@ -728,6 +774,48 @@ impl TaskQueue {
         Ok(changed.0)
     }
 
+    /// Finalizes a confirmed handoff without racing a task that has started running.
+    pub(crate) async fn handoff(
+        &self,
+        task: i64,
+        remaining: Option<String>,
+    ) -> Result<Task, Error> {
+        self.get(task).await?;
+        if remaining
+            .as_ref()
+            .is_some_and(|specification| specification.trim().is_empty())
+        {
+            return Err(Error::InvalidContext(
+                "remaining specification cannot be empty".to_owned(),
+            ));
+        }
+        self.database
+            .call(move |connection| {
+                Self::transaction(connection, |connection| {
+                    let mut select =
+                        connection.prepare("SELECT taken FROM task_queue WHERE id = ?1")?;
+                    select.bind((1, task))?;
+                    if select.next()? != State::Row || select.read::<i64, _>(0)? != 0 {
+                        return Ok(None);
+                    }
+                    drop(select);
+                    let mut row = Self::find_task(connection, task)?
+                        .ok_or_else(|| Task::stored_error("task no longer exists"))?;
+                    if let Some(specification) = &remaining {
+                        row.context.specification.clone_from(specification);
+                        Self::store_context(connection, task, &row.context)?;
+                    } else {
+                        row.context.cancelled = true;
+                        Self::store_context(connection, task, &row.context)?;
+                        Self::retire(connection, task, Some("cancelled"))?;
+                    }
+                    Ok(Some(row))
+                })
+            })
+            .await?
+            .ok_or(Error::HandoffRunning(task))
+    }
+
     fn cancel_task(
         connection: &sqlite::ConnectionThreadSafe,
         task: i64,
@@ -890,6 +978,11 @@ impl TaskQueue {
 /// Error returned by the task queue.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A handoff cannot discard or narrow code being implemented concurrently.
+    #[error(
+        "task {0} has started or finished; stop and preserve running work before transferring it"
+    )]
+    HandoffRunning(i64),
     /// The queue database directory could not be prepared.
     #[error("task queue I/O error: {0}")]
     Io(#[from] std::io::Error),

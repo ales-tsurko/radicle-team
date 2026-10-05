@@ -5,12 +5,21 @@ use std::str::FromStr as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{agent::Source, watcher::Subject};
+use crate::{
+    agent::Source,
+    queue::TaskKind,
+    watcher::{Activity, Subject},
+};
 
 /// Durable working context shared by the member's talking and building roles.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct TaskContext {
+    /// Runtime-owned work kind. A review assignment does not authorize implementation.
+    pub kind: TaskKind,
+    /// Latest repository request accepted by the runtime, independent of member-written notes.
+    #[schemars(skip)]
+    pub(crate) activity: Option<Activity>,
     /// Stable delivery or chat request that accepted the work.
     pub request: Option<String>,
     /// Current agreed specification, including acceptance criteria and exclusions.
@@ -26,6 +35,26 @@ pub struct TaskContext {
 }
 
 impl TaskContext {
+    /// Retains a newly accepted correction when the runtime reuses existing work.
+    pub(crate) fn accept(&mut self, context: Self, brief: &str) -> Result<(), crate::queue::Error> {
+        if context.specification != brief {
+            self.specification = context.specification;
+        } else if self.specification != brief && !self.notes.iter().any(|note| note == brief) {
+            self.notes.push(brief.to_owned());
+        }
+        if context.activity.is_some() {
+            self.activity = context.activity;
+        }
+        for artifact in context.artifacts {
+            self.relate(artifact);
+        }
+        self.update(ContextUpdate {
+            messages: context.messages,
+            notes: context.notes,
+            ..ContextUpdate::default()
+        })
+    }
+
     /// Starts a context without changing the place the work originated.
     #[must_use]
     pub fn new(specification: String, source: &Source, request: Option<String>) -> Self {

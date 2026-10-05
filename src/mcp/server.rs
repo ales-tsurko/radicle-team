@@ -148,6 +148,7 @@ pub(crate) struct ActivityContext {
     pub(crate) source: Source,
     pub(crate) activity: ActivityId,
     pub(crate) workspace: PathBuf,
+    pub(crate) delivery: Option<crate::watcher::Activity>,
 }
 
 impl From<AgentContext> for ActivityContext {
@@ -157,6 +158,7 @@ impl From<AgentContext> for ActivityContext {
             source: context.subject.into(),
             activity: context.delivery.into(),
             workspace: context.workspace,
+            delivery: None,
         }
     }
 }
@@ -168,6 +170,19 @@ impl From<ChatContext> for ActivityContext {
             source: Source::Chat(context.channel().clone()),
             activity: context.message().into(),
             workspace: context.workspace().to_owned(),
+            delivery: None,
+        }
+    }
+}
+
+impl ActivityContext {
+    pub(crate) fn delivery(activity: crate::watcher::Activity, workspace: PathBuf) -> Self {
+        Self {
+            repository: activity.repository,
+            source: activity.subject.into(),
+            activity: activity.delivery_id().into(),
+            workspace,
+            delivery: Some(activity),
         }
     }
 }

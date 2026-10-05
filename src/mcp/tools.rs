@@ -24,7 +24,7 @@ use crate::{
             AddTaskRequest, ChatReplyRecord, CommentIssueRequest, CommentOperation,
             CommentWriteRequest, ContextRequest, ContextUpdateRequest, CreateIssueRequest,
             CreatePatchRequest, DiffRequest, Document, EditIssueRequest, EditPatchRequest,
-            EmbedReadRequest, EntityRequest, EntryRequest, IssuePage, IssueRequest,
+            EmbedReadRequest, EntityRequest, EntryRequest, HandoffRequest, IssuePage, IssueRequest,
             ListIssuesRequest, MergePatchRequest, NoteRequest, PatchEntity, PatchEntityRequest,
             ReactionWriteRequest, ReplyChatRequest, ResolveCommentRequest, ReviewWriteRequest,
             SecurityIssueRequest, SecurityIssueResult, SetStateRequest, SetStringsRequest,
@@ -39,7 +39,7 @@ use crate::{
 };
 
 // Tools which coordinate the member's roles rather than write to the repository.
-const QUEUE_TOOLS: [&str; 4] = ["add_task", "cancel", "note", "task_status"];
+const QUEUE_TOOLS: [&str; 5] = ["add_task", "cancel", "handoff_task", "note", "task_status"];
 // Tools which need commits that only the building role can make.
 const BUILDING_TOOLS: [&str; 2] = ["create_patch", "update_patch"];
 // Tool which only the chatting role can use, while handling an authenticated message.
@@ -67,7 +67,7 @@ pub(crate) struct ToolService {
     pub(super) scope: ActivityScope,
     pub(super) publisher: Publisher,
     security: SecurityReporting,
-    role: Role,
+    pub(super) role: Role,
     pub(super) queue: TaskQueue,
     chat: ChatState,
     pub(super) creations: Arc<tokio::sync::Mutex<()>>,
@@ -330,11 +330,12 @@ impl ToolService {
                        only the patch ID and any new blocker or decision; do not repeat patch \
                        details or reviewer mentions."
     )]
-    async fn create_comment(
+    pub(super) async fn create_comment(
         &self,
         Parameters(request): Parameters<CommentWriteRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.access_subject(&request.subject).await?;
+        self.comment_boundary(&active, &request).await?;
         self.for_work(&active)
             .write_comment(request, CommentOperation::Create)
             .await
@@ -347,6 +348,7 @@ impl ToolService {
         Parameters(request): Parameters<CommentWriteRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.access_subject(&request.subject).await?;
+        self.comment_boundary(&active, &request).await?;
         self.for_work(&active)
             .write_comment(request, CommentOperation::Edit)
             .await
@@ -359,6 +361,7 @@ impl ToolService {
         Parameters(request): Parameters<CommentWriteRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.access_subject(&request.subject).await?;
+        self.comment_boundary(&active, &request).await?;
         self.for_work(&active)
             .write_comment(request, CommentOperation::Redact)
             .await
@@ -371,6 +374,8 @@ impl ToolService {
         Parameters(request): Parameters<ResolveCommentRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.access_subject(&request.subject).await?;
+        self.verify_review_thread(&active, &request.subject, &request.review)
+            .await?;
         self.for_work(&active)
             .resolve_review_comment(request)
             .await
@@ -387,6 +392,14 @@ impl ToolService {
         Parameters(request): Parameters<ReactionWriteRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.access_subject(&request.subject).await?;
+        if matches!(
+            request.target,
+            crate::mcp::protocol::CommentTargetKind::Review
+        ) && let Some(review) = &request.entity
+        {
+            self.verify_review_thread(&active, &request.subject, review)
+                .await?;
+        }
         self.for_work(&active)
             .reaction_write(request)
             .await
@@ -516,6 +529,7 @@ impl ToolService {
         Parameters(request): Parameters<CreatePatchRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.active().await?;
+        self.require_implementation(&active).await?;
         self.authorize("create_patch").await?;
         let _creation = self.creations.lock().await;
         if let Some(patch) = self.existing_patch(&active).await? {
@@ -558,6 +572,9 @@ impl ToolService {
         Parameters(request): Parameters<UpdatePatchRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.access_subject(&request.subject).await?;
+        self.require_implementation(&active).await?;
+        self.implementation_subject(&active, &request.subject)
+            .await?;
         self.for_work(&active)
             .update_patch_write(request, active.context().workspace.clone())
             .await
@@ -577,11 +594,16 @@ impl ToolService {
     }
 
     #[tool(description = "Set the active patch lifecycle")]
-    async fn set_patch_state(
+    pub(super) async fn set_patch_state(
         &self,
         Parameters(request): Parameters<SetStateRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.access_subject(&request.subject).await?;
+        if request.state == "open" || request.state == "draft" {
+            self.require_implementation(&active).await?;
+            self.implementation_subject(&active, &request.subject)
+                .await?;
+        }
         self.for_work(&active)
             .set_state_write(request, SubjectKind::Patch)
             .await
@@ -624,6 +646,7 @@ impl ToolService {
         Parameters(request): Parameters<ReviewWriteRequest>,
     ) -> Result<Json<Document>, String> {
         let active = self.access_subject(&request.subject).await?;
+        self.verify_review(&active, &request).await?;
         self.for_work(&active)
             .review_write(request, false)
             .await
@@ -689,44 +712,26 @@ impl ToolService {
         Parameters(request): Parameters<AddTaskRequest>,
     ) -> Result<Json<TaskRecord>, String> {
         let active = self.active().await?;
-        self.validate_context(&request.context).await?;
-        let position = request.position;
-        let mut submission = crate::queue::TaskRequest::new(
-            request.brief,
-            active.context().source.clone(),
-            position,
-        );
-        let mut key = active.context().activity.request();
-        if request.distinct {
-            key.push_str(
-                &crate::mcp::protocol::mutation_identity("add_task", &submission.brief)
-                    .map_err(|error| error.to_string())?,
-            );
+        let submission = self.task_submission(&active, request).await?;
+        let position = submission.position;
+        let receipt = if let Some(activity) = active.context().delivery.clone() {
+            self.queue.push_assignment(submission, activity).await
+        } else {
+            self.queue.push(submission).await
         }
-        submission.request = Some(key);
-        submission.distinct = request.distinct;
-        submission
-            .context
-            .update(request.context)
-            .map_err(|error| error.to_string())?;
-        if let (Source::Subject(subject), ActivityId::Delivery(delivery)) =
-            (&active.context().source, active.context().activity)
-        {
-            submission
-                .context
-                .messages
-                .push(crate::queue::MessageReference {
-                    subject: subject.to_string(),
-                    entry: delivery.operation.to_string(),
-                    revision: None,
-                    purpose: "Request accepting this work".to_owned(),
-                });
-        }
-        let receipt = self
-            .queue
-            .push(submission)
-            .await
-            .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?;
+        let position = if matches!(
+            receipt.state,
+            crate::queue::TaskState::Waiting | crate::queue::TaskState::Running
+        ) {
+            match self.queue.get(receipt.task).await {
+                Ok(task) => task.position,
+                Err(crate::queue::Error::MissingTask(_)) => position,
+                Err(error) => return Err(error.to_string()),
+            }
+        } else {
+            position
+        };
         let waiting = self
             .queue
             .waiting()
@@ -751,6 +756,20 @@ impl ToolService {
     ) -> Result<Json<TaskAction>, String> {
         self.task_action(request.task, self.queue.cancel(request.task))
             .await
+    }
+
+    #[tool(
+        description = "Finalize an explicit implementation handoff after the other member's \
+                       signed receipt confirms it is queued. A review assignment is not \
+                       acceptance of implementation. Cancels only your related waiting task, or \
+                       narrows its specification for a partial transfer. Running work must be \
+                       stopped and preserved separately."
+    )]
+    pub(super) async fn handoff_task(
+        &self,
+        Parameters(request): Parameters<HandoffRequest>,
+    ) -> Result<Json<TaskAction>, String> {
+        self.handoff(request).await
     }
 
     #[tool(description = "Save a correction for the specified running or waiting task")]

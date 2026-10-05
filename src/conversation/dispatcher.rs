@@ -3,7 +3,7 @@
 use crate::{
     agent::{self, ActivityId, Role, Source, Talker},
     delivery::{Inbox, State},
-    mcp::ActivityScope,
+    mcp::{ActivityContext, ActivityScope},
     member::Member,
     watcher::{Activity, Delivery},
     workspace::Workspaces,
@@ -149,7 +149,7 @@ impl Dispatcher {
         let path = self.scoped.prepare(subject.into()).await?;
         self.scoped
             .scope
-            .activate(activity.context(path.clone()))
+            .activate(ActivityContext::delivery(activity.clone(), path.clone()))
             .await
             .map_err(Error::ActivityScope)?;
         tracing::info!(

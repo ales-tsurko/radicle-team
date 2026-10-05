@@ -62,7 +62,13 @@ impl Builder {
             loop {
                 match self.carry(coder, queue, workspaces, scope, task).await {
                     Ok(()) => break,
-                    Err(Error::Coder(error)) => {
+                    Err(
+                        error @ (Error::Coder(_)
+                        | Error::Unpublished(_)
+                        | Error::Stalled(_)
+                        | Error::Abandoned(_)),
+                    ) => {
+                        watch.retrying(error.to_string()).await;
                         inbox
                             .task(
                                 identifier,
@@ -114,6 +120,7 @@ impl Builder {
                 source: source.clone(),
                 activity,
                 workspace: path.clone(),
+                delivery: task.context.activity.clone(),
             })
             .await
             .map_err(Error::ActivityScope)?;
@@ -125,13 +132,20 @@ impl Builder {
             workspace = %path.display(),
             "starting queued work"
         );
+        let identifier = task.id;
         let built = Self::build(coder, queue, task, path).await;
         scope.deactivate().await;
         scope
             .reconcile(activity)
             .await
             .map_err(Error::PublicationRecovery)?;
-        built
+        built?;
+        let task = queue.get(identifier).await?;
+        if let Err(error) = workspaces.verify_completion(&task).await {
+            queue.note(identifier, error.to_string()).await?;
+            return Err(Error::Unpublished(error));
+        }
+        Ok(())
     }
 
     // Carries out one task, stopping it when it is cancelled or when it stops making progress.
@@ -182,6 +196,9 @@ impl Builder {
 /// Error carrying out queued work.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The agent ended before its task's result was published.
+    #[error(transparent)]
+    Unpublished(crate::workspace::Error),
     /// Recording delivery state failed.
     #[error("delivery state failed: {0}")]
     Delivery(#[from] crate::delivery::Error),

@@ -47,7 +47,7 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
                     })
                     .mention_if(summary.as_deref(), Target::Review(review))
                     .change(
-                        Audience::involved(),
+                        Audience::owner(),
                         Change::ReviewSubmitted {
                             review,
                             revision: *revision,
@@ -65,14 +65,14 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
                     })
                     .mention_if(edit.summary().map(String::as_str), Target::Review(review))
                     .change(
-                        Audience::involved_or(Entity::Review(review)),
+                        Audience::owner().or_owned(Entity::Review(review)),
                         Change::ReviewEdited(review),
                     )
             }
             Action::ReviewRedact { review } => NormalizedAction::new()
                 .review(ReviewUpdate::Redacted(*review))
                 .change(
-                    Audience::involved_or(Entity::Review(*review)),
+                    Audience::owner().or_owned(Entity::Review(*review)),
                     Change::ReviewRedacted(*review),
                 ),
             Action::ReviewReact { review, active, .. } => NormalizedAction::new().change(
@@ -97,7 +97,7 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
                     .mention(body, Target::Comment(comment))
                     .reply(*reply_to, comment)
                     .change(
-                        Audience::involved_or(Entity::Review(*review)),
+                        Audience::owner().or_owned(Entity::Review(*review)),
                         Change::CommentCreated(comment),
                     )
             }
@@ -114,7 +114,7 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
                 NormalizedAction::new()
                     .mention(body, Target::Comment(target))
                     .change(
-                        Audience::involved_or(Entity::Review(*review)),
+                        Audience::owner().or_owned(Entity::Review(*review)),
                         Change::CommentEdited(target),
                     )
             }
@@ -124,7 +124,8 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
                     comment: *comment,
                 };
                 NormalizedAction::new().change(
-                    Audience::involved_or(Entity::Review(*review))
+                    Audience::owner()
+                        .or_owned(Entity::Review(*review))
                         .or_owned(Entity::Comment(*comment)),
                     Change::CommentRedacted(target),
                 )
@@ -203,7 +204,7 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
                     .track(Entity::Comment(operation.id))
                     .mention(body, Target::Comment(comment))
                     .reply(*reply_to, comment)
-                    .change(Audience::involved(), Change::CommentCreated(comment))
+                    .change(Audience::owner(), Change::CommentCreated(comment))
             }
             Action::RevisionCommentEdit {
                 revision,
@@ -214,12 +215,15 @@ impl<'a> From<ActionEnvelope<'a, Action>> for NormalizedAction<'a> {
                 let target = Comment::revision(*revision, *comment);
                 NormalizedAction::new()
                     .mention(body, Target::Comment(target))
-                    .change(Audience::involved(), Change::CommentEdited(target))
+                    .change(
+                        Audience::owner().or_owned(Entity::Comment(*comment)),
+                        Change::CommentEdited(target),
+                    )
             }
             Action::RevisionCommentRedact { revision, comment } => {
                 let target = Comment::revision(*revision, *comment);
                 NormalizedAction::new().change(
-                    Audience::involved_or(Entity::Comment(*comment)),
+                    Audience::owner().or_owned(Entity::Comment(*comment)),
                     Change::CommentRedacted(target),
                 )
             }

@@ -14,6 +14,16 @@ Follow `TEAM.md` for shared rules and your own character documents for voice.
 
 Work reaches you as a task carrying a brief and the place it came from.
 
+The runtime identifies its kind. An implementation task owns durable changes and
+publication. A review task checks the requested patch and your own findings. It
+does not authorize implementing another reviewer's feedback. Follow an explicit
+request before taking additional work.
+
+A patch assignment asks for your review. Publish it with `create_review`, or
+update your existing review with `edit_review`. A reaction, private
+verification, or a conclusion that no code changes are needed does not complete
+that request.
+
 The task context contains the current agreed specification, artifact
 relationships, pinned messages, and retained notes. Read it with
 `get_task_context` when needed, and save important findings with

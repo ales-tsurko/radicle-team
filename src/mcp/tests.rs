@@ -329,6 +329,18 @@ mcp_allow = ["read", "reactions"]
         source: Subject,
         activity: crate::agent::ActivityId,
     ) {
+        let delivery = match activity {
+            crate::agent::ActivityId::Task(id) => {
+                service
+                    .queue
+                    .get(id)
+                    .await
+                    .expect("task should exist")
+                    .context
+                    .activity
+            }
+            _ => None,
+        };
         service
             .scope
             .activate(super::ActivityContext {
@@ -336,9 +348,79 @@ mcp_allow = ["read", "reactions"]
                 source: source.into(),
                 activity,
                 workspace: self.working.clone(),
+                delivery,
             })
             .await
             .expect("work should activate");
+    }
+
+    async fn deliver(&self, service: &ToolService, activity: crate::watcher::Activity) {
+        service.scope.deactivate().await;
+        service
+            .scope
+            .activate(super::ActivityContext::delivery(
+                activity,
+                self.working.clone(),
+            ))
+            .await
+            .expect("delivery should activate");
+    }
+
+    fn activity(
+        &self,
+        subject: Subject,
+        operation: EntryId,
+        kind: crate::watcher::Kind,
+    ) -> crate::watcher::Activity {
+        crate::watcher::Activity {
+            repository: self.repository,
+            subject,
+            operation,
+            action: 0,
+            author: self.profile.did(),
+            kind,
+        }
+    }
+
+    async fn patch(&self, author: &ToolService) -> Subject {
+        let id = result_id(
+            author
+                .create_patch_write(
+                    CreatePatchRequest {
+                        title: "Change".to_owned(),
+                        description: "Focused change".to_owned(),
+                        base: self.base.to_string(),
+                        head: self.head.to_string(),
+                        labels: Vec::new(),
+                        draft: false,
+                    },
+                    self.working.clone(),
+                )
+                .await
+                .expect("patch should publish"),
+        );
+        Subject::Patch(ObjectId::from_str(&id).expect("patch should parse"))
+    }
+
+    async fn publish_receipts(
+        &self,
+        inbox: &crate::delivery::Inbox,
+        publisher: &crate::agent::Publisher,
+    ) {
+        let publish = inbox.publish(publisher, Member::Nico, Member::Nico.receipt());
+        let published = async {
+            while !inbox.pending().await.expect("pending receipts").is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = publish => panic!("receipt publisher should stay running: {result:?}"),
+                () = published => {},
+            }
+        })
+        .await
+        .expect("receipts should publish");
     }
 
     fn subject(kind: SubjectKind, id: impl ToString) -> SubjectRequest {
@@ -693,8 +775,7 @@ struct TestAuthorizer(RepoId);
 #[async_trait::async_trait]
 impl crate::agent::Authorizer for TestAuthorizer {
     async fn authorize(&self, method: &str) -> Result<(), crate::agent::PublishError> {
-        crate::manifest::McpAllowlist::everything()
-            .allows(method)
+        (method == "delivery_status" || crate::manifest::McpAllowlist::everything().allows(method))
             .then_some(())
             .ok_or_else(|| {
                 PublishError::Authorization(format!("MCP method '{method}' is not allowed"))
@@ -2921,6 +3002,7 @@ async fn carries_a_note_on_the_next_result_the_building_half_receives() {
             source: issue.into(),
             activity: crate::agent::ActivityId::Task(task),
             workspace: fixture.working.clone(),
+            delivery: None,
         })
         .await
         .expect("task should activate");
@@ -2984,6 +3066,7 @@ async fn records_the_patch_a_task_produced_before_the_task_can_fail() {
             source: issue.into(),
             activity: crate::agent::ActivityId::Task(task),
             workspace: fixture.working.clone(),
+            delivery: None,
         })
         .await
         .expect("the task should become the active activity");
@@ -3153,6 +3236,7 @@ async fn refuses_to_publish_when_the_task_record_is_unavailable() {
             source: issue.into(),
             activity: crate::agent::ActivityId::Task(task),
             workspace: fixture.working.clone(),
+            delivery: None,
         })
         .await
         .expect("the task should become the active activity");
@@ -3324,26 +3408,29 @@ async fn maya_and_nico_revise_one_patch_and_review_it_from_the_issue() {
         .await
         .expect("the issue task should revise its recorded patch after reactivation"),
     );
-    operator
-        .comment_issue_write(CommentIssueRequest {
-            issue: issue_id.clone(),
-            body: format!("Please review {patch}"),
-            reply_to: None,
-            embeds: Vec::new(),
-        })
-        .await
-        .expect("delegate should link the requested review");
-    maya.scope.deactivate().await;
+    let invitation = result_id(
+        operator
+            .comment_issue_write(CommentIssueRequest {
+                issue: issue_id.clone(),
+                body: format!("@maya please review {patch}"),
+                reply_to: None,
+                embeds: Vec::new(),
+            })
+            .await
+            .expect("delegate should request the review"),
+    );
     fixture
-        .activate(
+        .deliver(
             &maya,
-            issue,
-            crate::agent::DeliveryId {
-                operation: EntryId::from_str(&issue.id().to_string())
-                    .expect("operation should parse"),
-                action: 0,
-            }
-            .into(),
+            fixture.activity(
+                issue,
+                EntryId::from_str(&invitation).expect("invitation should parse"),
+                crate::watcher::Kind::Delivered(crate::watcher::Delivery::Mentioned(
+                    crate::watcher::Target::Comment(crate::watcher::Comment::Issue(
+                        EntryId::from_str(&invitation).expect("invitation should parse"),
+                    )),
+                )),
+            ),
         )
         .await;
     maya.get_subject(Parameters(SubjectRequest::from(patch)))
@@ -3513,6 +3600,7 @@ async fn assignment_and_mention_from_one_operation_record_one_task() {
         .await;
     let recorded = talker
         .add_task(Parameters(super::protocol::AddTaskRequest {
+            kind: None,
             brief: "same scaffold requested by mention".to_owned(),
             position: QueuePosition::End,
             context: crate::queue::ContextUpdate::default(),
@@ -3522,6 +3610,58 @@ async fn assignment_and_mention_from_one_operation_record_one_task() {
         .expect("mention should reuse assigned work");
     assert_eq!(recorded.0.task, first.task);
     assert_eq!(queue.waiting().await.expect("queue should read"), 1);
+}
+
+#[tokio::test]
+async fn patch_review_requests_report_their_effective_queue_priority() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{agent::DeliveryId, queue::TaskRequest};
+
+    let fixture = RepositoryFixture::new();
+    let queue = fixture.queue().await;
+    let subject = fixture.patch(&fixture.service().await).await;
+    let operation = EntryId::from_str("2222222222222222222222222222222222222222")
+        .expect("operation should parse");
+    let talker = fixture.service_with(Role::Talker, queue.clone()).await;
+    fixture
+        .activate(
+            &talker,
+            subject,
+            DeliveryId {
+                operation,
+                action: 0,
+            }
+            .into(),
+        )
+        .await;
+    let request = || super::protocol::AddTaskRequest {
+        kind: None,
+        brief: "Address the review".to_owned(),
+        position: QueuePosition::End,
+        context: crate::queue::ContextUpdate::default(),
+        distinct: false,
+    };
+    let recorded = talker
+        .add_task(Parameters(request()))
+        .await
+        .expect("review work should record");
+    assert_eq!(recorded.0.position, QueuePosition::Next);
+    let mut urgent = TaskRequest::new(
+        "Urgent correction".to_owned(),
+        subject.into(),
+        QueuePosition::Front,
+    );
+    urgent.request = Some("explicit-urgency".to_owned());
+    let promoted = queue.push(urgent).await.expect("work should promote");
+    let repeated = talker
+        .add_task(Parameters(request()))
+        .await
+        .expect("repeated request should reuse urgent work");
+    assert_eq!(recorded.0.task, promoted.task);
+    assert_eq!(repeated.0.task, recorded.0.task);
+    assert_eq!(repeated.0.position, QueuePosition::Front);
+    assert_eq!(repeated.0.waiting, 1);
 }
 
 #[tokio::test]
@@ -4766,4 +4906,732 @@ async fn runtime_receipts_acknowledge_the_actual_review_and_comment_targets() {
             .get(&reaction)
             .is_some_and(|authors| authors.contains(&fixture.profile.id()))
     );
+}
+
+#[tokio::test]
+async fn linked_patch_is_readable_but_requires_an_explicit_review_invitation() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::watcher::{Comment, Delivery, Kind, Target};
+    let fixture = RepositoryFixture::new();
+    let operator = fixture.service().await;
+    let patch = fixture.patch(&operator).await;
+    let issue_id = result_id(
+        operator
+            .create_issue_write(CreateIssueRequest {
+                title: "Origin".into(),
+                description: format!("Implemented in {patch}"),
+                labels: vec![],
+                assignees: vec![],
+            })
+            .await
+            .expect("issue"),
+    );
+    let issue = Subject::Issue(issue_id.parse().expect("issue ID"));
+    let comment = result_id(
+        operator
+            .comment_issue_write(CommentIssueRequest {
+                issue: issue_id,
+                body: format!("The implementation is in {patch}"),
+                reply_to: None,
+                embeds: vec![],
+            })
+            .await
+            .expect("link"),
+    );
+    let operation: EntryId = comment.parse().expect("comment ID");
+    let maya = fixture
+        .service_as(Member::Maya, Role::Talker, fixture.queue().await)
+        .await;
+    fixture
+        .deliver(
+            &maya,
+            fixture.activity(
+                issue,
+                operation,
+                Kind::Delivered(Delivery::Replied {
+                    comment: Comment::Issue(operation),
+                    reply_to: *issue.id(),
+                }),
+            ),
+        )
+        .await;
+    maya.get_subject(Parameters(SubjectRequest::from(patch)))
+        .await
+        .expect("linked patch is readable");
+    let review = || ReviewWriteRequest {
+        subject: SubjectRequest::from(patch),
+        revision: Some(patch.id().to_string()),
+        review: None,
+        verdict: Some("accept".into()),
+        summary: Some("Scope checked".into()),
+        labels: vec![],
+        embeds: vec![],
+        comments: vec![],
+    };
+    let error = maya
+        .create_review(Parameters(review()))
+        .await
+        .err()
+        .expect("a link is not a review invitation");
+    assert!(error.contains("does not invite a review"), "{error}");
+    let invited = result_id(
+        operator
+            .comment_issue_write(CommentIssueRequest {
+                issue: issue.id().to_string(),
+                body: format!("@maya please review {patch}"),
+                reply_to: None,
+                embeds: vec![],
+            })
+            .await
+            .expect("invitation"),
+    );
+    let invitation: EntryId = invited.parse().expect("invitation ID");
+    fixture
+        .deliver(
+            &maya,
+            fixture.activity(
+                issue,
+                invitation,
+                Kind::Delivered(Delivery::Mentioned(Target::Comment(Comment::Issue(
+                    invitation,
+                )))),
+            ),
+        )
+        .await;
+    maya.create_review(Parameters(review()))
+        .await
+        .expect("explicitly addressed review may publish");
+}
+
+#[tokio::test]
+async fn reviewer_follows_only_own_findings_and_cannot_implement_other_reviews() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{
+        queue::TaskKind,
+        watcher::{Change, Comment, Delivery, Kind, Target},
+    };
+    let fixture = RepositoryFixture::new();
+    let queue = fixture.queue().await;
+    let owner = fixture
+        .service_as(Member::Maya, Role::Talker, fixture.queue().await)
+        .await;
+    let patch = fixture.patch(&owner).await;
+    let delegate = fixture.service().await;
+    let reviewer = fixture
+        .service_as(Member::Nico, Role::Talker, queue.clone())
+        .await;
+    let assigned = result_id(
+        delegate
+            .set_strings_write(
+                SetStringsRequest {
+                    subject: SubjectRequest::from(patch),
+                    values: vec![format!("did:key:{}", reviewer.publisher.author())],
+                },
+                SubjectKind::Patch,
+                StringUpdate::Assignees,
+            )
+            .await
+            .expect("assignment"),
+    );
+    let assignment: EntryId = assigned.parse().expect("assignment ID");
+    fixture
+        .deliver(
+            &reviewer,
+            fixture.activity(patch, assignment, Kind::Assigned),
+        )
+        .await;
+    let review_request = |verdict: &str, revision: String, previous| ReviewWriteRequest {
+        subject: SubjectRequest::from(patch),
+        revision: Some(revision),
+        review: previous,
+        verdict: Some(verdict.into()),
+        summary: Some("Check the requested behavior".into()),
+        labels: vec![],
+        embeds: vec![],
+        comments: vec![],
+    };
+    let queued = reviewer
+        .add_task(Parameters(super::protocol::AddTaskRequest {
+            brief: "Review this patch".into(),
+            kind: None,
+            position: QueuePosition::End,
+            context: crate::queue::ContextUpdate::default(),
+            distinct: false,
+        }))
+        .await
+        .expect("review queued")
+        .0
+        .task;
+    assert_eq!(
+        queue.get(queued).await.expect("task").kind(),
+        TaskKind::Review
+    );
+    let coder = fixture.service_with(Role::Coder, queue.clone()).await;
+    fixture
+        .activate(&coder, patch, crate::agent::ActivityId::Task(queued))
+        .await;
+    coder
+        .create_patch(Parameters(CreatePatchRequest {
+            title: "Unauthorized implementation".into(),
+            description: "Wrong role".into(),
+            base: fixture.base.to_string(),
+            head: fixture.head.to_string(),
+            labels: vec![],
+            draft: true,
+        }))
+        .await
+        .err()
+        .expect("review work cannot publish implementation");
+    coder
+        .set_patch_state(Parameters(SetStateRequest {
+            subject: SubjectRequest::from(patch),
+            state: "open".into(),
+        }))
+        .await
+        .err()
+        .expect("review work cannot mark implementation ready");
+    reviewer
+        .add_task(Parameters(super::protocol::AddTaskRequest {
+            brief: "Implement somebody else's requested changes".into(),
+            kind: Some(TaskKind::Implementation),
+            position: QueuePosition::End,
+            context: crate::queue::ContextUpdate::default(),
+            distinct: true,
+        }))
+        .await
+        .err()
+        .expect("review assignment cannot authorize implementation");
+    let own = result_id(
+        reviewer
+            .create_review(Parameters(review_request(
+                "accept",
+                patch.id().to_string(),
+                None,
+            )))
+            .await
+            .expect("initial invited review"),
+    );
+    let mut delegate_review = review_request("reject", patch.id().to_string(), None);
+    delegate_review.comments.push(ReviewCommentRequest {
+        body: "Please correct this behavior".into(),
+        location: None,
+    });
+    let other = result_id(
+        delegate
+            .review_write(delegate_review, false)
+            .await
+            .expect("delegate review"),
+    );
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("storage");
+    let state = Patches::open(&stored, ReadOnly)
+        .expect("patches")
+        .get(&patch.id())
+        .expect("patch")
+        .expect("patch exists");
+    let other_id = other.parse::<EntryId>().expect("review ID").into();
+    let reply_to = find_review(&state, other_id)
+        .expect("delegate review")
+        .comments()
+        .next()
+        .expect("finding")
+        .0
+        .to_string();
+    let revision = result_id(
+        owner
+            .update_patch_write(
+                super::protocol::UpdatePatchRequest {
+                    subject: SubjectRequest::from(patch),
+                    description: "Delegate's feedback addressed".into(),
+                    base: fixture.base.to_string(),
+                    head: fixture.head.to_string(),
+                },
+                fixture.working.clone(),
+            )
+            .await
+            .expect("new revision"),
+    );
+    fixture
+        .deliver(
+            &reviewer,
+            fixture.activity(
+                patch,
+                revision.parse().expect("revision"),
+                Kind::Delivered(Delivery::Changed(Change::RevisionCreated(
+                    revision.parse::<EntryId>().expect("revision").into(),
+                ))),
+            ),
+        )
+        .await;
+    reviewer
+        .create_review(Parameters(review_request("accept", revision.clone(), None)))
+        .await
+        .err()
+        .expect("accepted reviewer must not claim another reviewer's fixes");
+    reviewer
+        .create_comment(Parameters(CommentWriteRequest {
+            subject: SubjectRequest::from(patch),
+            target: CommentTargetKind::Review,
+            entity: Some(other.clone()),
+            comment: None,
+            body: Some("I checked your fixes".into()),
+            reply_to: Some(reply_to.clone()),
+            location: None,
+            embeds: vec![],
+        }))
+        .await
+        .err()
+        .expect("another review's thread needs direct address");
+    reviewer
+        .review_write(
+            ReviewWriteRequest {
+                review: Some(own.clone()),
+                ..review_request("reject", patch.id().to_string(), None)
+            },
+            true,
+        )
+        .await
+        .expect("own verdict can be changed");
+    let follow_up = fixture.activity(
+        patch,
+        revision.parse().expect("revision"),
+        Kind::Delivered(Delivery::Changed(Change::ReviewFollowUp {
+            review: own.parse::<EntryId>().expect("review").into(),
+            revision: revision.parse::<EntryId>().expect("revision").into(),
+        })),
+    );
+    fixture.deliver(&reviewer, follow_up).await;
+    reviewer
+        .create_review(Parameters(review_request(
+            "accept",
+            revision.clone(),
+            Some(other.clone()),
+        )))
+        .await
+        .err()
+        .expect("own follow-up cannot substitute another review ID");
+    reviewer
+        .create_review(Parameters(review_request(
+            "accept",
+            revision.clone(),
+            Some(own),
+        )))
+        .await
+        .expect("own rejected findings may be checked on the new revision");
+    let addressed = result_id(
+        delegate
+            .write_comment(
+                CommentWriteRequest {
+                    subject: SubjectRequest::from(patch),
+                    target: CommentTargetKind::Review,
+                    entity: Some(other.clone()),
+                    comment: None,
+                    body: Some("@nico please clarify this finding".into()),
+                    reply_to: Some(reply_to),
+                    location: None,
+                    embeds: vec![],
+                },
+                CommentOperation::Create,
+            )
+            .await
+            .expect("direct request"),
+    );
+    let addressed_id: EntryId = addressed.parse().expect("request ID");
+    fixture
+        .deliver(
+            &reviewer,
+            fixture.activity(
+                patch,
+                addressed_id,
+                Kind::Delivered(Delivery::Mentioned(Target::Comment(Comment::Review {
+                    review: other.parse::<EntryId>().expect("review").into(),
+                    comment: addressed_id,
+                }))),
+            ),
+        )
+        .await;
+    reviewer
+        .create_comment(Parameters(CommentWriteRequest {
+            subject: SubjectRequest::from(patch),
+            target: CommentTargetKind::Review,
+            entity: Some(other),
+            comment: None,
+            body: Some("Answer to the direct request".into()),
+            reply_to: Some(addressed),
+            location: None,
+            embeds: vec![],
+        }))
+        .await
+        .expect("direct address permits a reply in that review");
+}
+
+#[tokio::test]
+async fn handoff_requires_receiving_members_signed_implementation_admission() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{
+        queue::{TaskKind, TaskRequest},
+        watcher::{Comment, Delivery, Kind, Target},
+    };
+    let fixture = RepositoryFixture::new();
+    fixture.bind_receipts(fixture.profile.did());
+    let receiver_queue = fixture.queue().await;
+    let receiver = fixture
+        .service_with(Role::Talker, receiver_queue.clone())
+        .await;
+    let sender_queue = TaskQueue::memory(fixture.repository, Member::Maya)
+        .await
+        .expect("sender queue");
+    let sender = fixture
+        .service_as(Member::Maya, Role::Talker, sender_queue.clone())
+        .await;
+    let issue = result_id(
+        receiver
+            .create_issue_write(CreateIssueRequest {
+                title: "Shared work".into(),
+                description: "An implementation task".into(),
+                labels: vec![],
+                assignees: vec![],
+            })
+            .await
+            .expect("issue"),
+    );
+    let subject = Subject::Issue(issue.parse().expect("issue ID"));
+    let task = sender_queue
+        .push(TaskRequest::new(
+            "Implementation".into(),
+            subject.into(),
+            QueuePosition::End,
+        ))
+        .await
+        .expect("original promise")
+        .task;
+    let operation = result_id(
+        sender
+            .comment_issue_write(CommentIssueRequest {
+                issue,
+                body: "@nico please take over this implementation".into(),
+                reply_to: None,
+                embeds: vec![],
+            })
+            .await
+            .expect("handoff message"),
+    );
+    let entry: EntryId = operation.parse().expect("operation");
+    let mut activity = fixture.activity(
+        subject,
+        entry,
+        Kind::Delivered(Delivery::Mentioned(Target::Comment(Comment::Issue(entry)))),
+    );
+    activity.author = sender.publisher.author().into();
+    fixture.deliver(&sender, activity.clone()).await;
+    let handoff = || super::protocol::HandoffRequest {
+        task,
+        member: "nico".into(),
+        operation: operation.clone(),
+        remaining: None,
+    };
+    sender
+        .handoff_task(Parameters(handoff()))
+        .await
+        .err()
+        .expect("message alone cannot transfer work");
+    assert!(
+        !sender_queue
+            .get(task)
+            .await
+            .expect("original remains")
+            .context
+            .cancelled
+    );
+    let inbox = receiver_queue.inbox().await.expect("receiver inbox");
+    inbox
+        .enqueue(activity.clone(), None)
+        .await
+        .expect("notification receipt");
+    fixture.publish_receipts(&inbox, &receiver.publisher).await;
+    sender
+        .handoff_task(Parameters(handoff()))
+        .await
+        .err()
+        .expect("a notification receipt is not implementation acceptance");
+    let request = |kind| {
+        let mut request = TaskRequest::new(
+            "Transferred work".into(),
+            subject.into(),
+            QueuePosition::Next,
+        );
+        request.request = Some("handoff-delivery".into());
+        request.context.kind = kind;
+        request.context.activity = Some(activity.clone());
+        request
+    };
+    receiver_queue
+        .push_assignment(request(TaskKind::Review), activity.clone())
+        .await
+        .expect("review queued");
+    fixture.publish_receipts(&inbox, &receiver.publisher).await;
+    sender
+        .handoff_task(Parameters(handoff()))
+        .await
+        .err()
+        .expect("review admission does not transfer implementation");
+    receiver_queue
+        .push_assignment(request(TaskKind::Implementation), activity.clone())
+        .await
+        .expect("implementation queued");
+    fixture.publish_receipts(&inbox, &receiver.publisher).await;
+    let transferred = sender
+        .handoff_task(Parameters(handoff()))
+        .await
+        .expect("confirmed handoff");
+    assert!(transferred.0.task.context.cancelled);
+    assert!(matches!(
+        sender_queue.get(task).await,
+        Err(crate::queue::Error::MissingTask(_))
+    ));
+    assert_eq!(
+        inbox.list().await.expect("receipt").len(),
+        1,
+        "queue changes update the existing receipt"
+    );
+}
+
+#[tokio::test]
+async fn resolved_findings_allow_followup_only_on_the_members_own_review() {
+    use std::collections::BTreeSet;
+
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::watcher::{Change, Delivery, Kind, Target};
+    let fixture = RepositoryFixture::new();
+    let owner = fixture.service().await;
+    let patch = fixture.patch(&owner).await;
+    let reviewer = fixture
+        .service_as(Member::Maya, Role::Talker, fixture.queue().await)
+        .await;
+    fixture
+        .deliver(
+            &reviewer,
+            fixture.activity(
+                patch,
+                *patch.id(),
+                Kind::Delivered(Delivery::Mentioned(Target::Revision((*patch.id()).into()))),
+            ),
+        )
+        .await;
+    let request = |revision: String, review| ReviewWriteRequest {
+        subject: SubjectRequest::from(patch),
+        revision: Some(revision),
+        review,
+        verdict: Some("accept".into()),
+        summary: Some("Required behavior is sound".into()),
+        labels: vec![],
+        embeds: vec![],
+        comments: vec![],
+    };
+    let mut initial = request(patch.id().to_string(), None);
+    initial.comments.push(ReviewCommentRequest {
+        body: "Optional simplification".into(),
+        location: None,
+    });
+    let own = result_id(
+        reviewer
+            .create_review(Parameters(initial))
+            .await
+            .expect("initial review"),
+    );
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("storage");
+    let signer = fixture.profile.signer().expect("signer");
+    let mut patches = patch::Cache::no_cache(&stored, &signer).expect("patch store");
+    let mut object = patches.get_mut(&patch.id()).expect("patch");
+    let review_id = own.parse::<EntryId>().expect("review ID").into();
+    let comment = *find_review(&object, review_id)
+        .expect("own review")
+        .comments()
+        .next()
+        .expect("finding")
+        .0;
+    let revision = object
+        .transaction("Resolve own finding", |tx| {
+            tx.push(PatchAction::Revision {
+                description: "Resolve the optional finding".into(),
+                base: fixture.base.into(),
+                oid: fixture.head.into(),
+                resolves: BTreeSet::from([(own.parse().expect("review ID"), comment)]),
+            })
+        })
+        .expect("resolved revision");
+    fixture
+        .deliver(
+            &reviewer,
+            fixture.activity(
+                patch,
+                revision,
+                Kind::Delivered(Delivery::Changed(Change::ReviewCommentsResolved)),
+            ),
+        )
+        .await;
+    reviewer
+        .create_review(Parameters(request(revision.to_string(), None)))
+        .await
+        .err()
+        .expect("followup requires own review ID");
+    reviewer
+        .create_review(Parameters(request(
+            revision.to_string(),
+            Some(patch.id().to_string()),
+        )))
+        .await
+        .err()
+        .expect("unrelated review is denied");
+    reviewer
+        .add_task(Parameters(super::protocol::AddTaskRequest {
+            brief: "Check my resolved finding".into(),
+            kind: None,
+            position: QueuePosition::End,
+            context: crate::queue::ContextUpdate::default(),
+            distinct: false,
+        }))
+        .await
+        .expect("scoped review may enter the queue");
+    reviewer
+        .create_review(Parameters(request(revision.to_string(), Some(own))))
+        .await
+        .expect("own resolved finding may be checked");
+}
+
+#[tokio::test]
+async fn implementation_reference_does_not_grant_another_authors_patch() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use crate::{
+        queue::{Artifact, ArtifactRole, ContextUpdate, TaskRequest},
+        watcher::{Comment, Delivery, Kind, Target},
+    };
+    let fixture = RepositoryFixture::new();
+    let owner = fixture
+        .service_as(Member::Maya, Role::Talker, fixture.queue().await)
+        .await;
+    let patch = fixture.patch(&owner).await;
+    let delegate = fixture.service().await;
+    let issue_id = result_id(
+        delegate
+            .create_issue_write(CreateIssueRequest {
+                title: "Related task".into(),
+                description: format!("Information from {patch}"),
+                labels: vec![],
+                assignees: vec![],
+            })
+            .await
+            .expect("issue"),
+    );
+    let issue = Subject::Issue(issue_id.parse().expect("issue ID"));
+    let queue = fixture.queue().await;
+    let mut request = TaskRequest::new(
+        "Own implementation".into(),
+        issue.into(),
+        QueuePosition::End,
+    );
+    request
+        .context
+        .update(ContextUpdate {
+            artifacts: vec![Artifact {
+                subject: patch.to_string(),
+                role: ArtifactRole::Implementation,
+                purpose: "Related code".into(),
+            }],
+            ..ContextUpdate::default()
+        })
+        .expect("reference");
+    request.request = Some("original request".into());
+    let task = queue.push(request).await.expect("task").task;
+    let coder = fixture.service_with(Role::Coder, queue.clone()).await;
+    fixture
+        .activate(&coder, issue, crate::agent::ActivityId::Task(task))
+        .await;
+    let update = || super::protocol::UpdatePatchRequest {
+        subject: SubjectRequest::from(patch),
+        description: "Updated behavior".into(),
+        base: fixture.base.to_string(),
+        head: fixture.head.to_string(),
+    };
+    let error = coder
+        .update_patch(Parameters(update()))
+        .await
+        .err()
+        .expect("reference is not permission");
+    assert!(error.contains("explicit implementation request"), "{error}");
+    coder
+        .set_patch_state(Parameters(SetStateRequest {
+            subject: SubjectRequest::from(patch),
+            state: "open".into(),
+        }))
+        .await
+        .err()
+        .expect("a saved reference cannot mark another author's patch ready");
+    let operation = result_id(
+        delegate
+            .comment_issue_write(CommentIssueRequest {
+                issue: issue_id,
+                body: format!("@nico implement this change in {patch}"),
+                reply_to: None,
+                embeds: vec![],
+            })
+            .await
+            .expect("explicit request"),
+    );
+    let operation: EntryId = operation.parse().expect("request ID");
+    let activity = fixture.activity(
+        issue,
+        operation,
+        Kind::Delivered(Delivery::Mentioned(Target::Comment(Comment::Issue(
+            operation,
+        )))),
+    );
+    let mut accepted = TaskRequest::new(
+        "Explicit implementation handoff".into(),
+        issue.into(),
+        QueuePosition::Next,
+    );
+    accepted.context.activity = Some(activity);
+    accepted.request = Some("explicit handoff".into());
+    assert_eq!(queue.push(accepted).await.expect("correction").task, task);
+    coder.scope.deactivate().await;
+    fixture
+        .activate(&coder, issue, crate::agent::ActivityId::Task(task))
+        .await;
+    coder
+        .update_patch(Parameters(update()))
+        .await
+        .expect("explicitly addressed implementation may revise the patch");
+    for state in ["draft", "open"] {
+        coder
+            .set_patch_state(Parameters(SetStateRequest {
+                subject: SubjectRequest::from(patch),
+                state: state.into(),
+            }))
+            .await
+            .expect("an explicit implementation handoff may change readiness");
+    }
+    let stored = fixture
+        .profile
+        .storage
+        .repository(fixture.repository)
+        .expect("storage");
+    let object = Patches::open(&stored, ReadOnly)
+        .expect("patch store")
+        .get(&patch.id())
+        .expect("patch")
+        .expect("patch exists");
+    assert!(matches!(object.state(), patch::State::Open { .. }));
 }

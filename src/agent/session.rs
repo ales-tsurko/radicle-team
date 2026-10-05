@@ -14,13 +14,14 @@
 use std::{
     collections::VecDeque,
     fs,
+    io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::{
         Arc, Mutex, OnceLock, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Instant, SystemTime},
+    time::Instant,
 };
 
 use tokio::{
@@ -31,7 +32,7 @@ use tokio::{
 use crate::{
     agent::{Role, Source},
     sandbox::{AgentChild, AgentCommand},
-    status::{Activity, Reporter},
+    status::{Activity, AgentState, Observation, Reporter, Snapshot},
 };
 
 // How much of what a run wrote is kept to explain a failure with. Enough to see what went wrong,
@@ -129,8 +130,20 @@ impl Session {
 
     /// Records actual observed progress on the existing supervision beat.
     pub(crate) async fn checkpoint(&self, at: Instant) {
+        let observation = self
+            .progress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .observation
+            .clone();
         if let Some(status) = self.status.get() {
-            status.progress(self.role, at).await;
+            status.progress(self.role, at, observation).await;
+        }
+    }
+
+    pub(crate) async fn retrying(&self, detail: String) {
+        if let Some(status) = self.status.get() {
+            status.retrying(self.role, detail).await;
         }
     }
 
@@ -214,6 +227,7 @@ impl Session {
         self.interrupted.store(false, Ordering::SeqCst);
         *self.stop.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&stop));
         self.opened();
+        *self.progress.lock().unwrap_or_else(PoisonError::into_inner) = Progress::default();
         self.saw();
 
         stop
@@ -368,9 +382,9 @@ impl Session {
 #[derive(Debug, Default)]
 struct Progress {
     at: Option<Instant>,
-    // What the report's modification time was when it was last read. A file which has changed
-    // since then is an agent which has done something since then.
-    written: Option<SystemTime>,
+    // Read only complete new records. Background writes must not replay earlier agent actions.
+    read: u64,
+    observation: Option<Observation>,
 }
 
 impl Progress {
@@ -379,14 +393,98 @@ impl Progress {
     }
 
     fn reported(&mut self, report: &Path) {
-        let Ok(written) = fs::metadata(report).and_then(|report| report.modified()) else {
+        let Ok(mut file) = fs::File::open(report) else {
             return;
         };
-        if self.written != Some(written) {
-            self.written = Some(written);
-            self.seen();
+        let Ok(length) = file.seek(SeekFrom::End(0)) else {
+            return;
+        };
+        if length < self.read {
+            self.read = 0;
+        }
+        let start = self.read.max(length.saturating_sub(64 * 1024));
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            return;
+        }
+        let mut tail = Vec::new();
+        if file.read_to_end(&mut tail).is_err() {
+            return;
+        }
+        let Some(end) = tail.iter().rposition(|byte| *byte == b'\n') else {
+            return;
+        };
+        tail.truncate(end + 1);
+        for line in tail
+            .split(|byte| *byte == b'\n')
+            .skip(usize::from(start > self.read))
+        {
+            if let Ok(report) = serde_json::from_slice::<ProgressReport>(line) {
+                self.observe(report);
+            }
+        }
+        self.read = start + end as u64 + 1;
+    }
+
+    fn observe(&mut self, report: ProgressReport) {
+        let at = report.at / 1000;
+        if self
+            .observation
+            .as_ref()
+            .is_some_and(|observed| observed.at > at)
+        {
+            return;
+        }
+        let (state, activity) = match report.kind.as_str() {
+            "session.step.started" => (AgentState::AwaitingModel, true),
+            "session.reasoning.started"
+            | "session.reasoning.delta"
+            | "session.text.started"
+            | "session.text.delta"
+            | "session.tool.input.started"
+            | "session.tool.input.delta"
+            | "session.compaction.started"
+            | "session.compaction.delta" => (AgentState::Thinking, true),
+            "session.tool.called" | "session.tool.progress" => (AgentState::UsingTool, true),
+            "session.tool.success" => (AgentState::AwaitingModel, true),
+            "session.tool.failed" | "session.step.failed" => (AgentState::ToolFailed, true),
+            "session.retry.scheduled" => (AgentState::Retrying, false),
+            _ => return,
+        };
+        let completed = if matches!(
+            report.kind.as_str(),
+            "session.tool.success" | "session.tool.failed"
+        ) {
+            Some(at)
+        } else {
+            self.observation
+                .as_ref()
+                .and_then(|observation| observation.completed)
+        };
+        let tool = report.tool.or_else(|| {
+            self.observation
+                .as_ref()
+                .and_then(|observation| observation.tool.clone())
+        });
+        self.observation = Some(Observation {
+            state,
+            at,
+            tool,
+            completed,
+            detail: report.detail,
+        });
+        if activity {
+            let age = std::time::Duration::from_secs(Snapshot::now().saturating_sub(at));
+            self.at = Instant::now().checked_sub(age);
         }
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProgressReport {
+    kind: String,
+    at: u64,
+    tool: Option<String>,
+    detail: Option<String>,
 }
 
 /// How a run ended.
@@ -463,7 +561,7 @@ impl Report {
 
     // Returns the last of what was written, for a failure which explained itself no other way.
     fn tail(&self) -> String {
-        Vec::from_iter(self.tail.iter().cloned()).join("; ")
+        Vec::from_iter(self.tail.iter().cloned()).join("\n")
     }
 
     fn remember(&mut self, line: &str) {
@@ -494,51 +592,84 @@ mod tests {
     // The runtime stops an agent which has shown nothing for fifteen minutes. From outside the
     // process there is nothing to see, so what counts as showing something is what a plugin wrote
     // down for a harness which does not stream its events.
-    #[tokio::test]
-    async fn takes_progress_from_what_the_plugin_reports() {
+    #[test]
+    fn takes_progress_from_agent_actions_without_replaying_background_events() {
+        use std::io::Write as _;
+
+        use crate::status::{AgentState, Snapshot};
         let session = Session::new(Role::Coder);
-        assert_eq!(
-            session.last_progress(),
-            None,
-            "a role which has not started has shown nothing"
-        );
-
-        let report = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("session-progress");
-        let _removed = std::fs::remove_dir_all(&report);
-        std::fs::create_dir_all(&report).expect("test directory should be created");
-        let report = report.join("progress.jsonl");
-        std::fs::write(&report, "{\"kind\":\"started\"}\n").expect("report should be written");
-        session.reports_in(report.clone());
-
-        let first = session
-            .last_progress()
-            .expect("a written report is an agent working");
+        let directory = tempfile::tempdir().expect("test directory");
+        let path = directory.path().join("progress.jsonl");
+        let mut report = std::fs::File::create(&path).expect("report");
+        session.reports_in(path);
+        let now = Snapshot::now() * 1000;
+        writeln!(report, r#"{{"kind":"file.watcher.updated","at":{now}}}"#)
+            .expect("background event");
+        assert_eq!(session.last_progress(), None);
+        let earlier = now - 10_000;
+        writeln!(
+            report,
+            r#"{{"kind":"session.tool.called","tool":"bash","at":{earlier}}}"#
+        )
+        .expect("tool call");
+        let first = session.last_progress().expect("agent action");
+        assert!(first.elapsed().as_secs() >= 10);
+        writeln!(report, r#"{{"kind":"provider.usage.updated","at":{now}}}"#)
+            .expect("background event");
         assert_eq!(
             session.last_progress(),
             Some(first),
-            "a report nobody added to says the agent has done nothing since"
+            "background events cannot refresh liveness"
         );
+        writeln!(report, r#"{{"kind":"session.retry.scheduled","at":{now}}}"#).expect("retry");
+        assert_eq!(
+            session.last_progress(),
+            Some(first),
+            "retries do not prove progress"
+        );
+        let observation = session
+            .progress
+            .lock()
+            .expect("progress")
+            .observation
+            .clone()
+            .expect("observation");
+        assert_eq!(observation.state, AgentState::Retrying);
+        assert_eq!(observation.completed, None);
+        assert_eq!(observation.tool.as_deref(), Some("bash"));
+        writeln!(report, r#"{{"kind":"session.tool.success","at":{now}}}"#).expect("tool result");
+        assert!(session.last_progress().expect("result") > first);
+        let observation = session
+            .progress
+            .lock()
+            .expect("progress")
+            .observation
+            .clone()
+            .expect("observation");
+        assert_eq!(observation.state, AgentState::AwaitingModel);
+        assert_eq!(observation.completed, Some(now / 1000));
+    }
 
-        std::fs::write(&report, "{\"kind\":\"started\"}\n{\"kind\":\"tool\"}\n")
-            .expect("report should be added to");
-        // Polled rather than slept through, because how finely a filesystem records a change is
-        // the filesystem's business.
-        let mut moved = None;
-        for _attempt in 0..100 {
-            match session.last_progress() {
-                Some(seen) if seen > first => {
-                    moved = Some(seen);
-                    break;
-                }
-                _unchanged => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
-            }
-        }
-
-        assert!(
-            moved.is_some(),
-            "another line in the report is the agent doing something else"
+    #[test]
+    fn waits_for_complete_progress_records_and_bounds_large_reports() {
+        use std::io::Write as _;
+        let directory = tempfile::tempdir().expect("test directory");
+        let path = directory.path().join("progress.jsonl");
+        let mut report = std::fs::File::create(&path).expect("report");
+        let mut progress = super::Progress::default();
+        let now = crate::status::Snapshot::now() * 1000;
+        write!(report, r#"{{"kind":"session.tool.success","at":{now}"#).expect("partial record");
+        progress.reported(&path);
+        assert!(progress.at.is_none());
+        writeln!(report, "}}").expect("finish record");
+        progress.reported(&path);
+        assert!(progress.at.is_some());
+        writeln!(report, "{}", "é".repeat(40_000)).expect("large background record");
+        writeln!(report, r#"{{"kind":"session.tool.called","at":{now}}}"#).expect("recent action");
+        progress.reported(&path);
+        assert_eq!(
+            progress.observation.expect("bounded report").state,
+            crate::status::AgentState::UsingTool
         );
     }
 

@@ -1,10 +1,14 @@
 //! Keeps presentation responsive while the member runs and inspection waits on storage.
 
-use std::{io, path::PathBuf, time::Duration};
+use std::{
+    io::{self, Write as _},
+    path::PathBuf,
+    time::Duration,
+};
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, EventStream,
+    KeyEventKind,
 };
 use futures_util::{FutureExt as _, Stream, StreamExt as _, future::BoxFuture};
 use ratatui::backend::Backend;
@@ -78,7 +82,6 @@ impl Dashboard {
                                 let _handled = shutdown.request();
                             }
                         }
-                        Event::Mouse(mouse) => screen.mouse(mouse),
                         Event::Paste(text) => screen.paste(&text),
                         _ => {}
                     }
@@ -129,7 +132,8 @@ impl Terminal {
         match ratatui::try_init() {
             Ok(terminal) => {
                 let terminal = Self(terminal);
-                crossterm::execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+                crossterm::execute!(io::stdout(), DisableMouseCapture, EnableBracketedPaste)?;
+                Self::alternate_scroll(true)?;
                 let hook = std::panic::take_hook();
                 std::panic::set_hook(Box::new(move |info| {
                     Self::restore();
@@ -145,6 +149,7 @@ impl Terminal {
     }
 
     pub(crate) fn restore() {
+        let scrolling = Self::alternate_scroll(false);
         let cursor = crossterm::execute!(
             io::stdout(),
             DisableMouseCapture,
@@ -152,11 +157,23 @@ impl Terminal {
             crossterm::cursor::Show
         );
         let screen = ratatui::try_restore();
-        for result in [cursor, screen] {
+        for result in [scrolling, cursor, screen] {
             if let Err(error) = result {
                 eprintln!("Error: failed to restore terminal: {error}");
             }
         }
+    }
+
+    fn alternate_scroll(enabled: bool) -> io::Result<()> {
+        // With native mouse selection, supporting terminals send wheel motion as arrow keys.
+        // Save and restore the terminal's previous private mode instead of leaving it changed.
+        let mut output = io::stdout().lock();
+        output.write_all(if enabled {
+            b"\x1b[?1007s\x1b[?1007h"
+        } else {
+            b"\x1b[?1007l\x1b[?1007r"
+        })?;
+        output.flush()
     }
 }
 

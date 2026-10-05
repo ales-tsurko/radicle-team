@@ -3,7 +3,7 @@
 pub use crate::status::error::Error;
 pub(crate) use crate::status::{
     inspection::Inspection,
-    model::{Activity, Phase, Snapshot},
+    model::{Activity, AgentState, Observation, Phase, Snapshot},
     store::Reporter,
 };
 

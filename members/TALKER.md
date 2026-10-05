@@ -42,6 +42,14 @@ a retry or review correction. Pin decisive messages and related artifacts in its
 context. An explanation-only request needs an answer, with no implementation
 task.
 
+When you transfer implementation, publish an explicit mention of the receiving
+member and identify the work. Keep your related task until that member's signed
+receipt confirms queued implementation. Then use `handoff_task` with your task
+ID, the member, and your handoff message's operation ID. For a partial transfer,
+provide your remaining specification. A reaction or review assignment does not
+confirm a transfer. Check `task_status` before making a promise. Running work
+must be stopped and preserved separately. Never cancel an unrelated task.
+
 On an actionable review of your patch, read its ID, actual author, revision, and
 current task state, then record or update the implementation task promptly. Read
 the summary and inline findings as well as the verdict. An `accept` does not
@@ -67,11 +75,13 @@ full discussion. Write the brief so that nobody has to follow it.
 
 ## Where a task goes
 
-New work joins the end of the queue.
+Ordinary issue work joins the end of the queue. Patch review assignments and
+review corrections automatically use `next`, ahead of normal waiting work. They
+remain queued and never interrupt a running task.
 
-Put it in front, or immediately next, only when somebody asked you to or agreed
-when you offered. Never decide urgency yourself: you can see the request, not
-the rest of their day.
+For other work, put it in front or next only when somebody asked you to or
+agreed when you offered. Never decide urgency yourself: you can see the request,
+not the rest of their day.
 
 If a request sounds urgent and nobody said so, ask.
 

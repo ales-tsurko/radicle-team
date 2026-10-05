@@ -21,10 +21,112 @@ use crate::{
         tools::ToolService,
     },
     queue::{Artifact, ArtifactRole, ContextUpdate, Task},
-    watcher::Subject,
+    watcher::{Delivery, Kind, Subject},
 };
 
 impl ToolService {
+    pub(super) async fn mentioned_patch(
+        &self,
+        access: &ActivityAccess,
+        target: Subject,
+    ) -> Result<bool, String> {
+        let Some(activity) = access.context().delivery.as_ref().filter(|activity| {
+            activity.subject != target
+                && matches!(activity.kind, Kind::Delivered(Delivery::Mentioned(_)))
+        }) else {
+            return Ok(false);
+        };
+        let request = EntryRequest {
+            subject: SubjectRequest::from(activity.subject),
+            entry: activity.operation.to_string(),
+        };
+        self.blocking(move |service| service.entry(request))
+            .await
+            .map(|entry| entry.to_string().contains(&target.id().to_string()))
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) async fn implementation_subject(
+        &self,
+        access: &ActivityAccess,
+        subject: &SubjectRequest,
+    ) -> Result<(), String> {
+        let target = subject.target()?;
+        let owned = self
+            .blocking(move |service| {
+                let repository = service.storage.repository(service.repository)?;
+                let patch = radicle::cob::patch::Patches::open(
+                    &repository,
+                    radicle::cob::store::access::ReadOnly,
+                )?
+                .get(&target.id())?
+                .ok_or_else(|| crate::mcp::server::ServiceError::NotFound(target.to_string()))?;
+                Ok(patch.author().public_key() == &service.publisher.author())
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let directly_addressed = access
+            .context()
+            .delivery
+            .as_ref()
+            .is_some_and(|activity| activity.subject == target && activity.direct());
+        if owned
+            || directly_addressed
+            || matches!(access.context().source, Source::Chat(_))
+            || self.mentioned_patch(access, target).await?
+        {
+            return Ok(());
+        }
+        Err(
+            "this patch belongs to another author; a review or saved reference does not authorize \
+             changing it. An explicit implementation request is required"
+                .to_owned(),
+        )
+    }
+
+    pub(super) async fn require_implementation(
+        &self,
+        access: &ActivityAccess,
+    ) -> Result<(), String> {
+        if self.role != crate::agent::Role::Coder {
+            return Err(
+                "this role investigates locally; use add_task for durable changes and publication"
+                    .to_owned(),
+            );
+        }
+        if let ActivityId::Task(id) = access.context().activity {
+            let task = self
+                .queue
+                .get(id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if task.kind() == crate::queue::TaskKind::Review {
+                return Err(
+                    "this task was assigned for review, not implementation; report your own \
+                     findings"
+                        .to_owned(),
+                );
+            }
+        }
+        self.building_may_write(access).await
+    }
+
+    pub(super) async fn comment_boundary(
+        &self,
+        access: &ActivityAccess,
+        request: &crate::mcp::protocol::CommentWriteRequest,
+    ) -> Result<(), String> {
+        if matches!(
+            request.target,
+            crate::mcp::protocol::CommentTargetKind::Review
+        ) && let Some(review) = &request.entity
+        {
+            self.verify_review_thread(access, &request.subject, review)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn active(&self) -> Result<ActivityAccess, String> {
         let access = self.scope.access_current().await?;
         if access.context().repository != self.repository {

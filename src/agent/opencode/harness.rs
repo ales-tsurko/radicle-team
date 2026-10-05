@@ -161,7 +161,7 @@ impl OpenCode {
                 .args(["--agent", &started.agent])
                 .args(["--model", &started.model])
                 .args(["--title", title])
-                .arg(prompt),
+                .arg(self.role.prompt(&prompt)),
         )
         .await
     }

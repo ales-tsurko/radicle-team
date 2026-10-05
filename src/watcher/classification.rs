@@ -201,7 +201,10 @@ impl Context {
                         && !(self.draft && change.requires_ready_patch())
                         && audience.matches(self, origin, change) =>
                 {
-                    let change = if audience.follow_review && !self.involved() {
+                    let change = if audience.follow_review
+                        && !self.owned
+                        && (!self.assigned || self.review.is_some())
+                    {
                         let Some(change) = self.review_followup(change) else {
                             continue;
                         };
@@ -396,12 +399,20 @@ impl<'a, A> ActionEnvelope<'a, A> {
 
 #[derive(Debug, Default)]
 pub(super) struct Audience {
+    subject_owner: bool,
     involved: bool,
     follow_review: bool,
     owners: Vec<Entity>,
 }
 
 impl Audience {
+    pub(super) fn owner() -> Self {
+        Self {
+            subject_owner: true,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn involved() -> Self {
         Self {
             involved: true,
@@ -442,7 +453,8 @@ impl Audience {
     fn matches(&self, context: &Context, origin: Author, change: Change) -> bool {
         self.owners.iter().any(|entity| context.owns(*entity))
             || ((origin != Author::Peer || change.is_task_submission())
-                && ((self.involved && context.involved())
+                && ((self.subject_owner && context.owned)
+                    || (self.involved && context.involved())
                     || (self.follow_review
                         && context
                             .review

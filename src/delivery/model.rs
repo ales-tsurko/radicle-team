@@ -14,6 +14,8 @@ pub(crate) struct Record {
     pub(crate) activity: Activity,
     pub(crate) state: State,
     pub(crate) task: Option<i64>,
+    #[serde(default)]
+    pub(crate) task_kind: Option<crate::queue::TaskKind>,
     pub(crate) received: u64,
     pub(crate) updated: u64,
     pub(crate) revision: i64,
@@ -27,6 +29,7 @@ impl Record {
             activity,
             state: State::Queued,
             task,
+            task_kind: None,
             received: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

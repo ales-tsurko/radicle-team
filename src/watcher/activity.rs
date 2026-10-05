@@ -65,6 +65,41 @@ impl Activity {
             action: self.action,
         }
     }
+
+    pub(crate) const fn direct(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Delivered(Delivery::Mentioned(_) | Delivery::Replied { .. })
+        )
+    }
+
+    /// A revision explicitly identified by a review invitation.
+    pub(crate) fn review_revision(&self) -> Option<RevisionId> {
+        match self.kind {
+            Kind::Delivered(
+                Delivery::Changed(Change::ReviewFollowUp { revision, .. })
+                | Delivery::Mentioned(Target::Revision(revision)),
+            ) => Some(revision),
+            Kind::Delivered(Delivery::Changed(Change::ReviewCommentsResolved)) => {
+                Some(self.operation.into())
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn addresses_review(&self, expected: ReviewId) -> bool {
+        match self.kind {
+            Kind::Delivered(Delivery::Mentioned(Target::Review(review))) => review == expected,
+            Kind::Delivered(
+                Delivery::Mentioned(Target::Comment(Comment::Review { review, .. }))
+                | Delivery::Replied {
+                    comment: Comment::Review { review, .. },
+                    ..
+                },
+            ) => review == expected,
+            _ => false,
+        }
+    }
 }
 
 /// Collaborative object receiving an interaction.

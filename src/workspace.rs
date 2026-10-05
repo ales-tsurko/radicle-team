@@ -19,10 +19,13 @@
 //! full and set with `--no-deref`, because a name in that namespace can be made to stand for
 //! another reference entirely.
 
-use std::{collections::BTreeSet, ffi::OsStr, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, ffi::OsStr, path::PathBuf, str::FromStr as _, sync::Arc};
 
 use radicle::{
-    cob::{patch::Patches, store::access::ReadOnly},
+    cob::{
+        patch::{self, Patches},
+        store::access::ReadOnly,
+    },
     git::{Url, UserInfo, Version},
     identity::RepoId,
     storage::{ReadRepository as _, ReadStorage as _, git::Storage},
@@ -229,6 +232,115 @@ impl Workspaces {
     /// and never shared with another piece of work.
     pub(crate) async fn prepare_task(&self, task: &Task) -> Result<PathBuf, Error> {
         self.settle(Role::Coder, task.target(), Some(task.id)).await
+    }
+
+    /// Verifies the task's published result instead of trusting a successful agent exit.
+    pub(crate) async fn verify_completion(&self, task: &Task) -> Result<(), Error> {
+        if task.context.cancelled {
+            return Ok(());
+        }
+        if task.kind() == crate::queue::TaskKind::Review {
+            let manager = self.clone();
+            let task = task.clone();
+            return tokio::task::spawn_blocking(move || manager.verify_review(&task))
+                .await
+                .map_err(|error| Error::Task(error.to_string()))?;
+        }
+        let dirty = self
+            .capture(In::Copy(Role::Coder), ["status", "--porcelain"])
+            .await?;
+        if !dirty.trim().is_empty() {
+            return Err(Error::Unpublished(task.id));
+        }
+        let head = self
+            .capture(In::Copy(Role::Coder), ["rev-parse", "HEAD"])
+            .await?;
+        let target = task.target();
+        let manager = self.clone();
+        let ready = tokio::task::spawn_blocking(move || {
+            let repository = manager.storage.repository(manager.repository)?;
+            let head = radicle::git::Oid::from_str(head.trim()).map_err(Error::Commit)?;
+            if let Source::Subject(Subject::Patch(id)) = target {
+                let patch = Patches::open(&repository, ReadOnly)?
+                    .get(&id)?
+                    .ok_or(Error::PatchNotFound(id))?;
+                Ok::<_, Error>(
+                    *patch.head() == head
+                        && matches!(
+                            patch.state(),
+                            radicle::cob::patch::State::Open { .. }
+                                | radicle::cob::patch::State::Merged { .. }
+                        ),
+                )
+            } else {
+                let (_, canonical) = repository.canonical_head()?;
+                if head == canonical {
+                    return Ok(true);
+                }
+                if !repository.backend.odb()?.exists(head.into()) {
+                    return Ok(false);
+                }
+                Ok(repository
+                    .backend
+                    .graph_descendant_of(canonical.into(), head.into())?)
+            }
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))??;
+        if ready {
+            Ok(())
+        } else {
+            Err(Error::Unpublished(task.id))
+        }
+    }
+
+    fn verify_review(&self, task: &Task) -> Result<(), Error> {
+        let Source::Subject(subject @ Subject::Patch(id)) = task.target() else {
+            return Err(Error::Unreviewed(task.id));
+        };
+        let repository = self.storage.repository(self.repository)?;
+        let patch = Patches::open(&repository, ReadOnly)?
+            .get(&id)?
+            .ok_or(Error::PatchNotFound(id))?;
+        let activity = task
+            .context
+            .activity
+            .as_ref()
+            .filter(|activity| activity.subject == subject);
+        let revision = activity
+            .and_then(crate::watcher::Activity::review_revision)
+            .unwrap_or_else(|| patch.latest().0);
+        let review = patch
+            .revision(&revision)
+            .and_then(|revision| revision.review_by(&self.info.key))
+            .ok_or(Error::Unreviewed(task.id))?;
+        let Some(activity) = activity else {
+            return Ok(());
+        };
+        if repository
+            .backend
+            .graph_descendant_of((*review.id()).into(), activity.operation.into())?
+        {
+            return Ok(());
+        }
+        // Updating an existing own review also completes a repeated request for that revision.
+        for operation in radicle::cob::store::ops(&id, &patch::TYPENAME, &repository)? {
+            if operation.author != self.info.key {
+                continue;
+            }
+            for encoded in operation.actions {
+                let action: patch::Action =
+                    serde_json::from_slice(&encoded).map_err(Error::ReviewAction)?;
+                if matches!(action, patch::Action::ReviewEdit(edit) if *edit.review_id() == review.id())
+                    && repository
+                        .backend
+                        .graph_descendant_of(operation.id.into(), activity.operation.into())?
+                {
+                    return Ok(());
+                }
+            }
+        }
+        Err(Error::Unreviewed(task.id))
     }
 
     async fn settle(
@@ -674,6 +786,24 @@ impl Workspaces {
 /// Error preparing or using a member's working copies.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A review task cannot complete with only a reaction or an internal summary.
+    #[error(
+        "task {0} still needs your published review for the requested revision. Use create_review \
+         or edit_review before finishing"
+    )]
+    Unreviewed(i64),
+    /// A stored review operation could not be decoded.
+    #[error("invalid stored review action: {0}")]
+    ReviewAction(#[source] serde_json::Error),
+    /// Durable edits must be committed and published before implementation is completed.
+    #[error(
+        "task {0} still has unpublished changes or a draft patch; commit and publish with \
+         update_patch, then open the patch before claiming completion"
+    )]
+    Unpublished(i64),
+    /// A checked-out commit identifier could not be read.
+    #[error("invalid workspace commit: {0}")]
+    Commit(#[source] radicle::git::ParseOidError),
     /// A workspace filesystem or subprocess operation failed.
     #[error("workspace I/O failed: {0}")]
     Io(#[source] std::io::Error),
@@ -732,7 +862,10 @@ mod tests {
     };
 
     use radicle::{
-        cob::{Title, patch::MergeTarget},
+        cob::{
+            Title,
+            patch::{self, MergeTarget},
+        },
         crypto::Seed,
         identity::doc::Visibility,
         node::Alias,
@@ -1500,6 +1633,275 @@ mod tests {
             committed,
             "commits the agent made but had not published must survive the next run"
         );
+    }
+
+    #[tokio::test]
+    async fn implementation_finishes_only_with_clean_published_ready_changes() {
+        use crate::workspace::Error;
+        let fixture = repository().await;
+        let workspaces = &fixture.workspaces;
+        workspaces.initialize().await.expect("workspaces");
+        let mut task = fixture.start(Subject::Issue(fixture.issue)).await;
+        let coder = workspaces.prepare_task(&task).await.expect("checkout");
+        workspaces
+            .verify_completion(&task)
+            .await
+            .expect("unchanged task");
+        fs::write(coder.join("README.md"), "unpublished fix\n").expect("local edit");
+        assert!(matches!(
+            workspaces.verify_completion(&task).await,
+            Err(Error::Unpublished(_))
+        ));
+        git(&coder, &["add", "--all"]);
+        git(
+            &coder,
+            &[
+                "-c",
+                "user.email=a@b.c",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "Local fix",
+            ],
+        );
+        assert!(matches!(
+            workspaces.verify_completion(&task).await,
+            Err(Error::Unpublished(_))
+        ));
+        fixture
+            .queue
+            .produced(task.id, Subject::Patch(fixture.patch))
+            .await
+            .expect("patch relation");
+        task = fixture.queue.get(task.id).await.expect("current context");
+        assert!(
+            matches!(
+                workspaces.verify_completion(&task).await,
+                Err(Error::Unpublished(_))
+            ),
+            "a patch link cannot make a local unpublished commit complete"
+        );
+        git(&coder, &["reset", "--hard", &fixture.head.to_string()]);
+        workspaces
+            .verify_completion(&task)
+            .await
+            .expect("published open patch");
+        let stored = fixture
+            .profile
+            .storage
+            .repository(fixture.repository)
+            .expect("storage");
+        let signer = fixture.profile.signer().expect("signer");
+        let mut patches = fixture
+            .profile
+            .patches_mut(&stored, &signer)
+            .expect("patches");
+        let mut patch = patches.get_mut(&fixture.patch).expect("patch");
+        patch.unready().expect("draft");
+        assert!(
+            matches!(
+                workspaces.verify_completion(&task).await,
+                Err(Error::Unpublished(_))
+            ),
+            "a draft must remain unfinished"
+        );
+        patch.ready().expect("ready");
+        workspaces
+            .verify_completion(&task)
+            .await
+            .expect("ready publication");
+        fs::write(coder.join("README.md"), "disposable review experiment\n").expect("experiment");
+        task.context.kind = crate::queue::TaskKind::Review;
+        assert!(matches!(
+            workspaces.verify_completion(&task).await,
+            Err(Error::Unreviewed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn review_assignment_finishes_only_after_own_publication_for_the_requested_revision() {
+        use std::collections::BTreeSet;
+
+        use crate::{
+            queue::TaskKind,
+            watcher::{Activity, Kind},
+            workspace::Error,
+        };
+        let fixture = repository().await;
+        let reviewer = Profile::init(
+            Home::new(fixture.profile.home.path().join("reviewer")).expect("reviewer home"),
+            Alias::new("reviewer"),
+            None,
+            Seed::generate(),
+        )
+        .expect("reviewer identity");
+        let mut workspaces = fixture.workspaces.clone();
+        workspaces.info = reviewer.info();
+        workspaces.initialize().await.expect("workspaces");
+        let mut task = fixture.start(Subject::Patch(fixture.patch)).await;
+        task.context.kind = TaskKind::Review;
+        let checkout = workspaces
+            .prepare_task(&task)
+            .await
+            .expect("review checkout");
+        let stored = fixture
+            .profile
+            .storage
+            .repository(fixture.repository)
+            .expect("storage");
+        let owner_signer = fixture.profile.signer().expect("owner signer");
+        let reviewer_signer = reviewer.signer().expect("reviewer signer");
+        let assignment = {
+            let mut patches = patch::Cache::no_cache(&stored, &owner_signer).expect("patches");
+            let mut object = patches.get_mut(&fixture.patch).expect("patch");
+            let assignment = object
+                .assign(BTreeSet::from([reviewer.did()]))
+                .expect("assignment");
+            object
+                .review(
+                    object.latest().0,
+                    Some(patch::Verdict::Accept),
+                    None,
+                    vec![],
+                )
+                .expect("another author's review");
+            assignment
+        };
+        task.context.activity = Some(Activity {
+            repository: fixture.repository,
+            subject: Subject::Patch(fixture.patch),
+            operation: assignment,
+            action: 0,
+            author: fixture.profile.did(),
+            kind: Kind::Assigned,
+        });
+        assert!(
+            matches!(
+                workspaces.verify_completion(&task).await,
+                Err(Error::Unreviewed(_))
+            ),
+            "another author's review cannot finish this assignment"
+        );
+        {
+            let mut patches =
+                patch::Cache::no_cache(&stored, &reviewer_signer).expect("reviewer patches");
+            let mut object = patches.get_mut(&fixture.patch).expect("patch");
+            object
+                .react(
+                    object.latest().0,
+                    "👀".parse().expect("reaction"),
+                    None,
+                    true,
+                )
+                .expect("queue receipt");
+        }
+        assert!(
+            matches!(
+                workspaces.verify_completion(&task).await,
+                Err(Error::Unreviewed(_))
+            ),
+            "a receipt does not complete the review"
+        );
+        {
+            let mut patches =
+                patch::Cache::no_cache(&stored, &reviewer_signer).expect("reviewer patches");
+            let mut object = patches.get_mut(&fixture.patch).expect("patch");
+            object
+                .review(
+                    object.latest().0,
+                    Some(patch::Verdict::Accept),
+                    Some("Behavior checked".into()),
+                    vec![],
+                )
+                .expect("own review");
+        }
+        fs::write(checkout.join("README.md"), "disposable verification edit\n")
+            .expect("experiment");
+        workspaces
+            .verify_completion(&task)
+            .await
+            .expect("published review completes without publishing local experiments");
+        let revision = {
+            let mut patches =
+                patch::Cache::no_cache(&stored, &owner_signer).expect("owner patches");
+            let mut object = patches.get_mut(&fixture.patch).expect("patch");
+            object
+                .update("New revision", *object.base(), fixture.head)
+                .expect("revision")
+        };
+        assert!(
+            matches!(
+                workspaces.verify_completion(&task).await,
+                Err(Error::Unreviewed(_))
+            ),
+            "an older revision's review cannot finish a current assignment"
+        );
+        let own = {
+            let mut patches =
+                patch::Cache::no_cache(&stored, &reviewer_signer).expect("reviewer patches");
+            let mut object = patches.get_mut(&fixture.patch).expect("patch");
+            object
+                .review(
+                    revision,
+                    Some(patch::Verdict::Accept),
+                    Some("New revision checked".into()),
+                    vec![],
+                )
+                .expect("current own review")
+        };
+        workspaces
+            .verify_completion(&task)
+            .await
+            .expect("current review");
+        let reassigned = {
+            let mut patches =
+                patch::Cache::no_cache(&stored, &owner_signer).expect("owner patches");
+            let mut object = patches.get_mut(&fixture.patch).expect("patch");
+            object
+                .assign(BTreeSet::from([reviewer.did()]))
+                .expect("repeated assignment")
+        };
+        task.context
+            .activity
+            .as_mut()
+            .expect("assignment")
+            .operation = reassigned;
+        assert!(
+            matches!(
+                workspaces.verify_completion(&task).await,
+                Err(Error::Unreviewed(_))
+            ),
+            "an old review cannot silently finish a renewed request"
+        );
+        {
+            let mut patches =
+                patch::Cache::no_cache(&stored, &reviewer_signer).expect("reviewer patches");
+            let mut object = patches.get_mut(&fixture.patch).expect("patch");
+            object
+                .review_edit(
+                    own,
+                    Some(patch::Verdict::Accept),
+                    "Rechecked on request".into(),
+                    vec![],
+                    [],
+                )
+                .expect("refresh own review");
+        }
+        workspaces
+            .verify_completion(&task)
+            .await
+            .expect("published edit also completes renewed review work");
+        task.context.activity = None;
+        workspaces
+            .verify_completion(&task)
+            .await
+            .expect("an authenticated chat review can use its published review");
+        task.context.cancelled = true;
+        workspaces
+            .verify_completion(&task)
+            .await
+            .expect("explicit cancellation");
     }
 
     fn git(directory: &Path, arguments: &[&str]) -> String {

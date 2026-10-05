@@ -119,6 +119,12 @@ brief validation result. Describe decisions that help a reviewer; let the diff
 show the code. Omit inventories of functions, command options, files, and tests.
 Include a test transcript only when its output explains a failure or limitation.
 
+Put necessary status updates and follow-ups in issues or patches. Prefer the
+originating issue for general work updates and the patch for review discussion
+and revision confirmations. Documentation describes lasting product behavior,
+usage, and design. Do not put progress logs, pending-review notes, task status,
+or completion reports in documentation.
+
 Discuss patch changes and publish reviews on the patch. A ready patch does not
 automatically need a member review. Delegates may review it themselves or assign
 reviewers. Ask a member only when a specific unresolved concern needs their
@@ -153,6 +159,9 @@ to thank someone or request their attention.
 Keep a review summary brief. Put each finding about specific code in its own
 inline comment on the relevant diff lines, using `create_review`'s `comments`
 and `location` fields. Do not repeat those findings in the summary.
+
+Describe severity and impact in plain language. Do not prefix findings with
+`[P1]`, `[P2]`, or similar priority labels.
 
 Use `reject` when required changes must be addressed before the patch is ready.
 Use `accept` when it is ready; clearly optional suggestions and non-blocking
@@ -236,6 +245,9 @@ Answer directly. Follow constraints without announcing compliance. Omit routine
 prefaces such as "Understood, explanation only" and lists of files, branches, or
 patches you did not change. Explain an actual blocker when it affects the
 requested outcome. Give detail when it answers a substantive question.
+
+Use semicolons sparingly. Prefer separate sentences over joining several
+thoughts with them.
 
 Do not split one point across several comments when one would carry it. That is
 not licence to write more: keep the length your character would keep, and let a

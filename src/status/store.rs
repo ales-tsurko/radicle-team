@@ -8,7 +8,7 @@ use crate::{
     agent::Role,
     database::Database,
     home::MemberHome,
-    status::{Activity, Error, Phase, Snapshot},
+    status::{Activity, Error, Observation, Phase, Snapshot},
 };
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS member_status (
@@ -67,6 +67,7 @@ impl Reporter {
                 status.activity = Some(activity);
                 status.started = Some(now);
                 status.progress = Some(now);
+                status.observation = None;
             }
             snapshot.updated = now;
             true
@@ -86,17 +87,41 @@ impl Reporter {
         .await;
     }
 
-    pub(crate) async fn progress(&self, role: Role, at: Instant) {
+    pub(crate) async fn progress(&self, role: Role, at: Instant, observation: Option<Observation>) {
         let observed = Snapshot::observed(at);
         self.change(move |snapshot| {
             let Some(status) = snapshot.roles.get_mut(&role) else {
                 return false;
             };
-            if status.activity.is_none() || status.progress.is_some_and(|last| last >= observed) {
+            if status.activity.is_none()
+                || (status.progress.is_some_and(|last| last >= observed)
+                    && status.observation == observation)
+            {
                 return false;
             }
-            status.progress = Some(observed);
+            status.progress = Some(status.progress.unwrap_or_default().max(observed));
+            status.observation = observation;
             snapshot.updated = snapshot.updated.max(observed);
+            true
+        })
+        .await;
+    }
+
+    pub(crate) async fn retrying(&self, role: Role, detail: String) {
+        self.change(move |snapshot| {
+            if let Some(status) = snapshot.roles.get_mut(&role) {
+                status.observation = Some(Observation {
+                    state: crate::status::AgentState::Retrying,
+                    at: Snapshot::now(),
+                    tool: None,
+                    completed: status
+                        .observation
+                        .as_ref()
+                        .and_then(|observation| observation.completed),
+                    detail: Some(detail),
+                });
+            }
+            snapshot.updated = Snapshot::now();
             true
         })
         .await;

@@ -3,12 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Terminal,
     backend::TestBackend,
-    buffer::Buffer,
-    layout::{Position, Rect},
     style::{Color, Modifier},
 };
 use tracing::Level;
@@ -21,7 +19,6 @@ use crate::{
         export::Export,
         logs::{LogLine, LogView},
         model::{Detail, EventLabel, Panel, Screen},
-        selection::TextSelection,
         view::View,
     },
     delivery::{Record, State},
@@ -149,315 +146,6 @@ impl Fixture {
             })
             .collect()
     }
-
-    fn buffer(screen: &mut Screen, width: u16, height: u16) -> Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
-        terminal
-            .draw(|frame| View::new(screen).draw(frame))
-            .expect("draw frame");
-        terminal.backend().buffer().clone()
-    }
-
-    fn position(buffer: &Buffer, area: Rect, needle: &str) -> Position {
-        let needle: Vec<_> = needle.chars().collect();
-        for y in area.top()..area.bottom() {
-            for x in area.left()..area.right() {
-                if x + needle.len() as u16 <= area.right()
-                    && needle.iter().enumerate().all(|(offset, character)| {
-                        buffer[(x + offset as u16, y)].symbol() == character.to_string()
-                    })
-                {
-                    return Position::new(x, y);
-                }
-            }
-        }
-        panic!("missing text {needle:?} in {area:?}: {buffer:?}");
-    }
-
-    fn mouse(screen: &mut Screen, kind: MouseEventKind, position: Position) {
-        screen.mouse(MouseEvent {
-            kind,
-            column: position.x,
-            row: position.y,
-            modifiers: KeyModifiers::NONE,
-        });
-    }
-
-    fn copy_at(screen: &mut Screen, position: Position, expected: &str) {
-        Self::mouse(screen, MouseEventKind::Down(MouseButton::Left), position);
-        Self::mouse(screen, MouseEventKind::Up(MouseButton::Left), position);
-        Self::key(screen, KeyCode::Char('y'));
-        match screen.export.take().expect("copy requested") {
-            Export::Copy { contents, .. } => assert_eq!(contents, expected),
-            Export::Save { .. } => panic!("unexpected save"),
-        }
-    }
-}
-
-#[test]
-fn direct_selection_copies_complete_header_and_clipped_status_ids() {
-    let mut screen = Screen::new(Fixture::inspection());
-    let repository = screen.data.repository.to_string();
-    let did = screen.data.did.expect("DID").to_string();
-    Fixture::key(&mut screen, KeyCode::Char('s'));
-    let buffer = Fixture::buffer(&mut screen, 50, 20);
-    let position = Fixture::position(&buffer, buffer.area, "did:key:z6Mk");
-    Fixture::copy_at(&mut screen, position, &did);
-    assert!(screen.detail.is_none(), "copy requires no menu");
-    Fixture::key(&mut screen, KeyCode::Esc);
-    let position = Fixture::position(&buffer, screen.header, &repository);
-    Fixture::copy_at(&mut screen, position, &repository);
-    Fixture::key(&mut screen, KeyCode::Esc);
-    Fixture::key(&mut screen, KeyCode::Enter);
-    let buffer = Fixture::buffer(&mut screen, 35, 32);
-    let position = Fixture::position(&buffer, screen.overlay.expect("detail"), "did:key:");
-    Fixture::copy_at(&mut screen, position, &did);
-    assert!(matches!(screen.detail, Some(Detail::Status)));
-    Fixture::key(&mut screen, KeyCode::Esc);
-    assert!(
-        screen.detail.is_some(),
-        "escape first clears text selection"
-    );
-    Fixture::key(&mut screen, KeyCode::Esc);
-    assert!(screen.detail.is_none());
-    for (width, height) in [(1, 1), (15, 4), (50, 8), (100, 24)] {
-        let _view = Fixture::render(&mut screen, width, height);
-    }
-}
-
-#[test]
-fn shortened_ids_resolve_per_row_even_with_identical_prefixes_and_scrolling() {
-    let mut screen = Screen::new(Fixture::inspection());
-    let buffer = Fixture::buffer(&mut screen, 120, 32);
-    let area = screen.areas[&Panel::Tasks];
-    for (row, id) in [(0, 2), (1, 3), (2, 4)] {
-        let scope = Rect::new(area.x + 1, area.y + 2 + row * 2, area.width - 2, 1);
-        let position = Fixture::position(&buffer, scope, "issue:0000000");
-        Fixture::copy_at(&mut screen, position, &format!("{id:040x}"));
-        Fixture::key(&mut screen, KeyCode::Esc);
-    }
-    let scope = Rect::new(area.x + 1, area.y + 4, area.width - 2, 1);
-    let position = Fixture::position(&buffer, scope, "0000000");
-    Fixture::mouse(
-        &mut screen,
-        MouseEventKind::Down(MouseButton::Left),
-        position,
-    );
-    Fixture::mouse(
-        &mut screen,
-        MouseEventKind::Drag(MouseButton::Left),
-        Position::new(position.x + 6, position.y),
-    );
-    Fixture::mouse(&mut screen, MouseEventKind::Up(MouseButton::Left), position);
-    Fixture::key(&mut screen, KeyCode::Char('y'));
-    assert!(
-        matches!(screen.export.take(), Some(Export::Copy { contents, .. }) if contents == format!("{:040x}", 3)),
-        "dragging just the abbreviated hash copies its full value"
-    );
-    Fixture::key(&mut screen, KeyCode::Esc);
-    for id in 5..20 {
-        screen.data.tasks.push((
-            Fixture::task(id, "Incoming task", QueuePosition::End),
-            false,
-        ));
-    }
-    Fixture::key(&mut screen, KeyCode::End);
-    let buffer = Fixture::buffer(&mut screen, 120, 32);
-    let offset = screen.tasks.state.offset();
-    assert!(offset > 0);
-    let position = Fixture::position(
-        &buffer,
-        Rect::new(area.x + 1, area.y + 2, area.width - 2, 1),
-        "issue:0000000",
-    );
-    let id = screen.data.tasks[offset].0.id;
-    Fixture::copy_at(&mut screen, position, &format!("{id:040x}"));
-}
-
-#[test]
-fn selection_keeps_the_original_id_while_live_tasks_change() {
-    let mut screen = Screen::new(Fixture::inspection());
-    let buffer = Fixture::buffer(&mut screen, 120, 32);
-    let area = screen.areas[&Panel::Tasks];
-    let position = Fixture::position(
-        &buffer,
-        Rect::new(area.x + 1, area.y + 4, area.width - 2, 1),
-        "issue:0000000",
-    );
-    Fixture::mouse(
-        &mut screen,
-        MouseEventKind::Down(MouseButton::Left),
-        position,
-    );
-    Fixture::mouse(&mut screen, MouseEventKind::Up(MouseButton::Left), position);
-    let mut update = Fixture::inspection();
-    update.tasks.remove(1);
-    screen.refresh(update);
-    let _view = Fixture::render(&mut screen, 120, 32);
-    Fixture::key(&mut screen, KeyCode::Char('y'));
-    assert!(
-        matches!(screen.export.take(), Some(Export::Copy { contents, .. }) if contents == format!("{:040x}", 3))
-    );
-    Fixture::key(&mut screen, KeyCode::Esc);
-    assert!(!screen.text.active());
-    let view = Fixture::render(&mut screen, 120, 32);
-    assert!(!view.contains("Safe undo"));
-}
-
-#[test]
-fn task_details_copy_relationships_messages_revisions_and_notes_directly() {
-    let mut data = Fixture::inspection();
-    let task = &mut data.tasks.first_mut().expect("task").0;
-    let patch = "7777777777777777777777777777777777777777";
-    let message = "8888888888888888888888888888888888888888";
-    let revision = "9999999999999999999999999999999999999999";
-    let note = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    task.context.artifacts.push(Artifact {
-        subject: format!("patch:{patch}"),
-        role: ArtifactRole::Produced,
-        purpose: "Implementation".to_owned(),
-    });
-    task.context.messages.push(MessageReference {
-        subject: format!("patch:{patch}"),
-        entry: message.to_owned(),
-        revision: Some(revision.to_owned()),
-        purpose: "Delegate review".to_owned(),
-    });
-    task.context.notes.push(format!("Verified commit `{note}`"));
-    task.context
-        .notes
-        .push("Related tasks #20 and #2".to_owned());
-    let mut screen = Screen::new(data);
-    Fixture::key(&mut screen, KeyCode::Enter);
-    for (displayed, value) in [
-        ("#2", "2"),
-        ("issue:0000000", "0000000000000000000000000000000000000002"),
-        (patch, patch),
-        (message, message),
-        (revision, revision),
-        (note, note),
-        ("#20", "20"),
-    ] {
-        let buffer = Fixture::buffer(&mut screen, 120, 50);
-        let position = Fixture::position(&buffer, screen.overlay.expect("detail"), displayed);
-        Fixture::copy_at(&mut screen, position, value);
-        assert!(matches!(screen.detail, Some(Detail::Task(_))));
-        Fixture::key(&mut screen, KeyCode::Esc);
-    }
-}
-
-#[test]
-fn inbox_copies_short_authors_and_nested_review_references() {
-    let review_entry: radicle::cob::EntryId = "3333333333333333333333333333333333333333"
-        .parse()
-        .expect("review");
-    let revision_entry: radicle::cob::EntryId = "4444444444444444444444444444444444444444"
-        .parse()
-        .expect("revision");
-    let mut data = Fixture::inspection();
-    let mut record = Fixture::record(10, State::Queued);
-    record.activity.kind = Kind::Delivered(Delivery::Changed(Change::ReviewSubmitted {
-        review: review_entry.into(),
-        revision: revision_entry.into(),
-    }));
-    record.task = Some(2);
-    data.did = None;
-    let author = record.activity.author.to_string();
-    let operation = record.activity.operation.to_string();
-    data.deliveries = vec![record];
-    let mut screen = Screen::new(data);
-    screen.focus = Panel::Inbox;
-    let buffer = Fixture::buffer(&mut screen, 120, 32);
-    let position = Fixture::position(&buffer, screen.areas[&Panel::Inbox], "z6MkvUJ");
-    Fixture::copy_at(&mut screen, position, &author);
-    Fixture::key(&mut screen, KeyCode::Esc);
-    Fixture::key(&mut screen, KeyCode::Enter);
-    for value in [
-        author,
-        operation,
-        review_entry.to_string(),
-        revision_entry.to_string(),
-    ] {
-        let buffer = Fixture::buffer(&mut screen, 120, 50);
-        let position = Fixture::position(&buffer, screen.overlay.expect("detail"), &value);
-        Fixture::copy_at(&mut screen, position, &value);
-        Fixture::key(&mut screen, KeyCode::Esc);
-    }
-}
-
-#[test]
-fn direct_log_selection_copies_ids_or_plain_text_without_color_codes() {
-    let mut screen = Screen::new(Fixture::inspection());
-    screen.focus = Panel::Logs;
-    let buffer = LogBuffer::default();
-    let did = screen.data.did.expect("DID").to_string();
-    let session = "3e1e4227-40d7-4e9d-a3be-d9749b88f3c2";
-    writeln!(buffer.make_writer(), "\x1b[31midentity={did}\x1b[0m").expect("DID log");
-    writeln!(buffer.make_writer(), "session_id={session} task=#42").expect("session log");
-    writeln!(buffer.make_writer(), "normal plain text").expect("plain log");
-    screen.logs.extend(buffer.since(0));
-    let view = Fixture::buffer(&mut screen, 120, 32);
-    let area = screen.areas[&Panel::Logs];
-    for value in [&did, session, "#42"] {
-        let position = Fixture::position(&view, area, value);
-        Fixture::copy_at(&mut screen, position, value.trim_start_matches('#'));
-        Fixture::key(&mut screen, KeyCode::Esc);
-    }
-    let position = Fixture::position(&view, area, "plain text");
-    Fixture::mouse(
-        &mut screen,
-        MouseEventKind::Down(MouseButton::Left),
-        position,
-    );
-    Fixture::mouse(
-        &mut screen,
-        MouseEventKind::Drag(MouseButton::Left),
-        Position::new(position.x + 9, position.y),
-    );
-    Fixture::mouse(&mut screen, MouseEventKind::Up(MouseButton::Left), position);
-    Fixture::key(&mut screen, KeyCode::Char('c'));
-    assert!(
-        matches!(screen.export.take(), Some(Export::Copy { contents, .. }) if contents == "plain text")
-    );
-    Fixture::key(&mut screen, KeyCode::Esc);
-    screen.focus = Panel::Tasks;
-    Fixture::key(&mut screen, KeyCode::Char('y'));
-    assert!(screen.export.is_none());
-    assert!(matches!(&screen.notice, Some(Err(message)) if message == "Select text to copy"));
-}
-
-#[test]
-fn text_selection_handles_reverse_drags_unicode_empty_lines_and_panel_bounds() {
-    let area = Rect::new(3, 2, 30, 5);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 10));
-    buffer.set_string(3, 2, "first 😀 value", ratatui::style::Style::new());
-    buffer.set_string(3, 4, "second line", ratatui::style::Style::new());
-    let mut selection = TextSelection::default();
-    selection.render(&mut buffer);
-    selection.start(area, Position::new(3, 2));
-    selection.extend(Position::new(13, 4));
-    assert_eq!(selection.contents(), "first 😀 value\n\nsecond line");
-    selection.clear();
-    selection.start(area, Position::new(13, 4));
-    selection.extend(Position::new(3, 2));
-    assert_eq!(selection.contents(), "first 😀 value\n\nsecond line");
-    selection.extend(Position::new(0, 0));
-    assert_eq!(
-        selection.contents(),
-        "first 😀 value\n\nsecond line",
-        "drag stays in its panel"
-    );
-    selection.render(&mut buffer);
-    selection.start(area, Position::new(3, 4));
-    selection.render(&mut buffer);
-    assert!(
-        !buffer[(3, 2)].modifier.contains(Modifier::UNDERLINED),
-        "moving selection removes the old highlight"
-    );
-    assert!(buffer[(3, 4)].modifier.contains(Modifier::UNDERLINED));
-    let mut resized = Buffer::empty(Rect::new(0, 0, 20, 10));
-    selection.render(&mut resized);
-    assert!(!selection.active(), "resize safely clears old coordinates");
 }
 
 #[test]
@@ -635,84 +323,8 @@ fn log_bindings_scroll_lines_pages_and_resume_following() {
     assert!(screen.logs.following, "unbound keys must not pause logs");
 }
 
-#[test]
-fn wheel_scrolling_targets_visible_panels_and_preserves_paused_logs() {
-    let mut screen = Screen::new(Fixture::inspection());
-    screen.logs.extend(Fixture::logs(40));
-    let _view = Fixture::render(&mut screen, 120, 32);
-    let logs = *screen.areas.get(&Panel::Logs).expect("log area");
-    let before = screen.logs.start(&screen.logs.visible());
-    let mut wheel = MouseEvent {
-        kind: MouseEventKind::ScrollUp,
-        column: logs.x + 1,
-        row: logs.y + 1,
-        modifiers: KeyModifiers::NONE,
-    };
-    screen.mouse(wheel);
-    assert_eq!(screen.focus, Panel::Logs);
-    assert!(!screen.logs.following);
-    assert_eq!(screen.logs.start(&screen.logs.visible()), before - 1);
-    screen.logs.extend(vec![LogLine {
-        id: 41,
-        text: "new entry during wheel scrolling".into(),
-    }]);
-    assert_eq!(screen.logs.start(&screen.logs.visible()), before - 1);
-    assert_eq!(screen.logs.unseen(), 1);
-    wheel.kind = MouseEventKind::ScrollDown;
-    screen.mouse(wheel);
-    assert_eq!(screen.logs.start(&screen.logs.visible()), before);
-    wheel.kind = MouseEventKind::Down(MouseButton::Left);
-    screen.mouse(wheel);
-    assert_eq!(screen.logs.start(&screen.logs.visible()), before);
-
-    let tasks = *screen.areas.get(&Panel::Tasks).expect("task area");
-    wheel.kind = MouseEventKind::ScrollDown;
-    wheel.column = tasks.x + 1;
-    wheel.row = tasks.y + 1;
-    screen.mouse(wheel);
-    assert_eq!(screen.focus, Panel::Tasks);
-    assert_eq!(screen.tasks.id.as_deref(), Some("3"));
-    let _view = Fixture::render(&mut screen, 76, 20);
-    assert_eq!(
-        screen.areas.keys().copied().collect::<Vec<_>>(),
-        [Panel::Tasks]
-    );
-    let tasks = *screen.areas.get(&Panel::Tasks).expect("compact task area");
-    wheel.column = tasks.x + 1;
-    wheel.row = tasks.y + 1;
-    screen.mouse(wheel);
-    assert_eq!(screen.tasks.id.as_deref(), Some("4"));
-    assert_eq!(screen.logs.start(&screen.logs.visible()), before);
-
-    let (task, _) = screen.data.tasks.last_mut().expect("selected task");
-    task.context.notes = (0..40).map(|line| format!("Context line {line}")).collect();
-    Fixture::key(&mut screen, KeyCode::Enter);
-    let _view = Fixture::render(&mut screen, 76, 20);
-    let overlay = screen.overlay.expect("detail area");
-    wheel.column = overlay.x + 1;
-    wheel.row = overlay.y + 1;
-    screen.mouse(wheel);
-    assert_eq!(screen.detail_scroll, 1);
-    wheel.column = 0;
-    wheel.row = 0;
-    screen.mouse(wheel);
-    assert_eq!(screen.detail_scroll, 1, "wheel outside details is ignored");
-    Fixture::key(&mut screen, KeyCode::Esc);
-    Fixture::key(&mut screen, KeyCode::Char('/'));
-    let _view = Fixture::render(&mut screen, 76, 20);
-    wheel.column = tasks.x + 1;
-    wheel.row = tasks.y + 1;
-    wheel.kind = MouseEventKind::ScrollUp;
-    screen.mouse(wheel);
-    assert_eq!(
-        screen.tasks.id.as_deref(),
-        Some("4"),
-        "filter editing keeps its selection"
-    );
-}
-
 #[tokio::test]
-async fn log_selection_exports_complete_plain_lines_and_survives_arrivals() {
+async fn log_exports_include_full_filtered_history_and_freeze_the_save_snapshot() {
     let buffer = LogBuffer::default();
     {
         let mut writer = buffer.make_writer();
@@ -727,41 +339,28 @@ async fn log_selection_exports_complete_plain_lines_and_survives_arrivals() {
     }
     let mut screen = Screen::new(Fixture::inspection());
     screen.logs.extend(buffer.since(0));
+    Fixture::key(&mut screen, KeyCode::Char('l'));
     let _view = Fixture::render(&mut screen, 120, 32);
-    let area = *screen.areas.get(&Panel::Logs).expect("log area");
-    let mut mouse = MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: area.x + 1,
-        row: area.y + 1,
-        modifiers: KeyModifiers::NONE,
-    };
-    screen.mouse(mouse);
-    mouse.kind = MouseEventKind::Drag(MouseButton::Left);
-    mouse.row += 1;
-    screen.mouse(mouse);
-    mouse.kind = MouseEventKind::Up(MouseButton::Left);
-    mouse.column = 0;
-    screen.mouse(mouse);
-    assert!(!screen.text.dragging);
-    assert!(!screen.logs.following);
-    assert_eq!(screen.focus, Panel::Logs);
-    let expected = format!("first 😀 {}\nsecond line\n", "long line ".repeat(30));
-    assert_eq!(screen.text.contents(), expected);
-    writeln!(buffer.make_writer(), "arrival during selection").expect("new log");
+    Fixture::key(&mut screen, KeyCode::Char(' '));
+    writeln!(buffer.make_writer(), "arrival while logs are paused").expect("new log");
     screen.logs.extend(buffer.since(screen.logs.latest()));
-    assert_eq!(screen.text.contents(), expected);
-
+    let expected = format!(
+        "first 😀 {}\nsecond line\nthird line\narrival while logs are paused\n",
+        "long line ".repeat(30)
+    );
     let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("terminal");
     terminal
         .draw(|frame| View::new(&mut screen).draw(frame))
-        .expect("selection frame");
-    let first = terminal
-        .backend()
-        .buffer()
-        .cell((area.x + 1, area.y + 1))
-        .expect("log cell");
-    assert!(first.modifier.contains(Modifier::REVERSED));
-    assert_eq!(first.fg, Color::Red, "selection keeps original log styling");
+        .expect("log frame");
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "f" && cell.fg == Color::Red),
+        "native selection leaves the original log styling intact"
+    );
     Fixture::key(&mut screen, KeyCode::Char('y'));
     assert!(
         matches!(screen.export.take(), Some(Export::Copy { contents, .. }) if contents == expected)
@@ -770,7 +369,8 @@ async fn log_selection_exports_complete_plain_lines_and_survives_arrivals() {
     Fixture::key(&mut screen, KeyCode::Char('w'));
     assert!(Fixture::render(&mut screen, 76, 20).contains("Save log"));
     assert!(!screen.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
-    Fixture::key(&mut screen, KeyCode::Backspace);
+    assert!(screen.saving.is_none(), "q closes the save dialog");
+    Fixture::key(&mut screen, KeyCode::Char('w'));
     assert!(!screen.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)));
     assert!(screen.saving.as_ref().expect("save prompt").path.is_empty());
     Fixture::key(&mut screen, KeyCode::Enter);
@@ -797,7 +397,6 @@ async fn log_selection_exports_complete_plain_lines_and_survives_arrivals() {
     Fixture::key(&mut screen, KeyCode::Esc);
     assert!(screen.saving.is_none());
     Fixture::key(&mut screen, KeyCode::Esc);
-    assert!(!screen.text.active());
     Fixture::key(&mut screen, KeyCode::Char('/'));
     screen.paste("second");
     Fixture::key(&mut screen, KeyCode::Enter);
@@ -1049,8 +648,85 @@ fn filtering_and_narrow_layout_preserve_navigation_and_quit() {
     Fixture::key(&mut screen, KeyCode::PageUp);
     Fixture::key(&mut screen, KeyCode::Char('?'));
     assert!(!screen.help);
-    assert!(screen.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
-    assert!(screen.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    Fixture::key(&mut screen, KeyCode::Char('q'));
+    assert_eq!(screen.quitting, Some(false));
+    Fixture::key(&mut screen, KeyCode::Enter);
+    assert!(screen.quitting.is_none());
+}
+
+#[test]
+fn quit_closes_the_current_popup_and_preserves_the_underlying_view() {
+    let mut screen = Screen::new(Fixture::inspection());
+    for panel in [Panel::Status, Panel::Tasks, Panel::Inbox] {
+        screen.focus = panel;
+        Fixture::key(&mut screen, KeyCode::Enter);
+        assert!(screen.detail.is_some());
+        Fixture::key(&mut screen, KeyCode::Char('?'));
+        assert!(!screen.help, "detail input stays inside the popup");
+        Fixture::key(&mut screen, KeyCode::Char('q'));
+        assert!(screen.detail.is_none());
+        assert!(screen.quitting.is_none());
+        assert_eq!(screen.focus, panel);
+    }
+    Fixture::key(&mut screen, KeyCode::Char('?'));
+    Fixture::key(&mut screen, KeyCode::Char('q'));
+    assert!(!screen.help);
+    assert!(screen.quitting.is_none());
+    Fixture::key(&mut screen, KeyCode::Enter);
+    assert!(!screen.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    assert!(screen.detail.is_some());
+    Fixture::key(&mut screen, KeyCode::Right);
+    Fixture::key(&mut screen, KeyCode::Char('q'));
+    assert!(
+        screen.detail.is_some(),
+        "closing quit returns to the original popup"
+    );
+    assert!(screen.quitting.is_none());
+}
+
+#[test]
+fn stopping_requires_explicit_confirmation_and_defaults_to_keep_running() {
+    let mut screen = Screen::new(Fixture::inspection());
+    for panel in Panel::ALL {
+        screen.focus = panel;
+        Fixture::key(&mut screen, KeyCode::Char('q'));
+        let view = Fixture::render(&mut screen, 120, 32);
+        assert!(view.contains("Keep running"));
+        assert!(view.contains("Stop nico"));
+        assert_eq!(screen.quitting, Some(false));
+        Fixture::key(&mut screen, KeyCode::Enter);
+        assert!(
+            screen.quitting.is_none(),
+            "Enter defaults to keeping the member running"
+        );
+        Fixture::key(&mut screen, KeyCode::Char('q'));
+        Fixture::key(&mut screen, KeyCode::Right);
+        Fixture::key(&mut screen, KeyCode::Char('q'));
+        assert!(
+            screen.quitting.is_none(),
+            "q cancels even with Stop selected"
+        );
+        assert_eq!(screen.focus, panel);
+    }
+    for _ in 0..2 {
+        assert!(!screen.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert_eq!(
+            screen.quitting,
+            Some(false),
+            "repeating Ctrl+C cannot stop the member"
+        );
+    }
+    screen.paste("q");
+    for (width, height) in [(1, 1), (15, 4), (50, 8)] {
+        let _view = Fixture::render(&mut screen, width, height);
+    }
+    Fixture::key(&mut screen, KeyCode::Tab);
+    Fixture::key(&mut screen, KeyCode::Left);
+    Fixture::key(&mut screen, KeyCode::Enter);
+    assert!(screen.quitting.is_none());
+    Fixture::key(&mut screen, KeyCode::Char('q'));
+    Fixture::key(&mut screen, KeyCode::Tab);
+    assert!(screen.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
 }
 
 #[test]
@@ -1177,6 +853,7 @@ fn full_details_preserve_task_relationships_notes_and_delivery_authors() {
     Fixture::key(&mut screen, KeyCode::Enter);
     let task = Fixture::render(&mut screen, 120, 55);
     for text in [
+        "issue:0000000000000000000000000000000000000002",
         "Delegate specification",
         "Cancellation requested",
         "origin",
@@ -1186,6 +863,7 @@ fn full_details_preserve_task_relationships_notes_and_delivery_authors() {
         "supporting",
         "Delegate review",
         "8888888888888888888888888888888888888888",
+        "7777777777777777777777777777777777777777",
         "Notes",
         "original review",
     ] {
@@ -1195,6 +873,8 @@ fn full_details_preserve_task_relationships_notes_and_delivery_authors() {
     Fixture::key(&mut screen, KeyCode::Char('s'));
     Fixture::key(&mut screen, KeyCode::Enter);
     let status = Fixture::render(&mut screen, 120, 55);
+    assert!(status.contains(&screen.data.repository.to_string()));
+    assert!(status.contains(&screen.data.did.expect("member DID").to_string()));
     for text in [
         "Last successful fetch",
         "Last activity",
@@ -1216,6 +896,9 @@ fn full_details_preserve_task_relationships_notes_and_delivery_authors() {
     record.error = Some("The fetch will be retried".to_owned());
     Fixture::key(&mut screen, KeyCode::Enter);
     let notification = Fixture::render(&mut screen, 120, 55);
+    let record = screen.data.deliveries.first().expect("notification");
+    assert!(notification.contains(&record.activity.author.to_string()));
+    assert!(notification.contains(&record.activity.operation.to_string()));
     for text in [
         "Author: did:key:",
         "Operation:",
@@ -1277,7 +960,7 @@ fn empty_queues_and_lifecycle_transitions_remain_clear_at_any_size() {
         }]);
     }
     screen.focus = Panel::Logs;
-    assert!(Fixture::render(&mut screen, 76, 20).contains("q stop"));
+    assert!(Fixture::render(&mut screen, 76, 20).contains("q quit"));
     Fixture::key(&mut screen, KeyCode::Char('/'));
     for character in "missing".chars() {
         Fixture::key(&mut screen, KeyCode::Char(character));
@@ -1300,7 +983,7 @@ fn empty_queues_and_lifecycle_transitions_remain_clear_at_any_size() {
 
 #[tokio::test]
 async fn dashboard_keeps_updating_during_paused_logs_and_shutdown() {
-    use crossterm::event::{Event, KeyEventKind};
+    use crossterm::event::{Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
     use futures_util::{StreamExt as _, stream};
 
     use crate::{cli::dashboard::runtime::Dashboard, shutdown::Shutdown};
@@ -1316,7 +999,6 @@ async fn dashboard_keeps_updating_during_paused_logs_and_shutdown() {
     terminal
         .draw(|frame| View::new(&mut screen).draw(frame))
         .expect("initial frame");
-    let log_area = *screen.areas.get(&Panel::Logs).expect("log area");
     let shutdown = Shutdown::default();
     let (updates, mut receiver) = tokio::sync::mpsc::channel(2);
     updates
@@ -1325,7 +1007,7 @@ async fn dashboard_keeps_updating_during_paused_logs_and_shutdown() {
         ))))
         .await
         .expect("error observation");
-    let (keys, input) = tokio::sync::mpsc::channel(4);
+    let (keys, input) = tokio::sync::mpsc::channel(8);
     keys.send(Ok(Event::Key(KeyEvent::new_with_kind(
         KeyCode::Char('q'),
         KeyModifiers::NONE,
@@ -1340,14 +1022,21 @@ async fn dashboard_keeps_updating_during_paused_logs_and_shutdown() {
     .await
     .expect("focus logs");
     keys.send(Ok(Event::Mouse(MouseEvent {
-        kind: MouseEventKind::ScrollUp,
-        column: log_area.x + 1,
-        row: log_area.y + 1,
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 1,
+        row: 1,
         modifiers: KeyModifiers::NONE,
     })))
     .await
-    .expect("wheel scroll logs");
+    .expect("terminal owns mouse selection");
+    keys.send(Ok(Event::Key(KeyEvent::new(
+        KeyCode::Up,
+        KeyModifiers::NONE,
+    ))))
+    .await
+    .expect("wheel translated to arrow key");
     let extra_logs = logs.clone();
+    let observed_shutdown = shutdown.clone();
     let arrival = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(120)).await;
         let mut next = Fixture::inspection();
@@ -1366,7 +1055,39 @@ async fn dashboard_keeps_updating_during_paused_logs_and_shutdown() {
             KeyModifiers::NONE,
         ))))
         .await
-        .expect("stop key");
+        .expect("request quit");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !observed_shutdown.is_requested(),
+            "quit waits for confirmation"
+        );
+        let mut next = Fixture::inspection();
+        next.tasks.insert(
+            1,
+            (
+                Fixture::task(8, "Incoming assignment", QueuePosition::Front),
+                false,
+            ),
+        );
+        next.tasks.push((
+            Fixture::task(9, "Arrival during quit dialog", QueuePosition::End),
+            false,
+        ));
+        updates
+            .send(Ok(next))
+            .await
+            .expect("update while quit dialog is open");
+        for code in [
+            KeyCode::Right,
+            KeyCode::Char('q'),
+            KeyCode::Char('q'),
+            KeyCode::Right,
+            KeyCode::Enter,
+        ] {
+            keys.send(Ok(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))))
+                .await
+                .expect("quit dialog navigation");
+        }
         tokio::time::sleep(Duration::from_millis(120)).await;
         drop(keys);
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -1399,7 +1120,7 @@ async fn dashboard_keeps_updating_during_paused_logs_and_shutdown() {
         "a later successful observation clears the error"
     );
     assert_eq!(screen.tasks.id.as_deref(), Some("3"));
-    assert_eq!(screen.task_ids(), ["2", "8", "3", "4"]);
+    assert_eq!(screen.task_ids(), ["2", "8", "3", "4", "9"]);
     assert!(!screen.logs.following);
     assert_eq!(screen.logs.unseen(), 1);
     let rendered: String = terminal

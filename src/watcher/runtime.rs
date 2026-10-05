@@ -521,9 +521,13 @@ impl DeliveryRuntime {
     async fn enqueue(&self, activity: Activity, scope: ScanScope) -> Result<(), Error> {
         let subject = activity.subject;
         let assignment = self.assignment(scope.repository, subject).await?;
-        let position = assignment.position;
         let mut request =
-            crate::queue::TaskRequest::new(assignment.brief, subject.into(), position);
+            crate::queue::TaskRequest::new(assignment.brief, subject.into(), assignment.position);
+        let position = request.position;
+        if matches!(subject, Subject::Patch(_)) {
+            request.context.kind = crate::queue::TaskKind::Review;
+        }
+        request.context.activity = Some(activity.clone());
         request.request = Some(crate::agent::ActivityId::from(activity.delivery_id()).request());
         request
             .context
@@ -561,7 +565,10 @@ impl Assignment {
         labels: impl Iterator<Item = &'a Label>,
         priority: &PriorityLabels,
     ) -> Self {
-        let mut brief = format!("You were assigned this {}: {title}", subject.kind());
+        let mut brief = match subject {
+            Subject::Issue(_) => format!("You were assigned this issue: {title}"),
+            Subject::Patch(_) => format!("You were assigned to review this patch: {title}"),
+        };
         let description = description.trim();
         if !description.is_empty() {
             brief.push_str("\n\n");

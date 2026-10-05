@@ -20,7 +20,7 @@ use crate::{
     manifest::{Limits, TriggerAccess},
     member::Member,
     watcher::{
-        Change, Comment, Subject,
+        Change, Comment, Subject, Target,
         activity::{Activity, Delivery, Kind},
         classification::{ActionEnvelope, Context, NormalizedAction},
     },
@@ -1148,6 +1148,152 @@ fn accepted_review_does_not_follow_another_reviewers_feedback() {
 }
 
 #[test]
+fn assigned_reviewer_does_not_receive_another_review_but_own_threads_and_handoffs_reach_them() {
+    let member = PublicKey::from_str(MEMBER).expect("member");
+    let author = PublicKey::from_str(AUTHOR).expect("patch author");
+    let delegate = PublicKey::from_str(DELEGATE).expect("delegate");
+    let revision = RevisionId::from(EntryId::from_str(ISSUE).expect("revision"));
+    let own_review = ReviewId::from(EntryId::from_str(OPERATION).expect("own review"));
+    let other_review = ReviewId::from(EntryId::from_str(CHANGE).expect("other review"));
+    let triggers = Fixture::triggers(vec![Did::from(author)]);
+    let mut context = Context::default();
+    let _opened = Fixture::classify_patch_with(
+        ISSUE,
+        Fixture::revision("Initial revision"),
+        author,
+        &mut context,
+        &triggers,
+    );
+    let assigned = Fixture::classify_patch_with(
+        COMMENT,
+        PatchAction::Assign {
+            assignees: BTreeSet::from([Did::from(member)]),
+        },
+        delegate,
+        &mut context,
+        &triggers,
+    );
+    assert!(matches!(
+        assigned.as_slice(),
+        [Activity {
+            kind: Kind::Assigned,
+            ..
+        }]
+    ));
+    for action in [
+        PatchAction::Review {
+            revision,
+            summary: Some("Required changes".into()),
+            verdict: Some(Verdict::Reject),
+            labels: Vec::new(),
+        },
+        PatchAction::ReviewComment {
+            review: other_review,
+            body: "Remove this section".into(),
+            reply_to: None,
+            location: None,
+            embeds: Vec::new(),
+        },
+        PatchAction::ReviewCommentEdit {
+            review: other_review,
+            comment: EntryId::from_str(REPLY).expect("comment"),
+            body: "Remove the whole section".into(),
+            embeds: Vec::new(),
+        },
+        PatchAction::RevisionComment {
+            revision,
+            body: "Another reviewer's general feedback".into(),
+            reply_to: None,
+            location: None,
+            embeds: Vec::new(),
+        },
+    ] {
+        assert!(
+            Fixture::classify_patch_with(CHANGE, action, delegate, &mut context, &triggers)
+                .is_empty(),
+            "assignment grants review work, not a subscription to others' feedback"
+        );
+    }
+    let _reviewed = Fixture::classify_patch_with(
+        OPERATION,
+        PatchAction::Review {
+            revision,
+            summary: Some("My findings".into()),
+            verdict: Some(Verdict::Reject),
+            labels: Vec::new(),
+        },
+        member,
+        &mut context,
+        &triggers,
+    );
+    let addressed = Fixture::classify_patch_with(
+        CHANGE,
+        Fixture::revision("Addressed your findings"),
+        author,
+        &mut context,
+        &triggers,
+    );
+    assert!(
+        matches!(addressed.as_slice(), [Activity { kind: Kind::Delivered(Delivery::Changed(Change::ReviewFollowUp { review, .. })), .. }] if *review == own_review)
+    );
+    let direct = Fixture::classify_patch_with(
+        REPLY,
+        PatchAction::ReviewComment {
+            review: own_review,
+            body: "I addressed your finding".into(),
+            reply_to: None,
+            location: None,
+            embeds: Vec::new(),
+        },
+        author,
+        &mut context,
+        &triggers,
+    );
+    assert!(
+        matches!(direct.as_slice(), [Activity { kind: Kind::Delivered(Delivery::Changed(Change::CommentCreated(Comment::Review { review, .. }))), .. }] if *review == own_review)
+    );
+    let mentioned = Fixture::classify_patch_with(
+        REPLY,
+        PatchAction::ReviewComment {
+            review: other_review,
+            body: "@nico please handle this specific change".into(),
+            reply_to: None,
+            location: None,
+            embeds: Vec::new(),
+        },
+        author,
+        &mut context,
+        &triggers,
+    );
+    assert!(
+        matches!(mentioned.as_slice(), [Activity { kind: Kind::Delivered(Delivery::Mentioned(Target::Comment(Comment::Review { review, .. }))), .. }] if *review == other_review)
+    );
+    let _accepted = Fixture::classify_patch_with(
+        REPLY,
+        PatchAction::ReviewEdit(ReviewEdit::new(
+            own_review,
+            "Satisfied".into(),
+            Some(Verdict::Accept),
+            Vec::new(),
+            Vec::new(),
+        )),
+        member,
+        &mut context,
+        &triggers,
+    );
+    assert!(
+        Fixture::classify_patch_with(
+            CHANGE,
+            Fixture::revision("More changes for the other reviewer"),
+            author,
+            &mut context,
+            &triggers
+        )
+        .is_empty()
+    );
+}
+
+#[test]
 fn clearing_or_accepting_or_redacting_the_own_review_stops_revision_followups() {
     let member = PublicKey::from_str(MEMBER).expect("member key should be valid");
     let author = PublicKey::from_str(AUTHOR).expect("author key should be valid");
@@ -1394,11 +1540,11 @@ fn draft_revisions_wait_for_readiness_but_explicit_messages_and_assignments_arri
             )
             .as_slice(),
             [Activity {
-                kind: Kind::Delivered(Delivery::Changed(Change::PatchReady)),
+                kind: Kind::Delivered(Delivery::Changed(Change::ReviewFollowUp { .. })),
                 ..
             }]
         ),
-        "opening the finished patch must notify an assignee without a mention"
+        "opening the finished patch must notify an assignee about their rejected review"
     );
 
     let mut uninvolved = Context::default();
