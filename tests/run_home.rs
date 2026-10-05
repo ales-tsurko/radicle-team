@@ -107,6 +107,66 @@ fn run_refuses_an_ordinary_checkout_without_creating_member_data() {
     assert!(!MemberHome::at(checkout).code().exists());
 }
 
+#[test]
+fn file_logging_appends_plain_records_and_the_final_error_without_hiding_console_output() {
+    let root = tempfile::tempdir().expect("temporary directory");
+    let home = MemberHome::at(root.path().join("maya"));
+    home.create().expect("member directory");
+    home.record(
+        Member::Maya,
+        "rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc".parse().expect("RID"),
+    )
+    .expect("member binding");
+    std::fs::create_dir_all(home.identity()).expect("identity directory");
+    std::fs::write(home.identity().join("config.json"), "{}").expect("partial identity");
+    let path = root.path().join("member.log");
+    std::fs::write(&path, "previous session\n").expect("existing log");
+    for level in ["info", "off"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rad-team"))
+            .args(["run", "--plain", "--log", level, "--log-file"])
+            .arg(&path)
+            .arg("--home")
+            .arg(home.path())
+            .env_remove("NO_COLOR")
+            .env_remove("RADICLE_TEAM_HOME")
+            .env_remove("RAD_PASSPHRASE")
+            .env("PATH", root.path().join("no-executables"))
+            .output()
+            .expect("run with file logging");
+        assert!(!output.status.success(), "partial identity stops startup");
+        let console = String::from_utf8(output.stdout).expect("console logs");
+        if level == "info" {
+            assert!(console.contains("Unlocking identity"));
+            assert!(
+                console.contains('\x1b'),
+                "normal console coloring is preserved"
+            );
+        } else {
+            assert!(console.is_empty());
+        }
+        let contents = std::fs::read_to_string(&path).expect("saved log");
+        let failure = String::from_utf8(output.stderr).expect("error output");
+        assert!(contents.starts_with("previous session\n"));
+        assert!(contents.contains("Unlocking identity"));
+        assert!(
+            contents.ends_with(&failure),
+            "final errors must reach the log file"
+        );
+        assert!(!contents.contains('\x1b'), "files must contain plain text");
+    }
+    let invalid = root.path().join("missing/member.log");
+    let output = Command::new(env!("CARGO_BIN_EXE_rad-team"))
+        .args(["run", "--log-file"])
+        .arg(&invalid)
+        .output()
+        .expect("invalid file destination");
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).expect("startup error");
+    assert!(error.contains("could not write log file"));
+    assert!(error.contains(invalid.to_str().expect("UTF-8 path")));
+    assert!(!invalid.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn log_timestamps_follow_the_process_timezone_and_include_its_offset() {

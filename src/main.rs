@@ -28,8 +28,9 @@ fn main() -> ExitCode {
 async fn run() -> ExitCode {
     let cli = Cli::parse();
     let logs = cli.interactive().then(LogBuffer::default);
+    let log_file = cli.log_file().map(std::path::Path::to_path_buf);
 
-    if let Err(error) = Logging::init(cli.log_level(), logs.clone()) {
+    if let Err(error) = Logging::init(cli.log_level(), logs.clone(), log_file.as_deref()) {
         eprintln!("failed to initialize logging: {error}");
         return ExitCode::FAILURE;
     }
@@ -37,6 +38,11 @@ async fn run() -> ExitCode {
     match cli.execute(logs).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            if let Some(path) = log_file.as_deref()
+                && let Err(error) = Logging::record_failure(path, &error)
+            {
+                eprintln!("Error: {error}");
+            }
             eprintln!("Error: {error}");
             ExitCode::FAILURE
         }

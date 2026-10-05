@@ -6,7 +6,8 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use tracing::{Level, Metadata};
+use ansi_to_tui::IntoText as _;
+use ratatui::text::{Line, Text};
 use tracing_subscriber::fmt::MakeWriter;
 
 const CAPACITY: usize = 2_000;
@@ -28,21 +29,28 @@ impl LogBuffer {
             .collect()
     }
 
-    fn append(&self, bytes: &[u8], level: Level) {
+    fn append(&self, bytes: &[u8]) {
         let text = String::from_utf8_lossy(bytes);
+        let formatted = text.as_bytes().into_text().unwrap_or_else(|error| {
+            Text::raw(format!("Could not format log entry: {error}\n{text}"))
+        });
         let mut buffer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        for line in text.lines().filter(|line| !line.is_empty()) {
-            buffer.sequence = buffer.sequence.saturating_add(1);
-            let id = buffer.sequence;
-            buffer.lines.push_back(LogLine {
-                id,
-                level,
-                text: line
+        for mut line in formatted.lines {
+            for span in &mut line.spans {
+                span.content = span
+                    .content
                     .replace('\t', "    ")
                     .chars()
                     .filter(|character| !character.is_control())
-                    .collect(),
-            });
+                    .collect::<String>()
+                    .into();
+            }
+            if line.width() == 0 {
+                continue;
+            }
+            buffer.sequence = buffer.sequence.saturating_add(1);
+            let id = buffer.sequence;
+            buffer.lines.push_back(LogLine { id, text: line });
             if buffer.lines.len() > CAPACITY {
                 buffer.lines.pop_front();
             }
@@ -56,15 +64,8 @@ impl<'a> MakeWriter<'a> for LogBuffer {
     fn make_writer(&'a self) -> Self::Writer {
         LogWriter {
             buffer: self.clone(),
-            level: Level::INFO,
             bytes: Vec::new(),
         }
-    }
-
-    fn make_writer_for(&'a self, metadata: &Metadata<'_>) -> Self::Writer {
-        let mut writer = self.make_writer();
-        writer.level = *metadata.level();
-        writer
     }
 }
 
@@ -72,7 +73,6 @@ impl<'a> MakeWriter<'a> for LogBuffer {
 #[derive(Debug)]
 pub struct LogWriter {
     buffer: LogBuffer,
-    level: Level,
     bytes: Vec<u8>,
 }
 
@@ -93,7 +93,7 @@ impl Write for LogWriter {
 
 impl Drop for LogWriter {
     fn drop(&mut self) {
-        self.buffer.append(&self.bytes, self.level);
+        self.buffer.append(&self.bytes);
     }
 }
 
@@ -106,8 +106,7 @@ struct Buffer {
 #[derive(Debug, Clone)]
 pub(super) struct LogLine {
     pub(super) id: u64,
-    pub(super) level: Level,
-    pub(super) text: String,
+    pub(super) text: Line<'static>,
 }
 
 #[derive(Debug)]
@@ -116,6 +115,8 @@ pub(super) struct LogView {
     pub(super) following: bool,
     pub(super) filter: String,
     pub(super) page: usize,
+    pub(super) selection: Option<(u64, u64)>,
+    pub(super) dragging: bool,
     anchor: Option<u64>,
     paused_at: u64,
 }
@@ -127,6 +128,8 @@ impl Default for LogView {
             following: true,
             filter: String::new(),
             page: 1,
+            selection: None,
+            dragging: false,
             anchor: None,
             paused_at: 0,
         }
@@ -156,7 +159,7 @@ impl LogView {
         let query = self.filter.to_lowercase();
         self.lines
             .iter()
-            .filter(|line| line.text.to_lowercase().contains(&query))
+            .filter(|line| line.text.to_string().to_lowercase().contains(&query))
             .collect()
     }
 
@@ -169,6 +172,36 @@ impl LogView {
             .and_then(|id| visible.iter().position(|line| line.id >= id))
             .unwrap_or(0)
             .min(last)
+    }
+
+    pub(super) fn selected(&self, id: u64) -> bool {
+        self.selection
+            .is_some_and(|(start, end)| (start.min(end)..=start.max(end)).contains(&id))
+    }
+
+    pub(super) fn select_row(&mut self, row: usize, extend: bool) {
+        let visible = self.visible();
+        let Some(id) = visible.get(self.start(&visible) + row).map(|line| line.id) else {
+            return;
+        };
+        self.scroll(0);
+        let anchor = if extend {
+            self.selection.map_or(id, |(anchor, _)| anchor)
+        } else {
+            id
+        };
+        self.selection = Some((anchor, id));
+    }
+
+    pub(super) fn export_text(&self) -> String {
+        let mut text = String::new();
+        for line in self.visible() {
+            if self.selection.is_none() || self.selected(line.id) {
+                text.push_str(&line.text.to_string());
+                text.push('\n');
+            }
+        }
+        text
     }
 
     pub(super) fn scroll(&mut self, amount: isize) {
@@ -192,6 +225,8 @@ impl LogView {
     pub(super) fn follow(&mut self) {
         self.following = true;
         self.anchor = None;
+        self.selection = None;
+        self.dragging = false;
     }
 
     pub(super) fn toggle_follow(&mut self) {

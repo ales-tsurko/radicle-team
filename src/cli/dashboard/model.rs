@@ -2,16 +2,19 @@
 
 use std::{collections::BTreeMap, time::Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
-    layout::{Position, Rect},
+    layout::{Margin, Position, Rect},
     widgets::ListState,
 };
 
 use crate::{
-    cli::dashboard::logs::LogView,
+    cli::dashboard::{
+        export::{Export, SavePrompt},
+        logs::LogView,
+    },
     delivery::{Record, State},
-    status::{Inspection, Phase},
+    status::{Inspection, Phase, Snapshot},
     watcher::{Change, Delivery, Kind},
 };
 
@@ -33,6 +36,9 @@ pub(super) struct Screen {
     pub(super) page: usize,
     pub(super) areas: BTreeMap<Panel, Rect>,
     pub(super) overlay: Option<Rect>,
+    pub(super) saving: Option<SavePrompt>,
+    pub(super) export: Option<Export>,
+    pub(super) notice: Option<Result<String, String>>,
     starting: bool,
 }
 
@@ -55,6 +61,9 @@ impl Screen {
             page: 1,
             areas: Default::default(),
             overlay: None,
+            saving: None,
+            export: None,
+            notice: None,
             starting: true,
         };
         screen.sort_inbox();
@@ -164,7 +173,14 @@ impl Screen {
     }
 
     pub(super) fn hint(&self, width: u16) -> String {
-        let text = if self.editing {
+        if let Some(message) = &self.notice {
+            return match message {
+                Ok(message) | Err(message) => message.clone(),
+            };
+        }
+        let text = if self.saving.is_some() {
+            "Enter save  Esc cancel  Ctrl+U clear path".to_owned()
+        } else if self.editing {
             format!("/{}▏   Enter apply · Esc clear", self.filter())
         } else if self.help || self.detail.is_some() {
             "↑↓ scroll  PgUp/PgDn page  Esc close  q stop".to_owned()
@@ -173,9 +189,10 @@ impl Screen {
         } else if self.focus == Panel::Status {
             "Tab panels  Enter details  ? help  q stop".to_owned()
         } else if self.focus == Panel::Logs && width < 100 {
-            "Tab panels  ↑↓ scroll  PgUp/Dn page  Space follow  ? help  q stop".to_owned()
+            "↑↓ scroll  Space follow  y copy  w save  ? help  q stop".to_owned()
         } else if self.focus == Panel::Logs {
-            "Tab panels  ↑↓ line  PgUp/PgDn page  Home/End  Space follow  / filter  ? help  q stop"
+            "Tab panels  ↑↓ scroll  Home/End  Space follow  / filter  y copy  w save  ? help  q \
+             stop"
                 .to_owned()
         } else {
             "Tab panels  ↑↓ select  Enter details  / filter  ? help  q stop".to_owned()
@@ -198,6 +215,11 @@ impl Screen {
     pub(super) fn key(&mut self, key: KeyEvent) -> bool {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return true;
+        }
+        self.notice = None;
+        if self.saving.is_some() {
+            self.edit_save(key);
+            return false;
         }
         if self.editing {
             self.edit_filter(key.code);
@@ -224,6 +246,30 @@ impl Screen {
     }
 
     pub(super) fn mouse(&mut self, event: MouseEvent) {
+        if event.kind == MouseEventKind::Up(MouseButton::Left) {
+            self.logs.dragging = false;
+        }
+        if self.saving.is_some() {
+            return;
+        }
+        if self.overlay.is_none()
+            && !self.editing
+            && let Some(area) = self.areas.get(&Panel::Logs)
+        {
+            let inner = area.inner(Margin::new(1, 1));
+            if inner.contains(Position::new(event.column, event.row)) {
+                let extend =
+                    event.kind == MouseEventKind::Drag(MouseButton::Left) && self.logs.dragging;
+                if event.kind == MouseEventKind::Down(MouseButton::Left) || extend {
+                    self.focus = Panel::Logs;
+                    self.notice = None;
+                    self.logs.dragging = true;
+                    self.logs
+                        .select_row(usize::from(event.row - inner.y), extend);
+                    return;
+                }
+            }
+        }
         let code = match event.kind {
             MouseEventKind::ScrollUp => KeyCode::Up,
             MouseEventKind::ScrollDown => KeyCode::Down,
@@ -256,15 +302,47 @@ impl Screen {
             }
             KeyCode::Char('/') if self.focus != Panel::Status => self.editing = true,
             KeyCode::Esc => {
+                self.logs.selection = None;
+                self.logs.dragging = false;
                 self.filter_mut().clear();
                 self.reconcile();
             }
             KeyCode::Enter => self.open_detail(),
+            KeyCode::Char('y') if self.focus == Panel::Logs => {
+                let contents = self.logs.export_text();
+                if contents.is_empty() {
+                    self.notice = Some(Err("No log lines to copy".to_owned()));
+                } else {
+                    self.export = Some(Export::Copy(contents));
+                }
+            }
+            KeyCode::Char('w') if self.focus == Panel::Logs => {
+                let contents = self.logs.export_text();
+                if contents.is_empty() {
+                    self.notice = Some(Err("No log lines to save".to_owned()));
+                } else {
+                    self.logs.scroll(0);
+                    self.saving = Some(SavePrompt {
+                        path: self
+                            .data
+                            .home
+                            .path()
+                            .join(format!("rad-team-{}.log", Snapshot::now()))
+                            .display()
+                            .to_string(),
+                        contents,
+                    });
+                }
+            }
             _ => self.scroll_panel(code),
         }
     }
 
     fn edit_filter(&mut self, code: KeyCode) {
+        if self.focus == Panel::Logs {
+            self.logs.selection = None;
+            self.logs.dragging = false;
+        }
         match code {
             KeyCode::Enter => self.editing = false,
             KeyCode::Esc => {
@@ -278,6 +356,57 @@ impl Screen {
             _ => {}
         }
         self.reconcile();
+    }
+
+    fn edit_save(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.saving = None,
+            KeyCode::Enter => {
+                if self
+                    .saving
+                    .as_ref()
+                    .is_some_and(|save| save.path.trim().is_empty())
+                {
+                    self.notice = Some(Err("Enter a file path".to_owned()));
+                } else if let Some(save) = self.saving.take() {
+                    self.export = Some(Export::Save {
+                        path: save.path.into(),
+                        contents: save.contents,
+                    });
+                }
+            }
+            _ => {
+                if let Some(save) = &mut self.saving {
+                    match key.code {
+                        KeyCode::Backspace => {
+                            save.path.pop();
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            save.path.clear();
+                        }
+                        KeyCode::Char(character)
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            save.path.push(character);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn paste(&mut self, text: &str) {
+        let text: String = text
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        if let Some(save) = &mut self.saving {
+            save.path.push_str(&text);
+        } else if self.editing {
+            self.filter_mut().push_str(&text);
+            self.reconcile();
+        }
     }
 
     fn scroll_panel(&mut self, code: KeyCode) {

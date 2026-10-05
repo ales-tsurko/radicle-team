@@ -502,7 +502,25 @@ In logs, `↑` and `↓` scroll one line, `PgUp` and `PgDn` scroll one page, and
 `Home` jumps to the oldest retained entry. Scrolling pauses following and shows
 the number of new entries. `End` follows the newest entries. `Space` toggles
 following. A mouse wheel or touchpad scrolls the panel under the pointer. The
-dashboard retains the latest 2,000 log lines and colors them by severity.
+dashboard retains the latest 2,000 log lines.
+
+Drag across log lines to select them. `y` copies the selection, or all filtered
+log lines when nothing is selected. `w` saves the same text: edit the suggested
+path and press `Enter`. `Ctrl+U` clears the path; `Esc` cancels. Exports include
+complete lines without color codes. Saving keeps existing files.
+
+On macOS, local sessions use the system clipboard. Over SSH and on other
+platforms, copying requires your terminal's clipboard support to be enabled.
+
+To record every log entry, including those beyond the dashboard's retained
+history, append logs to a file while the member runs:
+
+```sh
+rad-team run --log info --log-file maya.log
+```
+
+`--log-file` also works with `--plain`. It appends plain text at the selected
+log level without replacing existing contents.
 
 `q` or `Ctrl+C` gracefully stops the member. The dashboard remains visible
 during shutdown and restores the terminal on exit. Use plain logs for a service

@@ -2,14 +2,17 @@
 
 use std::{io, path::PathBuf, time::Duration};
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind};
-use futures_util::{Stream, StreamExt as _};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyEventKind,
+};
+use futures_util::{FutureExt as _, Stream, StreamExt as _, future::BoxFuture};
 use ratatui::backend::Backend;
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
     Application,
-    cli::dashboard::{LogBuffer, model::Screen, view::View},
+    cli::dashboard::{LogBuffer, export, model::Screen, view::View},
     shutdown::Shutdown,
     status::Inspection,
 };
@@ -63,6 +66,7 @@ impl Dashboard {
     {
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut exporting: Option<BoxFuture<'static, Result<String, export::Error>>> = None;
         loop {
             tokio::select! {
                 event = events.next() => {
@@ -75,6 +79,7 @@ impl Dashboard {
                             }
                         }
                         Event::Mouse(mouse) => screen.mouse(mouse),
+                        Event::Paste(text) => screen.paste(&text),
                         _ => {}
                     }
                 }
@@ -86,6 +91,23 @@ impl Dashboard {
                     }
                 }
                 _ = tick.tick() => {}
+                result = async {
+                    match &mut exporting {
+                        Some(export) => export.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    screen.notice = Some(result.map_err(|error| error.to_string()));
+                    exporting = None;
+                }
+            }
+            if let Some(export) = screen.export.take() {
+                if exporting.is_some() {
+                    screen.notice = Some(Err("A log export is already in progress".to_owned()));
+                } else {
+                    screen.notice = Some(Ok("Exporting log…".to_owned()));
+                    exporting = Some(export.execute().boxed());
+                }
             }
             screen.stopping |= shutdown.is_requested();
             screen.logs.extend(logs.since(screen.logs.latest()));
@@ -103,7 +125,7 @@ impl Terminal {
         match ratatui::try_init() {
             Ok(terminal) => {
                 let terminal = Self(terminal);
-                crossterm::execute!(io::stdout(), EnableMouseCapture)?;
+                crossterm::execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
                 let hook = std::panic::take_hook();
                 std::panic::set_hook(Box::new(move |info| {
                     Self::restore();
@@ -119,8 +141,12 @@ impl Terminal {
     }
 
     pub(crate) fn restore() {
-        let cursor =
-            crossterm::execute!(io::stdout(), DisableMouseCapture, crossterm::cursor::Show);
+        let cursor = crossterm::execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            crossterm::cursor::Show
+        );
         let screen = ratatui::try_restore();
         for result in [cursor, screen] {
             if let Err(error) = result {

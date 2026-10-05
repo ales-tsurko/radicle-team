@@ -50,10 +50,22 @@ impl<'a> View<'a> {
             self.wide(frame, body);
         }
         frame.render_widget(
-            Paragraph::new(self.screen.hint(footer.width)).style(self.theme.dim()),
+            Paragraph::new(self.screen.hint(footer.width)).style(match &self.screen.notice {
+                Some(Err(_)) => self.theme.state("failed"),
+                Some(Ok(_)) => self.theme.state("handled"),
+                None => self.theme.dim(),
+            }),
             footer,
         );
-        if self.screen.help {
+        if let Some(save) = &self.screen.saving {
+            let text = format!(
+                "{} log lines\n\nPath\n{}▏\n\nEnter save · Esc cancel · Ctrl+U clear \
+                 path\nExisting files are kept.",
+                save.contents.lines().count(),
+                save.path,
+            );
+            self.overlay(frame, "Save log", text);
+        } else if self.screen.help {
             self.overlay(frame, "Keyboard", Self::help());
         } else if self.screen.detail.is_some() {
             let (title, text) = self.detail();
@@ -387,7 +399,15 @@ impl<'a> View<'a> {
             .iter()
             .skip(start)
             .take(self.screen.logs.page)
-            .map(|line| Line::styled(line.text.clone(), self.theme.level(line.level)))
+            .map(|line| {
+                let mut text = line.text.clone();
+                if self.screen.logs.selected(line.id) {
+                    for span in &mut text.spans {
+                        span.style = span.style.add_modifier(Modifier::REVERSED);
+                    }
+                }
+                text
+            })
             .collect();
         let text = if lines.is_empty() {
             Text::from(Line::styled(
@@ -591,7 +611,7 @@ impl<'a> View<'a> {
     }
 
     fn help() -> String {
-        "Tab / Shift+Tab    Next / previous panel\ns / t / i / l      Status / tasks / inbox / logs\n↑↓ or j/k          Select a row or scroll a line\nWheel / touchpad   Scroll the panel under the pointer\nPgUp / PgDn        Scroll one page\nHome / End         First / last row\nEnter              Inspect selected task, notification, or status\n/                  Filter the focused list or logs\nEsc                Clear filter or close details\n\nLogs\nHome               Oldest retained entry\nEnd                Latest entry and resume following\nSpace              Pause / resume following\nScrolling          Pause following; new entries remain buffered\n\n?                  Show / close this help\nq / Ctrl+C         Gracefully stop the member\n\nStatus, tasks, and inbox refresh every second.\nLogs retain the latest 2,000 lines."
+        "Tab / Shift+Tab    Next / previous panel\ns / t / i / l      Status / tasks / inbox / logs\n↑↓ or j/k          Select a row or scroll a line\nWheel / touchpad   Scroll the panel under the pointer\nPgUp / PgDn        Scroll one page\nHome / End         First / last row\nEnter              Inspect selected task, notification, or status\n/                  Filter the focused list or logs\nEsc                Clear selection / filter or close details\n\nLogs\nHome               Oldest retained entry\nEnd                Latest entry and resume following\nSpace              Pause / resume following\nDrag               Select log lines and pause following\ny                  Copy selected or filtered log lines\nw                  Save selected or filtered log lines\nScrolling          Pause following; new entries remain buffered\n\n?                  Show / close this help\nq / Ctrl+C         Gracefully stop the member\n\nStatus, tasks, and inbox refresh every second.\nLogs retain the latest 2,000 lines."
             .to_owned()
     }
 
@@ -675,16 +695,6 @@ impl Theme {
             }
             "starting" | "synchronizing" | "initializing agents" | "queued" => self.accent(),
             _ => self.dim(),
-        }
-    }
-
-    fn level(&self, level: tracing::Level) -> Style {
-        match level {
-            tracing::Level::ERROR => self.color(Color::Red),
-            tracing::Level::WARN => self.color(Color::Yellow),
-            tracing::Level::INFO => self.color(Color::Green),
-            tracing::Level::DEBUG => self.color(Color::Blue),
-            tracing::Level::TRACE => self.color(Color::Magenta).dim(),
         }
     }
 

@@ -49,6 +49,15 @@ impl Cli {
         self.log
     }
 
+    /// Returns the optional file for continuous, plain-text logging during `run`.
+    #[must_use]
+    pub fn log_file(&self) -> Option<&Path> {
+        match &self.command {
+            Command::Run(options) => options.log_file.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Returns whether `run` should use the live dashboard on this terminal.
     #[must_use]
     pub fn interactive(&self) -> bool {
@@ -375,6 +384,9 @@ struct RunOptions {
     /// Print logs instead of the live dashboard; automatic when output is redirected.
     #[arg(long)]
     plain: bool,
+    /// Also append plain-text logs to this file, including entries outside dashboard history.
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -524,6 +536,28 @@ mod tests {
             Cli::try_parse_from(["rad-team", "setup", "nico", "--identity-only", "--plain"])
                 .expect_err("plain is only a run option");
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn log_file_is_optional_and_specific_to_run() {
+        assert!(
+            Cli::try_parse_from(["rad-team", "run"])
+                .expect("run")
+                .log_file()
+                .is_none()
+        );
+        for plain in [false, true] {
+            let mut arguments = vec!["rad-team", "run", "--log-file", "member.log"];
+            if plain {
+                arguments.push("--plain");
+            }
+            let cli = Cli::try_parse_from(arguments).expect("file logging");
+            assert_eq!(cli.log_file(), Some(std::path::Path::new("member.log")));
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["rad-team", "status", "--log-file", "member.log"]),
+            Err(error) if error.kind() == ErrorKind::UnknownArgument
+        ));
     }
 
     #[test]

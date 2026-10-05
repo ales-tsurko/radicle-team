@@ -4,7 +4,11 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::{Terminal, backend::TestBackend, style::Color};
+use ratatui::{
+    Terminal,
+    backend::TestBackend,
+    style::{Color, Modifier},
+};
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter as _;
 
@@ -12,6 +16,7 @@ use crate::{
     agent::{Role, Source},
     cli::dashboard::{
         LogBuffer,
+        export::Export,
         logs::{LogLine, LogView},
         model::{Detail, EventLabel, Panel, Screen},
         view::View,
@@ -137,8 +142,7 @@ impl Fixture {
         (1..=count)
             .map(|id| LogLine {
                 id,
-                level: Level::WARN,
-                text: format!("warning {id}"),
+                text: format!("warning {id}").into(),
             })
             .collect()
     }
@@ -214,8 +218,7 @@ fn logs_keep_the_reading_position_and_count_new_entries() {
         .id;
     logs.extend(vec![LogLine {
         id: 11,
-        level: Level::ERROR,
-        text: "failed fetch".to_owned(),
+        text: "failed fetch".into(),
     }]);
     assert!(!logs.following);
     assert_eq!(logs.unseen(), 1);
@@ -247,24 +250,39 @@ fn tracing_events_are_complete_bounded_and_never_written_to_the_screen() {
             .write_all("first 😀".as_bytes())
             .expect("first fragment");
         writer
-            .write_all(b" part\nsecond\tline\x1b\n")
+            .write_all(b" part\nsecond\t\x1b[31mline\x1b[0m\x07\x1b[2J\x1b\n")
             .expect("second fragment");
         writer.flush().expect("flush");
         assert!(buffer.since(0).is_empty());
     }
     let lines = buffer.since(0);
-    assert_eq!(lines.first().expect("first line").text, "first 😀 part");
-    assert_eq!(lines.last().expect("last line").text, "second    line");
+    assert_eq!(
+        lines.first().expect("first line").text.to_string(),
+        "first 😀 part"
+    );
+    assert_eq!(
+        lines.last().expect("last line").text.to_string(),
+        "second    line"
+    );
     let before = lines.last().expect("last line").id;
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(buffer.clone())
         .finish();
     tracing::subscriber::with_default(subscriber, || tracing::warn!("captured warning"));
-    assert_eq!(
-        buffer.since(before).first().expect("captured event").level,
-        Level::WARN
+    let captured = buffer.since(before);
+    let event = &captured.first().expect("captured event").text;
+    assert!(event.to_string().contains(" WARN "));
+    assert!(event.to_string().ends_with("captured warning"));
+    let mut view = LogView::default();
+    view.extend(lines);
+    view.filter = "31m".to_owned();
+    assert!(
+        view.visible().is_empty(),
+        "ANSI codes must not enter searches"
     );
+    view.filter = "SECOND".to_owned();
+    assert_eq!(view.visible().len(), 1);
     for id in 0..2_100 {
         writeln!(buffer.make_writer(), "entry {id}").expect("bounded capture");
     }
@@ -324,8 +342,7 @@ fn wheel_scrolling_targets_visible_panels_and_preserves_paused_logs() {
     assert_eq!(screen.logs.start(&screen.logs.visible()), before - 1);
     screen.logs.extend(vec![LogLine {
         id: 41,
-        level: Level::INFO,
-        text: "new entry during wheel scrolling".to_owned(),
+        text: "new entry during wheel scrolling".into(),
     }]);
     assert_eq!(screen.logs.start(&screen.logs.visible()), before - 1);
     assert_eq!(screen.logs.unseen(), 1);
@@ -382,60 +399,313 @@ fn wheel_scrolling_targets_visible_panels_and_preserves_paused_logs() {
     );
 }
 
-#[test]
-fn captured_log_severities_have_visible_colors_including_info() {
-    let logs = LogBuffer::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_target(false)
-        .with_max_level(Level::TRACE)
-        .with_writer(logs.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::error!("error entry");
-        tracing::warn!("warn entry");
-        tracing::info!("info entry");
-        tracing::debug!("debug entry");
-        tracing::trace!("trace entry");
-    });
+#[tokio::test]
+async fn log_selection_exports_complete_plain_lines_and_survives_arrivals() {
+    let buffer = LogBuffer::default();
+    {
+        let mut writer = buffer.make_writer();
+        writeln!(
+            writer,
+            "\x1b[31mfirst 😀\x1b[0m {}",
+            "long line ".repeat(30)
+        )
+        .expect("long log line");
+        writeln!(writer, "second line").expect("second line");
+        writeln!(writer, "third line").expect("third line");
+    }
     let mut screen = Screen::new(Fixture::inspection());
-    screen.focus = Panel::Logs;
-    screen.logs.extend(logs.since(0));
-    let mut terminal = Terminal::new(TestBackend::new(76, 20)).expect("test terminal");
+    screen.logs.extend(buffer.since(0));
+    let _view = Fixture::render(&mut screen, 120, 32);
+    let area = *screen.areas.get(&Panel::Logs).expect("log area");
+    let mut mouse = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 1,
+        row: area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    screen.mouse(mouse);
+    mouse.kind = MouseEventKind::Drag(MouseButton::Left);
+    mouse.row += 1;
+    screen.mouse(mouse);
+    mouse.kind = MouseEventKind::Up(MouseButton::Left);
+    mouse.column = 0;
+    screen.mouse(mouse);
+    assert!(!screen.logs.dragging);
+    assert!(!screen.logs.following);
+    assert_eq!(screen.focus, Panel::Logs);
+    let expected = format!("first 😀 {}\nsecond line\n", "long line ".repeat(30));
+    assert_eq!(screen.logs.export_text(), expected);
+    writeln!(buffer.make_writer(), "arrival during selection").expect("new log");
+    screen.logs.extend(buffer.since(screen.logs.latest()));
+    assert_eq!(screen.logs.export_text(), expected);
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("terminal");
     terminal
         .draw(|frame| View::new(&mut screen).draw(frame))
-        .expect("draw colored logs");
-    let colors = std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
-    for (message, expected) in [
-        ("error entry", Color::Red),
-        ("warn entry", Color::Yellow),
-        ("info entry", Color::Green),
-        ("debug entry", Color::Blue),
-        ("trace entry", Color::Magenta),
+        .expect("selection frame");
+    let first = terminal
+        .backend()
+        .buffer()
+        .cell((area.x + 1, area.y + 1))
+        .expect("log cell");
+    assert!(first.modifier.contains(Modifier::REVERSED));
+    assert_eq!(first.fg, Color::Red, "selection keeps original log styling");
+    Fixture::key(&mut screen, KeyCode::Char('y'));
+    assert!(matches!(screen.export.take(), Some(Export::Copy(text)) if text == expected));
+
+    Fixture::key(&mut screen, KeyCode::Char('w'));
+    assert!(Fixture::render(&mut screen, 76, 20).contains("Save log"));
+    assert!(!screen.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+    Fixture::key(&mut screen, KeyCode::Backspace);
+    assert!(!screen.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)));
+    assert!(screen.saving.as_ref().expect("save prompt").path.is_empty());
+    Fixture::key(&mut screen, KeyCode::Enter);
+    assert!(
+        screen.saving.is_some(),
+        "an empty path keeps the prompt open"
+    );
+    assert!(matches!(&screen.notice, Some(Err(message)) if message == "Enter a file path"));
+    let root = tempfile::tempdir().expect("export directory");
+    let path = root.path().join("q-logs.txt");
+    screen.paste(path.to_str().expect("UTF-8 export path"));
+    Fixture::key(&mut screen, KeyCode::Enter);
+    let export = screen.export.take().expect("save requested");
+    writeln!(buffer.make_writer(), "arrival after save requested").expect("new log");
+    screen.logs.extend(buffer.since(screen.logs.latest()));
+    let message = export.execute().await.expect("log saved");
+    assert!(message.contains(path.to_str().expect("export path")));
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("plain saved log"),
+        expected
+    );
+
+    Fixture::key(&mut screen, KeyCode::Char('w'));
+    Fixture::key(&mut screen, KeyCode::Esc);
+    assert!(screen.saving.is_none());
+    Fixture::key(&mut screen, KeyCode::Esc);
+    assert!(screen.logs.selection.is_none());
+    Fixture::key(&mut screen, KeyCode::Char('/'));
+    screen.paste("second");
+    Fixture::key(&mut screen, KeyCode::Enter);
+    Fixture::key(&mut screen, KeyCode::Char('y'));
+    assert!(matches!(screen.export.take(), Some(Export::Copy(text)) if text == "second line\n"));
+    screen.logs.filter = "absent".to_owned();
+    Fixture::key(&mut screen, KeyCode::Char('w'));
+    assert!(screen.saving.is_none());
+    Fixture::key(&mut screen, KeyCode::Char('y'));
+    assert!(screen.export.is_none());
+}
+
+#[tokio::test]
+async fn log_saving_preserves_existing_files_and_reports_invalid_destinations() {
+    let root = tempfile::tempdir().expect("export directory");
+    let existing = root.path().join("existing.txt");
+    std::fs::write(&existing, "keep this").expect("existing file");
+    for path in [existing.clone(), root.path().join("missing/log.txt")] {
+        let result = Export::Save {
+            path,
+            contents: "new log\n".to_owned(),
+        }
+        .execute()
+        .await;
+        assert!(matches!(
+            result,
+            Err(crate::cli::dashboard::export::Error::File { .. })
+        ));
+    }
+    assert_eq!(
+        std::fs::read_to_string(existing).expect("existing file"),
+        "keep this"
+    );
+    assert!(!root.path().join("missing").exists());
+    let mut view = LogView::default();
+    view.page = 3;
+    view.extend(Fixture::logs(10));
+    view.select_row(2, false);
+    view.select_row(0, true);
+    assert_eq!(view.export_text(), "warning 8\nwarning 9\nwarning 10\n");
+    view.extend(Fixture::logs(2_010).into_iter().skip(10).collect());
+    assert!(
+        view.export_text().is_empty(),
+        "eviction must not export unrelated lines"
+    );
+    view.follow();
+    assert!(view.selection.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clipboard_process_receives_the_full_selection_and_reports_failures() {
+    let root = tempfile::tempdir().expect("clipboard fixture");
+    let path = root.path().join("clipboard.txt");
+    let text = "first 😀\nsecond line\n";
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .args(["-c", "cat > \"$1\"", "clipboard-fixture"])
+        .arg(&path);
+    let copied = Export::copy_to_process(text.to_owned(), command)
+        .await
+        .expect("copied");
+    assert_eq!(copied, "Copied 2 log lines");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("clipboard contents"),
+        text
+    );
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command.args(["-c", "cat >/dev/null; exit 1"]);
+    let error = Export::copy_to_process(text.to_owned(), command)
+        .await
+        .expect_err("copy failure");
+    assert!(error.to_string().contains("exited with"));
+    let missing = tokio::process::Command::new(root.path().join("absent-copy-program"));
+    let error = Export::copy_to_process(text.to_owned(), missing)
+        .await
+        .expect_err("missing clipboard program");
+    assert!(matches!(
+        error,
+        crate::cli::dashboard::export::Error::Clipboard(source)
+            if source.kind() == std::io::ErrorKind::NotFound
+    ));
+}
+
+#[tokio::test]
+async fn failed_log_exports_leave_the_dashboard_running_and_refreshing() {
+    use crossterm::event::Event;
+    use futures_util::{StreamExt as _, stream};
+
+    use crate::{cli::dashboard::runtime::Dashboard, shutdown::Shutdown};
+
+    let root = tempfile::tempdir().expect("export fixture");
+    let mut screen = Screen::new(Fixture::inspection());
+    screen.focus = Panel::Logs;
+    let logs = LogBuffer::default();
+    writeln!(logs.make_writer(), "export this line").expect("log record");
+    screen.logs.extend(logs.since(0));
+    let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("terminal");
+    let shutdown = Shutdown::default();
+    let (updates, mut receiver) = tokio::sync::mpsc::channel(1);
+    let (input, keys) = tokio::sync::mpsc::channel(5);
+    for event in [
+        Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        Event::Paste(root.path().to_str().expect("fixture path").to_owned()),
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     ] {
-        let row = terminal
-            .backend()
-            .buffer()
-            .content
-            .chunks(76)
-            .find(|row| {
-                row.iter()
-                    .map(|cell| cell.symbol())
-                    .collect::<String>()
-                    .contains(message)
-            })
-            .expect("rendered log entry");
-        let actual = row
-            .iter()
-            .find(|cell| cell.symbol() == "e")
-            .expect("entry text")
-            .fg;
-        assert_eq!(
-            actual,
-            if colors { expected } else { Color::Reset },
-            "{message}"
-        );
+        input.send(Ok(event)).await.expect("export input");
+    }
+    let arrival = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let mut data = Fixture::inspection();
+        data.tasks.clear();
+        updates.send(Ok(data)).await.expect("live refresh");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(input);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    });
+    let events = stream::unfold(keys, |mut input| async move {
+        input.recv().await.map(|event| (event, input))
+    })
+    .boxed();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        Dashboard::drive(
+            &mut terminal,
+            &mut screen,
+            &mut receiver,
+            &logs,
+            &shutdown,
+            events,
+        ),
+    )
+    .await
+    .expect("responsive after export failure");
+    assert!(matches!(
+        result,
+        Err(crate::cli::dashboard::runtime::Error::Terminal(error))
+            if error.kind() == std::io::ErrorKind::UnexpectedEof
+    ));
+    arrival.await.expect("arrivals");
+    assert!(
+        !shutdown.is_requested(),
+        "export failure must not stop the member"
+    );
+    assert!(screen.data.tasks.is_empty(), "inspection keeps refreshing");
+    assert!(matches!(&screen.notice, Some(Err(error)) if error.contains("could not save log")));
+    assert!(Fixture::render(&mut screen, 120, 32).contains("could not save log"));
+}
+
+#[test]
+fn captured_logs_preserve_normal_formatter_styles_and_resets() {
+    for ansi in [true, false] {
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(ansi)
+            .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+                "time".to_owned(),
+            ))
+            .with_max_level(Level::TRACE)
+            .with_writer(logs.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = tracing::info_span!("worker", member = "maya").entered();
+            tracing::error!(target: "runtime", task = 42, "error entry");
+            tracing::warn!(target: "runtime", task = 42, "warn entry");
+            tracing::info!(target: "runtime", task = 42, "info entry");
+            tracing::debug!(target: "runtime", task = 42, "debug entry");
+            tracing::trace!(target: "runtime", task = 42, "trace entry");
+        });
+        let mut screen = Screen::new(Fixture::inspection());
+        screen.focus = Panel::Logs;
+        screen.logs.extend(logs.since(0));
+        let mut terminal = Terminal::new(TestBackend::new(76, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| View::new(&mut screen).draw(frame))
+            .expect("draw formatted logs");
+        for (level, message, color) in [
+            ("ERROR", "error entry", Color::Red),
+            ("WARN", "warn entry", Color::Yellow),
+            ("INFO", "info entry", Color::Green),
+            ("DEBUG", "debug entry", Color::Blue),
+            ("TRACE", "trace entry", Color::Magenta),
+        ] {
+            let row = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(76)
+                .find(|row| {
+                    row.iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                        .contains(message)
+                })
+                .expect("rendered log entry");
+            let text: String = row.iter().map(|cell| cell.symbol()).collect();
+            for (fragment, foreground, modifier) in [
+                ("time", Color::Reset, Modifier::DIM),
+                (level, color, Modifier::empty()),
+                ("worker", Color::Reset, Modifier::BOLD),
+                ("runtime", Color::Reset, Modifier::DIM),
+                (message, Color::Reset, Modifier::empty()),
+                ("task", Color::Reset, Modifier::ITALIC),
+                ("=", Color::Reset, Modifier::DIM),
+                ("42", Color::Reset, Modifier::empty()),
+            ] {
+                let offset = text.find(fragment).expect("formatted log fragment");
+                let start = text
+                    .get(..offset)
+                    .expect("fragment boundary")
+                    .chars()
+                    .count();
+                for cell in row.iter().skip(start).take(fragment.len()) {
+                    assert_eq!(cell.fg, if ansi { foreground } else { Color::Reset });
+                    assert_eq!(
+                        cell.modifier,
+                        if ansi { modifier } else { Modifier::empty() }
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -701,8 +971,7 @@ fn empty_queues_and_lifecycle_transitions_remain_clear_at_any_size() {
         let id = screen.logs.latest() + 1;
         screen.logs.extend(vec![LogLine {
             id,
-            level,
-            text: format!("{level} log entry"),
+            text: format!("{level} log entry").into(),
         }]);
     }
     screen.focus = Panel::Logs;
