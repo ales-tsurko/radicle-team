@@ -7,6 +7,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::{
     Terminal,
     backend::TestBackend,
+    buffer::Buffer,
+    layout::{Position, Rect},
     style::{Color, Modifier},
 };
 use tracing::Level;
@@ -19,6 +21,7 @@ use crate::{
         export::Export,
         logs::{LogLine, LogView},
         model::{Detail, EventLabel, Panel, Screen},
+        selection::TextSelection,
         view::View,
     },
     delivery::{Record, State},
@@ -146,6 +149,315 @@ impl Fixture {
             })
             .collect()
     }
+
+    fn buffer(screen: &mut Screen, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal
+            .draw(|frame| View::new(screen).draw(frame))
+            .expect("draw frame");
+        terminal.backend().buffer().clone()
+    }
+
+    fn position(buffer: &Buffer, area: Rect, needle: &str) -> Position {
+        let needle: Vec<_> = needle.chars().collect();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if x + needle.len() as u16 <= area.right()
+                    && needle.iter().enumerate().all(|(offset, character)| {
+                        buffer[(x + offset as u16, y)].symbol() == character.to_string()
+                    })
+                {
+                    return Position::new(x, y);
+                }
+            }
+        }
+        panic!("missing text {needle:?} in {area:?}: {buffer:?}");
+    }
+
+    fn mouse(screen: &mut Screen, kind: MouseEventKind, position: Position) {
+        screen.mouse(MouseEvent {
+            kind,
+            column: position.x,
+            row: position.y,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    fn copy_at(screen: &mut Screen, position: Position, expected: &str) {
+        Self::mouse(screen, MouseEventKind::Down(MouseButton::Left), position);
+        Self::mouse(screen, MouseEventKind::Up(MouseButton::Left), position);
+        Self::key(screen, KeyCode::Char('y'));
+        match screen.export.take().expect("copy requested") {
+            Export::Copy { contents, .. } => assert_eq!(contents, expected),
+            Export::Save { .. } => panic!("unexpected save"),
+        }
+    }
+}
+
+#[test]
+fn direct_selection_copies_complete_header_and_clipped_status_ids() {
+    let mut screen = Screen::new(Fixture::inspection());
+    let repository = screen.data.repository.to_string();
+    let did = screen.data.did.expect("DID").to_string();
+    Fixture::key(&mut screen, KeyCode::Char('s'));
+    let buffer = Fixture::buffer(&mut screen, 50, 20);
+    let position = Fixture::position(&buffer, buffer.area, "did:key:z6Mk");
+    Fixture::copy_at(&mut screen, position, &did);
+    assert!(screen.detail.is_none(), "copy requires no menu");
+    Fixture::key(&mut screen, KeyCode::Esc);
+    let position = Fixture::position(&buffer, screen.header, &repository);
+    Fixture::copy_at(&mut screen, position, &repository);
+    Fixture::key(&mut screen, KeyCode::Esc);
+    Fixture::key(&mut screen, KeyCode::Enter);
+    let buffer = Fixture::buffer(&mut screen, 35, 32);
+    let position = Fixture::position(&buffer, screen.overlay.expect("detail"), "did:key:");
+    Fixture::copy_at(&mut screen, position, &did);
+    assert!(matches!(screen.detail, Some(Detail::Status)));
+    Fixture::key(&mut screen, KeyCode::Esc);
+    assert!(
+        screen.detail.is_some(),
+        "escape first clears text selection"
+    );
+    Fixture::key(&mut screen, KeyCode::Esc);
+    assert!(screen.detail.is_none());
+    for (width, height) in [(1, 1), (15, 4), (50, 8), (100, 24)] {
+        let _view = Fixture::render(&mut screen, width, height);
+    }
+}
+
+#[test]
+fn shortened_ids_resolve_per_row_even_with_identical_prefixes_and_scrolling() {
+    let mut screen = Screen::new(Fixture::inspection());
+    let buffer = Fixture::buffer(&mut screen, 120, 32);
+    let area = screen.areas[&Panel::Tasks];
+    for (row, id) in [(0, 2), (1, 3), (2, 4)] {
+        let scope = Rect::new(area.x + 1, area.y + 2 + row * 2, area.width - 2, 1);
+        let position = Fixture::position(&buffer, scope, "issue:0000000");
+        Fixture::copy_at(&mut screen, position, &format!("{id:040x}"));
+        Fixture::key(&mut screen, KeyCode::Esc);
+    }
+    let scope = Rect::new(area.x + 1, area.y + 4, area.width - 2, 1);
+    let position = Fixture::position(&buffer, scope, "0000000");
+    Fixture::mouse(
+        &mut screen,
+        MouseEventKind::Down(MouseButton::Left),
+        position,
+    );
+    Fixture::mouse(
+        &mut screen,
+        MouseEventKind::Drag(MouseButton::Left),
+        Position::new(position.x + 6, position.y),
+    );
+    Fixture::mouse(&mut screen, MouseEventKind::Up(MouseButton::Left), position);
+    Fixture::key(&mut screen, KeyCode::Char('y'));
+    assert!(
+        matches!(screen.export.take(), Some(Export::Copy { contents, .. }) if contents == format!("{:040x}", 3)),
+        "dragging just the abbreviated hash copies its full value"
+    );
+    Fixture::key(&mut screen, KeyCode::Esc);
+    for id in 5..20 {
+        screen.data.tasks.push((
+            Fixture::task(id, "Incoming task", QueuePosition::End),
+            false,
+        ));
+    }
+    Fixture::key(&mut screen, KeyCode::End);
+    let buffer = Fixture::buffer(&mut screen, 120, 32);
+    let offset = screen.tasks.state.offset();
+    assert!(offset > 0);
+    let position = Fixture::position(
+        &buffer,
+        Rect::new(area.x + 1, area.y + 2, area.width - 2, 1),
+        "issue:0000000",
+    );
+    let id = screen.data.tasks[offset].0.id;
+    Fixture::copy_at(&mut screen, position, &format!("{id:040x}"));
+}
+
+#[test]
+fn selection_keeps_the_original_id_while_live_tasks_change() {
+    let mut screen = Screen::new(Fixture::inspection());
+    let buffer = Fixture::buffer(&mut screen, 120, 32);
+    let area = screen.areas[&Panel::Tasks];
+    let position = Fixture::position(
+        &buffer,
+        Rect::new(area.x + 1, area.y + 4, area.width - 2, 1),
+        "issue:0000000",
+    );
+    Fixture::mouse(
+        &mut screen,
+        MouseEventKind::Down(MouseButton::Left),
+        position,
+    );
+    Fixture::mouse(&mut screen, MouseEventKind::Up(MouseButton::Left), position);
+    let mut update = Fixture::inspection();
+    update.tasks.remove(1);
+    screen.refresh(update);
+    let _view = Fixture::render(&mut screen, 120, 32);
+    Fixture::key(&mut screen, KeyCode::Char('y'));
+    assert!(
+        matches!(screen.export.take(), Some(Export::Copy { contents, .. }) if contents == format!("{:040x}", 3))
+    );
+    Fixture::key(&mut screen, KeyCode::Esc);
+    assert!(!screen.text.active());
+    let view = Fixture::render(&mut screen, 120, 32);
+    assert!(!view.contains("Safe undo"));
+}
+
+#[test]
+fn task_details_copy_relationships_messages_revisions_and_notes_directly() {
+    let mut data = Fixture::inspection();
+    let task = &mut data.tasks.first_mut().expect("task").0;
+    let patch = "7777777777777777777777777777777777777777";
+    let message = "8888888888888888888888888888888888888888";
+    let revision = "9999999999999999999999999999999999999999";
+    let note = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    task.context.artifacts.push(Artifact {
+        subject: format!("patch:{patch}"),
+        role: ArtifactRole::Produced,
+        purpose: "Implementation".to_owned(),
+    });
+    task.context.messages.push(MessageReference {
+        subject: format!("patch:{patch}"),
+        entry: message.to_owned(),
+        revision: Some(revision.to_owned()),
+        purpose: "Delegate review".to_owned(),
+    });
+    task.context.notes.push(format!("Verified commit `{note}`"));
+    task.context
+        .notes
+        .push("Related tasks #20 and #2".to_owned());
+    let mut screen = Screen::new(data);
+    Fixture::key(&mut screen, KeyCode::Enter);
+    for (displayed, value) in [
+        ("#2", "2"),
+        ("issue:0000000", "0000000000000000000000000000000000000002"),
+        (patch, patch),
+        (message, message),
+        (revision, revision),
+        (note, note),
+        ("#20", "20"),
+    ] {
+        let buffer = Fixture::buffer(&mut screen, 120, 50);
+        let position = Fixture::position(&buffer, screen.overlay.expect("detail"), displayed);
+        Fixture::copy_at(&mut screen, position, value);
+        assert!(matches!(screen.detail, Some(Detail::Task(_))));
+        Fixture::key(&mut screen, KeyCode::Esc);
+    }
+}
+
+#[test]
+fn inbox_copies_short_authors_and_nested_review_references() {
+    let review_entry: radicle::cob::EntryId = "3333333333333333333333333333333333333333"
+        .parse()
+        .expect("review");
+    let revision_entry: radicle::cob::EntryId = "4444444444444444444444444444444444444444"
+        .parse()
+        .expect("revision");
+    let mut data = Fixture::inspection();
+    let mut record = Fixture::record(10, State::Queued);
+    record.activity.kind = Kind::Delivered(Delivery::Changed(Change::ReviewSubmitted {
+        review: review_entry.into(),
+        revision: revision_entry.into(),
+    }));
+    record.task = Some(2);
+    data.did = None;
+    let author = record.activity.author.to_string();
+    let operation = record.activity.operation.to_string();
+    data.deliveries = vec![record];
+    let mut screen = Screen::new(data);
+    screen.focus = Panel::Inbox;
+    let buffer = Fixture::buffer(&mut screen, 120, 32);
+    let position = Fixture::position(&buffer, screen.areas[&Panel::Inbox], "z6MkvUJ");
+    Fixture::copy_at(&mut screen, position, &author);
+    Fixture::key(&mut screen, KeyCode::Esc);
+    Fixture::key(&mut screen, KeyCode::Enter);
+    for value in [
+        author,
+        operation,
+        review_entry.to_string(),
+        revision_entry.to_string(),
+    ] {
+        let buffer = Fixture::buffer(&mut screen, 120, 50);
+        let position = Fixture::position(&buffer, screen.overlay.expect("detail"), &value);
+        Fixture::copy_at(&mut screen, position, &value);
+        Fixture::key(&mut screen, KeyCode::Esc);
+    }
+}
+
+#[test]
+fn direct_log_selection_copies_ids_or_plain_text_without_color_codes() {
+    let mut screen = Screen::new(Fixture::inspection());
+    screen.focus = Panel::Logs;
+    let buffer = LogBuffer::default();
+    let did = screen.data.did.expect("DID").to_string();
+    let session = "3e1e4227-40d7-4e9d-a3be-d9749b88f3c2";
+    writeln!(buffer.make_writer(), "\x1b[31midentity={did}\x1b[0m").expect("DID log");
+    writeln!(buffer.make_writer(), "session_id={session} task=#42").expect("session log");
+    writeln!(buffer.make_writer(), "normal plain text").expect("plain log");
+    screen.logs.extend(buffer.since(0));
+    let view = Fixture::buffer(&mut screen, 120, 32);
+    let area = screen.areas[&Panel::Logs];
+    for value in [&did, session, "#42"] {
+        let position = Fixture::position(&view, area, value);
+        Fixture::copy_at(&mut screen, position, value.trim_start_matches('#'));
+        Fixture::key(&mut screen, KeyCode::Esc);
+    }
+    let position = Fixture::position(&view, area, "plain text");
+    Fixture::mouse(
+        &mut screen,
+        MouseEventKind::Down(MouseButton::Left),
+        position,
+    );
+    Fixture::mouse(
+        &mut screen,
+        MouseEventKind::Drag(MouseButton::Left),
+        Position::new(position.x + 9, position.y),
+    );
+    Fixture::mouse(&mut screen, MouseEventKind::Up(MouseButton::Left), position);
+    Fixture::key(&mut screen, KeyCode::Char('c'));
+    assert!(
+        matches!(screen.export.take(), Some(Export::Copy { contents, .. }) if contents == "plain text")
+    );
+    Fixture::key(&mut screen, KeyCode::Esc);
+    screen.focus = Panel::Tasks;
+    Fixture::key(&mut screen, KeyCode::Char('y'));
+    assert!(screen.export.is_none());
+    assert!(matches!(&screen.notice, Some(Err(message)) if message == "Select text to copy"));
+}
+
+#[test]
+fn text_selection_handles_reverse_drags_unicode_empty_lines_and_panel_bounds() {
+    let area = Rect::new(3, 2, 30, 5);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 10));
+    buffer.set_string(3, 2, "first 😀 value", ratatui::style::Style::new());
+    buffer.set_string(3, 4, "second line", ratatui::style::Style::new());
+    let mut selection = TextSelection::default();
+    selection.render(&mut buffer);
+    selection.start(area, Position::new(3, 2));
+    selection.extend(Position::new(13, 4));
+    assert_eq!(selection.contents(), "first 😀 value\n\nsecond line");
+    selection.clear();
+    selection.start(area, Position::new(13, 4));
+    selection.extend(Position::new(3, 2));
+    assert_eq!(selection.contents(), "first 😀 value\n\nsecond line");
+    selection.extend(Position::new(0, 0));
+    assert_eq!(
+        selection.contents(),
+        "first 😀 value\n\nsecond line",
+        "drag stays in its panel"
+    );
+    selection.render(&mut buffer);
+    selection.start(area, Position::new(3, 4));
+    selection.render(&mut buffer);
+    assert!(
+        !buffer[(3, 2)].modifier.contains(Modifier::UNDERLINED),
+        "moving selection removes the old highlight"
+    );
+    assert!(buffer[(3, 4)].modifier.contains(Modifier::UNDERLINED));
+    let mut resized = Buffer::empty(Rect::new(0, 0, 20, 10));
+    selection.render(&mut resized);
+    assert!(!selection.active(), "resize safely clears old coordinates");
 }
 
 #[test]
@@ -430,14 +742,14 @@ async fn log_selection_exports_complete_plain_lines_and_survives_arrivals() {
     mouse.kind = MouseEventKind::Up(MouseButton::Left);
     mouse.column = 0;
     screen.mouse(mouse);
-    assert!(!screen.logs.dragging);
+    assert!(!screen.text.dragging);
     assert!(!screen.logs.following);
     assert_eq!(screen.focus, Panel::Logs);
     let expected = format!("first 😀 {}\nsecond line\n", "long line ".repeat(30));
-    assert_eq!(screen.logs.export_text(), expected);
+    assert_eq!(screen.text.contents(), expected);
     writeln!(buffer.make_writer(), "arrival during selection").expect("new log");
     screen.logs.extend(buffer.since(screen.logs.latest()));
-    assert_eq!(screen.logs.export_text(), expected);
+    assert_eq!(screen.text.contents(), expected);
 
     let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("terminal");
     terminal
@@ -451,7 +763,9 @@ async fn log_selection_exports_complete_plain_lines_and_survives_arrivals() {
     assert!(first.modifier.contains(Modifier::REVERSED));
     assert_eq!(first.fg, Color::Red, "selection keeps original log styling");
     Fixture::key(&mut screen, KeyCode::Char('y'));
-    assert!(matches!(screen.export.take(), Some(Export::Copy(text)) if text == expected));
+    assert!(
+        matches!(screen.export.take(), Some(Export::Copy { contents, .. }) if contents == expected)
+    );
 
     Fixture::key(&mut screen, KeyCode::Char('w'));
     assert!(Fixture::render(&mut screen, 76, 20).contains("Save log"));
@@ -483,12 +797,14 @@ async fn log_selection_exports_complete_plain_lines_and_survives_arrivals() {
     Fixture::key(&mut screen, KeyCode::Esc);
     assert!(screen.saving.is_none());
     Fixture::key(&mut screen, KeyCode::Esc);
-    assert!(screen.logs.selection.is_none());
+    assert!(!screen.text.active());
     Fixture::key(&mut screen, KeyCode::Char('/'));
     screen.paste("second");
     Fixture::key(&mut screen, KeyCode::Enter);
     Fixture::key(&mut screen, KeyCode::Char('y'));
-    assert!(matches!(screen.export.take(), Some(Export::Copy(text)) if text == "second line\n"));
+    assert!(
+        matches!(screen.export.take(), Some(Export::Copy { contents, .. }) if contents == "second line\n")
+    );
     screen.logs.filter = "absent".to_owned();
     Fixture::key(&mut screen, KeyCode::Char('w'));
     assert!(screen.saving.is_none());
@@ -518,19 +834,6 @@ async fn log_saving_preserves_existing_files_and_reports_invalid_destinations() 
         "keep this"
     );
     assert!(!root.path().join("missing").exists());
-    let mut view = LogView::default();
-    view.page = 3;
-    view.extend(Fixture::logs(10));
-    view.select_row(2, false);
-    view.select_row(0, true);
-    assert_eq!(view.export_text(), "warning 8\nwarning 9\nwarning 10\n");
-    view.extend(Fixture::logs(2_010).into_iter().skip(10).collect());
-    assert!(
-        view.export_text().is_empty(),
-        "eviction must not export unrelated lines"
-    );
-    view.follow();
-    assert!(view.selection.is_none());
 }
 
 #[cfg(unix)]
@@ -543,10 +846,9 @@ async fn clipboard_process_receives_the_full_selection_and_reports_failures() {
     command
         .args(["-c", "cat > \"$1\"", "clipboard-fixture"])
         .arg(&path);
-    let copied = Export::copy_to_process(text.to_owned(), command)
+    Export::copy_to_process(text.to_owned(), command)
         .await
         .expect("copied");
-    assert_eq!(copied, "Copied 2 log lines");
     assert_eq!(
         std::fs::read_to_string(path).expect("clipboard contents"),
         text

@@ -115,8 +115,6 @@ pub(super) struct LogView {
     pub(super) following: bool,
     pub(super) filter: String,
     pub(super) page: usize,
-    pub(super) selection: Option<(u64, u64)>,
-    pub(super) dragging: bool,
     anchor: Option<u64>,
     paused_at: u64,
 }
@@ -128,8 +126,6 @@ impl Default for LogView {
             following: true,
             filter: String::new(),
             page: 1,
-            selection: None,
-            dragging: false,
             anchor: None,
             paused_at: 0,
         }
@@ -174,32 +170,11 @@ impl LogView {
             .min(last)
     }
 
-    pub(super) fn selected(&self, id: u64) -> bool {
-        self.selection
-            .is_some_and(|(start, end)| (start.min(end)..=start.max(end)).contains(&id))
-    }
-
-    pub(super) fn select_row(&mut self, row: usize, extend: bool) {
-        let visible = self.visible();
-        let Some(id) = visible.get(self.start(&visible) + row).map(|line| line.id) else {
-            return;
-        };
-        self.scroll(0);
-        let anchor = if extend {
-            self.selection.map_or(id, |(anchor, _)| anchor)
-        } else {
-            id
-        };
-        self.selection = Some((anchor, id));
-    }
-
     pub(super) fn export_text(&self) -> String {
         let mut text = String::new();
         for line in self.visible() {
-            if self.selection.is_none() || self.selected(line.id) {
-                text.push_str(&line.text.to_string());
-                text.push('\n');
-            }
+            text.push_str(&line.text.to_string());
+            text.push('\n');
         }
         text
     }
@@ -225,8 +200,6 @@ impl LogView {
     pub(super) fn follow(&mut self) {
         self.following = true;
         self.anchor = None;
-        self.selection = None;
-        self.dragging = false;
     }
 
     pub(super) fn toggle_follow(&mut self) {

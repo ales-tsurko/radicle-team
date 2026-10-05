@@ -498,6 +498,10 @@ Use `Tab` or `Shift+Tab` to switch panels, or `s`, `t`, `i`, and `l` to jump to
 status, tasks, inbox, and logs. `/` filters the focused list or logs; `Esc`
 clears the filter or closes details. `?` shows keyboard help.
 
+Click an ID to select it, or drag to select text in any panel or detail view.
+Press `y` (or `c`) to copy. Shortened IDs copy their complete value. `Esc`
+clears the selection; selected text stays stable while other panels update.
+
 In logs, `↑` and `↓` scroll one line, `PgUp` and `PgDn` scroll one page, and
 `Home` jumps to the oldest retained entry. Scrolling pauses following and shows
 the number of new entries. `End` follows the newest entries. `Space` toggles
@@ -506,8 +510,9 @@ dashboard retains the latest 2,000 log lines.
 
 Drag across log lines to select them. `y` copies the selection, or all filtered
 log lines when nothing is selected. `w` saves the same text: edit the suggested
-path and press `Enter`. `Ctrl+U` clears the path; `Esc` cancels. Exports include
-complete lines without color codes. Saving keeps existing files.
+path and press `Enter`. `Ctrl+U` clears the path; `Esc` cancels. Exports omit
+color codes; selecting entire log lines includes their full text. Saving keeps
+existing files.
 
 On macOS, local sessions use the system clipboard. Over SSH and on other
 platforms, copying requires your terminal's clipboard support to be enabled.

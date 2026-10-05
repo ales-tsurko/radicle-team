@@ -103,9 +103,13 @@ impl Dashboard {
             }
             if let Some(export) = screen.export.take() {
                 if exporting.is_some() {
-                    screen.notice = Some(Err("A log export is already in progress".to_owned()));
+                    screen.notice = Some(Err("An export is already in progress".to_owned()));
                 } else {
-                    screen.notice = Some(Ok("Exporting log…".to_owned()));
+                    let progress = match &export {
+                        export::Export::Copy { .. } => "Copying…",
+                        export::Export::Save { .. } => "Saving log…",
+                    };
+                    screen.notice = Some(Ok(progress.to_owned()));
                     exporting = Some(export.execute().boxed());
                 }
             }

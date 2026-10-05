@@ -2,7 +2,7 @@
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap},
@@ -35,6 +35,7 @@ impl<'a> View<'a> {
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>) {
         self.screen.areas.clear();
         self.screen.overlay = None;
+        self.screen.text.begin_frame();
         let area = frame.area();
         let narrow = area.width < 100 || area.height < 24;
         let [header, body, footer] = Layout::vertical([
@@ -43,6 +44,7 @@ impl<'a> View<'a> {
             Constraint::Length(1),
         ])
         .areas(area);
+        self.screen.header = header;
         self.header(frame, header);
         if narrow {
             self.compact(frame, body);
@@ -71,9 +73,10 @@ impl<'a> View<'a> {
             let (title, text) = self.detail();
             self.overlay(frame, &title, text);
         }
+        self.screen.text.render(frame.buffer_mut());
     }
 
-    fn header(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn header(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let phase = self.screen.phase().to_string();
         let snapshot = self.screen.data.snapshot.as_ref();
         let uptime = snapshot.map_or_else(
@@ -125,6 +128,12 @@ impl<'a> View<'a> {
             ));
         }
         frame.render_widget(Paragraph::new(text), area);
+        let repository = self.screen.data.repository.to_string();
+        self.screen.text.bind(
+            Rect::new(area.x, area.y + 1, area.width, 1),
+            repository.clone(),
+            repository,
+        );
     }
 
     fn wide(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -183,7 +192,7 @@ impl<'a> View<'a> {
             .title(Line::styled(format!(" {title} "), Style::new().bold()))
     }
 
-    fn status(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn status(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let mut lines = [Role::Coder, Role::Talker, Role::Chatter]
             .map(|role| self.role(role))
             .to_vec();
@@ -198,6 +207,40 @@ impl<'a> View<'a> {
             Paragraph::new(lines).block(self.block(Panel::Status, "Status".to_owned())),
             area,
         );
+        let inner = area.inner(Margin::new(1, 1));
+        if let Some(did) = self.screen.data.did {
+            self.screen.text.bind(
+                Rect::new(inner.x, inner.y + 3, inner.width, 1).intersection(inner),
+                did.to_string(),
+                did.to_string(),
+            );
+        }
+        for (row, role) in [Role::Coder, Role::Talker, Role::Chatter]
+            .into_iter()
+            .enumerate()
+        {
+            let activity = self
+                .screen
+                .data
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.roles.get(&role))
+                .and_then(|status| status.activity.as_ref());
+            if let Some(activity) = activity {
+                let row =
+                    Rect::new(inner.x, inner.y + row as u16, inner.width, 1).intersection(inner);
+                let source = activity.source.clone();
+                let task_visible = activity
+                    .task
+                    .is_some_and(|id| self.screen.data.tasks.iter().any(|(task, _)| task.id == id));
+                if let Some(id) = activity.task {
+                    self.screen.text.bind(row, format!("#{id}"), id.to_string());
+                }
+                if !task_visible {
+                    self.bind_source(row, &source);
+                }
+            }
+        }
     }
 
     fn role(&self, role: Role) -> Line<'static> {
@@ -323,6 +366,61 @@ impl<'a> View<'a> {
             &mut self.screen.inbox.state
         };
         frame.render_stateful_widget(list, area, selection);
+        let offset = selection.offset();
+        let inner = area.inner(Margin::new(1, 1));
+        let indices = if panel == Panel::Tasks {
+            self.screen.task_indices()
+        } else {
+            self.screen.inbox_indices()
+        };
+        for (row, index) in indices
+            .into_iter()
+            .skip(offset)
+            .take(usize::from(inner.height).div_ceil(2))
+            .enumerate()
+        {
+            let heading =
+                Rect::new(inner.x, inner.y + row as u16 * 2, inner.width, 1).intersection(inner);
+            let metadata = Rect::new(inner.x, heading.y + 1, inner.width, 1).intersection(inner);
+            if panel == Panel::Tasks {
+                let Some((task, _)) = self.screen.data.tasks.get(index) else {
+                    continue;
+                };
+                let id = task.id;
+                let source = task.source.to_string();
+                self.screen
+                    .text
+                    .bind(heading, format!("#{id}"), id.to_string());
+                self.bind_source(metadata, &source);
+            } else {
+                let Some(record) = self.screen.data.deliveries.get(index) else {
+                    continue;
+                };
+                let subject = record.activity.subject.to_string();
+                if let Some(id) = record.task {
+                    self.screen
+                        .text
+                        .bind(heading, format!("#{id}"), id.to_string());
+                }
+                if self.screen.data.did != Some(record.activity.author) {
+                    let author = record.activity.author.to_string();
+                    self.screen
+                        .text
+                        .bind(metadata, Self::short_identity(&author), author);
+                }
+                self.bind_source(heading, &subject);
+            }
+        }
+    }
+
+    fn bind_source(&mut self, area: Rect, source: &str) {
+        let value = source.split_once(':').map_or(source, |(_, id)| id);
+        self.screen
+            .text
+            .bind(area, value.chars().take(7).collect(), value.to_owned());
+        self.screen
+            .text
+            .bind(area, Self::short_subject(source), value.to_owned());
     }
 
     fn task_row(&self, task: &Task, taken: bool) -> ListItem<'static> {
@@ -399,16 +497,17 @@ impl<'a> View<'a> {
             .iter()
             .skip(start)
             .take(self.screen.logs.page)
-            .map(|line| {
-                let mut text = line.text.clone();
-                if self.screen.logs.selected(line.id) {
-                    for span in &mut text.spans {
-                        span.style = span.style.add_modifier(Modifier::REVERSED);
-                    }
-                }
-                text
-            })
+            .map(|line| line.text.clone())
             .collect();
+        let inner = area.inner(Margin::new(1, 1));
+        for (row, line) in lines.iter().enumerate() {
+            let row = Rect::new(inner.x, inner.y + row as u16, inner.width, 1).intersection(inner);
+            let value = line.to_string();
+            self.screen
+                .text
+                .bind(row, value.clone(), format!("{value}\n"));
+            self.screen.text.bind_text(row, &value);
+        }
         let text = if lines.is_empty() {
             Text::from(Line::styled(
                 if self.screen.logs.filter.is_empty() {
@@ -428,21 +527,19 @@ impl<'a> View<'a> {
     }
 
     fn overlay(&mut self, frame: &mut Frame<'_>, title: &str, text: String) {
-        let area = frame.area();
-        let width = area.width.saturating_sub(4).min(100);
-        let height = area.height.saturating_sub(4);
-        let popup = Rect::new(
-            area.x + (area.width - width) / 2,
-            area.y + (area.height - height) / 2,
-            width,
-            height,
-        );
+        let popup = Self::popup(frame.area());
         self.screen.overlay = Some(popup);
-        self.screen.page = usize::from(height.saturating_sub(2)).max(1);
+        self.screen.page = usize::from(popup.height.saturating_sub(2)).max(1);
+        self.screen
+            .text
+            .bind_text(Rect::new(popup.x, popup.y, popup.width, 1), title);
+        self.screen
+            .text
+            .bind_text(popup.inner(Margin::new(1, 1)), &text);
         let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
         let maximum = paragraph
-            .line_count(width.saturating_sub(2))
-            .saturating_sub(usize::from(height.saturating_sub(2)));
+            .line_count(popup.width.saturating_sub(2))
+            .saturating_sub(usize::from(popup.height.saturating_sub(2)));
         self.screen.detail_scroll = self
             .screen
             .detail_scroll
@@ -457,6 +554,17 @@ impl<'a> View<'a> {
             ),
             popup,
         );
+    }
+
+    fn popup(area: Rect) -> Rect {
+        let width = area.width.saturating_sub(4).min(100);
+        let height = area.height.saturating_sub(4);
+        Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        )
     }
 
     fn detail(&self) -> (String, String) {
@@ -532,6 +640,7 @@ impl<'a> View<'a> {
                 .to_owned();
         };
         let mut lines = vec![
+            format!("Task: #{}", task.id),
             task.brief.clone(),
             format!(
                 "\nState: {}\nPriority: {}\nSource: {}",
@@ -611,7 +720,7 @@ impl<'a> View<'a> {
     }
 
     fn help() -> String {
-        "Tab / Shift+Tab    Next / previous panel\ns / t / i / l      Status / tasks / inbox / logs\n↑↓ or j/k          Select a row or scroll a line\nWheel / touchpad   Scroll the panel under the pointer\nPgUp / PgDn        Scroll one page\nHome / End         First / last row\nEnter              Inspect selected task, notification, or status\n/                  Filter the focused list or logs\nEsc                Clear selection / filter or close details\n\nLogs\nHome               Oldest retained entry\nEnd                Latest entry and resume following\nSpace              Pause / resume following\nDrag               Select log lines and pause following\ny                  Copy selected or filtered log lines\nw                  Save selected or filtered log lines\nScrolling          Pause following; new entries remain buffered\n\n?                  Show / close this help\nq / Ctrl+C         Gracefully stop the member\n\nStatus, tasks, and inbox refresh every second.\nLogs retain the latest 2,000 lines."
+        "Tab / Shift+Tab    Next / previous panel\ns / t / i / l      Status / tasks / inbox / logs\n↑↓ or j/k          Select a row or scroll a line\nWheel / touchpad   Scroll the panel under the pointer\nPgUp / PgDn        Scroll one page\nHome / End         First / last row\nEnter              Inspect selected task, notification, or status\nClick an ID        Select its complete value, even when shortened\nDrag               Select text in any panel or detail\ny / c              Copy selected text\n/                  Filter the focused list or logs\nEsc                Clear selection / filter or close details\n\nLogs\nHome               Oldest retained entry\nEnd                Latest entry and resume following\nSpace              Pause / resume following\ny                  Copy selection, or all filtered log lines\nw                  Save selection, or all filtered log lines\nScrolling          Pause following; new entries remain buffered\n\n?                  Show / close this help\nq / Ctrl+C         Gracefully stop the member\n\nStatus, tasks, and inbox refresh every second.\nLogs retain the latest 2,000 lines."
             .to_owned()
     }
 

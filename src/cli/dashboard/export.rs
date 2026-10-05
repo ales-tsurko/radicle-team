@@ -1,4 +1,4 @@
-//! Plain-text exports without interrupting the member or overwriting existing files.
+//! Clipboard copies and plain-text exports without interrupting the member.
 
 use std::{
     fs::OpenOptions,
@@ -10,33 +10,41 @@ use crossterm::clipboard::CopyToClipboard;
 
 #[derive(Debug)]
 pub(super) enum Export {
-    Copy(String),
-    Save { path: PathBuf, contents: String },
+    Copy {
+        contents: String,
+        description: String,
+    },
+    Save {
+        path: PathBuf,
+        contents: String,
+    },
 }
 
 impl Export {
     pub(super) async fn execute(self) -> Result<String, Error> {
         match self {
-            Self::Copy(contents) => {
+            Self::Copy {
+                contents,
+                description,
+            } => {
                 #[cfg(target_os = "macos")]
                 if std::env::var_os("SSH_TTY").is_none()
                     && std::env::var_os("SSH_CONNECTION").is_none()
                 {
-                    return Self::copy_to_process(
+                    Self::copy_to_process(
                         contents,
                         tokio::process::Command::new("/usr/bin/pbcopy"),
                     )
-                    .await;
+                    .await?;
+                    return Ok(format!("Copied {description}"));
                 }
-                let count = contents.lines().count();
                 crossterm::execute!(
                     io::stdout().lock(),
                     CopyToClipboard::to_clipboard_from(contents)
                 )
                 .map_err(Error::Clipboard)?;
                 Ok(format!(
-                    "Sent {count} log lines to terminal clipboard · clipboard access must be \
-                     enabled"
+                    "Sent {description} to terminal clipboard · clipboard access must be enabled"
                 ))
             }
             Self::Save { path, contents } => {
@@ -59,10 +67,9 @@ impl Export {
     pub(super) async fn copy_to_process(
         contents: String,
         mut command: tokio::process::Command,
-    ) -> Result<String, Error> {
+    ) -> Result<(), Error> {
         use tokio::io::AsyncWriteExt as _;
 
-        let count = contents.lines().count();
         let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
@@ -85,7 +92,7 @@ impl Export {
                 "clipboard program exited with {status}"
             ))));
         }
-        Ok(format!("Copied {count} log lines"))
+        Ok(())
     }
 }
 
@@ -99,8 +106,8 @@ pub(super) struct SavePrompt {
 pub(super) enum Error {
     #[error("could not save log to '{path}': {source}")]
     File { path: PathBuf, source: io::Error },
-    #[error("could not copy log: {0}")]
+    #[error("could not copy to clipboard: {0}")]
     Clipboard(io::Error),
-    #[error("log export failed: {0}")]
+    #[error("dashboard export failed: {0}")]
     Worker(#[from] tokio::task::JoinError),
 }

@@ -12,6 +12,7 @@ use crate::{
     cli::dashboard::{
         export::{Export, SavePrompt},
         logs::LogView,
+        selection::TextSelection,
     },
     delivery::{Record, State},
     status::{Inspection, Phase, Snapshot},
@@ -35,8 +36,10 @@ pub(super) struct Screen {
     pub(super) refresh_error: Option<String>,
     pub(super) page: usize,
     pub(super) areas: BTreeMap<Panel, Rect>,
+    pub(super) header: Rect,
     pub(super) overlay: Option<Rect>,
     pub(super) saving: Option<SavePrompt>,
+    pub(super) text: TextSelection,
     pub(super) export: Option<Export>,
     pub(super) notice: Option<Result<String, String>>,
     starting: bool,
@@ -60,8 +63,10 @@ impl Screen {
             refresh_error: None,
             page: 1,
             areas: Default::default(),
+            header: Rect::default(),
             overlay: None,
             saving: None,
+            text: TextSelection::default(),
             export: None,
             notice: None,
             starting: true,
@@ -182,12 +187,14 @@ impl Screen {
             "Enter save  Esc cancel  Ctrl+U clear path".to_owned()
         } else if self.editing {
             format!("/{}▏   Enter apply · Esc clear", self.filter())
-        } else if self.help || self.detail.is_some() {
+        } else if self.help {
             "↑↓ scroll  PgUp/PgDn page  Esc close  q stop".to_owned()
+        } else if self.detail.is_some() {
+            "↑↓ scroll  Drag select  y copy  Esc close  q stop".to_owned()
         } else if width < 60 {
-            "Tab panels  ? help  q stop".to_owned()
+            "Drag select  y copy  ? help  q stop".to_owned()
         } else if self.focus == Panel::Status {
-            "Tab panels  Enter details  ? help  q stop".to_owned()
+            "Tab panels  Enter details  Drag select  y copy  ? help  q stop".to_owned()
         } else if self.focus == Panel::Logs && width < 100 {
             "↑↓ scroll  Space follow  y copy  w save  ? help  q stop".to_owned()
         } else if self.focus == Panel::Logs {
@@ -195,7 +202,8 @@ impl Screen {
              stop"
                 .to_owned()
         } else {
-            "Tab panels  ↑↓ select  Enter details  / filter  ? help  q stop".to_owned()
+            "Tab panels  ↑↓ select  Enter details  / filter  Drag select  y copy  ? help  q stop"
+                .to_owned()
         };
         if !self.editing && !self.filter().is_empty() {
             format!("Filter: {} · {text}", self.filter())
@@ -228,10 +236,19 @@ impl Screen {
         if key.code == KeyCode::Char('q') {
             return true;
         }
+        if matches!(key.code, KeyCode::Char('y' | 'c')) {
+            self.copy();
+            return false;
+        }
+        if key.code == KeyCode::Esc && self.text.active() {
+            self.text.clear();
+            return false;
+        }
         if self.help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter) {
                 self.help = false;
                 self.detail_scroll = 0;
+                self.text.clear();
             } else {
                 self.scroll_detail(key.code);
             }
@@ -247,35 +264,47 @@ impl Screen {
 
     pub(super) fn mouse(&mut self, event: MouseEvent) {
         if event.kind == MouseEventKind::Up(MouseButton::Left) {
-            self.logs.dragging = false;
+            self.text.dragging = false;
         }
-        if self.saving.is_some() {
+        if self.saving.is_some() || self.editing {
             return;
         }
-        if self.overlay.is_none()
-            && !self.editing
-            && let Some(area) = self.areas.get(&Panel::Logs)
-        {
-            let inner = area.inner(Margin::new(1, 1));
-            if inner.contains(Position::new(event.column, event.row)) {
-                let extend =
-                    event.kind == MouseEventKind::Drag(MouseButton::Left) && self.logs.dragging;
-                if event.kind == MouseEventKind::Down(MouseButton::Left) || extend {
-                    self.focus = Panel::Logs;
-                    self.notice = None;
-                    self.logs.dragging = true;
-                    self.logs
-                        .select_row(usize::from(event.row - inner.y), extend);
-                    return;
+        let position = Position::new(event.column, event.row);
+        if event.kind == MouseEventKind::Drag(MouseButton::Left) && self.text.dragging {
+            self.text.extend(position);
+            return;
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            let area = if let Some(popup) = self.overlay {
+                if position.y == popup.y {
+                    Rect::new(popup.x, popup.y, popup.width, 1)
+                } else {
+                    popup.inner(Margin::new(1, 1))
                 }
+            } else if let Some((&panel, &area)) = self
+                .areas
+                .iter()
+                .find(|(_, area)| area.inner(Margin::new(1, 1)).contains(position))
+            {
+                self.focus = panel;
+                if panel == Panel::Logs {
+                    self.logs.scroll(0);
+                }
+                area.inner(Margin::new(1, 1))
+            } else {
+                self.header
+            };
+            if area.contains(position) {
+                self.notice = None;
+                self.text.start(area, position);
             }
+            return;
         }
         let code = match event.kind {
             MouseEventKind::ScrollUp => KeyCode::Up,
             MouseEventKind::ScrollDown => KeyCode::Down,
             _ => return,
         };
-        let position = Position::new(event.column, event.row);
         if let Some(area) = self.overlay {
             if area.contains(position) {
                 self.scroll_detail(code);
@@ -289,6 +318,12 @@ impl Screen {
     }
 
     fn navigate(&mut self, code: KeyCode) {
+        if matches!(
+            code,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('s' | 't' | 'i' | 'l' | '?' | '/')
+        ) {
+            self.text.clear();
+        }
         match code {
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.previous(),
@@ -302,26 +337,17 @@ impl Screen {
             }
             KeyCode::Char('/') if self.focus != Panel::Status => self.editing = true,
             KeyCode::Esc => {
-                self.logs.selection = None;
-                self.logs.dragging = false;
                 self.filter_mut().clear();
                 self.reconcile();
             }
             KeyCode::Enter => self.open_detail(),
-            KeyCode::Char('y') if self.focus == Panel::Logs => {
-                let contents = self.logs.export_text();
-                if contents.is_empty() {
-                    self.notice = Some(Err("No log lines to copy".to_owned()));
-                } else {
-                    self.export = Some(Export::Copy(contents));
-                }
-            }
             KeyCode::Char('w') if self.focus == Panel::Logs => {
-                let contents = self.logs.export_text();
+                let contents = self.export_text();
                 if contents.is_empty() {
                     self.notice = Some(Err("No log lines to save".to_owned()));
                 } else {
                     self.logs.scroll(0);
+                    self.text.clear();
                     self.saving = Some(SavePrompt {
                         path: self
                             .data
@@ -339,10 +365,7 @@ impl Screen {
     }
 
     fn edit_filter(&mut self, code: KeyCode) {
-        if self.focus == Panel::Logs {
-            self.logs.selection = None;
-            self.logs.dragging = false;
-        }
+        self.text.clear();
         match code {
             KeyCode::Enter => self.editing = false,
             KeyCode::Esc => {
@@ -356,6 +379,32 @@ impl Screen {
             _ => {}
         }
         self.reconcile();
+    }
+
+    fn export_text(&self) -> String {
+        if self.text.active() {
+            self.text.contents()
+        } else if self.focus == Panel::Logs && self.detail.is_none() && !self.help {
+            self.logs.export_text()
+        } else {
+            String::new()
+        }
+    }
+
+    fn copy(&mut self) {
+        let contents = self.export_text();
+        if contents.is_empty() {
+            self.notice = Some(Err("Select text to copy".to_owned()));
+        } else {
+            self.export = Some(Export::Copy {
+                description: if self.text.active() {
+                    "selection".to_owned()
+                } else {
+                    format!("{} log lines", contents.lines().count())
+                },
+                contents,
+            });
+        }
     }
 
     fn edit_save(&mut self, key: KeyEvent) {
@@ -410,6 +459,9 @@ impl Screen {
     }
 
     fn scroll_panel(&mut self, code: KeyCode) {
+        if Self::distance(code, self.page) != 0 || code == KeyCode::Char(' ') {
+            self.text.clear();
+        }
         if self.focus == Panel::Logs {
             match code {
                 KeyCode::Home => self.logs.home(),
@@ -433,6 +485,7 @@ impl Screen {
     }
 
     fn open_detail(&mut self) {
+        self.text.clear();
         self.detail = match self.focus {
             Panel::Status => Some(Detail::Status),
             Panel::Tasks => self.tasks.id.clone().map(Detail::Task),
@@ -443,6 +496,9 @@ impl Screen {
     }
 
     fn scroll_detail(&mut self, code: KeyCode) {
+        if Self::distance(code, self.page) != 0 || matches!(code, KeyCode::Esc | KeyCode::Enter) {
+            self.text.clear();
+        }
         if code == KeyCode::Esc || code == KeyCode::Enter {
             self.detail = None;
             return;
