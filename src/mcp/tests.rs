@@ -73,8 +73,13 @@ impl RepositoryFixture {
     fn new() -> Self {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let home = Home::new(root.path().join("home")).expect("home should be created");
-        let profile = Profile::init(home, Alias::new("mcp-fixture"), None, Seed::generate())
-            .expect("profile should be initialized");
+        let profile = Profile::init(
+            home,
+            Alias::new("mcp-fixture"),
+            None,
+            Seed::new(rand::random()),
+        )
+        .expect("profile should be initialized");
         let working = root.path().join("working");
         let checkout = git2::Repository::init(&working).expect("repository should initialize");
         let signature =
@@ -299,8 +304,13 @@ mcp_allow = ["read", "reactions"]
     async fn service_as(&self, member: Member, role: Role, queue: TaskQueue) -> ToolService {
         let home = Home::new(self._root.path().join(format!("{}-{role:?}", member.id())))
             .expect("member home should open");
-        let mut profile = Profile::init(home, Alias::new(member.id()), None, Seed::generate())
-            .expect("member identity should initialize");
+        let mut profile = Profile::init(
+            home,
+            Alias::new(member.id()),
+            None,
+            Seed::new(rand::random()),
+        )
+        .expect("member identity should initialize");
         profile.storage = self.profile.storage.clone();
         let publisher = crate::agent::Publisher::new(
             profile,
@@ -547,8 +557,13 @@ fn exposes_the_complete_mcp_tool_set() {
 async fn starts_on_a_loopback_capability_url_and_stops() {
     let root = tempfile::tempdir().expect("temporary directory should be created");
     let home = Home::new(root.path()).expect("Radicle home should be created");
-    let profile = Profile::init(home, Alias::new("mcp-test"), None, Seed::generate())
-        .expect("Radicle profile should be initialized");
+    let profile = Profile::init(
+        home,
+        Alias::new("mcp-test"),
+        None,
+        Seed::new(rand::random()),
+    )
+    .expect("Radicle profile should be initialized");
     let repository = RepoId::from_str(REPOSITORY).expect("repository should be valid");
     let publisher = crate::agent::Publisher::new(
         profile.clone(),

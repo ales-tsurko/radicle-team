@@ -461,16 +461,22 @@ mod tests {
                 result.expect("an adapter failure must not end the builder");
                 Vec::new()
             }
-            attempts = tokio::time::timeout(
-                super::RETRY_DELAY + std::time::Duration::from_secs(10),
-                async {
-                    let mut attempts = Vec::new();
-                    for _ in 0..3 {
-                        attempts.push(observed.recv().await.expect("builder should stay active"));
-                    }
-                    attempts
-                },
-            ) => attempts.expect("the same task should retry after the delay"),
+            attempts = async {
+                let mut attempts = Vec::new();
+                for _ in 0..3 {
+                    // Each attempt prepares a real sandboxed worktree. Bound progress separately
+                    // instead of making all three preparations share one retry deadline.
+                    let attempt = tokio::time::timeout(
+                        super::RETRY_DELAY + std::time::Duration::from_secs(30),
+                        observed.recv(),
+                    )
+                    .await
+                    .expect("each attempt should make progress after the retry delay")
+                    .expect("builder should stay active");
+                    attempts.push(attempt);
+                }
+                attempts
+            } => attempts,
         };
         let [initial, retried, following]: [Task; 3] = attempts
             .try_into()
@@ -493,7 +499,7 @@ mod tests {
             Home::new(root.join("identity")).expect("profile home should be created"),
             Alias::new("builder-test"),
             None,
-            Seed::generate(),
+            Seed::new(rand::random()),
         )
         .expect("profile should initialize");
         let repository = {

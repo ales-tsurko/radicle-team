@@ -806,6 +806,9 @@ pub enum Error {
     /// Opening or validating the member's Radicle repository failed.
     #[error("member repository operation failed: {0}")]
     Repository(#[from] radicle::storage::RepositoryError),
+    /// Preparing the member's Radicle storage failed.
+    #[error("member storage operation failed: {0}")]
+    Storage(#[from] radicle::storage::Error),
     /// Reading the repository's collaborative objects failed.
     #[error("member collaborative object operation failed: {0}")]
     Cob(#[from] radicle::cob::store::Error),

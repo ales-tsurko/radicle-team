@@ -1045,7 +1045,7 @@ mod tests {
 
     #[test]
     fn validates_chat_configuration_and_authenticates_only_the_pinned_account() {
-        use radicle::crypto::{Signature, signature::Signer as _, ssh::keystore::MemorySigner};
+        use radicle::crypto::{Signature, SigningKey, signature::Signer as _};
 
         use crate::chat::{
             AttestationPayload, ClientCertificateFingerprint, IrcAccount, Server, ServerEndpoint,
@@ -1059,7 +1059,7 @@ mod tests {
         const CERTIFICATE: &str =
             "cert-sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
-        let signer = MemorySigner::r#gen();
+        let signer = SigningKey::from_seed(radicle::crypto::Seed::new(rand::random()));
         let did = Did::from(*radicle::crypto::Signer::public_key(&signer));
         let repository = REPOSITORY.parse().expect("RID should parse");
         let server = Server::new(

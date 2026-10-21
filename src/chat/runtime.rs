@@ -501,7 +501,7 @@ mod tests {
     use config::{Config as ConfigLoader, File, FileFormat};
     use irc_proto::Message;
     use radicle::{
-        crypto::{Signature, signature::Signer as _, ssh::keystore::MemorySigner},
+        crypto::{Signature, SigningKey, signature::Signer as _},
         identity::{Did, RepoId},
     };
     use rcgen::generate_simple_self_signed;
@@ -639,9 +639,9 @@ mod tests {
 
     fn fixture() -> (RepoId, Did, ServerPin, Config, ClientIdentity) {
         let repository = REPOSITORY.parse().expect("RID should parse");
-        let signer = MemorySigner::r#gen();
+        let signer = SigningKey::from_seed(radicle::crypto::Seed::new(rand::random()));
         let did = Did::from(*radicle::crypto::Signer::public_key(&signer));
-        let alice = MemorySigner::r#gen();
+        let alice = SigningKey::from_seed(radicle::crypto::Seed::new(rand::random()));
         let alice_did = Did::from(*radicle::crypto::Signer::public_key(&alice));
         let generated = generate_simple_self_signed(vec!["nico".to_owned()])
             .expect("certificate should be generated");

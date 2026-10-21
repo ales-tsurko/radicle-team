@@ -1260,7 +1260,7 @@ impl AgentRuntime {
             Application::warn_agent_shutdown(talker.shutdown().await);
             Application::warn_agent_shutdown(chatter.shutdown().await);
             Application::warn_agent_shutdown(coder.shutdown().await);
-            Application::warn_mcp_stop(servers.stop().await);
+            Application::warn_mcp_stop(Box::pin(servers.stop()).await);
             return Err(error);
         }
 
@@ -1639,7 +1639,7 @@ impl AgentRuntime {
         let talker = talker.shutdown().await;
         let chatter = chatter.shutdown().await;
         let coder = coder.shutdown().await;
-        let mcp = self.resources.servers.stop().await;
+        let mcp = Box::pin(self.resources.servers.stop()).await;
         let failure = if interrupted {
             None
         } else {
@@ -2415,7 +2415,7 @@ mod tests {
             Home::new(root.path().join("identity")).expect("identity home should create"),
             Alias::new("replication-test"),
             None,
-            Seed::generate(),
+            Seed::new(rand::random()),
         )
         .expect("identity should create");
         let checkout = git2::Repository::init(root.path().join("checkout"))
@@ -2740,8 +2740,13 @@ mod tests {
     fn rejects_a_public_security_repository() {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let home = Home::new(root.path().join("home")).expect("Radicle home should be created");
-        let profile = Profile::init(home, Alias::new("security-test"), None, Seed::generate())
-            .expect("Radicle profile should initialize");
+        let profile = Profile::init(
+            home,
+            Alias::new("security-test"),
+            None,
+            Seed::new(rand::random()),
+        )
+        .expect("Radicle profile should initialize");
         let working = root.path().join("working");
         let checkout = git2::Repository::init(&working).expect("Git repository should initialize");
         checkout
@@ -2821,7 +2826,7 @@ mod tests {
     #[tokio::test]
     async fn activation_waits_for_canonical_approval_and_rejects_an_invalid_binding() {
         use radicle::{
-            node::device::Device,
+            profile::Signer,
             storage::{ReadRepository as _, SignRepository as _, WriteRepository as _},
         };
 
@@ -2841,7 +2846,7 @@ mod tests {
                 },
             )
             .expect("member identity should create");
-        let signer = Device::from(identity.memory_signer().expect("signer should load")).boxed();
+        let signer = Signer::Key(identity.memory_signer().expect("signer should load"));
         let source =
             git2::Repository::init(root.path().join("source")).expect("source should initialize");
         source

@@ -1,11 +1,15 @@
 //! Persistent IRC client certificate and private key.
 
 use std::{
-    io::{self, Cursor, Read as _, Write as _},
+    io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
 };
 
 use rcgen::generate_simple_self_signed;
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer,
+    pem::{self, PemObject as _},
+};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -38,18 +42,13 @@ impl Credentials {
             path: path.into(),
             source,
         })?;
-        let certificates = rustls_pemfile::certs(&mut Cursor::new(&pem))
+        let certificates = CertificateDer::pem_slice_iter(&pem)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| Error::Pem {
-                path: path.into(),
-                source,
-            })?;
-        let private_key = rustls_pemfile::private_key(&mut Cursor::new(&pem))
-            .map_err(|source| Error::Pem {
-                path: path.into(),
-                source,
-            })?
-            .ok_or_else(|| Error::MissingPrivateKey(path.into()))?;
+            .map_err(|_source| Error::Pem { path: path.into() })?;
+        let private_key = PrivateKeyDer::from_pem_slice(&pem).map_err(|source| match source {
+            pem::Error::NoItemsFound => Error::MissingPrivateKey(path.into()),
+            _source => Error::Pem { path: path.into() },
+        })?;
         let certificate = certificates
             .first()
             .ok_or_else(|| Error::MissingCertificate(path.into()))?;
@@ -134,13 +133,11 @@ pub(crate) enum Error {
     /// The identity file has unsafe ownership, permissions, or type.
     #[error(transparent)]
     Permissions(#[from] permissions::Error),
-    /// PEM decoding failed.
-    #[error("failed to decode IRC identity '{path}': {source}")]
+    /// PEM decoding failed. Parser diagnostics can contain private input bytes.
+    #[error("failed to decode IRC identity '{path}'")]
     Pem {
         /// Identity path.
         path: PathBuf,
-        /// PEM decoder error.
-        source: io::Error,
     },
     /// The identity contains no certificate.
     #[error("IRC identity '{0}' contains no certificate")]
@@ -163,7 +160,34 @@ mod tests {
         sync::{Arc, Barrier},
     };
 
-    use crate::chat::credentials::Credentials;
+    use crate::{
+        chat::credentials::{Credentials, Error},
+        identity::permissions::Permissions,
+    };
+
+    #[test]
+    fn malformed_pem_diagnostics_do_not_disclose_private_input() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let path = root.path().join("irc-identity.pem");
+        let canary = "private-material-must-not-appear";
+        Permissions::write_private(&path, &format!("-----BEGIN {canary}\n"))
+            .expect("malformed identity fixture");
+
+        let error = Credentials::load(&path).expect_err("invalid PEM must be refused");
+        assert!(matches!(error, Error::Pem { .. }));
+        let diagnostic = format!("{error} {error:?}");
+        let encoded = canary
+            .as_bytes()
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(!diagnostic.contains(canary));
+        assert!(
+            !diagnostic.contains(&encoded),
+            "debug byte arrays also disclose the input"
+        );
+    }
 
     #[test]
     fn generates_and_reloads_the_same_private_identity() {

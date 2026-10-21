@@ -19,7 +19,7 @@ use crate::home::MemberHome;
 /// Exclusive ownership of one member home for the lifetime of a process.
 #[derive(Debug)]
 pub struct MemberLock {
-    _file: fs::File,
+    file: fs::File,
     session: String,
 }
 
@@ -54,10 +54,7 @@ impl MemberLock {
                         path: path.into(),
                         source,
                     })?;
-                Ok(Self {
-                    _file: file,
-                    session,
-                })
+                Ok(Self { file, session })
             }
             Err(fs::TryLockError::WouldBlock) => Err(Error::AlreadyRunning(home.path().into())),
             Err(fs::TryLockError::Error(source)) => Err(Error::Io {
@@ -106,6 +103,14 @@ impl MemberLock {
                 source,
             }),
         }
+    }
+}
+
+impl Drop for MemberLock {
+    fn drop(&mut self) {
+        // A concurrently spawned child can briefly inherit this open file description before
+        // exec closes it. Release ownership now instead of waiting for that duplicate to close.
+        let _unlocked = self.file.unlock();
     }
 }
 
@@ -164,6 +169,24 @@ mod tests {
         let _lock = MemberLock::acquire(&home).expect("first lock should be acquired");
 
         MemberLock::acquire(&home).expect_err("second lock should be rejected");
+    }
+
+    #[test]
+    fn releases_ownership_while_an_inherited_handle_stays_open() {
+        let directory = TestDirectory::new();
+        let home = MemberHome::at(&directory.0);
+        let lock = MemberLock::acquire(&home).expect("lock should acquire");
+        let inherited = lock
+            .file
+            .try_clone()
+            .expect("inherited handle should duplicate");
+
+        drop(lock);
+        let replacement = MemberLock::acquire(&home)
+            .expect("dropping the owner must release its lock before inherited handles close");
+        drop(inherited);
+        MemberLock::acquire(&home).expect_err("the replacement must retain ownership");
+        drop(replacement);
     }
 
     #[test]

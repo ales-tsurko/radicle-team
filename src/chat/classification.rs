@@ -296,7 +296,7 @@ mod tests {
     use config::{Config as ConfigLoader, File, FileFormat};
     use irc_proto::Message;
     use radicle::{
-        crypto::{Signature, signature::Signer as _, ssh::keystore::MemorySigner},
+        crypto::{Signature, SigningKey, signature::Signer as _},
         identity::{Did, RepoId},
     };
 
@@ -330,9 +330,9 @@ mod tests {
             let repository = REPOSITORY.parse().expect("RID should parse");
             let server_pin = SERVER_PIN.parse().expect("server pin should parse");
             let server = Server::new(ENDPOINT.parse().expect("endpoint should parse"), server_pin);
-            let nico = MemorySigner::r#gen();
-            let maya = MemorySigner::r#gen();
-            let alice = MemorySigner::r#gen();
+            let nico = SigningKey::from_seed(radicle::crypto::Seed::new(rand::random()));
+            let maya = SigningKey::from_seed(radicle::crypto::Seed::new(rand::random()));
+            let alice = SigningKey::from_seed(radicle::crypto::Seed::new(rand::random()));
             let participants = [
                 participant(&nico, repository, &server, "nico", 1),
                 participant(&maya, repository, &server, "maya", 2),
@@ -390,12 +390,12 @@ mod tests {
         }
     }
 
-    fn did(signer: &MemorySigner) -> Did {
+    fn did(signer: &SigningKey) -> Did {
         Did::from(*radicle::crypto::Signer::public_key(signer))
     }
 
     fn participant(
-        signer: &MemorySigner,
+        signer: &SigningKey,
         repository: RepoId,
         server: &Server,
         account: &str,
@@ -678,7 +678,7 @@ mod tests {
             Limits::default(),
         )
         .expect_err("another server must be rejected");
-        let unknown = MemorySigner::r#gen();
+        let unknown = SigningKey::from_seed(radicle::crypto::Seed::new(rand::random()));
         Classifier::new(
             fixture.repository,
             Member::Nico,

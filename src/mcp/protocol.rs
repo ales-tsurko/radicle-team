@@ -5,6 +5,7 @@ use std::{collections::BTreeSet, str::FromStr as _};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use radicle::{
     cob::{Embed, EntryId, ObjectId, common::Uri, issue, patch},
+    crypto::Signer as _,
     storage::ReadRepository as _,
 };
 use rmcp::Json;
@@ -942,7 +943,7 @@ pub(super) fn parse_entry(value: &str) -> Result<EntryId, ServiceError> {
 pub(super) fn validate_merge(
     repository: &radicle::storage::git::Repository,
     patch: &patch::Patch,
-    signer: &radicle::node::device::BoxedDevice,
+    signer: &radicle::profile::Signer,
     revision: patch::RevisionId,
     commit: radicle::git::Oid,
 ) -> Result<(), ServiceError> {

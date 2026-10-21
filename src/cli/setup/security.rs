@@ -97,7 +97,12 @@ impl SecuritySetup {
         let profile = Profile::load().map_err(Error::OperatorProfile)?;
         match profile.signer() {
             Ok(_) => return Ok(()),
-            Err(error) if error.prompt_for_passphrase() => {}
+            Err(
+                radicle::profile::SignerError::AgentConnection(_)
+                | radicle::profile::SignerError::Agent(
+                    radicle::crypto::ssh::agent::IntoSignerError::IdentityNotFound { .. },
+                ),
+            ) => {}
             Err(error) => return Err(Error::OperatorSigner(error)),
         }
 
@@ -213,12 +218,13 @@ mod tests {
         let repository =
             git2::Repository::open(directory.path()).expect("Git repository should open");
         let head = repository.head().expect("repository should have a head");
-        assert_eq!(head.shorthand(), Some("main"));
+        assert_eq!(head.shorthand().expect("branch name"), "main");
         assert_eq!(
             head.peel_to_commit()
                 .expect("head should resolve to a commit")
-                .message(),
-            Some("Initialize security reports")
+                .message()
+                .expect("commit message"),
+            "Initialize security reports"
         );
     }
 

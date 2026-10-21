@@ -1,0 +1,23 @@
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Ed25519 DID fingerprints are public identifiers, not credentials"
+regexTarget = "secret"
+regexes = ['''^z6Mk[1-9A-HJ-NP-Za-km-z]{44}$''']
+
+[[rules]]
+id = "local-runtime-state"
+description = "Local assistant settings and member credentials must not be committed"
+path = '''(^|/)(radicle-team-member\.toml|irc-identity\.pem|identity/keys/.*|harness/\.providers/.*|credentials/[^/]+\.toml|\.claude/.*)$'''
+
+[[rules]]
+id = "credential-assignment"
+description = "Detect credential assignments even beside an allowed public DID"
+regex = '''(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret)["']?\s*[:=]\s*["']([A-Za-z0-9_./+=-]{20,})["']'''
+secretGroup = 1
+entropy = 4.2
+keywords = ["api_key", "apikey", "api-key", "access_token", "access-token", "refresh_token", "refresh-token", "client_secret", "client-secret"]

@@ -101,7 +101,7 @@ async fn inspection_of_a_never_started_member_creates_nothing() {
 
     let keystore = Keystore::new(&fixture.home.identity().join("keys"));
     let key = keystore
-        .init("nico", None, Seed::generate())
+        .init("nico", None, Seed::new(rand::random()))
         .expect("test identity should create");
     fs::remove_file(keystore.secret_key_path()).expect("secret key should remove");
     let public_path = keystore.public_key_path().expect("public key has a path");

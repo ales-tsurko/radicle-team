@@ -2,3 +2,26 @@
 /target
 .rumdl_cache/
 /RADICLE_INTEGRATION_SPEC.md
+
+# Local assistant settings and credentials never belong in source control.
+.claude/
+.env
+.env.*
+!.env.example
+credentials/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Keep member homes outside this checkout. Also exclude their root-level state
+# if setup is accidentally pointed at the source directory.
+/radicle-team-member.toml
+/sandbox.toml
+/identity/
+/harness/
+/cache/
+/code/
+/state.db
+/state.db-*
+/node.log

@@ -23,11 +23,8 @@ use std::{
 
 use radicle::{
     crypto::{
-        KeyPair, PublicKey, Seed,
-        ssh::{
-            Keystore, Passphrase,
-            keystore::{MemorySigner, MemorySignerError},
-        },
+        Seed, SigningKey,
+        ssh::{Keystore, Passphrase},
     },
     git,
     identity::{Did, RepoId},
@@ -35,7 +32,10 @@ use radicle::{
     profile::{Config, Home as RadicleHome, Profile as RadicleProfile},
     storage::git::{Storage, transport},
 };
-use rand::distr::{Alphanumeric, SampleString as _};
+use rand::{
+    TryRngCore as _,
+    distr::{Alphanumeric, SampleString as _},
+};
 
 use crate::{
     home::MemberHome,
@@ -53,7 +53,7 @@ pub struct Identity {
     profile: RadicleProfile,
     did: Did,
     passphrase: Option<Passphrase>,
-    signer: Option<MemorySigner>,
+    signer: Option<SigningKey>,
 }
 
 impl fmt::Debug for Identity {
@@ -80,7 +80,7 @@ impl Identity {
         &self.profile
     }
 
-    pub(crate) fn memory_signer(&self) -> Option<MemorySigner> {
+    pub(crate) fn memory_signer(&self) -> Option<SigningKey> {
         self.signer.clone()
     }
 
@@ -117,7 +117,7 @@ impl Identity {
             drop(profile.signer()?);
             None
         } else {
-            Some(MemorySigner::load(&profile.keystore, passphrase.clone())?)
+            Some(SigningKey::load(&profile.keystore, passphrase.clone())?)
         };
         Permissions::private_file(profile.keystore.secret_key_path())?;
         let did = Did::from(profile.id());
@@ -198,8 +198,13 @@ where
                 (profile, passphrase)
             }
             ProfileFiles::Empty => {
-                let seed = Seed::generate();
-                let key = PublicKey::from(KeyPair::from_seed(seed).pk);
+                let mut bytes = [0; Seed::BYTES];
+                rand::rngs::OsRng
+                    .try_fill_bytes(&mut bytes)
+                    .map_err(io::Error::other)?;
+                let seed = Seed::new(bytes);
+                let key =
+                    *radicle::crypto::Signer::public_key(&SigningKey::from_seed(seed.clone()));
                 let passphrase = self.new_passphrase(member, Did::from(key), protection)?;
                 let alias = Alias::from_str(member.id())?;
                 let profile = RadicleProfile::init(home, alias, passphrase.clone(), seed)?;
@@ -410,7 +415,7 @@ pub enum Error {
     PartialProfile(PathBuf),
     /// Loading and checking the private signing key failed.
     #[error("failed to load Radicle signing key: {0}")]
-    SigningKey(#[from] MemorySignerError),
+    SigningKey(#[from] radicle::crypto::LoadError),
     /// Reading the OpenSSH key failed.
     #[error("Radicle keystore error: {0}")]
     Keystore(#[from] radicle::crypto::ssh::keystore::Error),
@@ -579,7 +584,7 @@ mod tests {
             radicle::profile::Home::new(home.identity()).expect("identity home should initialize"),
             "nico".parse().expect("alias should parse"),
             Some(passphrase.clone()),
-            radicle::crypto::Seed::generate(),
+            radicle::crypto::Seed::new(rand::random()),
         )
         .expect("legacy encrypted profile should initialize");
         let credentials = MemoryCredentials::default();

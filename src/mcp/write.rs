@@ -9,6 +9,7 @@ use radicle::{
         patch::{self, Patches},
         store::access::ReadOnly,
     },
+    crypto::Signer as _,
     storage::{ReadRepository as _, ReadStorage as _},
 };
 use rmcp::Json;
@@ -67,7 +68,7 @@ impl ToolService {
         T: Send + ToString + 'static,
         F: FnOnce(
                 &radicle::storage::git::Repository,
-                &radicle::node::device::BoxedDevice,
+                &radicle::profile::Signer,
                 &str,
             ) -> Result<T, PublishError>
             + Send

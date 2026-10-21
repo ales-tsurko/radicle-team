@@ -10,7 +10,7 @@ use radicle::{
             access::{ReadOnly, WriteAs},
         },
     },
-    crypto::PublicKey,
+    crypto::{PublicKey, Signer as _},
     storage::{ReadRepository, git::Repository},
 };
 use serde::{Deserialize, Serialize};
@@ -71,7 +71,7 @@ impl Deliveries {
 
     fn write(
         repository: &Repository,
-        signer: &radicle::node::device::BoxedDevice,
+        signer: &radicle::profile::Signer,
         member: Member,
         record: Record,
         marker: &str,

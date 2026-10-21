@@ -943,7 +943,7 @@ mod tests {
             profile_home,
             Alias::new("workspace-test"),
             None,
-            Seed::generate(),
+            Seed::new(rand::random()),
         )
         .expect("profile should initialize");
         let working = root.join("working");
@@ -1733,7 +1733,7 @@ mod tests {
             Home::new(fixture.profile.home.path().join("reviewer")).expect("reviewer home"),
             Alias::new("reviewer"),
             None,
-            Seed::generate(),
+            Seed::new(rand::random()),
         )
         .expect("reviewer identity");
         let mut workspaces = fixture.workspaces.clone();

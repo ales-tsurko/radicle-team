@@ -125,6 +125,11 @@ documents.
   documentation.
 - `make fmt` formats Rust with nightly `rustfmt` and Markdown with rumdl.
 - `make code-health` runs the extended health and analysis suite.
+- `make audit` optionally checks dependency advisories locally using
+  `cargo-audit`, with the documented [security policy](SECURITY.md).
+
+For an optional local secret scan, run
+`gitleaks git --redact=100 --ignore-gitleaks-allow --log-opts="--all"`.
 
 Terminal workflow tests require Python 3 and use disposable member homes and
 fake adapter and node binaries.

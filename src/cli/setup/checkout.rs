@@ -11,7 +11,7 @@ use radicle::{
     },
     git::Url,
     identity::RepoId,
-    node::device::Device,
+    profile::Signer,
     storage::{ReadRepository as _, ReadStorage as _, SignRepository as _, WriteRepository as _},
 };
 
@@ -79,6 +79,9 @@ impl RepositoryCheckout {
     fn initialize(&self) -> Result<(), Error> {
         let storage = &self.identity.profile().storage;
         let stored = storage.repository(self.repository)?;
+        // Replicated storage can lack a local Git identity. COB commits must use the member,
+        // regardless of whether the operator has a global Git identity configured.
+        stored.set_user(&self.identity.profile().info())?;
         let (_, canonical) = stored.canonical_head()?;
         let repository = Repository::open(&self.path)?;
         self.validate_checkout(&repository)?;
@@ -124,8 +127,7 @@ impl RepositoryCheckout {
         if !repository.is_worktree() || fs::canonicalize(repository.commondir())? != common {
             return Err(Error::CheckoutStorage);
         }
-        if repository.find_remote("rad")?.url()
-            != Some(Url::from(self.repository).to_string().as_str())
+        if repository.find_remote("rad")?.url()? != Url::from(self.repository).to_string().as_str()
         {
             return Err(Error::CheckoutRepository);
         }
@@ -323,7 +325,7 @@ impl RepositoryCheckout {
             )?
             .fetch(&[&head.to_string()], None, None)?;
         let signer = match self.identity.memory_signer() {
-            Some(signer) => Device::from(signer).boxed(),
+            Some(signer) => Signer::Key(signer),
             None => self.identity.profile().signer()?,
         };
         let id = match self.find_patch(proposal.base, head)? {
@@ -754,6 +756,16 @@ mod tests {
             .storage
             .repository(fixture.application.repository())
             .expect("member storage should open");
+        let commit = stored
+            .raw()
+            .find_commit((*id).into())
+            .expect("patch COB commit should read");
+        let info = checkout.identity.profile().info();
+        assert_eq!(
+            commit.author().name().expect("member name"),
+            info.name().as_ref()
+        );
+        assert_eq!(commit.author().email().expect("member email"), info.email());
         assert_eq!(
             stored
                 .raw()
@@ -1351,7 +1363,7 @@ mcp_allow = ["read"]
             git.statuses(None)
                 .expect("draft status")
                 .iter()
-                .any(|entry| entry.path() == Some(FILE_NAME))
+                .any(|entry| entry.path().is_ok_and(|path| path == FILE_NAME))
         );
         let mut changed: toml_edit::DocumentMut = fs::read_to_string(checkout.path.join(FILE_NAME))
             .expect("draft manifest")
@@ -1524,7 +1536,7 @@ mcp_allow = ["read"]
                 git.statuses(None)
                     .expect("manual draft status")
                     .iter()
-                    .any(|entry| entry.path() == Some(FILE_NAME))
+                    .any(|entry| entry.path().is_ok_and(|path| path == FILE_NAME))
             );
             assert_eq!(
                 crate::cli::provider::Context::load(home.clone())

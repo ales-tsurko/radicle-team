@@ -826,7 +826,7 @@ mod tests {
     use futures_util::{SinkExt as _, StreamExt as _};
     use irc_proto::{Command, Message};
     use radicle::{
-        crypto::{Signature, signature::Signer as _, ssh::keystore::MemorySigner},
+        crypto::{Signature, SigningKey, signature::Signer as _},
         identity::{Did, RepoId},
     };
     use rcgen::{CertifiedKey, PublicKeyData as _, generate_simple_self_signed};
@@ -887,7 +887,7 @@ mod tests {
 
     fn chat_config(
         server: &Server,
-        signer: &MemorySigner,
+        signer: &SigningKey,
         certificate: ClientCertificateFingerprint,
     ) -> (Config, Did) {
         let repository = REPOSITORY.parse::<RepoId>().expect("RID should parse");
@@ -901,7 +901,7 @@ mod tests {
             did,
         );
         let signature: Signature = signer.sign(payload.canonical().as_bytes());
-        let alice = MemorySigner::r#gen();
+        let alice = SigningKey::from_seed(radicle::crypto::Seed::new(rand::random()));
         let alice_did = Did::from(*radicle::crypto::Signer::public_key(&alice));
         let alice_account = "alice".parse::<IrcAccount>().expect("account should parse");
         let alice_certificate = ClientCertificateFingerprint::from_digest([9; 32]);
@@ -1002,7 +1002,7 @@ mod tests {
         let client_fingerprint = ClientCertificateFingerprint::from_digest(
             Sha256::digest(client_certificate.as_ref()).into(),
         );
-        let signer = MemorySigner::r#gen();
+        let signer = SigningKey::from_seed(radicle::crypto::Seed::new(rand::random()));
         let (config, did) = chat_config(&server, &signer, client_fingerprint);
         let project = "#project"
             .parse::<IrcChannel>()

@@ -224,7 +224,7 @@ impl<'a> CommentRecovery<'a> {
             return None;
         }
         comments.find_map(|(id, comment)| {
-            (comment.author() == author
+            (*comment.author() == author
                 && Some(comment.body()) == self.body
                 && comment.reply_to() == reply_to
                 && comment.location() == location

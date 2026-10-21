@@ -2,7 +2,7 @@
 
 use radicle::{
     cob::{EntryId, Reaction, issue, patch},
-    crypto::PublicKey,
+    crypto::{PublicKey, Signer as _},
 };
 
 use crate::{
@@ -64,7 +64,7 @@ impl Receipt {
     fn apply(
         self,
         repo: &radicle::storage::git::Repository,
-        signer: &radicle::node::device::BoxedDevice,
+        signer: &radicle::profile::Signer,
         subject: Subject,
         reaction: Reaction,
         marker: &str,

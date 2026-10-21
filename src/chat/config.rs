@@ -7,7 +7,7 @@ use std::{
 };
 
 use radicle::{
-    crypto::{PublicKey, Signature},
+    crypto::{PublicKey, Signature, VerifyingKey, signature::Verifier as _},
     identity::{Did, RepoId},
 };
 use serde::{Deserialize, Deserializer, de};
@@ -460,6 +460,7 @@ pub struct Attestation {
     account: IrcAccount,
     certificate: ClientCertificateFingerprint,
     did: Did,
+    #[serde(deserialize_with = "radicle::serde_ext::string::deserialize")]
     signature: Signature,
 }
 
@@ -491,8 +492,8 @@ impl Attestation {
             self.did,
         );
         let public_key = PublicKey::from(self.did);
-        public_key
-            .verify(payload.canonical().as_bytes(), &self.signature)
+        VerifyingKey::try_from(&public_key)
+            .and_then(|key| key.verify(payload.canonical().as_bytes(), &self.signature))
             .map_err(|_error| Error::InvalidSignature {
                 account: self.account.clone(),
                 did: self.did,
@@ -625,7 +626,10 @@ pub(crate) enum AuthenticationError {
 #[cfg(test)]
 mod tests {
     use radicle::{
-        crypto::{Signature, signature::Signer as _, ssh::keystore::MemorySigner},
+        crypto::{
+            Signature, SigningKey,
+            signature::{Signer as _, Verifier as _},
+        },
         identity::{Did, RepoId},
     };
 
@@ -640,7 +644,7 @@ mod tests {
     const CLIENT_CERTIFICATE: &str =
         "cert-sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
-    fn payload(signer: &MemorySigner) -> AttestationPayload {
+    fn payload(signer: &SigningKey) -> AttestationPayload {
         AttestationPayload::new(
             REPOSITORY.parse::<RepoId>().expect("RID should parse"),
             Server::new(
@@ -661,7 +665,7 @@ mod tests {
 
     #[test]
     fn defines_an_exact_canonical_attestation_payload() {
-        let signer = MemorySigner::r#gen();
+        let signer = SigningKey::from_seed(radicle::crypto::Seed::new(rand::random()));
         let payload = payload(&signer);
 
         assert_eq!(
@@ -683,7 +687,8 @@ mod tests {
             )
         );
         let signature: Signature = signer.sign(payload.canonical().as_bytes());
-        radicle::crypto::PublicKey::from(payload.did)
+        radicle::crypto::VerifyingKey::try_from(&radicle::crypto::PublicKey::from(payload.did))
+            .expect("valid verification key")
             .verify(payload.canonical().as_bytes(), &signature)
             .expect("canonical payload signature should verify");
     }

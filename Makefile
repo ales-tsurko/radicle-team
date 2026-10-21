@@ -7,13 +7,17 @@ CRAP_REPORT := target/radicle-team-crap.md
 CRAP_EXCLUDES := --exclude '**/build.rs' --exclude '**/benches/**' --exclude '**/examples/**' --exclude '**/tests.rs' --exclude '**/*_tests.rs' --exclude '**/tests/**'
 SIMILARITY_ARGS := src --threshold 0.92 --min-lines 12 --min-tokens 80 --fail-on-duplicates
 
-.PHONY: check test-all lint fmt code-health
+.PHONY: check test-all lint fmt code-health audit
 
 check:
 	cargo check $(CARGO_PACKAGES) --all-features --all-targets
 
 test-all:
 	cargo nextest run $(CARGO_PACKAGES) --all-features --all-targets
+
+audit:
+	# Radicle uses Ed25519 only. See SECURITY.md for the transitive RSA exception.
+	cargo audit --deny unsound --ignore RUSTSEC-2023-0071
 
 lint:
 	@status=0; \

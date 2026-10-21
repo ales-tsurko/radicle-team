@@ -885,7 +885,7 @@ mod tests {
             Home::new(root.path()).expect("home should be created"),
             Alias::new("dispatch-test"),
             None,
-            Seed::generate(),
+            Seed::new(rand::random()),
         )
         .expect("profile should initialize");
         let repository = RepoId::from_str("rad:z3cyotNHuasWowQ2h4yF9c3tFFdvc")
@@ -971,7 +971,7 @@ mod tests {
             Home::new(root.join("home")).expect("home should be created"),
             Alias::new("assignment-test"),
             None,
-            Seed::generate(),
+            Seed::new(rand::random()),
         )
         .expect("profile should initialize");
         let working = root.join("working");

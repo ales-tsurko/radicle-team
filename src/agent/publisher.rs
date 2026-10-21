@@ -10,10 +10,10 @@ use radicle::{
         store::access::ReadOnly,
         stream::CobStream as _,
     },
-    crypto::{PublicKey, ssh::keystore::MemorySigner},
+    crypto::{PublicKey, SigningKey},
     identity::RepoId,
-    node::{Handle as _, Node, device::Device},
-    profile::Profile,
+    node::{Handle as _, Node},
+    profile::{Profile, Signer},
     storage::{ReadRepository as _, ReadStorage as _, SignRepository as _, refs::SignedRefs},
 };
 use sqlite::State;
@@ -42,7 +42,7 @@ const JOURNAL_SCHEMA: &str = "
 pub(crate) struct Publisher {
     profile: Profile,
     repository: RepoId,
-    signer: Option<MemorySigner>,
+    signer: Option<SigningKey>,
     announcer: Arc<dyn Announcer>,
     authorizer: Arc<dyn Authorizer>,
     journal: Option<MutationJournal>,
@@ -81,7 +81,7 @@ impl Publisher {
     pub(crate) fn new(
         profile: Profile,
         repository: RepoId,
-        signer: Option<MemorySigner>,
+        signer: Option<SigningKey>,
         announcer: impl Announcer,
         authorizer: impl Authorizer,
     ) -> Self {
@@ -222,7 +222,7 @@ impl Publisher {
         T: Send + ToString + 'static,
         F: FnOnce(
                 &radicle::storage::git::Repository,
-                &radicle::node::device::BoxedDevice,
+                &radicle::profile::Signer,
                 &str,
             ) -> Result<T, Error>
             + Send
@@ -269,7 +269,7 @@ impl Publisher {
         let (value, author) = tokio::task::spawn_blocking(move || {
             let repository = publisher.profile.storage.repository(publisher.repository)?;
             let signer = match publisher.signer.clone() {
-                Some(signer) => Device::from(signer).boxed(),
+                Some(signer) => Signer::Key(signer),
                 None => publisher
                     .profile
                     .signer()
@@ -360,7 +360,7 @@ impl Publisher {
         tokio::task::spawn_blocking(move || {
             let repository = publisher.profile.storage.repository(publisher.repository)?;
             let signer = match publisher.signer.clone() {
-                Some(signer) => Device::from(signer).boxed(),
+                Some(signer) => Signer::Key(signer),
                 None => publisher
                     .profile
                     .signer()
@@ -440,7 +440,7 @@ impl Publisher {
             let commit = repository.backend.find_commit(operation.id.into())?;
             if commit
                 .message()
-                .is_some_and(|message| message.lines().next() == Some(marker))
+                .is_ok_and(|message| message.lines().next() == Some(marker))
             {
                 return Ok(Some(operation.id));
             }
