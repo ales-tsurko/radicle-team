@@ -1,80 +1,57 @@
 # Style guide
 
-Follow the [Rust Style Guide](https://doc.rust-lang.org/style-guide/) and the
-[rustc coding conventions][rustc-style]. Nightly `rustfmt` is the Rust
-formatting authority.
+Follow the [Rust Style Guide](https://doc.rust-lang.org/style-guide/) and
+[rustc conventions][rustc-style]. Nightly `rustfmt` is the Rust formatting
+authority.
 
 
 
 
 ## Module layout
 
-Keep crate roots and directory module roots thin. `lib.rs` and `mod.rs` files
-contain module-level documentation, re-exports, and module declarations. Move
-substantial implementations into focused module files. Small glue code is
-acceptable only when a separate module would make navigation harder.
+Keep `lib.rs` and `mod.rs` focused on documentation, re-exports, and
+declarations. Keep small glue there only when extraction would make navigation
+harder. Modules with submodules use `foo/mod.rs` and `foo/submodule.rs`.
 
-Represent modules with submodules as directories: use `foo/mod.rs` with
-`foo/submodule.rs`, never `foo.rs` alongside a `foo/` directory.
+Order each module as follows:
 
-Write modules from the public concept down to its details:
+1. Module documentation, imports, re-exports, module declarations, constants.
+2. The primary type followed by its inherent and trait implementations.
+3. Supporting types in introduction order, each followed by its implementations.
+4. Private utilities, error types, tests.
 
-1. Module documentation.
-2. `std`/`core` imports, third-party imports, then current-crate imports.
-   Current-crate paths must start with `crate::`.
-3. Re-exports, module declarations, then constants.
-4. The module's primary type, immediately followed by all of its inherent and
-   trait impls.
-5. Supporting types in the order the primary abstraction introduces them, each
-   immediately followed by its impls.
-6. Private utilities, error types, and tests, in that order.
-
-Keep an item earlier only when Rust's lexical rules require it, such as a macro
-used by the primary implementation.
+Imports follow `std`/`core`, third-party, then current-crate order.
+Current-crate paths start with `crate::`. Move items earlier only when lexical
+rules require it, such as a macro used by the primary implementation.
 
 
 
 
 ## Functions and types
 
-- Prefer methods on the type that owns the operation's state or context. Avoid
-  standalone functions unless the operation has no natural owner. `main`, tests,
-  and trait-required functions are normal exceptions.
-- Use traits and conversion types such as `From` when they make an extension
-  point explicit and keep variant-specific logic localized.
-- Derive errors with `thiserror`. Do not write manual `std::error::Error`
-  implementations.
+- Prefer methods on the type owning the state or context. Standalone functions
+  suit operations without a natural owner, `main`, tests, and trait
+  requirements.
+- Use traits and conversions such as `From` to clarify extension points and
+  localize variant-specific logic.
+- Derive errors with `thiserror`.
 
 
 
 
-## Formatting
+## Formatting and documentation
 
+Run `make fmt` before `make lint`. Formatting uses nightly `rustfmt` and rumdl
+0.2.75 with `.rumdl.toml`. For one Markdown file, use `rumdl fmt PATH` or
+`rumdl fmt --check PATH`.
 
-### Rust
+Rust lines, including comments and documentation, are limited to 100 characters.
+Markdown uses 80 characters, preserves code and output layout, and has one H1.
+Put four blank lines before H2, two before H3, and one before lower headings.
+Rumdl enforces minimum heading gaps, so remove excess blank lines manually.
 
-- Limit Rust lines to 100 characters, including documentation and comments.
-- Use four-space indentation and standard Rust naming, whitespace, and item
-  formatting.
-- Run `make fmt` and `make lint` before submitting changes.
-
-
-### Markdown
-
-Use rumdl 0.2.75, configured in `.rumdl.toml`. Install it with
-`cargo install --locked rumdl --version 0.2.75`.
-
-`make fmt` formats Rust and Markdown. `make lint` checks both formats without
-rewriting files, alongside Clippy and rustdoc. To format or check one document,
-use `rumdl fmt PATH` or `rumdl fmt --check PATH`.
-
-Rumdl enforces heading gaps as minimums; remove excess blank lines manually.
-
-- Limit Markdown lines to 80 characters.
-- Preserve line layout in code examples and command output.
-- Use exactly one H1 heading as the document title.
-- Put four blank lines before each H2 heading.
-- Put two blank lines before each H3 heading.
-- Put one blank line before each lower-level heading.
+Keep user documentation focused on setup, decisions, and non-obvious
+constraints. Document each fact once and link to it. Leave keybindings and
+command option lists to the application's help.
 
 [rustc-style]: https://rustc-dev-guide.rust-lang.org/conventions.html
