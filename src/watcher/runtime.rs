@@ -845,7 +845,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        time::{Duration, UNIX_EPOCH},
+        time::Duration,
     };
 
     use radicle::{
@@ -857,7 +857,7 @@ mod tests {
         identity::{Did, RepoId, doc::Visibility},
         node::Alias,
         profile::{Home, Profile},
-        storage::ReadStorage as _,
+        storage::{ReadStorage as _, WriteRepository as _},
     };
 
     use crate::{
@@ -1229,7 +1229,6 @@ mod tests {
         state: ProcessedActivities,
         watcher: Watcher,
         delivery: DeliveryRuntime,
-        dispatcher: Option<Dispatcher>,
     }
 
     impl RuntimeFixture {
@@ -1244,27 +1243,7 @@ mod tests {
             let state = ProcessedActivities::open(&root.path().join("state.db"))
                 .await
                 .expect("state should open");
-            let home = crate::home::MemberHome::at(root.path().join("member"));
-            home.create().expect("home should be created");
-            let workspaces = Workspaces::new(
-                Member::Nico,
-                home,
-                profile.storage.clone(),
-                repository,
-                profile.info(),
-                queue.clone(),
-            );
-            workspaces
-                .initialize()
-                .await
-                .expect("working copies should be prepared");
             let inbox = queue.inbox().await.expect("inbox should open");
-            let dispatcher = Dispatcher::new(
-                Member::Nico,
-                workspaces,
-                crate::mcp::ActivityScope::default(),
-                inbox.clone(),
-            );
             let delivery = DeliveryRuntime::new(
                 profile.storage.clone(),
                 queue.clone(),
@@ -1291,8 +1270,30 @@ mod tests {
                 state,
                 watcher,
                 delivery,
-                dispatcher: Some(dispatcher),
             }
+        }
+
+        async fn dispatcher(&self) -> Dispatcher {
+            let home = crate::home::MemberHome::at(self._root.path().join("member"));
+            home.create().expect("home should be created");
+            let workspaces = Workspaces::new(
+                Member::Nico,
+                home,
+                self.profile.storage.clone(),
+                self.repository,
+                self.profile.info(),
+                self.queue.clone(),
+            );
+            workspaces
+                .create()
+                .await
+                .expect("working copies should be prepared");
+            Dispatcher::new(
+                Member::Nico,
+                workspaces,
+                crate::mcp::ActivityScope::default(),
+                self.delivery.inbox.clone(),
+            )
         }
 
         fn comment(&self, body: &str) -> EntryId {
@@ -1311,6 +1312,51 @@ mod tests {
                 .expect("issue should open")
                 .comment(body, *self.issue, [])
                 .expect("comment should be created")
+        }
+
+        fn comment_at(&self, body: &str, seconds: u64) -> EntryId {
+            let id = self.comment(body);
+            let stored = self
+                .profile
+                .storage
+                .repository(self.repository)
+                .expect("stored repository");
+            let odb = stored.raw().odb().expect("object database");
+            let object = odb.read(id.into()).expect("comment commit");
+            let raw = std::str::from_utf8(object.data()).expect("UTF-8 commit");
+            let (headers, message) = raw.split_once("\n\n").expect("commit headers");
+            // COB signatures cover the tree. Keep that signature and change only fixture times.
+            let headers = headers
+                .lines()
+                .map(|line| {
+                    if line.starts_with("author ") || line.starts_with("committer ") {
+                        let (without_zone, _) = line.rsplit_once(' ').expect("time zone");
+                        let (identity, _) = without_zone.rsplit_once(' ').expect("timestamp");
+                        format!("{identity} {seconds} +0000")
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let rewritten = odb
+                .write(
+                    git2::ObjectType::Commit,
+                    format!("{headers}\n\n{message}").as_bytes(),
+                )
+                .expect("timestamped comment commit");
+            stored
+                .raw()
+                .find_reference(&format!(
+                    "refs/namespaces/{}/refs/cobs/{}/{}",
+                    self.profile.id(),
+                    *TYPENAME,
+                    self.issue,
+                ))
+                .expect("issue reference")
+                .set_target(rewritten, "set fixture timestamp")
+                .expect("timestamped issue reference");
+            rewritten.into()
         }
 
         fn assign_existing_issue(&self) {
@@ -1356,33 +1402,34 @@ mod tests {
         }
 
         async fn wait_for_tasks(&self, count: usize) {
-            while self
-                .queue
-                .waiting()
-                .await
-                .expect("queue should be readable")
-                != count
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            loop {
+                let changed = self.delivery.inbox.changed();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self
+                    .queue
+                    .waiting()
+                    .await
+                    .expect("queue should be readable")
+                    == count
+                {
+                    break;
+                }
+                changed.await;
             }
         }
     }
 
     #[tokio::test]
     async fn fresh_state_skips_old_replies_and_discovers_tasks_during_a_slow_reply() {
-        let mut fixture = RuntimeFixture::new().await;
-        let historical = fixture.comment("@nico please inspect this");
+        const PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let fixture = RuntimeFixture::new().await;
+        let historical = fixture.comment_at("@nico please inspect this", 99);
         fixture.assign_existing_issue();
-        let cutoff = Timestamp::from_secs(
-            UNIX_EPOCH
-                .elapsed()
-                .expect("clock should be after the epoch")
-                .as_secs()
-                + 1,
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let cutoff = Timestamp::from_secs(100);
         // This mention arrives after node startup, before the watcher finishes initialization.
-        let current = fixture.comment("@nico please explain the new request");
+        let current = fixture.comment_at("@nico please explain the new request", 100);
         let (updates, events) = tokio::sync::watch::channel(());
         let release = Arc::new(tokio::sync::Notify::new());
         let mut agent = NoopAgent {
@@ -1391,10 +1438,14 @@ mod tests {
         };
         let calls = agent.calls.clone();
         let reply_started = agent.started.clone();
-        let dispatcher = fixture.dispatcher.take().expect("dispatcher should exist");
+        let dispatcher = fixture.dispatcher().await;
         let exercise = async {
-            reply_started.notified().await;
-            fixture.wait_for_tasks(1).await;
+            tokio::time::timeout(PROGRESS_TIMEOUT, async {
+                reply_started.notified().await;
+                fixture.wait_for_tasks(1).await;
+            })
+            .await
+            .expect("the initial reply and assignment must be admitted");
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 1,
@@ -1416,25 +1467,32 @@ mod tests {
                     .expect("admission should checkpoint")
             );
             let new_issue = fixture.create_assignment();
-            let later = fixture.comment("@nico another question while you are busy");
+            let later = fixture.comment_at("@nico another question while you are busy", 101);
             updates.send(()).expect("scanners should be notified");
-            fixture.wait_for_tasks(2).await;
             let inbox = &fixture.delivery.inbox;
-            loop {
-                if inbox
-                    .list()
-                    .await
-                    .expect("inbox should read")
-                    .iter()
-                    .any(|record| {
-                        record.activity.operation == later
-                            && record.state == crate::delivery::State::Queued
-                    })
-                {
-                    break;
+            tokio::time::timeout(PROGRESS_TIMEOUT, async {
+                fixture.wait_for_tasks(2).await;
+                loop {
+                    let changed = inbox.changed();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if inbox
+                        .list()
+                        .await
+                        .expect("inbox should read")
+                        .iter()
+                        .any(|record| {
+                            record.activity.operation == later
+                                && record.state == crate::delivery::State::Queued
+                        })
+                    {
+                        break;
+                    }
+                    changed.await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            })
+            .await
+            .expect("new work must be admitted while the first reply remains blocked");
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 1,
@@ -1450,24 +1508,33 @@ mod tests {
                     .any(|task| task.source == Subject::Issue(new_issue).into())
             );
             release.notify_one();
-            reply_started.notified().await;
+            tokio::time::timeout(PROGRESS_TIMEOUT, reply_started.notified())
+                .await
+                .expect("the queued reply must start after releasing the first reply");
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 2,
                 "the queued reply must follow the active one"
             );
             release.notify_one();
-            loop {
-                let records = inbox.list().await.expect("inbox should read");
-                if records
-                    .iter()
-                    .filter(|record| record.task.is_none())
-                    .all(|record| record.state == crate::delivery::State::Handled)
-                {
-                    break;
+            tokio::time::timeout(PROGRESS_TIMEOUT, async {
+                loop {
+                    let changed = inbox.changed();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    let records = inbox.list().await.expect("inbox should read");
+                    if records
+                        .iter()
+                        .filter(|record| record.task.is_none())
+                        .all(|record| record.state == crate::delivery::State::Handled)
+                    {
+                        break;
+                    }
+                    changed.await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            })
+            .await
+            .expect("both released replies must finish handling");
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 2,
@@ -1484,15 +1551,11 @@ mod tests {
         );
         tokio::pin!(watching);
         let dispatching = dispatcher.run(&mut agent);
-        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::select! {
-                () = exercise => Ok(()),
-                result = watching => result.and(Err(super::Error::EventStreamClosed)),
-                result = dispatching => panic!("dispatcher ended: {result:?}"),
-            }
-        })
-        .await
-        .expect("task discovery must not wait for the slow reply");
+        let outcome = tokio::select! {
+            () = exercise => Ok(()),
+            result = watching => result.and(Err(super::Error::EventStreamClosed)),
+            result = dispatching => panic!("dispatcher ended: {result:?}"),
+        };
         outcome.expect("the watcher and dispatcher should stay running");
     }
 

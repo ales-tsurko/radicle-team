@@ -55,13 +55,7 @@ jobs:
         run: cargo check --locked --workspace --all-features --all-targets
 
       - name: Run tests
-        run: |
-          test_home="$(mktemp -d)"
-          mkdir -p "$test_home/.config"
-          env CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
-            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-            HOME="$test_home" XDG_CONFIG_HOME="$test_home/.config" \
-            cargo test --locked --workspace --all-features --all-targets
+        run: cargo test --locked --workspace --all-features --all-targets
 
   quality:
     name: Quality

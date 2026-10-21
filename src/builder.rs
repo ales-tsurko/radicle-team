@@ -462,16 +462,34 @@ mod tests {
                 Vec::new()
             }
             attempts = async {
-                let mut attempts = Vec::new();
-                for _ in 0..3 {
-                    // Each attempt prepares a real sandboxed worktree. Bound progress separately
-                    // instead of making all three preparations share one retry deadline.
+                let initial = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    observed.recv(),
+                )
+                .await
+                .expect("the first task should start")
+                .expect("builder should stay active");
+
+                // Freeze only the backoff. Git subprocesses run with the clock resumed.
+                tokio::time::pause();
+                let tick = std::time::Duration::from_millis(1);
+                let before_retry = super::RETRY_DELAY.checked_sub(tick).expect("nonzero backoff");
+                tokio::time::sleep(before_retry).await;
+                assert!(
+                    matches!(observed.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
+                    "the failed task must not retry before the backoff expires"
+                );
+                tokio::time::advance(tick).await;
+                tokio::time::resume();
+
+                let mut attempts = vec![initial];
+                for _ in 0..2 {
                     let attempt = tokio::time::timeout(
-                        super::RETRY_DELAY + std::time::Duration::from_secs(30),
+                        std::time::Duration::from_secs(5),
                         observed.recv(),
                     )
                     .await
-                    .expect("each attempt should make progress after the retry delay")
+                    .expect("each attempt should make progress after the virtual backoff")
                     .expect("builder should stay active");
                     attempts.push(attempt);
                 }
@@ -557,7 +575,7 @@ mod tests {
             queue.clone(),
         );
         copies
-            .initialize()
+            .create()
             .await
             .expect("working copies should be created");
         (repository, queue, copies)
